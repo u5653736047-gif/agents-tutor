@@ -21,7 +21,7 @@ def route_by_next_agent(state: AgentState) -> str:
     return state.get("next_agent") or END
 
 
-def build_graph() -> CompiledStateGraph:
+def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState]:
     """构建多智能体 StateGraph.
 
     Supervisor 通过条件边按意图分派任务；子 Agent 执行完成后通过普通边
