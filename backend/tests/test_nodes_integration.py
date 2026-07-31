@@ -7,7 +7,7 @@ from langgraph.graph import END
 
 from core.graph import build_graph
 from core.nodes import BaseAgentNode
-from core.state import AgentRole, AgentState, TaskContext, create_initial_state
+from core.state import AgentRole, AgentState, TaskContext, TaskStatus, create_initial_state
 
 
 def _state_with_intent(intent: str, *, completed: bool = False) -> AgentState:
@@ -17,9 +17,8 @@ def _state_with_intent(intent: str, *, completed: bool = False) -> AgentState:
         intent=intent,
         description="测试任务",
         subtasks=["子任务1"],
+        status=TaskStatus.COMPLETED if completed else TaskStatus.PENDING,
     )
-    if completed:
-        state["extra"] = {"task_completed": True}
     return state
 
 
@@ -73,7 +72,7 @@ def test_graph_routes_intent_to_worker_and_terminates(intent: str, worker: str) 
     assert "supervisor" in names
     assert result["current_agent"] == "supervisor"
     assert result["next_agent"] == END
-    assert result["extra"]["task_completed"] is True
+    assert result["task_context"].status == TaskStatus.COMPLETED
 
 
 def test_graph_falls_back_to_teaching_assistant_for_unknown_intent() -> None:

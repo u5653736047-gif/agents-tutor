@@ -13,7 +13,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langgraph.graph import END
 
-from core.state import AgentRole, AgentState
+from core.state import AgentRole, AgentState, TaskContext, TaskStatus
 
 
 class BaseAgentNode(ABC):
@@ -81,9 +81,9 @@ class SupervisorNode(BaseAgentNode):
 
     def decide(self, state: AgentState, plan: str) -> str:
         """返回下一节点名；任务全部完成时返回 END."""
-        if state.get("extra", {}).get("task_completed"):
-            return END
         task = state.get("task_context")
+        if task and task.status == TaskStatus.COMPLETED:
+            return END
         intent = task.intent if task else ""
         return _INTENT_ROUTING.get(intent, AgentRole.TEACHING_ASSISTANT.value)
 
@@ -114,11 +114,17 @@ class _WorkerNode(BaseAgentNode):
         return f"{self.name} 的回复（占位）：任务已处理完毕。"
 
     def observe(self, state: AgentState, action: str, result: str) -> dict[str, Any]:
+        task = state.get("task_context")
+        completed_task = (
+            task.model_copy(update={"status": TaskStatus.COMPLETED})
+            if task is not None
+            else TaskContext(status=TaskStatus.COMPLETED)
+        )
         return {
             "messages": [AIMessage(content=result, name=self.name)],
             "current_agent": self.name,
             "next_agent": action,
-            "extra": {**state.get("extra", {}), "task_completed": True},
+            "task_context": completed_task,
         }
 
 
