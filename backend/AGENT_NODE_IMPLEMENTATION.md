@@ -32,6 +32,11 @@ Agent 切换次数设置显式上限。
 - `src/core/context.py`：结构完整的模型上下文窗口。
 - `src/core/persistence.py`：SQLite checkpointer 生命周期封装。
 - `src/core/sessions.py`：独立的会话元数据与归档状态。
+- `src/core/knowledge/loaders.py`：UTF-8 文本与逐页 PDF 加载。
+- `src/core/knowledge/chunking.py`：确定性的重叠字符分块。
+- `src/core/knowledge/index.py`：可替换索引协议与内存词法索引。
+- `src/core/knowledge/service.py`：知识写入、删除和 Top-K 检索。
+- `src/core/knowledge/tools.py`：无全局状态的 `search_knowledge` 工具工厂。
 - `src/core/models/deepseek.py`：从项目 `.env` 创建 DeepSeek 模型。
 - `src/core/graph_builder.py`：Supervisor 与 Worker 的 LangGraph 编排。
 - `scripts/verify_deepseek_react.py`：真实 DeepSeek 工具调用验证。
@@ -45,3 +50,11 @@ python scripts/verify_deepseek_react.py
 
 脚本要求 `.env` 提供 `DEEPSEEK_MODEL`、`DEEPSEEK_BASE_URL` 和
 `DEEPSEEK_API_KEY`，执行过程中不会打印 API Key。
+
+## 知识工具接入
+
+`create_search_knowledge_tool(service)` 返回普通 LangChain 工具。现有
+`ToolExecutor` 会把命中内容、分数和 Citation 字典转换为 JSON Observation，
+无需修改 ReAct 循环。Graph 对业务工具默认允许全部角色，因此接入时必须通过
+`tool_permissions` 显式排除 Supervisor。该工具只保证零命中时不伪造引用，不
+负责校验模型最终回答中的自由文本引用。
