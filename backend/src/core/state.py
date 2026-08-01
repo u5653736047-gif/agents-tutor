@@ -13,15 +13,15 @@
 from __future__ import annotations
 
 import operator
-from datetime import datetime, timezone
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Optional, Sequence, TypedDict
+from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
-
 
 # ─────────────────────────────────────────────
 # 枚举定义
@@ -72,7 +72,7 @@ class TaskContext(BaseModel):
         default_factory=dict,
         description="扩展元数据（难度级别、学科标签、关联知识点等）",
     )
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ToolResult(BaseModel):
@@ -87,9 +87,9 @@ class ToolResult(BaseModel):
     agent_role: AgentRole = Field(description="发起调用的 Agent 角色")
     success: bool = Field(default=True)
     output: str = Field(default="", description="工具返回的文本结果")
-    error: Optional[str] = Field(default=None, description="失败时的错误信息")
+    error: str | None = Field(default=None, description="失败时的错误信息")
     duration_ms: float = Field(default=0.0, description="执行耗时（毫秒）")
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ─────────────────────────────────────────────
@@ -98,8 +98,8 @@ class ToolResult(BaseModel):
 
 
 def _replace(existing: Any, new: Any) -> Any:
-    """直接覆盖式 reducer：新值非 None 时替换旧值."""
-    return new if new is not None else existing
+    """直接覆盖式 reducer；显式 None 也用于清空旧状态."""
+    return new
 
 
 # ─────────────────────────────────────────────
@@ -130,22 +130,22 @@ class AgentState(TypedDict, total=False):
 
     # --- Agent 调度信息 ---
     # 当前正在执行的 Agent 角色（last-write-wins）
-    current_agent: Annotated[Optional[str], _replace]
+    current_agent: Annotated[str | None, _replace]
 
     # 路由决策：Supervisor 输出的下一步目标节点名称
-    next_agent: Annotated[Optional[str], _replace]
+    next_agent: Annotated[str | None, _replace]
 
     # --- 任务上下文 ---
     # 结构化的当前任务信息（由 Supervisor 填充）
-    task_context: Annotated[Optional[TaskContext], _replace]
+    task_context: Annotated[TaskContext | None, _replace]
 
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计
     tool_results: Annotated[list[ToolResult], operator.add]
 
     # --- 会话元信息 ---
-    session_id: Annotated[Optional[str], _replace]
-    user_id: Annotated[Optional[str], _replace]
+    session_id: Annotated[str | None, _replace]
+    user_id: Annotated[str | None, _replace]
 
     # --- 扩展预留 ---
     # 自由格式附加数据，避免频繁修改 Schema
