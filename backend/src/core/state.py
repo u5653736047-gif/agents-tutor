@@ -75,6 +75,21 @@ class TaskContext(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class SubtaskResult(BaseModel):
+    """单个子任务的结构化执行结果.
+
+    由子 Agent 节点在任务执行完毕后追加到状态，
+    Supervisor 据此聚合判断并行子任务是否全部完成。
+    """
+
+    task_id: str = Field(description="所属任务（TaskContext）的唯一 ID")
+    subtask: str = Field(default="", description="子任务文本描述")
+    worker: AgentRole = Field(description="执行该子任务的 Agent 角色")
+    output: str = Field(default="", description="子任务执行结果文本")
+    success: bool = Field(default=True)
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class ToolResult(BaseModel):
     """单次工具调用的结构化结果.
 
@@ -139,6 +154,11 @@ class AgentState(TypedDict, total=False):
     # 结构化的当前任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
 
+    # --- 子任务结果聚合 ---
+    # 追加式累积（整个会话生命周期只增不减），Supervisor 按当前 task_id
+    # 过滤计数后与计划总数对比，判断本轮并行子任务是否全部完成
+    subtask_results: Annotated[list[SubtaskResult], operator.add]
+
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计
     tool_results: Annotated[list[ToolResult], operator.add]
@@ -176,6 +196,7 @@ def create_initial_state(
         current_agent=None,
         next_agent=None,
         task_context=None,
+        subtask_results=[],
         tool_results=[],
         session_id=session_id,
         user_id=user_id,
