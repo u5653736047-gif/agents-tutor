@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
 from core.events import ErrorCode, EventType, RunError, RunEvent
@@ -56,6 +56,78 @@ def test_react_agent_rejects_non_positive_iteration_limit(
             model=ScriptedModel([]),
             max_iterations=max_iterations,
         )
+
+
+@pytest.mark.parametrize("max_context_messages", [-1, 0, 2])
+def test_react_agent_rejects_too_small_context_window(
+    max_context_messages: int,
+) -> None:
+    with pytest.raises(ValueError, match="max_context_messages"):
+        ReActAgentNode(
+            role=AgentRole.SUPERVISOR,
+            system_prompt="supervisor",
+            model=ScriptedModel([]),
+            max_context_messages=max_context_messages,
+        )
+
+
+def test_react_agent_trims_only_model_context_and_merges_extra_metrics() -> None:
+    model = ScriptedModel([AIMessage(content="new answer")])
+    agent = ReActAgentNode(
+        role=AgentRole.TEACHING_ASSISTANT,
+        system_prompt="system",
+        model=model,
+        max_context_messages=3,
+    )
+    history: list[BaseMessage] = [
+        HumanMessage(content="old question"),
+        AIMessage(content="old answer"),
+        HumanMessage(content="latest question"),
+        AIMessage(content="recent-1"),
+        AIMessage(content="recent-2"),
+    ]
+    original = list(history)
+    state = create_initial_state()
+    state["messages"] = history
+    state["extra"] = {"trace_id": "trace-1", "context_trimmed": 99}
+
+    result = agent.run(state)
+
+    assert [message.content for message in model.calls[0]] == [
+        "system",
+        "latest question",
+        "recent-1",
+        "recent-2",
+    ]
+    assert state["messages"] is history
+    assert state["messages"] == original
+    assert result.updates["messages"] == [result.messages[-1]]
+    assert result.updates["extra"] == {
+        "trace_id": "trace-1",
+        "context_trimmed": 2,
+        "context_message_count": 3,
+    }
+
+
+def test_react_agent_default_context_keeps_all_history_and_records_metrics() -> None:
+    model = ScriptedModel([AIMessage(content="answer")])
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=model,
+    )
+    state = create_initial_state()
+    state["messages"] = [HumanMessage(content="question")]
+    state["extra"] = {"request_id": "request-1"}
+
+    result = agent.run(state)
+
+    assert [message.content for message in model.calls[0]] == ["system", "question"]
+    assert result.updates["extra"] == {
+        "request_id": "request-1",
+        "context_trimmed": 0,
+        "context_message_count": 1,
+    }
 
 
 def test_react_agent_returns_direct_answer_without_tool() -> None:

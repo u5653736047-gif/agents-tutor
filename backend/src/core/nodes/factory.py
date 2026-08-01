@@ -19,6 +19,7 @@ def create_agent_nodes(
     tools: Sequence[BaseTool] = (),
     registry: ToolRegistry | None = None,
     max_iterations: int = 5,
+    max_context_messages: int | None = None,
 ) -> dict[AgentRole, ReActAgentNode]:
     """共享模型、工具和循环配置，仅为每个角色替换 Prompt。"""
     tool_executor = ToolExecutor(tools, registry=registry)
@@ -30,6 +31,7 @@ def create_agent_nodes(
             model=prepared_model,
             tool_executor=tool_executor,
             max_iterations=max_iterations,
+            max_context_messages=max_context_messages,
         )
         for role, prompt in ROLE_PROMPTS.items()
     }

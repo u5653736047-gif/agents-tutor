@@ -35,13 +35,19 @@ def double(value: int) -> int:
 def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     model = BindableModel()
 
-    agents = create_agent_nodes(model=model, tools=[double], max_iterations=3)
+    agents = create_agent_nodes(
+        model=model,
+        tools=[double],
+        max_iterations=3,
+        max_context_messages=7,
+    )
 
     assert set(agents) == set(AgentRole)
     assert {type(agent) for agent in agents.values()} == {ReActAgentNode}
     assert {id(agent.model) for agent in agents.values()} == {id(model)}
     assert len({id(agent.tool_executor) for agent in agents.values()}) == 1
     assert {agent.max_iterations for agent in agents.values()} == {3}
+    assert {agent.max_context_messages for agent in agents.values()} == {7}
     assert {agent.system_prompt for agent in agents.values()} == set(ROLE_PROMPTS.values())
     assert max(map(len, ROLE_PROMPTS.values())) <= 80
     assert model.bind_count == 1
@@ -59,3 +65,4 @@ def test_factory_accepts_and_shares_registry() -> None:
     assert {
         id(agent.tool_executor.registry) for agent in agents.values()
     } == {id(registry)}
+    assert {agent.max_context_messages for agent in agents.values()} == {None}

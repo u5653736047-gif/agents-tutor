@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Collection, Hashable, Mapping, Sequence
 from typing import Literal, cast
 
-from langchain_core.messages import HumanMessage
-from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -37,9 +38,11 @@ class CollaborativeAgentGraph:
         model: ChatModel,
         tools: Sequence[BaseTool] = (),
         max_iterations: int = 5,
+        max_context_messages: int | None = None,
         tool_permissions: Mapping[str, Collection[AgentRole]] | None = None,
         max_handoffs: int = 4,
         max_agent_switches: int = 8,
+        checkpointer: BaseCheckpointSaver[str] | None = None,
     ) -> None:
         if max_handoffs <= 0:
             raise ValueError("max_handoffs must be positive")
@@ -63,11 +66,13 @@ class CollaborativeAgentGraph:
         self.registry = registry
         self.max_handoffs = max_handoffs
         self.max_agent_switches = max_agent_switches
+        self.checkpointer = checkpointer
         # 创建4个同构的agent，均遵循react设计范式
         self.agents = create_agent_nodes(
             model=model,
             registry=registry,
             max_iterations=max_iterations,
+            max_context_messages=max_context_messages,
         )
 
         # 图缓存，避免重复编译
@@ -96,7 +101,7 @@ class CollaborativeAgentGraph:
 
         # 设置入口节点并编译图
         graph.set_entry_point(AgentRole.SUPERVISOR.value)
-        self._app = graph.compile()
+        self._app = graph.compile(checkpointer=self.checkpointer)
         return self._app
 
     def _wrap(self, agent: ReActAgentNode) -> Runnable[AgentState, AgentState]:
@@ -268,11 +273,83 @@ class CollaborativeAgentGraph:
             return AgentRole.SUPERVISOR.value
         return "end"
 
-    def run(self, user_input: str, session_id: str = "demo") -> AgentState:
+    def run(
+        self,
+        user_input: str,
+        session_id: str = "demo",
+        user_id: str | None = None,
+    ) -> AgentState:
         """从一条用户消息启动协作图。"""
-        state = create_initial_state(session_id=session_id)
-        state["messages"] = [HumanMessage(content=user_input)]
-        return cast(AgentState, self.build().invoke(state))
+        self._user_key(user_id)
+        self._session_key(session_id)
+        app = self.build()
+        if self.checkpointer is None:
+            state = create_initial_state(session_id=session_id, user_id=user_id)
+            state["messages"] = [HumanMessage(content=user_input)]
+            return cast(AgentState, app.invoke(state))
+
+        config = self._thread_config(session_id, user_id)
+        if app.get_state(config).values:
+            state = cast(
+                AgentState,
+                {
+                    "messages": [HumanMessage(content=user_input)],
+                    "next_agent": None,
+                    "run_error": None,
+                    "handoff_count": 0,
+                    "agent_switch_count": 0,
+                },
+            )
+        else:
+            state = create_initial_state(session_id=session_id, user_id=user_id)
+            state["messages"] = [HumanMessage(content=user_input)]
+        return cast(AgentState, app.invoke(state, config=config))
+
+    @staticmethod
+    def _thread_config(session_id: str, user_id: str | None) -> RunnableConfig:
+        user_key = CollaborativeAgentGraph._user_key(user_id)
+        session_key = CollaborativeAgentGraph._session_key(session_id)
+        thread_id = f"user:{user_key}|session:{session_key}"
+        return {"configurable": {"thread_id": thread_id}}
+
+    @staticmethod
+    def _user_key(user_id: str | None) -> str:
+        if user_id is None:
+            return "none"
+        if not user_id.strip():
+            raise ValueError("user_id must not be empty")
+        return f"value:{len(user_id)}:{user_id}"
+
+    @staticmethod
+    def _session_key(session_id: str) -> str:
+        if not session_id.strip():
+            raise ValueError("session_id must not be empty")
+        return f"{len(session_id)}:{session_id}"
+
+    def get_state(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> AgentState | None:
+        """Return the latest persisted state for a user session."""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError("get_state requires a configured checkpointer")
+        values = self.build().get_state(config).values
+        if not values:
+            return None
+        return cast(AgentState, dict(values))
+
+    def get_history(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> list[BaseMessage]:
+        """Return the persisted messages for a user session."""
+        state = self.get_state(session_id, user_id)
+        if state is None:
+            return []
+        return list(state.get("messages", []))
 
     def get_node_info(self) -> dict[str, dict[str, str]]:
         """返回节点身份与 Prompt，便于调试和展示。"""

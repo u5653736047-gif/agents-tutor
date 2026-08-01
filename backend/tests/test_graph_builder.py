@@ -39,13 +39,27 @@ class ScriptedModel:
 
 @pytest.mark.parametrize(
     ("option", "value"),
-    [("max_handoffs", 0), ("max_handoffs", -1), ("max_agent_switches", 0)],
+    [
+        ("max_handoffs", 0),
+        ("max_handoffs", -1),
+        ("max_agent_switches", 0),
+        ("max_context_messages", 2),
+    ],
 )
 def test_graph_rejects_non_positive_limits(option: str, value: int) -> None:
     kwargs = {option: value}
 
     with pytest.raises(ValueError, match=option):
         CollaborativeAgentGraph(model=ScriptedModel([]), **kwargs)
+
+
+def test_graph_forwards_context_window_to_every_agent() -> None:
+    builder = CollaborativeAgentGraph(
+        model=ScriptedModel([]),
+        max_context_messages=7,
+    )
+
+    assert {agent.max_context_messages for agent in builder.agents.values()} == {7}
 
 
 def test_graph_registry_limits_handoff_to_supervisor() -> None:

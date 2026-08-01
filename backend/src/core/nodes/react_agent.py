@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
+from ..context import trim_message_history
 from ..events import ErrorCode, EventType, RunError, RunEvent
 from ..state import AgentRole, AgentState, ToolResult
 from ..tools import ToolExecutor
@@ -42,18 +43,37 @@ class ReActAgentNode:
         model: ChatModel,
         tool_executor: ToolExecutor | None = None,
         max_iterations: int = 5,
+        max_context_messages: int | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
+        if max_context_messages is not None and max_context_messages < 3:
+            raise ValueError("max_context_messages must be at least 3")
         self.role = role
         self.system_prompt = system_prompt
         self.model = model
         self.tool_executor = tool_executor or ToolExecutor()
         self.max_iterations = max_iterations
+        self.max_context_messages = max_context_messages
 
     def run(self, state: AgentState) -> ReActResult:
         """运行到模型给出最终回答，或达到最大轮数。"""
-        history = list(state.get("messages", []))
+        persisted_history = list(state.get("messages", []))
+        if self.max_context_messages is None:
+            history = list(persisted_history)
+            context_trimmed = 0
+        else:
+            context_window = trim_message_history(
+                persisted_history,
+                self.max_context_messages,
+            )
+            history = list(context_window.messages)
+            context_trimmed = context_window.trimmed_count
+        extra = {
+            **state.get("extra", {}),
+            "context_trimmed": context_trimmed,
+            "context_message_count": len(history),
+        }
         generated: list[BaseMessage] = []
         tool_results: list[ToolResult] = []
         events: list[RunEvent] = []
@@ -104,6 +124,7 @@ class ReActAgentNode:
                     tool_results,
                     events,
                     iteration,
+                    extra,
                     error,
                 )
             generated.append(response)
@@ -114,7 +135,13 @@ class ReActAgentNode:
                     success=True,
                     duration_ms=(perf_counter() - started_at) * 1000,
                 )
-                return self._result(generated, tool_results, events, iteration)
+                return self._result(
+                    generated,
+                    tool_results,
+                    events,
+                    iteration,
+                    extra,
+                )
 
             # 工具返回的 ToolMessage 会进入下一轮模型输入，形成 Observation。
             for tool_call in response.tool_calls:
@@ -149,6 +176,7 @@ class ReActAgentNode:
             tool_results,
             events,
             self.max_iterations,
+            extra,
             error,
         )
 
@@ -158,6 +186,7 @@ class ReActAgentNode:
         tool_results: list[ToolResult],
         events: list[RunEvent],
         iterations: int,
+        extra: dict[str, Any],
         error: RunError | None = None,
     ) -> ReActResult:
         """统一整理写回 AgentState 的数据。"""
@@ -166,6 +195,7 @@ class ReActAgentNode:
             "messages": messages,
             "tool_results": tool_results,
             "events": events,
+            "extra": extra,
         }
         return ReActResult(
             updates=updates,
