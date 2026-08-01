@@ -23,6 +23,8 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
+from .events import ErrorCode, RunError, RunEvent
+
 # ─────────────────────────────────────────────
 # 枚举定义
 # ─────────────────────────────────────────────
@@ -88,6 +90,7 @@ class ToolResult(BaseModel):
     success: bool = Field(default=True)
     output: str = Field(default="", description="工具返回的文本结果")
     error: str | None = Field(default=None, description="失败时的错误信息")
+    error_code: ErrorCode | None = Field(default=None, description="失败错误分类")
     duration_ms: float = Field(default=0.0, description="执行耗时（毫秒）")
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -147,6 +150,11 @@ class AgentState(TypedDict, total=False):
     session_id: Annotated[str | None, _replace]
     user_id: Annotated[str | None, _replace]
 
+    events: Annotated[list[RunEvent], operator.add]
+    run_error: Annotated[RunError | None, _replace]
+    handoff_count: Annotated[int, _replace]
+    agent_switch_count: Annotated[int, _replace]
+
     # --- 扩展预留 ---
     # 自由格式附加数据，避免频繁修改 Schema
     extra: Annotated[dict[str, Any], _replace]
@@ -179,5 +187,9 @@ def create_initial_state(
         tool_results=[],
         session_id=session_id,
         user_id=user_id,
+        events=[],
+        run_error=None,
+        handoff_count=0,
+        agent_switch_count=0,
         extra={},
     )

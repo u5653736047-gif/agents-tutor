@@ -8,7 +8,7 @@ from typing import cast
 from langchain_core.tools import BaseTool
 
 from ..state import AgentRole
-from ..tools import ToolExecutor
+from ..tools import ToolExecutor, ToolRegistry
 from .prompts import ROLE_PROMPTS
 from .react_agent import ChatModel, ReActAgentNode
 
@@ -17,11 +17,12 @@ def create_agent_nodes(
     *,
     model: ChatModel,
     tools: Sequence[BaseTool] = (),
+    registry: ToolRegistry | None = None,
     max_iterations: int = 5,
 ) -> dict[AgentRole, ReActAgentNode]:
     """共享模型、工具和循环配置，仅为每个角色替换 Prompt。"""
-    prepared_model = _bind_tools(model, tools)
-    tool_executor = ToolExecutor(tools)
+    tool_executor = ToolExecutor(tools, registry=registry)
+    prepared_model = _bind_tools(model, tool_executor.registry.list_tools())
     return {
         role: ReActAgentNode(
             role=role,

@@ -6,12 +6,15 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel, ValidationError
 
+from ..events import ErrorCode
 from ..state import AgentRole, ToolResult
+from .registry import ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +28,21 @@ class ToolExecution:
 class ToolExecutor:
     """按名称执行 LangChain 工具，并统一记录成功或失败。"""
 
-    def __init__(self, tools: Sequence[BaseTool] = ()) -> None:
-        self._tools = {tool.name: tool for tool in tools}
+    def __init__(
+        self,
+        tools: Sequence[BaseTool] | ToolRegistry = (),
+        *,
+        registry: ToolRegistry | None = None,
+    ) -> None:
+        if isinstance(tools, ToolRegistry):
+            if registry is not None:
+                raise ValueError("不能重复指定工具注册表")
+            registry = tools
+        elif registry is None:
+            registry = ToolRegistry(tools)
+        elif tools:
+            raise ValueError("不能同时指定工具列表和工具注册表")
+        self.registry = registry
 
     def execute(
         self,
@@ -39,19 +55,38 @@ class ToolExecutor:
         args = tool_call.get("args", {})
         started_at = perf_counter()
 
-        tool = self._tools.get(tool_name)
+        tool = self.registry.get(tool_name)
         success = False
         output = ""
         error: str | None = None
+        error_code: ErrorCode | None = None
 
         if tool is None:
             error = f"未注册工具：{tool_name}"
+            error_code = ErrorCode.TOOL_UNKNOWN
+        elif not self.registry.is_authorized(tool_name, agent_role):
+            error = f"角色 {agent_role.value} 无权调用工具：{tool_name}"
+            error_code = ErrorCode.TOOL_UNAUTHORIZED
+        elif not isinstance(args, Mapping):
+            error = "工具参数必须是对象"
+            error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
         else:
             try:
-                output = _to_text(tool.invoke(args))
-                success = True
-            except Exception as exc:  # noqa: BLE001 - 工具边界必须把异常反馈给模型
+                input_schema = cast(type[BaseModel], tool.get_input_schema())
+                input_schema.model_validate(dict(args))
+            except ValidationError as exc:
                 error = str(exc)
+                error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
+            except Exception as exc:  # noqa: BLE001 - Schema 边界也必须生成 Observation
+                error = str(exc)
+                error_code = ErrorCode.TOOL_EXECUTION_FAILED
+            else:
+                try:
+                    output = _to_text(tool.invoke(dict(args)))
+                    success = True
+                except Exception as exc:  # noqa: BLE001 - 工具边界必须捕获所有运行异常
+                    error = str(exc)
+                    error_code = ErrorCode.TOOL_EXECUTION_FAILED
 
         duration_ms = (perf_counter() - started_at) * 1000
         content = output if success else f"错误：{error}"
@@ -62,6 +97,7 @@ class ToolExecutor:
             success=success,
             output=output,
             error=error,
+            error_code=error_code,
             duration_ms=duration_ms,
         )
         message = ToolMessage(

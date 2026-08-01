@@ -8,6 +8,8 @@
 - Supervisor、助教、助学、评价四个同构 Agent
 - “模型决策 → 工具执行 → 结果观察”ReAct 循环
 - Supervisor 通过 `handoff` 工具进行节点路由
+- 工具名称唯一校验、角色权限和结构化错误
+- 安全运行事件以及 handoff、Agent 切换上限
 - 使用项目根目录 `.env` 接入 DeepSeek
 - pytest、Ruff 和 mypy 质量检查
 

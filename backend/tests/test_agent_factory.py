@@ -9,6 +9,7 @@ from core.nodes.factory import create_agent_nodes
 from core.nodes.prompts import ROLE_PROMPTS
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole
+from core.tools import ToolRegistry
 
 
 class BindableModel:
@@ -44,3 +45,17 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     assert {agent.system_prompt for agent in agents.values()} == set(ROLE_PROMPTS.values())
     assert max(map(len, ROLE_PROMPTS.values())) <= 80
     assert model.bind_count == 1
+
+
+def test_factory_accepts_and_shares_registry() -> None:
+    model = BindableModel()
+    registry = ToolRegistry([double])
+
+    agents = create_agent_nodes(model=model, registry=registry)
+
+    assert model.bind_count == 1
+    assert {id(agent.model) for agent in agents.values()} == {id(model)}
+    assert len({id(agent.tool_executor) for agent in agents.values()}) == 1
+    assert {
+        id(agent.tool_executor.registry) for agent in agents.values()
+    } == {id(registry)}

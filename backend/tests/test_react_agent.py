@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import pytest
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.tools import tool
 
+from core.events import ErrorCode, EventType, RunError, RunEvent
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole, create_initial_state
 from core.tools.executor import ToolExecutor
@@ -43,6 +45,19 @@ def tool_call(name: str, call_id: str = "call-1") -> dict[str, object]:
     return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
 
 
+@pytest.mark.parametrize("max_iterations", [0, -1])
+def test_react_agent_rejects_non_positive_iteration_limit(
+    max_iterations: int,
+) -> None:
+    with pytest.raises(ValueError, match="max_iterations"):
+        ReActAgentNode(
+            role=AgentRole.SUPERVISOR,
+            system_prompt="supervisor",
+            model=ScriptedModel([]),
+            max_iterations=max_iterations,
+        )
+
+
 def test_react_agent_returns_direct_answer_without_tool() -> None:
     model = ScriptedModel([AIMessage(content="直接回答")])
     agent = ReActAgentNode(
@@ -59,6 +74,13 @@ def test_react_agent_returns_direct_answer_without_tool() -> None:
     assert result.updates["tool_results"] == []
     assert result.metadata["iterations"] == 1
     assert model.calls[0][0].content == "你是助教。"
+    assert [event.event_type for event in result.updates["events"]] == [
+        EventType.AGENT_STARTED,
+        EventType.AGENT_COMPLETED,
+    ]
+    assert {event.session_id for event in result.updates["events"]} == {None}
+    assert result.updates["events"][-1].success is True
+    assert result.updates["events"][-1].duration_ms is not None
 
 
 def test_react_agent_feeds_tool_observation_back_to_model() -> None:
@@ -88,6 +110,57 @@ def test_react_agent_feeds_tool_observation_back_to_model() -> None:
     assert result.metadata["iterations"] == 2
 
 
+def test_react_agent_emits_safe_ordered_events_after_history() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("double")]),
+            AIMessage(content="sensitive answer"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.TEACHING_ASSISTANT,
+        system_prompt="你是助教。",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+    )
+    state = create_initial_state(session_id="session-1")
+    state["events"] = [
+        RunEvent(
+            event_type=EventType.RUN_COMPLETED,
+            sequence=7,
+            session_id="session-1",
+        )
+    ]
+
+    result = agent.run(state)
+    events = result.updates["events"]
+
+    assert [event.event_type for event in events] == [
+        EventType.AGENT_STARTED,
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.AGENT_COMPLETED,
+    ]
+    assert [event.sequence for event in events] == [8, 9, 10, 11]
+    assert {event.session_id for event in events} == {"session-1"}
+    assert events[1].tool_name == "double"
+    assert events[2].success is True
+    assert events[2].duration_ms is not None
+    assert events[3].success is True
+    assert events[3].duration_ms is not None
+    safe_fields = {
+        "event_type",
+        "sequence",
+        "session_id",
+        "agent",
+        "tool_name",
+        "success",
+        "duration_ms",
+        "error_code",
+    }
+    assert all(set(event.model_dump()) == safe_fields for event in events)
+
+
 def test_react_agent_stops_at_iteration_limit() -> None:
     model = ScriptedModel(
         [
@@ -105,9 +178,19 @@ def test_react_agent_stops_at_iteration_limit() -> None:
 
     result = agent.run(create_initial_state())
 
-    assert result.error == "ReAct 循环达到最大轮数：2"
+    assert result.error == RunError(
+        error_code=ErrorCode.REACT_ITERATION_LIMIT,
+        message="ReAct 循环达到最大轮数：2",
+        agent="teaching_assistant",
+    )
     assert len(result.updates["tool_results"]) == 2
     assert result.metadata["iterations"] == 2
+    assert result.updates["events"][-1].event_type is EventType.AGENT_COMPLETED
+    assert result.updates["events"][-1].success is False
+    assert (
+        result.updates["events"][-1].error_code
+        is ErrorCode.REACT_ITERATION_LIMIT
+    )
 
 
 def test_react_agent_returns_model_error() -> None:
@@ -119,7 +202,17 @@ def test_react_agent_returns_model_error() -> None:
 
     result = agent.run(create_initial_state())
 
-    assert result.error == "模型调用失败：模型不可用"
+    assert result.error == RunError(
+        error_code=ErrorCode.MODEL_CALL_FAILED,
+        message="模型调用失败：模型不可用",
+        agent="evaluator",
+    )
     assert result.updates["current_agent"] == "evaluator"
     assert result.updates["messages"] == []
     assert result.metadata["iterations"] == 1
+    assert [event.event_type for event in result.updates["events"]] == [
+        EventType.AGENT_STARTED,
+        EventType.AGENT_COMPLETED,
+    ]
+    assert result.updates["events"][-1].success is False
+    assert result.updates["events"][-1].error_code is ErrorCode.MODEL_CALL_FAILED

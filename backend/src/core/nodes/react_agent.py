@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
+from ..events import ErrorCode, EventType, RunError, RunEvent
 from ..state import AgentRole, AgentState, ToolResult
 from ..tools import ToolExecutor
 
@@ -17,7 +19,7 @@ class ReActResult:
 
     updates: dict[str, Any] = field(default_factory=dict)
     messages: list[BaseMessage] = field(default_factory=list)
-    error: str | None = None
+    error: RunError | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -41,6 +43,8 @@ class ReActAgentNode:
         tool_executor: ToolExecutor | None = None,
         max_iterations: int = 5,
     ) -> None:
+        if max_iterations <= 0:
+            raise ValueError("max_iterations must be positive")
         self.role = role
         self.system_prompt = system_prompt
         self.model = model
@@ -52,6 +56,28 @@ class ReActAgentNode:
         history = list(state.get("messages", []))
         generated: list[BaseMessage] = []
         tool_results: list[ToolResult] = []
+        events: list[RunEvent] = []
+        sequence = max(
+            (event.sequence for event in state.get("events", [])),
+            default=-1,
+        )
+        session_id = state.get("session_id")
+        started_at = perf_counter()
+
+        def emit(event_type: EventType, **values: Any) -> None:
+            nonlocal sequence
+            sequence += 1
+            events.append(
+                RunEvent(
+                    event_type=event_type,
+                    sequence=sequence,
+                    session_id=session_id,
+                    agent=self.role.value,
+                    **values,
+                )
+            )
+
+        emit(EventType.AGENT_STARTED)
 
         for iteration in range(1, self.max_iterations + 1):
             messages = [
@@ -62,34 +88,84 @@ class ReActAgentNode:
             try:
                 response = self.model.invoke(messages)
             except Exception as exc:  # noqa: BLE001 - 模型边界统一返回结构化错误
-                error = f"模型调用失败：{exc!s}"
-                return self._result(generated, tool_results, iteration, error)
+                error = RunError(
+                    error_code=ErrorCode.MODEL_CALL_FAILED,
+                    message=f"模型调用失败：{exc!s}",
+                    agent=self.role.value,
+                )
+                emit(
+                    EventType.AGENT_COMPLETED,
+                    success=False,
+                    duration_ms=(perf_counter() - started_at) * 1000,
+                    error_code=error.error_code,
+                )
+                return self._result(
+                    generated,
+                    tool_results,
+                    events,
+                    iteration,
+                    error,
+                )
             generated.append(response)
 
             if not response.tool_calls:
-                return self._result(generated, tool_results, iteration)
+                emit(
+                    EventType.AGENT_COMPLETED,
+                    success=True,
+                    duration_ms=(perf_counter() - started_at) * 1000,
+                )
+                return self._result(generated, tool_results, events, iteration)
 
             # 工具返回的 ToolMessage 会进入下一轮模型输入，形成 Observation。
             for tool_call in response.tool_calls:
+                emit(
+                    EventType.TOOL_STARTED,
+                    tool_name=str(tool_call.get("name", "")),
+                )
                 execution = self.tool_executor.execute(tool_call, self.role)
                 generated.append(execution.message)
                 tool_results.append(execution.result)
+                emit(
+                    EventType.TOOL_COMPLETED,
+                    tool_name=execution.result.tool_name,
+                    success=execution.result.success,
+                    duration_ms=execution.result.duration_ms,
+                    error_code=execution.result.error_code,
+                )
 
-        error = f"ReAct 循环达到最大轮数：{self.max_iterations}"
-        return self._result(generated, tool_results, self.max_iterations, error)
+        error = RunError(
+            error_code=ErrorCode.REACT_ITERATION_LIMIT,
+            message=f"ReAct 循环达到最大轮数：{self.max_iterations}",
+            agent=self.role.value,
+        )
+        emit(
+            EventType.AGENT_COMPLETED,
+            success=False,
+            duration_ms=(perf_counter() - started_at) * 1000,
+            error_code=error.error_code,
+        )
+        return self._result(
+            generated,
+            tool_results,
+            events,
+            self.max_iterations,
+            error,
+        )
 
     def _result(
         self,
         messages: list[BaseMessage],
         tool_results: list[ToolResult],
+        events: list[RunEvent],
         iterations: int,
-        error: str | None = None,
+        error: RunError | None = None,
     ) -> ReActResult:
         """统一整理写回 AgentState 的数据。"""
         updates: dict[str, Any] = {
             "current_agent": self.role.value,
             "messages": messages,
             "tool_results": tool_results,
+            "events": events,
         }
         return ReActResult(
             updates=updates,

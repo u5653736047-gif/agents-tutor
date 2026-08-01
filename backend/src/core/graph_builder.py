@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Collection, Hashable, Mapping, Sequence
 from typing import Literal, cast
 
 from langchain_core.messages import HumanMessage
@@ -11,9 +11,11 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from .events import ErrorCode, EventType, RunError, RunEvent
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
 from .state import AgentRole, AgentState, ToolResult, create_initial_state
+from .tools import ToolRegistry
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
@@ -35,12 +37,36 @@ class CollaborativeAgentGraph:
         model: ChatModel,
         tools: Sequence[BaseTool] = (),
         max_iterations: int = 5,
+        tool_permissions: Mapping[str, Collection[AgentRole]] | None = None,
+        max_handoffs: int = 4,
+        max_agent_switches: int = 8,
     ) -> None:
-        all_tools = [handoff, *tools]
+        if max_handoffs <= 0:
+            raise ValueError("max_handoffs must be positive")
+        if max_agent_switches <= 0:
+            raise ValueError("max_agent_switches must be positive")
+
+        permissions = tool_permissions or {}
+        business_tool_names = {business_tool.name for business_tool in tools}
+        unknown_permissions = set(permissions) - business_tool_names
+        if unknown_permissions:
+            names = ", ".join(sorted(unknown_permissions))
+            raise ValueError(f"tool_permissions 包含非业务工具：{names}")
+
+        registry = ToolRegistry()
+        registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})
+        for business_tool in tools:
+            registry.register(
+                business_tool,
+                allowed_roles=permissions.get(business_tool.name),
+            )
+        self.registry = registry
+        self.max_handoffs = max_handoffs
+        self.max_agent_switches = max_agent_switches
         # 创建4个同构的agent，均遵循react设计范式
         self.agents = create_agent_nodes(
             model=model,
-            tools=all_tools,
+            registry=registry,
             max_iterations=max_iterations,
         )
 
@@ -73,20 +99,159 @@ class CollaborativeAgentGraph:
         self._app = graph.compile()
         return self._app
 
-    @staticmethod
-    def _wrap(agent: ReActAgentNode) -> Runnable[AgentState, AgentState]:
+    def _wrap(self, agent: ReActAgentNode) -> Runnable[AgentState, AgentState]:
         """把 ReAct 结果转换为 LangGraph 状态更新。"""
 
         def node(state: AgentState) -> AgentState:
+            existing_error = state.get("run_error")
+            if existing_error is not None:
+                return cast(
+                    AgentState,
+                    {"next_agent": None, "run_error": existing_error},
+                )
+
+            existing_target = state.get("next_agent")
+            registered_targets = {role.value for role in self.agents}
+            if (
+                existing_target is not None
+                and existing_target not in registered_targets
+            ):
+                error = RunError(
+                    error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                    message=f"非法 next_agent：{existing_target}",
+                    agent=agent.role.value,
+                )
+                sequence = max(
+                    (event.sequence for event in state.get("events", [])),
+                    default=-1,
+                )
+                return cast(
+                    AgentState,
+                    {
+                        "next_agent": None,
+                        "run_error": error,
+                        "events": [
+                            RunEvent(
+                                event_type=EventType.RUN_FAILED,
+                                sequence=sequence + 1,
+                                session_id=state.get("session_id"),
+                                agent=agent.role.value,
+                                success=False,
+                                error_code=error.error_code,
+                            )
+                        ],
+                    },
+                )
+
             # 运行 Agent
             result = agent.run(state)
-            if result.error:
-                raise RuntimeError(result.error)
 
             # 解读 Agent 的返回值
             updates = dict(result.updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
-            updates["next_agent"] = _handoff_target(tool_results)
+            target = _handoff_target(tool_results)
+            events = cast(list[RunEvent], updates.get("events", []))
+            sequence = max(
+                (
+                    event.sequence
+                    for event in [*state.get("events", []), *events]
+                ),
+                default=-1,
+            )
+
+            def emit(
+                event_type: EventType,
+                event_agent: str,
+                *,
+                success: bool = True,
+                error_code: ErrorCode | None = None,
+            ) -> None:
+                nonlocal sequence
+                sequence += 1
+                events.append(
+                    RunEvent(
+                        event_type=event_type,
+                        sequence=sequence,
+                        session_id=state.get("session_id"),
+                        agent=event_agent,
+                        success=success,
+                        error_code=error_code,
+                    )
+                )
+
+            handoff_count = state.get("handoff_count", 0)
+            switch_count = state.get("agent_switch_count", 0)
+            updates["next_agent"] = None
+            updates["run_error"] = None
+
+            def fail(error: RunError) -> AgentState:
+                updates["run_error"] = error
+                emit(
+                    EventType.RUN_FAILED,
+                    agent.role.value,
+                    success=False,
+                    error_code=error.error_code,
+                )
+                updates["handoff_count"] = handoff_count
+                updates["agent_switch_count"] = switch_count
+                updates["events"] = events
+                return cast(AgentState, updates)
+
+            if result.error is not None:
+                return fail(result.error)
+            if target is not None and target not in registered_targets:
+                return fail(
+                    RunError(
+                        error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                        message=f"非法 next_agent：{target}",
+                        agent=agent.role.value,
+                    )
+                )
+
+            if agent.role is AgentRole.SUPERVISOR:
+                if target is not None:
+                    if handoff_count + 1 > self.max_handoffs:
+                        error = RunError(
+                            error_code=ErrorCode.GRAPH_HANDOFF_LIMIT,
+                            message=f"handoff 次数超过上限：{self.max_handoffs}",
+                            agent=agent.role.value,
+                        )
+                        return fail(error)
+                    if switch_count + 1 > self.max_agent_switches:
+                        return fail(
+                            RunError(
+                                error_code=ErrorCode.GRAPH_SWITCH_LIMIT,
+                                message=(
+                                    "Agent 切换次数超过上限："
+                                    f"{self.max_agent_switches}"
+                                ),
+                                agent=agent.role.value,
+                            )
+                        )
+                    handoff_count += 1
+                    switch_count += 1
+                    updates["next_agent"] = target
+                    emit(EventType.AGENT_SWITCHED, target)
+                else:
+                    emit(EventType.RUN_COMPLETED, agent.role.value)
+            else:
+                if switch_count + 1 > self.max_agent_switches:
+                    return fail(
+                        RunError(
+                            error_code=ErrorCode.GRAPH_SWITCH_LIMIT,
+                            message=(
+                                "Agent 切换次数超过上限："
+                                f"{self.max_agent_switches}"
+                            ),
+                            agent=agent.role.value,
+                        )
+                    )
+                switch_count += 1
+                emit(EventType.AGENT_SWITCHED, AgentRole.SUPERVISOR.value)
+
+            updates["handoff_count"] = handoff_count
+            updates["agent_switch_count"] = switch_count
+            updates["events"] = events
             return cast(AgentState, updates)
 
         return RunnableLambda(node)
@@ -94,12 +259,10 @@ class CollaborativeAgentGraph:
     @staticmethod
     def _route(state: AgentState) -> str:
         """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
+        if state.get("run_error") is not None:
+            return "end"
         next_agent = state.get("next_agent")
-        if next_agent in {
-            AgentRole.TEACHING_ASSISTANT.value,
-            AgentRole.LEARNING_ASSISTANT.value,
-            AgentRole.EVALUATOR.value,
-        }:
+        if next_agent in {role.value for role in AgentRole}:
             return next_agent
         if state.get("current_agent") != AgentRole.SUPERVISOR.value:
             return AgentRole.SUPERVISOR.value
