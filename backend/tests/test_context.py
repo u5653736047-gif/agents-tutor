@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from core.context import ContextWindow, trim_message_history
 
 
-def _tool_call(call_id: str) -> dict[str, object]:
+def _tool_call(call_id: str | None) -> dict[str, object]:
     return {
         "name": "lookup",
         "args": {"query": call_id},
@@ -130,6 +130,68 @@ def test_trim_drops_incomplete_multi_tool_call_group() -> None:
 
     assert window.messages == (latest_human, final_answer)
     assert window.trimmed_count == 3
+
+
+@pytest.mark.parametrize(
+    ("tool_calls", "result_id"),
+    [
+        ([_tool_call("valid"), _tool_call(None)], "valid"),
+        ([_tool_call("same"), _tool_call("same")], "same"),
+    ],
+    ids=["missing-id", "duplicate-id"],
+)
+def test_trim_drops_tool_group_with_invalid_call_ids(
+    tool_calls: list[dict[str, object]],
+    result_id: str,
+) -> None:
+    latest_human = HumanMessage(content="look up both")
+    request = AIMessage(content="", tool_calls=tool_calls)
+    result = ToolMessage(content="one", tool_call_id=result_id)
+    final_answer = AIMessage(content="partial answer")
+    history: list[BaseMessage] = [
+        latest_human,
+        request,
+        result,
+        final_answer,
+    ]
+
+    window = trim_message_history(history, max_messages=3)
+
+    assert window.messages == (latest_human, final_answer)
+    assert window.trimmed_count == 2
+
+
+def test_incomplete_group_is_removed_before_complete_group_capacity_check() -> None:
+    latest_human = HumanMessage(content="latest")
+    complete_request = AIMessage(
+        content="",
+        tool_calls=[_tool_call("complete")],
+    )
+    complete_result = ToolMessage(content="complete", tool_call_id="complete")
+    incomplete_request = AIMessage(
+        content="",
+        tool_calls=[_tool_call("partial"), _tool_call("missing")],
+    )
+    partial_result = ToolMessage(content="partial", tool_call_id="partial")
+    final_answer = AIMessage(content="final")
+    history: list[BaseMessage] = [
+        latest_human,
+        complete_request,
+        complete_result,
+        incomplete_request,
+        partial_result,
+        final_answer,
+    ]
+
+    window = trim_message_history(history, max_messages=4)
+
+    assert window.messages == (
+        latest_human,
+        complete_request,
+        complete_result,
+        final_answer,
+    )
+    assert window.trimmed_count == 2
 
 
 def test_trim_drops_complete_tool_group_when_expansion_exceeds_hard_limit() -> None:

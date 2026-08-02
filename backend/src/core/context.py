@@ -44,11 +44,14 @@ def trim_message_history(
 
     tool_groups, incomplete_parents, orphan_results = _tool_groups(history)
     selected.difference_update(orphan_results)
+    # Tool Call 必须整组保留，缺失或越界则整组删除。
+    for parent in incomplete_parents:
+        selected.difference_update(tool_groups[parent])
+
     for parent, group in tool_groups.items():
-        if selected.isdisjoint(group):
+        if parent in incomplete_parents or selected.isdisjoint(group):
             continue
-        # Tool Call 必须整组保留，缺失或越界则整组删除。
-        if parent in incomplete_parents or len(selected | group) > hard_limit:
+        if len(selected) + len(group - selected) > hard_limit:
             selected.difference_update(group)
         else:
             selected.update(group)
@@ -68,6 +71,7 @@ def _tool_groups(
     expected_ids: dict[int, set[str]] = {}
     observed_ids: dict[int, set[str]] = {}
     groups: dict[int, set[int]] = {}
+    invalid_parents: set[int] = set()
     orphan_results: set[int] = set()
 
     for index, message in enumerate(messages):
@@ -77,10 +81,15 @@ def _tool_groups(
             observed_ids[index] = set()
             for tool_call in message.tool_calls:
                 call_id = tool_call.get("id")
-                if call_id:
-                    normalized_id = str(call_id)
-                    expected_ids[index].add(normalized_id)
-                    call_parents[normalized_id] = index
+                if not call_id:
+                    invalid_parents.add(index)
+                    continue
+                normalized_id = str(call_id)
+                if normalized_id in expected_ids[index]:
+                    invalid_parents.add(index)
+                    continue
+                expected_ids[index].add(normalized_id)
+                call_parents[normalized_id] = index
             continue
         if not isinstance(message, ToolMessage):
             continue
@@ -92,7 +101,7 @@ def _tool_groups(
         groups[parent].add(index)
         observed_ids[parent].add(normalized_id)
 
-    incomplete_parents = {
+    incomplete_parents = invalid_parents | {
         parent
         for parent, expected in expected_ids.items()
         if not expected or not expected.issubset(observed_ids[parent])
