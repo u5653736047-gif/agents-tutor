@@ -51,10 +51,15 @@ class CollaborativeAgentGraph:
 
         permissions = tool_permissions or {}
         business_tool_names = {business_tool.name for business_tool in tools}
-        unknown_permissions = set(permissions) - business_tool_names
+        permission_names = set(permissions)
+        unknown_permissions = permission_names - business_tool_names
         if unknown_permissions:
             names = ", ".join(sorted(unknown_permissions))
             raise ValueError(f"tool_permissions 包含非业务工具：{names}")
+        missing_permissions = business_tool_names - permission_names
+        if missing_permissions:
+            names = ", ".join(sorted(missing_permissions))
+            raise ValueError(f"tool_permissions 缺少业务工具：{names}")
 
         registry = ToolRegistry()
         registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})

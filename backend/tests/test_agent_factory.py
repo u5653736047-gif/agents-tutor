@@ -48,7 +48,8 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     assert len({id(agent.tool_executor) for agent in agents.values()}) == 1
     assert {agent.max_iterations for agent in agents.values()} == {3}
     assert {agent.max_context_messages for agent in agents.values()} == {7}
-    assert {agent.system_prompt for agent in agents.values()} == set(ROLE_PROMPTS.values())
+    for role, agent in agents.items():
+        assert agent.system_prompt == ROLE_PROMPTS[role]
     assert max(map(len, ROLE_PROMPTS.values())) <= 80
     assert model.bind_count == 1
 

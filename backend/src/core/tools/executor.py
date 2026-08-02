@@ -16,6 +16,15 @@ from ..events import ErrorCode
 from ..state import AgentRole, ToolResult
 from .registry import ToolRegistry
 
+UNKNOWN_TOOL_NAME = "unknown_tool"
+
+_SAFE_ERRORS = {
+    ErrorCode.TOOL_UNKNOWN: "未注册工具",
+    ErrorCode.TOOL_UNAUTHORIZED: "当前角色无权调用该工具",
+    ErrorCode.TOOL_INVALID_ARGUMENTS: "工具参数无效",
+    ErrorCode.TOOL_EXECUTION_FAILED: "工具执行失败",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ToolExecution:
@@ -44,6 +53,12 @@ class ToolExecutor:
             raise ValueError("不能同时指定工具列表和工具注册表")
         self.registry = registry
 
+    def public_tool_name(self, tool_call: Mapping[str, Any]) -> str:
+        """只公开注册表中的规范名称，避免模型生成名称进入持久状态。"""
+        requested_name = str(tool_call.get("name") or "")
+        tool = self.registry.get(requested_name)
+        return tool.name if tool is not None else UNKNOWN_TOOL_NAME
+
     def execute(
         self,
         tool_call: Mapping[str, Any],
@@ -51,43 +66,38 @@ class ToolExecutor:
     ) -> ToolExecution:
         """执行工具；异常会成为 Observation，而不是打断 Agent。"""
         call_id = str(tool_call.get("id") or "unknown")
-        tool_name = str(tool_call.get("name") or "")
+        requested_name = str(tool_call.get("name") or "")
+        tool_name = self.public_tool_name(tool_call)
         args = tool_call.get("args", {})
         started_at = perf_counter()
 
-        tool = self.registry.get(tool_name)
+        tool = self.registry.get(requested_name)
         success = False
         output = ""
-        error: str | None = None
         error_code: ErrorCode | None = None
 
         if tool is None:
-            error = f"未注册工具：{tool_name}"
             error_code = ErrorCode.TOOL_UNKNOWN
-        elif not self.registry.is_authorized(tool_name, agent_role):
-            error = f"角色 {agent_role.value} 无权调用工具：{tool_name}"
+        elif not self.registry.is_authorized(requested_name, agent_role):
             error_code = ErrorCode.TOOL_UNAUTHORIZED
         elif not isinstance(args, Mapping):
-            error = "工具参数必须是对象"
             error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
         else:
             try:
                 input_schema = cast(type[BaseModel], tool.get_input_schema())
                 input_schema.model_validate(dict(args))
-            except ValidationError as exc:
-                error = str(exc)
+            except ValidationError:
                 error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
-            except Exception as exc:  # noqa: BLE001 - Schema 边界也必须生成 Observation
-                error = str(exc)
+            except Exception:  # noqa: BLE001 - Schema 边界只公开稳定错误分类
                 error_code = ErrorCode.TOOL_EXECUTION_FAILED
             else:
                 try:
                     output = _to_text(tool.invoke(dict(args)))
                     success = True
-                except Exception as exc:  # noqa: BLE001 - 工具边界必须捕获所有运行异常
-                    error = str(exc)
+                except Exception:  # noqa: BLE001 - 工具边界只公开稳定错误分类
                     error_code = ErrorCode.TOOL_EXECUTION_FAILED
 
+        error = None if error_code is None else _SAFE_ERRORS[error_code]
         duration_ms = (perf_counter() - started_at) * 1000
         content = output if success else f"错误：{error}"
         result = ToolResult(

@@ -37,6 +37,13 @@ class ScriptedModel:
         return self.responses.pop(0)
 
 
+class FailingModel:
+    """模拟携带敏感细节的模型调用错误。"""
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        raise RuntimeError("secret=/srv/private/model-token")
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -78,6 +85,28 @@ def test_graph_registry_limits_handoff_to_supervisor() -> None:
     assert not registry.is_authorized("handoff", AgentRole.TEACHING_ASSISTANT)
     assert registry.is_authorized("double", AgentRole.EVALUATOR)
     assert not registry.is_authorized("double", AgentRole.SUPERVISOR)
+
+
+@pytest.mark.parametrize("tool_permissions", [None, {}])
+def test_graph_rejects_missing_permissions_for_business_tools(
+    tool_permissions: dict[str, set[AgentRole]] | None,
+) -> None:
+    with pytest.raises(ValueError, match=r"缺少.*double"):
+        CollaborativeAgentGraph(
+            model=ScriptedModel([]),
+            tools=[double],
+            tool_permissions=tool_permissions,
+        )
+
+
+def test_graph_accepts_empty_tools_and_permissions() -> None:
+    builder = CollaborativeAgentGraph(
+        model=ScriptedModel([]),
+        tools=[],
+        tool_permissions={},
+    )
+
+    assert [tool.name for tool in builder.registry.list_tools()] == ["handoff"]
 
 
 @pytest.mark.parametrize("permission_name", ["doubl", "handoff"])
@@ -232,7 +261,8 @@ def test_graph_stops_with_structured_error_at_switch_limit() -> None:
 
 
 def test_graph_converts_agent_error_to_failed_run() -> None:
-    builder = CollaborativeAgentGraph(model=ScriptedModel([]))
+    secret = "/srv/private/model-token"
+    builder = CollaborativeAgentGraph(model=FailingModel())
 
     result = builder.run("test", session_id="model-failure")
 
@@ -240,6 +270,8 @@ def test_graph_converts_agent_error_to_failed_run() -> None:
     assert result["next_agent"] is None
     assert result["run_error"] is not None
     assert result["run_error"].error_code is ErrorCode.MODEL_CALL_FAILED
+    assert result["run_error"].message == "模型调用失败"
+    assert secret not in str(result)
     assert [event.event_type for event in result["events"]] == [
         EventType.AGENT_STARTED,
         EventType.AGENT_COMPLETED,

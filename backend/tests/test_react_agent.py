@@ -13,6 +13,9 @@ from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole, create_initial_state
 from core.tools.executor import ToolExecutor
 
+MODEL_ERROR_SECRET = "secret=/srv/private/model-token"
+UNKNOWN_TOOL_NAME = "unknown_tool"
+
 
 class ScriptedModel:
     """按顺序返回预设消息，便于验证 ReAct 循环。"""
@@ -30,7 +33,7 @@ class FailingModel:
     """模拟不可恢复的模型调用错误。"""
 
     def invoke(self, messages: list[BaseMessage]) -> AIMessage:
-        raise RuntimeError("模型不可用")
+        raise RuntimeError(MODEL_ERROR_SECRET)
 
 
 @tool
@@ -233,6 +236,35 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
     assert all(set(event.model_dump()) == safe_fields for event in events)
 
 
+def test_react_agent_replaces_unknown_tool_name_in_public_updates() -> None:
+    secret_name = "missing-/srv/private/key"
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call(secret_name)]),
+            AIMessage(content="fallback"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=model,
+    )
+
+    result = agent.run(create_initial_state())
+
+    assert secret_name not in str(result.updates)
+    assert result.updates["tool_results"][0].tool_name == UNKNOWN_TOOL_NAME
+    tool_events = [
+        event
+        for event in result.updates["events"]
+        if event.event_type in {EventType.TOOL_STARTED, EventType.TOOL_COMPLETED}
+    ]
+    assert [event.tool_name for event in tool_events] == [
+        UNKNOWN_TOOL_NAME,
+        UNKNOWN_TOOL_NAME,
+    ]
+
+
 def test_react_agent_stops_at_iteration_limit() -> None:
     model = ScriptedModel(
         [
@@ -276,9 +308,11 @@ def test_react_agent_returns_model_error() -> None:
 
     assert result.error == RunError(
         error_code=ErrorCode.MODEL_CALL_FAILED,
-        message="模型调用失败：模型不可用",
+        message="模型调用失败",
         agent="evaluator",
     )
+    assert MODEL_ERROR_SECRET not in result.error.model_dump_json()
+    assert MODEL_ERROR_SECRET not in str(result.updates)
     assert result.updates["current_agent"] == "evaluator"
     assert result.updates["messages"] == []
     assert result.metadata["iterations"] == 1

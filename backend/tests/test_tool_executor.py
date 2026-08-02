@@ -8,6 +8,8 @@ from core.state import AgentRole
 from core.tools.executor import ToolExecutor
 from core.tools.registry import ToolRegistry
 
+UNKNOWN_TOOL_NAME = "unknown_tool"
+
 
 @tool
 def double(value: int) -> int:
@@ -18,7 +20,7 @@ def double(value: int) -> int:
 @tool
 def broken_tool() -> str:
     """用于验证工具异常会变成 Observation。"""
-    raise RuntimeError("工具不可用")
+    raise RuntimeError("secret=/srv/private/tool-token")
 
 
 class PositiveValue(BaseModel):
@@ -68,11 +70,17 @@ def test_tool_executor_records_successful_result() -> None:
 
 
 def test_tool_executor_classifies_unknown_tool() -> None:
-    execution = ToolExecutor().execute(tool_call("missing"), AgentRole.EVALUATOR)
+    secret_name = "missing-/srv/private/key"
+    execution = ToolExecutor().execute(tool_call(secret_name), AgentRole.EVALUATOR)
 
     assert execution.result.error_code is ErrorCode.TOOL_UNKNOWN
     assert execution.result.success is False
-    assert "错误" in str(execution.message.content)
+    assert execution.result.tool_name == UNKNOWN_TOOL_NAME
+    assert execution.message.name == UNKNOWN_TOOL_NAME
+    assert execution.result.error == "未注册工具"
+    assert execution.message.content == "错误：未注册工具"
+    assert secret_name not in execution.result.model_dump_json()
+    assert secret_name not in str(execution.message)
 
 
 def test_tool_executor_classifies_unauthorized_tool() -> None:
@@ -84,7 +92,8 @@ def test_tool_executor_classifies_unauthorized_tool() -> None:
 
     assert execution.result.error_code is ErrorCode.TOOL_UNAUTHORIZED
     assert execution.result.success is False
-    assert "错误" in str(execution.message.content)
+    assert execution.result.error == "当前角色无权调用该工具"
+    assert execution.message.content == "错误：当前角色无权调用该工具"
 
 
 def test_tool_executor_classifies_invalid_arguments() -> None:
@@ -96,7 +105,8 @@ def test_tool_executor_classifies_invalid_arguments() -> None:
 
     assert execution.result.error_code is ErrorCode.TOOL_INVALID_ARGUMENTS
     assert execution.result.success is False
-    assert "错误" in str(execution.message.content)
+    assert execution.result.error == "工具参数无效"
+    assert execution.message.content == "错误：工具参数无效"
 
 
 def test_tool_executor_classifies_runtime_failure() -> None:
@@ -106,8 +116,10 @@ def test_tool_executor_classifies_runtime_failure() -> None:
 
     assert execution.result.error_code is ErrorCode.TOOL_EXECUTION_FAILED
     assert execution.result.success is False
-    assert "工具不可用" in (execution.result.error or "")
-    assert "错误" in str(execution.message.content)
+    assert execution.result.error == "工具执行失败"
+    assert execution.message.content == "错误：工具执行失败"
+    assert "private/tool-token" not in execution.result.model_dump_json()
+    assert "private/tool-token" not in str(execution.message)
 
 
 def test_tool_executor_treats_internal_validation_error_as_runtime_failure() -> None:
@@ -119,7 +131,8 @@ def test_tool_executor_treats_internal_validation_error_as_runtime_failure() -> 
 
     assert execution.result.error_code is ErrorCode.TOOL_EXECUTION_FAILED
     assert execution.result.success is False
-    assert "错误" in str(execution.message.content)
+    assert execution.result.error == "工具执行失败"
+    assert execution.message.content == "错误：工具执行失败"
 
 
 def test_tool_executor_turns_schema_runtime_error_into_observation() -> None:
@@ -131,5 +144,7 @@ def test_tool_executor_turns_schema_runtime_error_into_observation() -> None:
 
     assert execution.result.error_code is ErrorCode.TOOL_EXECUTION_FAILED
     assert execution.result.success is False
-    assert "参数 Schema 解析失败" in (execution.result.error or "")
-    assert "错误" in str(execution.message.content)
+    assert execution.result.error == "工具执行失败"
+    assert execution.message.content == "错误：工具执行失败"
+    assert "参数 Schema 解析失败" not in execution.result.model_dump_json()
+    assert "参数 Schema 解析失败" not in str(execution.message)

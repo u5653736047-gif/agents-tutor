@@ -107,10 +107,10 @@ class ReActAgentNode:
             ]
             try:
                 response = self.model.invoke(messages)
-            except Exception as exc:  # noqa: BLE001 - 模型边界统一返回结构化错误
+            except Exception:  # noqa: BLE001 - 模型边界只公开稳定错误分类
                 error = RunError(
                     error_code=ErrorCode.MODEL_CALL_FAILED,
-                    message=f"模型调用失败：{exc!s}",
+                    message="模型调用失败",
                     agent=self.role.value,
                 )
                 emit(
@@ -127,9 +127,8 @@ class ReActAgentNode:
                     extra,
                     error,
                 )
-            generated.append(response)
-
             if not response.tool_calls:
+                generated.append(response)
                 emit(
                     EventType.AGENT_COMPLETED,
                     success=True,
@@ -143,11 +142,29 @@ class ReActAgentNode:
                     extra,
                 )
 
+            public_tool_calls = [
+                (self.tool_executor.public_tool_name(tool_call), tool_call)
+                for tool_call in response.tool_calls
+            ]
+            additional_kwargs = dict(response.additional_kwargs)
+            additional_kwargs.pop("tool_calls", None)
+            generated.append(
+                response.model_copy(
+                    update={
+                        "additional_kwargs": additional_kwargs,
+                        "tool_calls": [
+                            {**tool_call, "name": public_name}
+                            for public_name, tool_call in public_tool_calls
+                        ],
+                    }
+                )
+            )
+
             # 工具返回的 ToolMessage 会进入下一轮模型输入，形成 Observation。
-            for tool_call in response.tool_calls:
+            for public_name, tool_call in public_tool_calls:
                 emit(
                     EventType.TOOL_STARTED,
-                    tool_name=str(tool_call.get("name", "")),
+                    tool_name=public_name,
                 )
                 execution = self.tool_executor.execute(tool_call, self.role)
                 generated.append(execution.message)
