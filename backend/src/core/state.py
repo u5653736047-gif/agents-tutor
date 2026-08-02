@@ -13,15 +13,17 @@
 from __future__ import annotations
 
 import operator
-from datetime import datetime, timezone
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Optional, Sequence, TypedDict
+from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
+from .events import ErrorCode, RunError, RunEvent
 
 # ─────────────────────────────────────────────
 # 枚举定义
@@ -72,7 +74,7 @@ class TaskContext(BaseModel):
         default_factory=dict,
         description="扩展元数据（难度级别、学科标签、关联知识点等）",
     )
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ToolResult(BaseModel):
@@ -87,9 +89,10 @@ class ToolResult(BaseModel):
     agent_role: AgentRole = Field(description="发起调用的 Agent 角色")
     success: bool = Field(default=True)
     output: str = Field(default="", description="工具返回的文本结果")
-    error: Optional[str] = Field(default=None, description="失败时的错误信息")
+    error: str | None = Field(default=None, description="失败时的错误信息")
+    error_code: ErrorCode | None = Field(default=None, description="失败错误分类")
     duration_ms: float = Field(default=0.0, description="执行耗时（毫秒）")
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ─────────────────────────────────────────────
@@ -98,8 +101,8 @@ class ToolResult(BaseModel):
 
 
 def _replace(existing: Any, new: Any) -> Any:
-    """直接覆盖式 reducer：新值非 None 时替换旧值."""
-    return new if new is not None else existing
+    """直接覆盖式 reducer；显式 None 也用于清空旧状态."""
+    return new
 
 
 # ─────────────────────────────────────────────
@@ -113,7 +116,9 @@ class AgentState(TypedDict, total=False):
     基于 TypedDict 定义，与 LangGraph StateGraph 状态通道机制原生兼容。
     各字段通过 Annotated 指定 reducer 控制并发更新语义：
     - messages: 追加合并（由 langgraph add_messages 处理去重与按 ID 更新）
-    - tool_results: 追加合并（operator.add 拼接列表）
+    - tool_results、events: 追加合并（operator.add 拼接列表）
+    - task_context、extra: 后写覆盖，但作为跨轮持久字段保留
+    - next_agent、run_error、handoff_count、agent_switch_count: 后写覆盖，每轮开始重置
     - 其余字段: 后写覆盖（last-write-wins）
 
     total=False 使所有字段变为可选，允许节点仅返回部分更新（partial update）。
@@ -130,25 +135,30 @@ class AgentState(TypedDict, total=False):
 
     # --- Agent 调度信息 ---
     # 当前正在执行的 Agent 角色（last-write-wins）
-    current_agent: Annotated[Optional[str], _replace]
+    current_agent: Annotated[str | None, _replace]
 
     # 路由决策：Supervisor 输出的下一步目标节点名称
-    next_agent: Annotated[Optional[str], _replace]
+    next_agent: Annotated[str | None, _replace]
 
     # --- 任务上下文 ---
-    # 结构化的当前任务信息（由 Supervisor 填充）
-    task_context: Annotated[Optional[TaskContext], _replace]
+    # 跨轮持久的结构化任务信息（由 Supervisor 填充）
+    task_context: Annotated[TaskContext | None, _replace]
 
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计
     tool_results: Annotated[list[ToolResult], operator.add]
 
     # --- 会话元信息 ---
-    session_id: Annotated[Optional[str], _replace]
-    user_id: Annotated[Optional[str], _replace]
+    session_id: Annotated[str | None, _replace]
+    user_id: Annotated[str | None, _replace]
+
+    events: Annotated[list[RunEvent], operator.add]
+    run_error: Annotated[RunError | None, _replace]
+    handoff_count: Annotated[int, _replace]
+    agent_switch_count: Annotated[int, _replace]
 
     # --- 扩展预留 ---
-    # 自由格式附加数据，避免频繁修改 Schema
+    # 跨轮持久的自由格式附加数据，避免频繁修改 Schema
     extra: Annotated[dict[str, Any], _replace]
 
 
@@ -179,5 +189,9 @@ def create_initial_state(
         tool_results=[],
         session_id=session_id,
         user_id=user_id,
+        events=[],
+        run_error=None,
+        handoff_count=0,
+        agent_switch_count=0,
         extra={},
     )

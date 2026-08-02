@@ -13,6 +13,8 @@ venv/
 # IDE
 .idea/
 .vscode/
+.reasonix/
+.tools/
 *.swp
 *.swo
 
