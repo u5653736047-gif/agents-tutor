@@ -72,7 +72,7 @@
 - 完成备注：2026-08-02；覆盖多页整文档替换、删除、重复写入与重复页拒绝，
   chunk 坐标均可回指所属文档内容；全量测试 180 通过，ruff、mypy strict 干净。
 
-### S0-T3 真实 DeepSeek 冒烟验证
+### [x] S0-T3 真实 DeepSeek 冒烟验证
 
 - 对应总清单：当前冲刺「真实 DeepSeek 冒烟验证尚未执行」
 - 范围：`backend/scripts/verify_deepseek_react.py`（需要 `.env` 中
@@ -83,6 +83,9 @@
     或本任务勾选备注中。
   - 若暴露真实问题，先记录再修复，修复计入本任务。
 - 依赖：S0-T1、S0-T2（用干净基线验证）。
+- 完成备注：2026-08-02；真实 `deepseek-v4-flash` 两轮 ReAct 成功调用
+  `double` 并回答 `42`，脱敏日志已写入 `AGENT_NODE_IMPLEMENTATION.md`；
+  全量测试 180 通过，ruff、mypy strict 干净。
 
 ### S0-T4 全量质量复核
 
