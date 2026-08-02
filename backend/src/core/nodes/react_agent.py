@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
@@ -148,10 +149,25 @@ class ReActAgentNode:
             ]
             additional_kwargs = dict(response.additional_kwargs)
             additional_kwargs.pop("tool_calls", None)
+            public_content = (
+                [
+                    {
+                        **block,
+                        "name": self.tool_executor.public_tool_name(block),
+                    }
+                    if isinstance(block, Mapping)
+                    and block.get("type") == "tool_call"
+                    else block
+                    for block in response.content
+                ]
+                if isinstance(response.content, list)
+                else response.content
+            )
             generated.append(
                 response.model_copy(
                     update={
                         "additional_kwargs": additional_kwargs,
+                        "content": public_content,
                         "tool_calls": [
                             {**tool_call, "name": public_name}
                             for public_name, tool_call in public_tool_calls

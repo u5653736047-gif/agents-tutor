@@ -60,6 +60,12 @@ class CollaborativeAgentGraph:
         if missing_permissions:
             names = ", ".join(sorted(missing_permissions))
             raise ValueError(f"tool_permissions 缺少业务工具：{names}")
+        none_permissions = {
+            name for name in business_tool_names if permissions[name] is None
+        }
+        if none_permissions:
+            names = ", ".join(sorted(none_permissions))
+            raise ValueError(f"tool_permissions 不允许业务工具权限为 None：{names}")
 
         registry = ToolRegistry()
         registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})

@@ -265,6 +265,83 @@ def test_react_agent_replaces_unknown_tool_name_in_public_updates() -> None:
     ]
 
 
+def test_react_agent_replaces_unknown_tool_name_in_v1_content_block() -> None:
+    secret_name = "missing-/srv/private/v1-key"
+    call = tool_call(secret_name)
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content=[
+                    {
+                        "type": "tool_call",
+                        "name": secret_name,
+                        "args": {},
+                        "id": "call-1",
+                    }
+                ],
+                tool_calls=[call],
+                response_metadata={"output_version": "v1"},
+            ),
+            AIMessage(content="fallback"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=model,
+    )
+
+    result = agent.run(create_initial_state())
+
+    persisted_message = result.updates["messages"][0]
+    assert isinstance(persisted_message, AIMessage)
+    assert isinstance(persisted_message.content, list)
+    assert persisted_message.content[0]["name"] == UNKNOWN_TOOL_NAME
+    assert secret_name not in str(result.updates)
+
+
+def test_react_agent_preserves_registered_v1_tool_call_metadata() -> None:
+    call = tool_call("double")
+    content = [
+        {"type": "text", "text": "working"},
+        {
+            "type": "tool_call",
+            "name": "double",
+            "args": {"value": 3},
+            "id": "call-1",
+        },
+    ]
+    response_metadata = {"output_version": "v1", "provider": "test"}
+    additional_kwargs = {"provider_marker": "keep"}
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content=content,
+                tool_calls=[call],
+                response_metadata=response_metadata,
+                additional_kwargs=additional_kwargs,
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+    )
+
+    result = agent.run(create_initial_state())
+
+    persisted_message = result.updates["messages"][0]
+    assert isinstance(persisted_message, AIMessage)
+    assert persisted_message.content == content
+    assert persisted_message.response_metadata == response_metadata
+    assert persisted_message.additional_kwargs == additional_kwargs
+    assert result.updates["tool_results"][0].success is True
+    assert result.updates["tool_results"][0].output == "6"
+
+
 def test_react_agent_stops_at_iteration_limit() -> None:
     model = ScriptedModel(
         [

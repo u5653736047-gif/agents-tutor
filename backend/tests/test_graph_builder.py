@@ -109,6 +109,27 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
     assert [tool.name for tool in builder.registry.list_tools()] == ["handoff"]
 
 
+def test_graph_rejects_none_permission_for_business_tool() -> None:
+    with pytest.raises(ValueError, match=r"tool_permissions.*double"):
+        CollaborativeAgentGraph(
+            model=ScriptedModel([]),
+            tools=[double],
+            tool_permissions={"double": None},  # type: ignore[dict-item]
+        )
+
+
+def test_graph_accepts_explicit_empty_role_set() -> None:
+    builder = CollaborativeAgentGraph(
+        model=ScriptedModel([]),
+        tools=[double],
+        tool_permissions={"double": set()},
+    )
+
+    assert all(
+        not builder.registry.is_authorized("double", role) for role in AgentRole
+    )
+
+
 @pytest.mark.parametrize("permission_name", ["doubl", "handoff"])
 def test_graph_rejects_permissions_for_non_business_tools(
     permission_name: str,
