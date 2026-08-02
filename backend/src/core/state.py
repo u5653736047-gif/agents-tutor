@@ -16,7 +16,7 @@ import operator
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
@@ -43,6 +43,13 @@ class AgentRole(StrEnum):
     EVALUATOR = "evaluator"
 
 
+WorkerAgentRole = Literal[
+    AgentRole.TEACHING_ASSISTANT,
+    AgentRole.LEARNING_ASSISTANT,
+    AgentRole.EVALUATOR,
+]
+
+
 class TaskStatus(StrEnum):
     """任务生命周期状态."""
 
@@ -51,6 +58,15 @@ class TaskStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class TaskPlanStatus(StrEnum):
+    """Supervisor 显式任务计划的调度状态。"""
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class HandoffApprovalAction(StrEnum):
@@ -85,6 +101,60 @@ class TaskContext(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class TaskPlanStep(BaseModel):
+    """一个按序执行、面向 Worker 的计划步骤。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1)
+    description: str = Field(min_length=1)
+    target_agent: WorkerAgentRole
+
+    @field_validator("description")
+    @classmethod
+    def description_must_not_be_blank(cls, description: str) -> str:
+        if not description.strip():
+            raise ValueError("plan step description must not be blank")
+        return description
+
+class TaskPlan(BaseModel):
+    """可持久化、可审计的 Supervisor 有序任务计划。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[TaskPlanStep] = Field(min_length=2)
+    current_step_index: int = Field(default=0, ge=0)
+    status: TaskPlanStatus = TaskPlanStatus.ACTIVE
+
+    @field_validator("steps")
+    @classmethod
+    def steps_must_have_contiguous_sequences(
+        cls,
+        steps: list[TaskPlanStep],
+    ) -> list[TaskPlanStep]:
+        ordered = sorted(steps, key=lambda step: step.sequence)
+        if [step.sequence for step in ordered] != list(range(1, len(steps) + 1)):
+            raise ValueError("plan step sequences must be contiguous from 1")
+        return ordered
+
+    @model_validator(mode="after")
+    def progress_must_match_status(self) -> TaskPlan:
+        step_count = len(self.steps)
+        if self.current_step_index > step_count:
+            raise ValueError("current_step_index exceeds plan length")
+        if (
+            self.status is TaskPlanStatus.ACTIVE
+            and self.current_step_index == step_count
+        ):
+            raise ValueError("completed plan cannot remain active")
+        if (
+            self.status is TaskPlanStatus.COMPLETED
+            and self.current_step_index != step_count
+        ):
+            raise ValueError("completed plan must consume every step")
+        return self
+
+
 class HandoffApprovalRequest(BaseModel):
     """等待人工确认的 Supervisor 分派提案。"""
 
@@ -92,6 +162,7 @@ class HandoffApprovalRequest(BaseModel):
 
     target_agent: AgentRole
     task_content: str
+    plan_step_sequence: int | None = Field(default=None, ge=1)
 
     @field_validator("target_agent")
     @classmethod
@@ -192,6 +263,7 @@ class AgentState(TypedDict, total=False):
     - messages: 追加合并（由 langgraph add_messages 处理去重与按 ID 更新）
     - tool_results、events: 追加合并（operator.add 拼接列表）
     - task_context、extra: 后写覆盖，但作为跨轮持久字段保留
+    - task_plan: 后写覆盖；新用户轮次清空，历史 checkpoint 保留旧计划
     - next_agent、pending_handoff、run_error、handoff_count、agent_switch_count:
       后写覆盖，每轮开始重置
     - 其余字段: 后写覆盖（last-write-wins）
@@ -221,6 +293,9 @@ class AgentState(TypedDict, total=False):
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
+
+    # 当前用户轮次的显式有序任务计划；步骤结果由后续聚合任务扩展。
+    task_plan: Annotated[TaskPlan | None, _replace]
 
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计
@@ -265,6 +340,7 @@ def create_initial_state(
         next_agent=None,
         pending_handoff=None,
         task_context=None,
+        task_plan=None,
         tool_results=[],
         session_id=session_id,
         user_id=user_id,

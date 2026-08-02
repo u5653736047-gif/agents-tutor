@@ -163,7 +163,7 @@
   进程重建与 LangGraph 0.4/1.2 Interrupt ID 兼容路径均有回归测试。独立 review
   无 Critical/Important；最终全量测试 235 通过，ruff、mypy strict 干净。
 
-### S1-T4 Supervisor 显式任务分解
+### [x] S1-T4 Supervisor 显式任务分解
 
 - 对应总清单：1.1.3（显式任务分解部分）、2.1.1（复杂任务分解部分）
 - 范围：`src/core/state.py`（新增任务计划字段与 reducer）、`nodes/prompts.py`、
@@ -176,6 +176,12 @@
   - 测试覆盖：多子任务请求的计划生成与按序分派、计划字段随 checkpoint 持久化。
 - 依赖：S1-T3（断点可挂接在计划确认点；若工期紧张，本任务可先不接断点，
   但状态字段设计需预留）。
+- 完成备注：2026-08-02；Supervisor 通过仅限三个 Worker 目标的
+  `create_task_plan` 结构化工具生成有序计划，并由确定性 `task_plan_dispatch`
+  节点顺序分派；游标仅在对应 Worker 成功后推进，handoff / Agent 切换上限、
+  人工确认/修改/拒绝与 SQLite 重开持久化均有回归。简单请求继续直接 handoff，
+  模型调用轮次保持不变。三路独立复审无 Critical/Important；最终全量测试
+  257 通过，ruff、mypy strict 干净。
 
 ### S1-T5 多结果聚合
 

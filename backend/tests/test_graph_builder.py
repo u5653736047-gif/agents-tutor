@@ -320,6 +320,10 @@ def test_graph_registry_limits_handoff_to_supervisor() -> None:
     assert len(registries) == 1
     assert registry.is_authorized("handoff", AgentRole.SUPERVISOR)
     assert not registry.is_authorized("handoff", AgentRole.TEACHING_ASSISTANT)
+    assert registry.is_authorized("create_task_plan", AgentRole.SUPERVISOR)
+    assert not registry.is_authorized(
+        "create_task_plan", AgentRole.TEACHING_ASSISTANT
+    )
     assert registry.is_authorized("double", AgentRole.EVALUATOR)
     assert not registry.is_authorized("double", AgentRole.SUPERVISOR)
 
@@ -343,7 +347,10 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
         tool_permissions={},
     )
 
-    assert [tool.name for tool in builder.registry.list_tools()] == ["handoff"]
+    assert [tool.name for tool in builder.registry.list_tools()] == [
+        "handoff",
+        "create_task_plan",
+    ]
 
 
 def test_graph_rejects_none_permission_for_business_tool() -> None:
@@ -367,7 +374,9 @@ def test_graph_accepts_explicit_empty_role_set() -> None:
     )
 
 
-@pytest.mark.parametrize("permission_name", ["doubl", "handoff"])
+@pytest.mark.parametrize(
+    "permission_name", ["doubl", "handoff", "create_task_plan"]
+)
 def test_graph_rejects_permissions_for_non_business_tools(
     permission_name: str,
 ) -> None:

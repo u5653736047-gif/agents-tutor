@@ -101,7 +101,8 @@
 - [ ] **（部分完成）** 1.1.3 实现协调者（Supervisor）模式
   - [x] Supervisor 可通过 `handoff` 工具分派到三个 Worker，并在完成后回收控制权。
   - [x] 已实现基于模型 Tool Call 的 conditional edge 动态路由。
-  - [ ] 复杂请求的显式任务分解和结果聚合策略尚未实现。
+  - [x] 复杂请求可生成带描述、目标 Worker 和顺序的显式计划，并确定性顺序分派。
+  - [ ] 多结果聚合策略尚未实现。
   - [ ] LangGraph Send API / fan-out 子代理并行尚未实现。
 - [x] 1.1.4 实现人机交互断点（Human-in-the-loop）
   - [x] Supervisor handoff 分派前可暂停，并通过 checkpoint 跨进程恢复确认。
@@ -156,7 +157,8 @@
 - [ ] **（部分完成）** 2.1.1 协调 Agent（Supervisor）
   - [x] 已建立极简 Supervisor Prompt、handoff 工具和安全路由边界。
   - [ ] 教学场景意图识别尚未实现。
-  - [ ] 复杂任务分解与多结果聚合尚未实现。
+  - [x] 复杂任务可生成结构化有序计划并按计划依次分派。
+  - [ ] 多结果聚合尚未实现。
 - [ ] **（部分完成）** 2.1.2 助教 Agent（Teaching Assistant）
   - [x] 已接入同构 ReAct 节点，并可按权限调用知识检索工具。
   - [ ] 教案/例题生成的结构化工作流尚未实现。

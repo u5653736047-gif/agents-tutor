@@ -10,6 +10,8 @@ from core.state import (
     AgentState,
     HandoffApprovalAction,
     HandoffApprovalDecision,
+    TaskPlan,
+    TaskPlanStatus,
     create_initial_state,
 )
 
@@ -43,6 +45,117 @@ def test_initial_state_has_runtime_defaults() -> None:
     assert state["handoff_count"] == 0
     assert state["agent_switch_count"] == 0
     assert state["pending_handoff"] is None
+    assert state["task_plan"] is None
+
+
+def test_task_plan_normalizes_and_preserves_structured_steps() -> None:
+    plan = TaskPlan(
+        steps=[
+            {
+                "sequence": 2,
+                "description": "检查讲解准确性",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+            {
+                "sequence": 1,
+                "description": "讲解梯度下降",
+                "target_agent": AgentRole.TEACHING_ASSISTANT,
+            },
+        ]
+    )
+
+    assert [step.sequence for step in plan.steps] == [1, 2]
+    assert [step.description for step in plan.steps] == [
+        "讲解梯度下降",
+        "检查讲解准确性",
+    ]
+    assert plan.current_step_index == 0
+    assert plan.status is TaskPlanStatus.ACTIVE
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        [
+            {
+                "sequence": 1,
+                "description": "只有一步",
+                "target_agent": AgentRole.EVALUATOR,
+            }
+        ],
+        [
+            {
+                "sequence": 1,
+                "description": "   ",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+            {
+                "sequence": 2,
+                "description": "有效步骤",
+                "target_agent": AgentRole.TEACHING_ASSISTANT,
+            },
+        ],
+        [
+            {
+                "sequence": 1,
+                "description": "非法目标",
+                "target_agent": AgentRole.SUPERVISOR,
+            },
+            {
+                "sequence": 2,
+                "description": "有效步骤",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+        ],
+        [
+            {
+                "sequence": 1,
+                "description": "第一步",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+            {
+                "sequence": 1,
+                "description": "重复序号",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+        ],
+        [
+            {
+                "sequence": 1,
+                "description": "第一步",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+            {
+                "sequence": 3,
+                "description": "缺号",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+        ],
+        [
+            {
+                "sequence": 0,
+                "description": "非正序号",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+            {
+                "sequence": 1,
+                "description": "有效步骤",
+                "target_agent": AgentRole.EVALUATOR,
+            },
+        ],
+    ],
+    ids=[
+        "single-step",
+        "blank-description",
+        "supervisor-target",
+        "duplicate-sequence",
+        "missing-sequence",
+        "non-positive-sequence",
+    ],
+)
+def test_task_plan_rejects_invalid_steps(steps: list[dict[str, object]]) -> None:
+    with pytest.raises(ValidationError):
+        TaskPlan(steps=steps)
 
 
 @pytest.mark.parametrize(

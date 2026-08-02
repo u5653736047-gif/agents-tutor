@@ -13,6 +13,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot, interrupt
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
@@ -26,6 +27,9 @@ from .state import (
     HandoffApprovalRequest,
     PendingHandoffApproval,
     TaskContext,
+    TaskPlan,
+    TaskPlanStatus,
+    TaskPlanStep,
     ToolResult,
     create_initial_state,
 )
@@ -34,12 +38,32 @@ from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
+_TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
+
+
+class _TaskPlanInput(BaseModel):
+    """仅暴露给模型的计划输入，不允许模型伪造运行时游标。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[TaskPlanStep] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_complete_plan(self) -> _TaskPlanInput:
+        TaskPlan(steps=self.steps)
+        return self
 
 
 @tool
 def handoff(target: WorkerRole) -> str:
     """将当前任务交给指定的专业 Agent。"""
     return target
+
+
+@tool(args_schema=_TaskPlanInput)
+def create_task_plan(steps: list[TaskPlanStep]) -> str:
+    """为需要至少两个有序子任务的复杂请求创建一次任务计划。"""
+    return TaskPlan(steps=steps).model_dump_json()
 
 
 class CollaborativeAgentGraph:
@@ -91,6 +115,10 @@ class CollaborativeAgentGraph:
 
         registry = ToolRegistry()
         registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})
+        registry.register(
+            create_task_plan,
+            allowed_roles={AgentRole.SUPERVISOR},
+        )
         for business_tool in tools:
             registry.register(
                 business_tool,
@@ -129,6 +157,7 @@ class CollaborativeAgentGraph:
             AgentRole.TEACHING_ASSISTANT.value: AgentRole.TEACHING_ASSISTANT.value,
             AgentRole.LEARNING_ASSISTANT.value: AgentRole.LEARNING_ASSISTANT.value,
             AgentRole.EVALUATOR.value: AgentRole.EVALUATOR.value,
+            _TASK_PLAN_DISPATCH_NODE: _TASK_PLAN_DISPATCH_NODE,
             "end": END,
         }
         if self.interrupt_before_handoff:
@@ -137,6 +166,13 @@ class CollaborativeAgentGraph:
         for role, agent in self.agents.items():
             graph.add_node(role.value, self._wrap(agent))
             graph.add_conditional_edges(role.value, self._route, routes)
+
+        graph.add_node(_TASK_PLAN_DISPATCH_NODE, self._dispatch_task_plan)
+        graph.add_conditional_edges(
+            _TASK_PLAN_DISPATCH_NODE,
+            self._route,
+            routes,
+        )
 
         if self.interrupt_before_handoff:
             graph.add_node(_HANDOFF_APPROVAL_NODE, self._approve_handoff)
@@ -199,6 +235,12 @@ class CollaborativeAgentGraph:
             updates = dict(result.updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             target = _handoff_target(tool_results)
+            new_plan = _task_plan_from_results(tool_results)
+            existing_plan = _task_plan_from_state(state)
+            plan = existing_plan or new_plan
+            replacing_plan = new_plan is not None and existing_plan is not None
+            if new_plan is not None and existing_plan is None:
+                updates["task_plan"] = new_plan
             events = cast(list[RunEvent], updates.get("events", []))
             sequence = max(
                 (
@@ -235,6 +277,13 @@ class CollaborativeAgentGraph:
 
             def fail(error: RunError) -> AgentState:
                 updates["run_error"] = error
+                if plan is not None and plan.status not in {
+                    TaskPlanStatus.CANCELLED,
+                    TaskPlanStatus.FAILED,
+                }:
+                    updates["task_plan"] = plan.model_copy(
+                        update={"status": TaskPlanStatus.FAILED}
+                    )
                 emit(
                     EventType.RUN_FAILED,
                     agent.role.value,
@@ -248,6 +297,14 @@ class CollaborativeAgentGraph:
 
             if result.error is not None:
                 return fail(result.error)
+            if replacing_plan:
+                return fail(
+                    RunError(
+                        error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                        message="当前用户轮次已存在任务计划，不允许覆盖",
+                        agent=agent.role.value,
+                    )
+                )
             if target is not None and target not in registered_targets:
                 return fail(
                     RunError(
@@ -256,6 +313,29 @@ class CollaborativeAgentGraph:
                         agent=agent.role.value,
                     )
                 )
+
+            if target is not None and plan is not None:
+                if plan.status is not TaskPlanStatus.ACTIVE:
+                    return fail(
+                        RunError(
+                            error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                            message="任务计划结束后不允许继续 handoff",
+                            agent=agent.role.value,
+                        )
+                    )
+                expected_target = plan.steps[
+                    plan.current_step_index
+                ].target_agent.value
+                if target != expected_target:
+                    return fail(
+                        RunError(
+                            error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                            message=f"handoff 目标偏离当前计划步骤：{target}",
+                            agent=agent.role.value,
+                        )
+                    )
+                # 活动计划由确定性调度节点分派；一致的模型 handoff 仅作冗余观察。
+                target = None
 
             if agent.role is AgentRole.SUPERVISOR:
                 if target is not None:
@@ -289,9 +369,35 @@ class CollaborativeAgentGraph:
                         handoff_count += 1
                         switch_count += 1
                         emit(EventType.AGENT_SWITCHED, target)
-                else:
+                elif plan is None or plan.status is not TaskPlanStatus.ACTIVE:
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
+                if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
+                    step = plan.steps[plan.current_step_index]
+                    if step.target_agent is not agent.role:
+                        return fail(
+                            RunError(
+                                error_code=ErrorCode.GRAPH_INVALID_TARGET,
+                                message=(
+                                    "当前 Worker 与计划步骤目标不一致："
+                                    f"{agent.role.value}"
+                                ),
+                                agent=agent.role.value,
+                            )
+                        )
+                    next_index = plan.current_step_index + 1
+                    next_status = (
+                        TaskPlanStatus.COMPLETED
+                        if next_index == len(plan.steps)
+                        else TaskPlanStatus.ACTIVE
+                    )
+                    plan = plan.model_copy(
+                        update={
+                            "current_step_index": next_index,
+                            "status": next_status,
+                        }
+                    )
+                    updates["task_plan"] = plan
                 if switch_count + 1 > self.max_agent_switches:
                     return fail(
                         RunError(
@@ -313,44 +419,19 @@ class CollaborativeAgentGraph:
 
         return RunnableLambda(node)
 
-    def _approve_handoff(self, state: AgentState) -> AgentState:
-        """暂停并提交分派决定；恢复时仅重放这个无外部副作用的 gate。"""
-        pending = state.get("pending_handoff")
-        if pending is None:
-            raise RuntimeError("handoff approval node requires a pending proposal")
-        proposal = HandoffApprovalRequest.model_validate(pending)
-        raw_decision = interrupt(proposal.model_dump(mode="json"))
-        decision = HandoffApprovalDecision.model_validate(raw_decision)
+    def _dispatch_task_plan(self, state: AgentState) -> AgentState:
+        """按持久化计划选择下一 Worker，不把顺序控制交还给模型。"""
+        plan = _task_plan_from_state(state)
+        if plan is None or plan.status is not TaskPlanStatus.ACTIVE:
+            raise RuntimeError("task plan dispatch requires an active plan")
+        step = plan.steps[plan.current_step_index]
+        handoff_count = state.get("handoff_count", 0)
+        switch_count = state.get("agent_switch_count", 0)
         sequence = max(
             (event.sequence for event in state.get("events", [])),
             default=-1,
         )
 
-        if decision.action is HandoffApprovalAction.REJECT:
-            # 拒绝不执行 Worker 或自动重规划；本轮以成功终止事件安全收口。
-            return cast(
-                AgentState,
-                {
-                    "next_agent": None,
-                    "pending_handoff": None,
-                    "run_error": None,
-                    "handoff_count": state.get("handoff_count", 0),
-                    "agent_switch_count": state.get("agent_switch_count", 0),
-                    "events": [
-                        RunEvent(
-                            event_type=EventType.RUN_COMPLETED,
-                            sequence=sequence + 1,
-                            session_id=state.get("session_id"),
-                            agent=AgentRole.SUPERVISOR.value,
-                            success=True,
-                        )
-                    ],
-                },
-            )
-
-        target = decision.target_agent or proposal.target_agent
-        handoff_count = state.get("handoff_count", 0)
-        switch_count = state.get("agent_switch_count", 0)
         limit_error: RunError | None = None
         if handoff_count + 1 > self.max_handoffs:
             limit_error = RunError(
@@ -368,8 +449,12 @@ class CollaborativeAgentGraph:
             return cast(
                 AgentState,
                 {
+                    "current_agent": AgentRole.SUPERVISOR.value,
                     "next_agent": None,
                     "pending_handoff": None,
+                    "task_plan": plan.model_copy(
+                        update={"status": TaskPlanStatus.FAILED}
+                    ),
                     "run_error": limit_error,
                     "handoff_count": handoff_count,
                     "agent_switch_count": switch_count,
@@ -384,6 +469,124 @@ class CollaborativeAgentGraph:
                         )
                     ],
                 },
+            )
+
+        updates: dict[str, object] = {
+            "current_agent": AgentRole.SUPERVISOR.value,
+            "next_agent": step.target_agent.value,
+            "pending_handoff": None,
+            "task_plan": plan,
+            "run_error": None,
+            "handoff_count": handoff_count,
+            "agent_switch_count": switch_count,
+        }
+        if self.interrupt_before_handoff:
+            updates["pending_handoff"] = HandoffApprovalRequest(
+                target_agent=step.target_agent,
+                task_content=step.description,
+                plan_step_sequence=step.sequence,
+            )
+        else:
+            updates["messages"] = [HumanMessage(content=step.description)]
+            updates["handoff_count"] = handoff_count + 1
+            updates["agent_switch_count"] = switch_count + 1
+            updates["events"] = [
+                RunEvent(
+                    event_type=EventType.AGENT_SWITCHED,
+                    sequence=sequence + 1,
+                    session_id=state.get("session_id"),
+                    agent=step.target_agent.value,
+                    success=True,
+                )
+            ]
+        return cast(AgentState, updates)
+
+    def _approve_handoff(self, state: AgentState) -> AgentState:
+        """暂停并提交分派决定；恢复时仅重放这个无外部副作用的 gate。"""
+        pending = state.get("pending_handoff")
+        if pending is None:
+            raise RuntimeError("handoff approval node requires a pending proposal")
+        proposal = HandoffApprovalRequest.model_validate(pending)
+        raw_decision = interrupt(
+            proposal.model_dump(mode="json", exclude_none=True)
+        )
+        decision = HandoffApprovalDecision.model_validate(raw_decision)
+        sequence = max(
+            (event.sequence for event in state.get("events", [])),
+            default=-1,
+        )
+
+        if decision.action is HandoffApprovalAction.REJECT:
+            # 拒绝不执行 Worker 或自动重规划；本轮以成功终止事件安全收口。
+            reject_updates: dict[str, object] = {
+                "next_agent": None,
+                "pending_handoff": None,
+                "run_error": None,
+                "handoff_count": state.get("handoff_count", 0),
+                "agent_switch_count": state.get("agent_switch_count", 0),
+                "events": [
+                    RunEvent(
+                        event_type=EventType.RUN_COMPLETED,
+                        sequence=sequence + 1,
+                        session_id=state.get("session_id"),
+                        agent=AgentRole.SUPERVISOR.value,
+                        success=True,
+                    )
+                ],
+            }
+            rejected_plan = _task_plan_for_proposal(state, proposal)
+            if rejected_plan is not None:
+                reject_updates["task_plan"] = rejected_plan.model_copy(
+                    update={"status": TaskPlanStatus.CANCELLED}
+                )
+            return cast(
+                AgentState,
+                reject_updates,
+            )
+
+        target = decision.target_agent or proposal.target_agent
+        task_content = decision.task_content or proposal.task_content
+        planned = _task_plan_for_proposal(state, proposal)
+        handoff_count = state.get("handoff_count", 0)
+        switch_count = state.get("agent_switch_count", 0)
+        limit_error: RunError | None = None
+        if handoff_count + 1 > self.max_handoffs:
+            limit_error = RunError(
+                error_code=ErrorCode.GRAPH_HANDOFF_LIMIT,
+                message=f"handoff 次数超过上限：{self.max_handoffs}",
+                agent=AgentRole.SUPERVISOR.value,
+            )
+        elif switch_count + 1 > self.max_agent_switches:
+            limit_error = RunError(
+                error_code=ErrorCode.GRAPH_SWITCH_LIMIT,
+                message=f"Agent 切换次数超过上限：{self.max_agent_switches}",
+                agent=AgentRole.SUPERVISOR.value,
+            )
+        if limit_error is not None:
+            failure_updates: dict[str, object] = {
+                "next_agent": None,
+                "pending_handoff": None,
+                "run_error": limit_error,
+                "handoff_count": handoff_count,
+                "agent_switch_count": switch_count,
+                "events": [
+                    RunEvent(
+                        event_type=EventType.RUN_FAILED,
+                        sequence=sequence + 1,
+                        session_id=state.get("session_id"),
+                        agent=AgentRole.SUPERVISOR.value,
+                        success=False,
+                        error_code=limit_error.error_code,
+                    )
+                ],
+            }
+            if planned is not None:
+                failure_updates["task_plan"] = planned.model_copy(
+                    update={"status": TaskPlanStatus.FAILED}
+                )
+            return cast(
+                AgentState,
+                failure_updates,
             )
 
         updates: dict[str, object] = {
@@ -402,6 +605,17 @@ class CollaborativeAgentGraph:
                 )
             ],
         }
+        if planned is not None:
+            step_index = planned.current_step_index
+            steps = list(planned.steps)
+            steps[step_index] = steps[step_index].model_copy(
+                update={
+                    "target_agent": target,
+                    "description": task_content,
+                }
+            )
+            updates["task_plan"] = planned.model_copy(update={"steps": steps})
+            updates["messages"] = [HumanMessage(content=task_content)]
         if decision.task_content is not None:
             task_context = state.get("task_context")
             updates["task_context"] = (
@@ -425,6 +639,9 @@ class CollaborativeAgentGraph:
         next_agent = state.get("next_agent")
         if next_agent in {role.value for role in AgentRole}:
             return next_agent
+        plan = _task_plan_from_state(state)
+        if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
+            return _TASK_PLAN_DISPATCH_NODE
         if state.get("current_agent") != AgentRole.SUPERVISOR.value:
             return AgentRole.SUPERVISOR.value
         return "end"
@@ -461,6 +678,7 @@ class CollaborativeAgentGraph:
                         "messages": [HumanMessage(content=user_input)],
                         "next_agent": None,
                         "pending_handoff": None,
+                        "task_plan": None,
                         "run_error": None,
                         "handoff_count": 0,
                         "agent_switch_count": 0,
@@ -599,6 +817,35 @@ def _handoff_target(tool_results: Sequence[ToolResult]) -> str | None:
     return None
 
 
+def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | None:
+    """只解析本次 Supervisor 成功创建的最后一个结构化计划。"""
+    for result in reversed(tool_results):
+        if result.tool_name == "create_task_plan" and result.success:
+            return TaskPlan.model_validate_json(result.output)
+    return None
+
+
+def _task_plan_from_state(state: AgentState) -> TaskPlan | None:
+    raw_plan = state.get("task_plan")
+    return None if raw_plan is None else TaskPlan.model_validate(raw_plan)
+
+
+def _task_plan_for_proposal(
+    state: AgentState,
+    proposal: HandoffApprovalRequest,
+) -> TaskPlan | None:
+    """校验计划型审批仍对应 checkpoint 中未推进的当前步骤。"""
+    if proposal.plan_step_sequence is None:
+        return None
+    plan = _task_plan_from_state(state)
+    if plan is None or plan.status is not TaskPlanStatus.ACTIVE:
+        raise RuntimeError("planned handoff requires an active task plan")
+    step = plan.steps[plan.current_step_index]
+    if step.sequence != proposal.plan_step_sequence:
+        raise RuntimeError("planned handoff no longer matches current step")
+    return plan
+
+
 def _latest_human_content(messages: Sequence[BaseMessage]) -> str:
     """读取本轮最近用户指令，作为人工确认时展示的初始任务。"""
     for message in reversed(messages):
@@ -633,4 +880,4 @@ def _pending_handoff_from_snapshot(
     )
 
 
-__all__ = ["CollaborativeAgentGraph", "handoff"]
+__all__ = ["CollaborativeAgentGraph", "create_task_plan", "handoff"]

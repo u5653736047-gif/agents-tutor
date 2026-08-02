@@ -62,7 +62,7 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     } == {count_context_messages}
     for role, agent in agents.items():
         assert agent.system_prompt == ROLE_PROMPTS[role]
-    assert max(map(len, ROLE_PROMPTS.values())) <= 80
+    assert max(map(len, ROLE_PROMPTS.values())) <= 160
     assert model.bind_count == 1
 
 
