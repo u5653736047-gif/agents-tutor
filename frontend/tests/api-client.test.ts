@@ -1,0 +1,124 @@
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import test from "node:test";
+
+const apiClientPath = new URL("../lib/api-client.ts", import.meta.url);
+
+async function loadApiClient() {
+  assert.ok(existsSync(apiClientPath), "missing generated-type API client");
+  return import("../lib/api-client");
+}
+
+test("the API client injects the demo user header and generated session query", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example/",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json([
+        {
+          archived: false,
+          created_at: "2026-08-03T00:00:00Z",
+          session_id: "session-1",
+          user_id: "demo-user",
+        },
+      ]);
+    },
+  });
+
+  const sessions = await client.listSessions(true);
+
+  assert.equal(sessions[0]?.session_id, "session-1");
+  assert.equal(requests[0]?.url, "https://api.example/sessions?include_archived=true");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+});
+
+test("the API client preserves an optional generated session ID", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (_input, init) => {
+      requests.push({ body: String(init?.body ?? null) });
+      return Response.json({
+        archived: false,
+        created_at: "2026-08-03T00:00:00Z",
+        session_id: "session/1",
+        user_id: "demo-user",
+      });
+    },
+  });
+
+  await client.createSession({ session_id: "session/1" });
+
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { session_id: "session/1" });
+});
+
+test("the API client exposes non-success responses as one error shape", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          detail: { error_code: "session_not_found", message: "会话不存在。" },
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 404 },
+      ),
+  });
+
+  await assert.rejects(client.getSessionMessages("missing"), (error: unknown) => {
+    assert.ok(error instanceof ApiClientError);
+    assert.equal(error.status, 404);
+    assert.equal(error.code, "session_not_found");
+    assert.equal(error.message, "会话不存在。");
+    return true;
+  });
+});
+
+test("the API client reports an aborted request through the same error shape", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Request aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+    timeoutMs: 1,
+  });
+
+  await assert.rejects(client.listSessions(), (error: unknown) => {
+    assert.ok(error instanceof ApiClientError);
+    assert.equal(error.status, null);
+    assert.equal(error.code, null);
+    return true;
+  });
+});
+
+test("the handoff client only serializes supported decision fields", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ body: String(init?.body ?? null), url: String(input) });
+      return Response.json({ events: [], session_id: "session/1" });
+    },
+  });
+
+  await client.decideHandoff("session/1", {
+    action: "confirm",
+    interrupt_id: "interrupt-1",
+  });
+
+  assert.equal(requests[0]?.url, "https://api.example/sessions/session%2F1/handoff");
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    action: "confirm",
+    interrupt_id: "interrupt-1",
+  });
+});
