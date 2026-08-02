@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -59,6 +60,48 @@ def test_session_store_rejects_duplicate_user_session_key(tmp_path: Path) -> Non
 
         with pytest.raises(ValueError, match="already exists"):
             store.create_session("session-1", user_id="user-1")
+
+
+def test_session_store_supports_one_instance_across_threads(tmp_path: Path) -> None:
+    with SessionStore(tmp_path / "sessions.sqlite") as store:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(
+                    store.create_session,
+                    f"session-{index}",
+                    "user-1",
+                )
+                for index in range(8)
+            ]
+            records = [future.result() for future in futures]
+
+        assert store.list_sessions(user_id="user-1") == sorted(
+            records,
+            key=lambda record: (record.created_at, record.session_id),
+        )
+
+
+def test_create_propagates_non_unique_integrity_error(tmp_path: Path) -> None:
+    database_path = tmp_path / "sessions.sqlite"
+    with SessionStore(database_path) as store:
+        with sqlite3.connect(database_path) as setup:
+            setup.execute(
+                """
+                CREATE TRIGGER reject_create
+                BEFORE INSERT ON sessions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced create failure');
+                END
+                """
+            )
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced create failure"):
+            store.create_session("blocked", user_id="user-1")
+
+        assert store._connection.in_transaction is False
+        with sqlite3.connect(database_path, timeout=0) as independent:
+            independent.execute("BEGIN IMMEDIATE")
+            independent.rollback()
 
 
 def test_session_store_isolates_users_and_persists_after_reopen(tmp_path: Path) -> None:
