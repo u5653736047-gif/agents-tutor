@@ -26,6 +26,13 @@ class KnowledgeService:
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
         document_batch = list(documents)
+        coordinates: set[tuple[str, int | None]] = set()
+        for document in document_batch:
+            coordinate = (document.document_id, document.page)
+            if coordinate in coordinates:
+                raise ValueError("duplicate document page in one batch")
+            coordinates.add(coordinate)
+
         chunks = chunk_documents(
             document_batch,
             chunk_size=self._chunk_size,
