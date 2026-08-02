@@ -67,10 +67,10 @@
   - [x] 知识模型、Citation 与检索 Observation 仅暴露逻辑 source（S0-T1）。
   - [x] 重复写入替换与 chunk 坐标一致性已覆盖（S0-T2）。
 - [x] 为状态 reducer、恢复流程、上下文裁剪和知识替换语义补充关键注释。
-- [ ] **（部分完成）** 再次执行多代理 review、全量测试、静态检查和真实 DeepSeek
+- [x] 再次执行多代理 review、全量测试、静态检查和真实 DeepSeek
   冒烟验证。
   - [x] 真实 DeepSeek 两轮 ReAct 冒烟通过并记录脱敏日志（S0-T3）。
-  - [ ] Sprint 0 独立代码 review 与最终三项门禁复核尚待完成（S0-T4）。
+  - [x] Sprint 0 独立代码 review 与最终三项门禁复核通过（S0-T4）。
 - [x] 创建加固提交并推送 `soldier`，核对远端提交哈希
   （2026-08-02 已推送，远端 HEAD 与本地一致）。
 
