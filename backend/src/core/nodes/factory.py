@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from langchain_core.tools import BaseTool
 
 from ..state import AgentRole
-from ..tools import ToolExecutor, ToolRegistry
+from ..tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolExecutor, ToolRegistry
 from .prompts import ROLE_PROMPTS
 from .react_agent import ChatModel, ReActAgentNode
 
@@ -20,9 +20,16 @@ def create_agent_nodes(
     registry: ToolRegistry | None = None,
     max_iterations: int = 5,
     max_context_messages: int | None = None,
+    tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    tool_timeouts: Mapping[str, float] | None = None,
 ) -> dict[AgentRole, ReActAgentNode]:
     """共享模型、工具和循环配置，仅为每个角色替换 Prompt。"""
-    tool_executor = ToolExecutor(tools, registry=registry)
+    tool_executor = ToolExecutor(
+        tools,
+        registry=registry,
+        tool_timeout_seconds=tool_timeout_seconds,
+        tool_timeouts=tool_timeouts,
+    )
     prepared_model = _bind_tools(model, tool_executor.registry.list_tools())
     return {
         role: ReActAgentNode(

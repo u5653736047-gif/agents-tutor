@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from threading import Event
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -183,6 +184,67 @@ def test_react_agent_feeds_tool_observation_back_to_model() -> None:
     assert len(result.updates["tool_results"]) == 1
     assert result.updates["messages"][-1].content == "结果是 6"
     assert result.metadata["iterations"] == 2
+
+
+def test_react_agent_observes_timeout_and_continues_to_final_answer() -> None:
+    entered = Event()
+    release = Event()
+    finished = Event()
+
+    @tool
+    def blocking_tool() -> str:
+        """等待测试释放后才结束。"""
+        entered.set()
+        release.wait(timeout=2)
+        finished.set()
+        return "late result"
+
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("blocking_tool")]),
+            AIMessage(content="已识别工具超时，继续回答"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.TEACHING_ASSISTANT,
+        system_prompt="你是助教。",
+        model=model,
+        tool_executor=ToolExecutor(
+            [blocking_tool],
+            tool_timeout_seconds=0.25,
+        ),
+    )
+
+    try:
+        result = agent.run(create_initial_state())
+
+        assert entered.is_set()
+        assert finished.is_set() is False
+        assert result.error is None
+        assert result.metadata["iterations"] == 2
+        assert result.updates["messages"][-1].content == "已识别工具超时，继续回答"
+        assert any(
+            isinstance(message, ToolMessage)
+            and message.content == "错误：工具执行超时"
+            for message in model.calls[1]
+        )
+        tool_result = result.updates["tool_results"][0]
+        assert tool_result.error_code is ErrorCode.TOOL_TIMEOUT
+        assert tool_result.duration_ms is not None
+        tool_completed = next(
+            event
+            for event in result.updates["events"]
+            if event.event_type is EventType.TOOL_COMPLETED
+        )
+        assert tool_completed.success is False
+        assert tool_completed.error_code is ErrorCode.TOOL_TIMEOUT
+        assert tool_completed.duration_ms == tool_result.duration_ms
+        assert result.updates["events"][-1].event_type is EventType.AGENT_COMPLETED
+        assert result.updates["events"][-1].success is True
+    finally:
+        release.set()
+        finished.wait(timeout=1)
+    assert finished.is_set()
 
 
 def test_react_agent_emits_safe_ordered_events_after_history() -> None:

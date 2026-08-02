@@ -24,6 +24,7 @@ class ErrorCode(StrEnum):
     TOOL_UNAUTHORIZED = "tool_unauthorized"
     TOOL_INVALID_ARGUMENTS = "tool_invalid_arguments"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
+    TOOL_TIMEOUT = "tool_timeout"
     MODEL_CALL_FAILED = "model_call_failed"
     REACT_ITERATION_LIMIT = "react_iteration_limit"
     GRAPH_HANDOFF_LIMIT = "graph_handoff_limit"

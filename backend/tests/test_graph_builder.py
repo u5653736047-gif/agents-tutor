@@ -51,6 +51,7 @@ class FailingModel:
         ("max_handoffs", -1),
         ("max_agent_switches", 0),
         ("max_context_messages", 2),
+        ("tool_timeout_seconds", 0),
     ],
 )
 def test_graph_rejects_non_positive_limits(option: str, value: int) -> None:
@@ -67,6 +68,23 @@ def test_graph_forwards_context_window_to_every_agent() -> None:
     )
 
     assert {agent.max_context_messages for agent in builder.agents.values()} == {7}
+
+
+def test_graph_forwards_tool_timeout_configuration_to_shared_executor() -> None:
+    builder = CollaborativeAgentGraph(
+        model=ScriptedModel([]),
+        tools=[double],
+        tool_permissions={"double": {AgentRole.EVALUATOR}},
+        tool_timeout_seconds=2.0,
+        tool_timeouts={"double": 0.25},
+    )
+
+    executors = {id(agent.tool_executor) for agent in builder.agents.values()}
+    executor = next(iter(builder.agents.values())).tool_executor
+
+    assert len(executors) == 1
+    assert executor.timeout_seconds_for("double") == 0.25
+    assert executor.timeout_seconds_for("handoff") == 2.0
 
 
 def test_graph_registry_limits_handoff_to_supervisor() -> None:

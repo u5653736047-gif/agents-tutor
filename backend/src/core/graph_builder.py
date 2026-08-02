@@ -17,7 +17,7 @@ from .events import ErrorCode, EventType, RunError, RunEvent
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
 from .state import AgentRole, AgentState, ToolResult, create_initial_state
-from .tools import ToolRegistry
+from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
@@ -39,6 +39,8 @@ class CollaborativeAgentGraph:
         tools: Sequence[BaseTool] = (),
         max_iterations: int = 5,
         max_context_messages: int | None = None,
+        tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        tool_timeouts: Mapping[str, float] | None = None,
         tool_permissions: Mapping[str, Collection[AgentRole]] | None = None,
         max_handoffs: int = 4,
         max_agent_switches: int = 8,
@@ -85,6 +87,8 @@ class CollaborativeAgentGraph:
             registry=registry,
             max_iterations=max_iterations,
             max_context_messages=max_context_messages,
+            tool_timeout_seconds=tool_timeout_seconds,
+            tool_timeouts=tool_timeouts,
         )
 
         # 图缓存，避免重复编译

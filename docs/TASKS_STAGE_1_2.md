@@ -107,7 +107,7 @@
 > 1.2.2 工具超时，附带上文裁剪的 Token 预算化，形成稳定 Agent 框架基线。
 > 出口标准 = 里程碑 M1「协调者能分派任务给多个子 Agent 并汇总」完整达成。
 
-### S1-T1 工具执行超时控制
+### [x] S1-T1 工具执行超时控制
 
 - 对应总清单：1.2.2
 - 范围：`src/core/tools/executor.py`、`events.py`（错误分类）、调用方配置。
@@ -120,6 +120,9 @@
 - 依赖：Sprint 0 完成。
 - 备注：实现方式自选（如线程池 + future timeout），注意 Windows 兼容性，
   不要引入强杀线程之类的危险操作。
+- 完成备注：2026-08-02；支持 30 秒全局默认与按工具覆盖，超时转换为脱敏的
+  `TOOL_TIMEOUT` Observation 并保留耗时/审计事件，ReAct 可继续完成回答；独立
+  review 无 Critical/Important，最终全量测试 195 通过，ruff、mypy strict 干净。
 
 ### S1-T2 Token 级上下文预算
 
