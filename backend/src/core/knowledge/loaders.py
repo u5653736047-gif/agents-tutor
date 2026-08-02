@@ -13,9 +13,11 @@ def load_text(
     path: str | Path,
     *,
     document_id: str | None = None,
+    source_label: str | None = None,
 ) -> list[KnowledgeDocument]:
     """Load one non-empty UTF-8 text file."""
     source = Path(path)
+    public_source = _public_source(source, source_label)
     content = source.read_text(encoding="utf-8").strip()
     if not content:
         raise ValueError(f"Text file '{source.name}' is empty")
@@ -24,7 +26,7 @@ def load_text(
         KnowledgeDocument(
             document_id=document_id if document_id is not None else _default_document_id(source),
             content=content,
-            source=str(source),
+            source=public_source,
         )
     ]
 
@@ -33,12 +35,14 @@ def load_pdf(
     path: str | Path,
     *,
     document_id: str | None = None,
+    source_label: str | None = None,
 ) -> list[KnowledgeDocument]:
     """Load each non-empty PDF page as a separate document."""
     # Import lazily so plain-text loading does not require the PDF dependency.
     from pypdf import PdfReader
 
     source = Path(path)
+    public_source = _public_source(source, source_label)
     try:
         reader = PdfReader(source)
     except Exception as exc:
@@ -54,7 +58,7 @@ def load_pdf(
                     KnowledgeDocument(
                         document_id=resolved_id,
                         content=content,
-                        source=str(source),
+                        source=public_source,
                         page=page_number,
                     )
                 )
@@ -64,6 +68,13 @@ def load_pdf(
     if not documents:
         raise ValueError(f"PDF '{source.name}' contains no extractable text")
     return documents
+
+
+def _public_source(source: Path, source_label: str | None) -> str:
+    """Keep private file paths out of knowledge models and public results."""
+    if source_label is None:
+        return source.name
+    return source_label
 
 
 def _default_document_id(source: Path) -> str:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from core.knowledge.loaders import load_pdf, load_text
 
@@ -74,10 +75,36 @@ def test_load_text_reads_utf8_and_derives_stable_document_id(tmp_path: Path) -> 
     assert documents[0].document_id.startswith("lesson:")
     assert documents[0].model_dump(exclude={"document_id"}) == {
         "content": "牛顿第一定律",
-        "source": str(source),
+        "source": source.name,
         "page": None,
         "metadata": {},
     }
+
+
+def test_load_text_accepts_a_controlled_source_label(tmp_path: Path) -> None:
+    source = tmp_path / "private" / "lesson.txt"
+    source.parent.mkdir()
+    source.write_text("content", encoding="utf-8")
+
+    default_document = load_text(source)[0]
+    labeled_document = load_text(source, source_label="course://lesson")[0]
+
+    assert default_document.source == source.name
+    assert labeled_document.source == "course://lesson"
+    assert default_document.document_id == labeled_document.document_id
+
+
+@pytest.mark.parametrize("prefix", ["", " "])
+def test_load_text_rejects_an_absolute_source_label(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    source = tmp_path / "private" / "lesson.txt"
+    source.parent.mkdir()
+    source.write_text("content", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="logical identifier"):
+        load_text(source, source_label=f"{prefix}{source}")
 
 
 def test_load_text_rejects_empty_content_with_filename(tmp_path: Path) -> None:
@@ -109,14 +136,18 @@ def test_load_pdf_returns_only_nonempty_pages(tmp_path: Path) -> None:
     source = tmp_path / "lesson.pdf"
     _write_pdf(source, ["First page", None, "Third page"])
 
-    documents = load_pdf(source, document_id="physics")
+    documents = load_pdf(
+        source,
+        document_id="physics",
+        source_label="course://physics",
+    )
 
     assert [(item.content, item.page) for item in documents] == [
         ("First page", 1),
         ("Third page", 3),
     ]
     assert all(item.document_id == "physics" for item in documents)
-    assert all(item.source == str(source) for item in documents)
+    assert all(item.source == "course://physics" for item in documents)
 
 
 def test_load_pdf_rejects_document_without_text(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
@@ -11,6 +12,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from core.events import ErrorCode
 from core.graph_builder import CollaborativeAgentGraph
 from core.knowledge.index import InMemoryKnowledgeIndex
+from core.knowledge.loaders import load_text
 from core.knowledge.models import KnowledgeDocument
 from core.knowledge.service import KnowledgeService
 from core.knowledge.tools import create_search_knowledge_tool
@@ -86,6 +88,34 @@ def test_tool_executor_turns_search_dict_into_json_observation() -> None:
     assert execution.result.output == execution.message.content
     assert observation["found"] is True
     assert observation["hits"][0]["citation"]["document_id"] == "algebra"
+
+
+def test_absolute_loader_path_is_not_exposed_by_search(
+    tmp_path: Path,
+) -> None:
+    private_dir = tmp_path / "server" / "knowledge"
+    private_dir.mkdir(parents=True)
+    source = private_dir / "private-lesson.txt"
+    source.write_text("梯度下降通过迭代更新参数。", encoding="utf-8")
+    service = KnowledgeService(InMemoryKnowledgeIndex())
+    service.add_documents(load_text(source, document_id="gradient-descent"))
+
+    hit = service.search("梯度下降", top_k=1)[0]
+    search_tool = create_search_knowledge_tool(service)
+    execution = ToolExecutor([search_tool]).execute(
+        {
+            "name": "search_knowledge",
+            "args": {"query": "梯度下降", "top_k": 1},
+            "id": "safe-source-search",
+        },
+        AgentRole.LEARNING_ASSISTANT,
+    )
+    observation = str(execution.message.content)
+
+    assert hit.chunk.source == source.name
+    assert hit.citation.source == source.name
+    assert str(source.parent) not in observation
+    assert json.loads(observation)["hits"][0]["citation"]["source"] == source.name
 
 
 @pytest.mark.parametrize(
