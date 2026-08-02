@@ -81,7 +81,7 @@
 
 > 目标：API 层立起来、前端工程立起来、双端类型管道打通、UI 参考基准定案。
 
-### W0-T1 FastAPI 应用骨架
+### [x] W0-T1 FastAPI 应用骨架
 
 - 范围：`backend/src/api/`（新增包）、`pyproject.toml`。
 - 验收标准：
