@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Lock
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -13,6 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from core.events import ErrorCode
 from core.graph_builder import CollaborativeAgentGraph
 from core.persistence import open_sqlite_checkpointer
+from core.state import TaskContext, create_initial_state
 
 
 class ScriptedModel:
@@ -28,6 +31,32 @@ class ScriptedModel:
     def invoke(self, messages: list[BaseMessage]) -> AIMessage:
         self.calls.append(list(messages))
         return self.responses.pop(0)
+
+
+class BlockingModel:
+    """Block the first model call so concurrent graph entry is observable."""
+
+    def __init__(self) -> None:
+        self.first_entered = Event()
+        self.second_entered = Event()
+        self.release_first = Event()
+        self._call_lock = Lock()
+        self._call_count = 0
+
+    def bind_tools(self, tools: Sequence[object]) -> BlockingModel:
+        return self
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        with self._call_lock:
+            self._call_count += 1
+            call_number = self._call_count
+        if call_number == 1:
+            self.first_entered.set()
+            if not self.release_first.wait(timeout=2):
+                raise TimeoutError("first model call was not released")
+        else:
+            self.second_entered.set()
+        return AIMessage(content=f"answer {call_number}")
 
 
 def _human_contents(messages: Sequence[BaseMessage]) -> list[str]:
@@ -113,6 +142,54 @@ def test_each_persisted_turn_resets_transient_run_state() -> None:
     )
 
 
+def test_new_turn_preserves_persistent_task_fields() -> None:
+    graph = CollaborativeAgentGraph(
+        model=ScriptedModel(
+            [AIMessage(content="first answer"), AIMessage(content="second answer")]
+        ),
+        checkpointer=InMemorySaver(),
+    )
+    session_id = "persistent-fields"
+    user_id = "user-1"
+
+    graph.run("first question", session_id=session_id, user_id=user_id)
+    task_context = TaskContext(intent="teach")
+    graph.build().update_state(
+        graph._thread_config(session_id, user_id),
+        {"task_context": task_context, "extra": {"course": "ml"}},
+    )
+
+    result = graph.run("second question", session_id=session_id, user_id=user_id)
+
+    assert result["task_context"] == task_context
+    assert result["extra"]["course"] == "ml"
+
+
+def test_persisted_runs_are_serialized_per_graph_instance() -> None:
+    model = BlockingModel()
+    graph = CollaborativeAgentGraph(model=model, checkpointer=InMemorySaver())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(graph.run, "first question", "shared-session", "user-1")
+        try:
+            assert model.first_entered.wait(timeout=1)
+            second = executor.submit(
+                graph.run,
+                "second question",
+                "shared-session",
+                "user-1",
+            )
+            assert model.second_entered.wait(timeout=0.1) is False
+        finally:
+            model.release_first.set()
+
+        first_result = first.result(timeout=2)
+        second_result = second.result(timeout=2)
+
+    assert first_result["messages"][-1].content == "answer 1"
+    assert second_result["messages"][-1].content == "answer 2"
+
+
 def test_checkpointer_isolates_different_sessions() -> None:
     model = ScriptedModel([AIMessage(content="answer one"), AIMessage(content="answer two")])
     graph = CollaborativeAgentGraph(model=model, checkpointer=InMemorySaver())
@@ -142,7 +219,52 @@ def test_missing_checkpoint_has_no_state_or_history() -> None:
     assert graph.get_history("missing", user_id="user-1") == []
 
 
-@pytest.mark.parametrize("method_name", ["get_state", "get_history"])
+def test_pending_checkpoint_must_be_resumed_without_appending_input() -> None:
+    graph = CollaborativeAgentGraph(
+        model=ScriptedModel([AIMessage(content="resumed answer")]),
+        checkpointer=InMemorySaver(),
+    )
+    app = graph.build()
+    config = graph._thread_config("pending-session", "user-1")
+    initial_state = create_initial_state(
+        session_id="pending-session",
+        user_id="user-1",
+    )
+    initial_state["messages"] = [HumanMessage(content="pending question")]
+    app.update_state(config, initial_state, as_node="__start__")
+
+    assert app.get_state(config).next == ("supervisor",)
+    with pytest.raises(RuntimeError, match="resume"):
+        graph.run("must not be appended", "pending-session", "user-1")
+    assert _human_contents(app.get_state(config).values["messages"]) == [
+        "pending question"
+    ]
+
+    result = graph.resume("pending-session", user_id="user-1")
+
+    assert result["messages"][-1].content == "resumed answer"
+    assert app.get_state(config).next == ()
+
+
+@pytest.mark.parametrize("checkpoint_kind", ["missing", "completed"])
+def test_resume_requires_a_pending_checkpoint(checkpoint_kind: str) -> None:
+    responses = (
+        [AIMessage(content="completed answer")]
+        if checkpoint_kind == "completed"
+        else []
+    )
+    graph = CollaborativeAgentGraph(
+        model=ScriptedModel(responses),
+        checkpointer=InMemorySaver(),
+    )
+    if checkpoint_kind == "completed":
+        graph.run("completed question", session_id=checkpoint_kind, user_id="user-1")
+
+    with pytest.raises(ValueError, match="待恢复"):
+        graph.resume(checkpoint_kind, user_id="user-1")
+
+
+@pytest.mark.parametrize("method_name", ["get_state", "get_history", "resume"])
 def test_persistence_reads_require_a_checkpointer(method_name: str) -> None:
     graph = CollaborativeAgentGraph(model=ScriptedModel([]))
 
@@ -178,7 +300,7 @@ def test_sqlite_checkpointer_restores_after_graph_and_connection_reopen(
 
 
 @pytest.mark.parametrize("user_id", ["", "   "])
-@pytest.mark.parametrize("method_name", ["run", "get_state", "get_history"])
+@pytest.mark.parametrize("method_name", ["run", "resume", "get_state", "get_history"])
 def test_graph_rejects_empty_user_ids(user_id: str, method_name: str) -> None:
     graph = CollaborativeAgentGraph(model=ScriptedModel([]), checkpointer=InMemorySaver())
 
@@ -200,7 +322,7 @@ def test_thread_id_uses_explicit_anonymous_and_value_user_keys() -> None:
 
 
 @pytest.mark.parametrize("session_id", ["", "   "])
-@pytest.mark.parametrize("method_name", ["run", "get_state", "get_history"])
+@pytest.mark.parametrize("method_name", ["run", "resume", "get_state", "get_history"])
 def test_graph_rejects_empty_session_ids(session_id: str, method_name: str) -> None:
     graph = CollaborativeAgentGraph(model=ScriptedModel([]), checkpointer=InMemorySaver())
 

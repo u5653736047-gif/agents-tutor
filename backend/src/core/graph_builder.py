@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Hashable, Mapping, Sequence
+from threading import RLock
 from typing import Literal, cast
 
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -22,7 +23,6 @@ WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
 
 
-# supervisor 分派任务使用的工具函数
 @tool
 def handoff(target: WorkerRole) -> str:
     """将当前任务交给指定的专业 Agent。"""
@@ -78,6 +78,7 @@ class CollaborativeAgentGraph:
         self.max_handoffs = max_handoffs
         self.max_agent_switches = max_agent_switches
         self.checkpointer = checkpointer
+        self._persistence_lock = RLock()
         # 创建4个同构的agent，均遵循react设计范式
         self.agents = create_agent_nodes(
             model=model,
@@ -91,7 +92,6 @@ class CollaborativeAgentGraph:
 
     def build(self) -> CompiledAgentGraph:
         """构建一次并缓存可执行图。"""
-        # 返回已有图：如果已经构建过，则直接返回
         if self._app is not None:
             return self._app
 
@@ -105,12 +105,10 @@ class CollaborativeAgentGraph:
             "end": END,
         }
 
-        # 注册所有agent
         for role, agent in self.agents.items():
             graph.add_node(role.value, self._wrap(agent))
             graph.add_conditional_edges(role.value, self._route, routes)
 
-        # 设置入口节点并编译图
         graph.set_entry_point(AgentRole.SUPERVISOR.value)
         self._app = graph.compile(checkpointer=self.checkpointer)
         return self._app
@@ -159,10 +157,8 @@ class CollaborativeAgentGraph:
                     },
                 )
 
-            # 运行 Agent
             result = agent.run(state)
 
-            # 解读 Agent 的返回值
             updates = dict(result.updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             target = _handoff_target(tool_results)
@@ -300,26 +296,47 @@ class CollaborativeAgentGraph:
             return cast(AgentState, app.invoke(state))
 
         config = self._thread_config(session_id, user_id)
-        if app.get_state(config).values:
-            state = cast(
-                AgentState,
-                {
-                    "messages": [HumanMessage(content=user_input)],
-                    "next_agent": None,
-                    "run_error": None,
-                    "handoff_count": 0,
-                    "agent_switch_count": 0,
-                },
-            )
-        else:
-            state = create_initial_state(session_id=session_id, user_id=user_id)
-            state["messages"] = [HumanMessage(content=user_input)]
-        return cast(AgentState, app.invoke(state, config=config))
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            if snapshot.next:
+                raise RuntimeError("存在待恢复执行，请先调用 resume()")
+            if snapshot.values:
+                state = cast(
+                    AgentState,
+                    {
+                        "messages": [HumanMessage(content=user_input)],
+                        "next_agent": None,
+                        "run_error": None,
+                        "handoff_count": 0,
+                        "agent_switch_count": 0,
+                    },
+                )
+            else:
+                state = create_initial_state(session_id=session_id, user_id=user_id)
+                state["messages"] = [HumanMessage(content=user_input)]
+            return cast(AgentState, app.invoke(state, config=config))
+
+    def resume(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> AgentState:
+        """恢复当前用户会话中尚未完成的持久化执行。"""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError("resume requires a configured checkpointer")
+        app = self.build()
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            if not snapshot.values or not snapshot.next:
+                raise ValueError("当前会话没有待恢复执行")
+            return cast(AgentState, app.invoke(None, config=config))
 
     @staticmethod
     def _thread_config(session_id: str, user_id: str | None) -> RunnableConfig:
         user_key = CollaborativeAgentGraph._user_key(user_id)
         session_key = CollaborativeAgentGraph._session_key(session_id)
+        # 长度前缀避免分隔符碰撞，none 明示匿名租户，实现 user+session 隔离。
         thread_id = f"user:{user_key}|session:{session_key}"
         return {"configurable": {"thread_id": thread_id}}
 

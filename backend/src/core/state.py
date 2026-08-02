@@ -116,7 +116,9 @@ class AgentState(TypedDict, total=False):
     基于 TypedDict 定义，与 LangGraph StateGraph 状态通道机制原生兼容。
     各字段通过 Annotated 指定 reducer 控制并发更新语义：
     - messages: 追加合并（由 langgraph add_messages 处理去重与按 ID 更新）
-    - tool_results: 追加合并（operator.add 拼接列表）
+    - tool_results、events: 追加合并（operator.add 拼接列表）
+    - task_context、extra: 后写覆盖，但作为跨轮持久字段保留
+    - next_agent、run_error、handoff_count、agent_switch_count: 后写覆盖，每轮开始重置
     - 其余字段: 后写覆盖（last-write-wins）
 
     total=False 使所有字段变为可选，允许节点仅返回部分更新（partial update）。
@@ -139,7 +141,7 @@ class AgentState(TypedDict, total=False):
     next_agent: Annotated[str | None, _replace]
 
     # --- 任务上下文 ---
-    # 结构化的当前任务信息（由 Supervisor 填充）
+    # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
 
     # --- 工具调用结果 ---
@@ -156,7 +158,7 @@ class AgentState(TypedDict, total=False):
     agent_switch_count: Annotated[int, _replace]
 
     # --- 扩展预留 ---
-    # 自由格式附加数据，避免频繁修改 Schema
+    # 跨轮持久的自由格式附加数据，避免频繁修改 Schema
     extra: Annotated[dict[str, Any], _replace]
 
 
