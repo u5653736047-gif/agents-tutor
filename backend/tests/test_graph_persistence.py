@@ -15,7 +15,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from core.events import ErrorCode
 from core.graph_builder import CollaborativeAgentGraph
 from core.persistence import open_sqlite_checkpointer
-from core.state import TaskContext, create_initial_state
+from core.state import (
+    HandoffApprovalAction,
+    HandoffApprovalDecision,
+    TaskContext,
+    create_initial_state,
+)
 
 
 class ScriptedModel:
@@ -65,6 +70,20 @@ def _human_contents(messages: Sequence[BaseMessage]) -> list[str]:
 
 def _one_token_per_context_message(messages: Sequence[BaseMessage]) -> int:
     return sum(not isinstance(message, SystemMessage) for message in messages)
+
+
+def _handoff_response(target: str = "teaching_assistant") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "handoff",
+                "args": {"target": target},
+                "id": "persisted-handoff",
+                "type": "tool_call",
+            }
+        ],
+    )
 
 
 def test_checkpointer_continues_the_same_user_session() -> None:
@@ -282,6 +301,20 @@ def test_pending_checkpoint_must_be_resumed_without_appending_input() -> None:
     assert _human_contents(app.get_state(config).values["messages"]) == [
         "pending question"
     ]
+    ordinary_pending_decision = HandoffApprovalDecision(
+        interrupt_id="not-a-handoff-interrupt",
+        action=HandoffApprovalAction.CONFIRM,
+    )
+    with pytest.raises(ValueError, match="人工.*断点"):
+        graph.resume_handoff(
+            "pending-session",
+            ordinary_pending_decision,
+            user_id="user-1",
+        )
+    assert graph.get_pending_handoff(
+        "pending-session",
+        user_id="user-1",
+    ) is None
 
     result = graph.resume("pending-session", user_id="user-1")
 
@@ -315,6 +348,97 @@ def test_persistence_reads_require_a_checkpointer(method_name: str) -> None:
         getattr(graph, method_name)("session-1", user_id="user-1")
 
 
+def test_handoff_resume_requires_a_checkpointer() -> None:
+    graph = CollaborativeAgentGraph(model=ScriptedModel([]))
+    decision = HandoffApprovalDecision(
+        interrupt_id="interrupt-1",
+        action=HandoffApprovalAction.CONFIRM,
+    )
+
+    with pytest.raises(ValueError, match="checkpointer"):
+        graph.resume_handoff("session-1", decision, user_id="user-1")
+    with pytest.raises(ValueError, match="checkpointer"):
+        graph.get_pending_handoff("session-1", user_id="user-1")
+
+
+def test_handoff_interrupt_uses_separate_resume_semantics() -> None:
+    model = ScriptedModel(
+        [
+            _handoff_response(),
+            AIMessage(content="分派提案已生成"),
+            AIMessage(content="教学结果"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "separate-resume"
+    user_id = "user-1"
+    graph.run("原始任务", session_id, user_id)
+    paused_state = graph.get_state(session_id, user_id=user_id)
+    assert paused_state is not None
+    paused_messages = list(paused_state["messages"])
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert pending is not None
+
+    with pytest.raises(ValueError, match="resume_handoff"):
+        graph.resume(session_id, user_id=user_id)
+    with pytest.raises(RuntimeError, match="resume_handoff"):
+        graph.run("不得追加", session_id, user_id)
+
+    unchanged = graph.get_state(session_id, user_id=user_id)
+    assert unchanged is not None
+    assert graph.get_pending_handoff(session_id, user_id=user_id) == pending
+    assert unchanged["messages"] == paused_messages
+    assert len(model.calls) == 2
+
+    decision = HandoffApprovalDecision(
+        interrupt_id=pending.interrupt_id,
+        action=HandoffApprovalAction.CONFIRM,
+    )
+    result = graph.resume_handoff(session_id, decision, user_id=user_id)
+
+    assert result["messages"][-1].content == "最终汇总"
+    assert len(model.calls) == 4
+
+
+def test_stale_handoff_decision_does_not_consume_interrupt() -> None:
+    model = ScriptedModel(
+        [_handoff_response(), AIMessage(content="分派提案已生成")]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "stale-decision"
+    user_id = "user-1"
+    graph.run("原始任务", session_id, user_id)
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert pending is not None
+    stale = HandoffApprovalDecision(
+        interrupt_id="stale-interrupt-id",
+        action=HandoffApprovalAction.REJECT,
+    )
+
+    with pytest.raises(ValueError, match="interrupt_id"):
+        graph.resume_handoff(session_id, stale, user_id=user_id)
+
+    unchanged = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert unchanged == pending
+    assert len(model.calls) == 2
+
+    current = HandoffApprovalDecision(
+        interrupt_id=pending.interrupt_id,
+        action=HandoffApprovalAction.REJECT,
+    )
+    result = graph.resume_handoff(session_id, current, user_id=user_id)
+    assert result["pending_handoff"] is None
+
+
 def test_sqlite_checkpointer_restores_after_graph_and_connection_reopen(
     tmp_path: Path,
 ) -> None:
@@ -342,8 +466,71 @@ def test_sqlite_checkpointer_restores_after_graph_and_connection_reopen(
     assert _human_contents(result["messages"]) == ["first question", "second question"]
 
 
+def test_sqlite_handoff_interrupt_resumes_after_graph_reopen(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "hitl" / "checkpoints.sqlite"
+    session_id = "persisted-approval"
+    user_id = "user-1"
+    first_model = ScriptedModel(
+        [_handoff_response(), AIMessage(content="分派提案已生成")]
+    )
+
+    with open_sqlite_checkpointer(checkpoint_path) as first_saver:
+        first_graph = CollaborativeAgentGraph(
+            model=first_model,
+            checkpointer=first_saver,
+            interrupt_before_handoff=True,
+        )
+        first_graph.run("持久化任务", session_id, user_id)
+        assert first_graph.get_pending_handoff(
+            session_id,
+            user_id=user_id,
+        ) is not None
+
+    second_model = ScriptedModel(
+        [AIMessage(content="教学结果"), AIMessage(content="最终汇总")]
+    )
+    with open_sqlite_checkpointer(checkpoint_path) as second_saver:
+        second_graph = CollaborativeAgentGraph(
+            model=second_model,
+            checkpointer=second_saver,
+            interrupt_before_handoff=True,
+        )
+        restored = second_graph.get_pending_handoff(
+            session_id,
+            user_id=user_id,
+        )
+        assert restored is not None
+        decision = HandoffApprovalDecision(
+            interrupt_id=restored.interrupt_id,
+            action=HandoffApprovalAction.CONFIRM,
+        )
+
+        result = second_graph.resume_handoff(
+            session_id,
+            decision,
+            user_id=user_id,
+        )
+        completed_pending = second_graph.get_pending_handoff(
+            session_id,
+            user_id=user_id,
+        )
+
+    assert len(first_model.calls) == 2
+    assert len(second_model.calls) == 2
+    assert "助教" in str(second_model.calls[0][0].content)
+    assert result["pending_handoff"] is None
+    assert result["messages"][-1].content == "最终汇总"
+    assert result["next_agent"] is None
+    assert completed_pending is None
+
+
 @pytest.mark.parametrize("user_id", ["", "   "])
-@pytest.mark.parametrize("method_name", ["run", "resume", "get_state", "get_history"])
+@pytest.mark.parametrize(
+    "method_name",
+    ["run", "resume", "get_state", "get_history", "get_pending_handoff"],
+)
 def test_graph_rejects_empty_user_ids(user_id: str, method_name: str) -> None:
     graph = CollaborativeAgentGraph(model=ScriptedModel([]), checkpointer=InMemorySaver())
 
@@ -365,7 +552,10 @@ def test_thread_id_uses_explicit_anonymous_and_value_user_keys() -> None:
 
 
 @pytest.mark.parametrize("session_id", ["", "   "])
-@pytest.mark.parametrize("method_name", ["run", "resume", "get_state", "get_history"])
+@pytest.mark.parametrize(
+    "method_name",
+    ["run", "resume", "get_state", "get_history", "get_pending_handoff"],
+)
 def test_graph_rejects_empty_session_ids(session_id: str, method_name: str) -> None:
     graph = CollaborativeAgentGraph(model=ScriptedModel([]), checkpointer=InMemorySaver())
 

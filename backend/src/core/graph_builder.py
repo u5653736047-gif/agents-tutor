@@ -12,16 +12,28 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, StateSnapshot, interrupt
 
 from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
-from .state import AgentRole, AgentState, ToolResult, create_initial_state
+from .state import (
+    AgentRole,
+    AgentState,
+    HandoffApprovalAction,
+    HandoffApprovalDecision,
+    HandoffApprovalRequest,
+    PendingHandoffApproval,
+    TaskContext,
+    ToolResult,
+    create_initial_state,
+)
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
+_HANDOFF_APPROVAL_NODE = "handoff_approval"
 
 
 @tool
@@ -48,11 +60,16 @@ class CollaborativeAgentGraph:
         max_handoffs: int = 4,
         max_agent_switches: int = 8,
         checkpointer: BaseCheckpointSaver[str] | None = None,
+        interrupt_before_handoff: bool = False,
     ) -> None:
         if max_handoffs <= 0:
             raise ValueError("max_handoffs must be positive")
         if max_agent_switches <= 0:
             raise ValueError("max_agent_switches must be positive")
+        if interrupt_before_handoff and checkpointer is None:
+            raise ValueError(
+                "interrupt_before_handoff requires a configured checkpointer"
+            )
 
         permissions = tool_permissions or {}
         business_tool_names = {business_tool.name for business_tool in tools}
@@ -83,6 +100,7 @@ class CollaborativeAgentGraph:
         self.max_handoffs = max_handoffs
         self.max_agent_switches = max_agent_switches
         self.checkpointer = checkpointer
+        self.interrupt_before_handoff = interrupt_before_handoff
         self._persistence_lock = RLock()
         # 创建4个同构的agent，均遵循react设计范式
         self.agents = create_agent_nodes(
@@ -113,10 +131,20 @@ class CollaborativeAgentGraph:
             AgentRole.EVALUATOR.value: AgentRole.EVALUATOR.value,
             "end": END,
         }
+        if self.interrupt_before_handoff:
+            routes[_HANDOFF_APPROVAL_NODE] = _HANDOFF_APPROVAL_NODE
 
         for role, agent in self.agents.items():
             graph.add_node(role.value, self._wrap(agent))
             graph.add_conditional_edges(role.value, self._route, routes)
+
+        if self.interrupt_before_handoff:
+            graph.add_node(_HANDOFF_APPROVAL_NODE, self._approve_handoff)
+            graph.add_conditional_edges(
+                _HANDOFF_APPROVAL_NODE,
+                self._route,
+                routes,
+            )
 
         graph.set_entry_point(AgentRole.SUPERVISOR.value)
         self._app = graph.compile(checkpointer=self.checkpointer)
@@ -249,10 +277,18 @@ class CollaborativeAgentGraph:
                                 agent=agent.role.value,
                             )
                         )
-                    handoff_count += 1
-                    switch_count += 1
                     updates["next_agent"] = target
-                    emit(EventType.AGENT_SWITCHED, target)
+                    if self.interrupt_before_handoff:
+                        updates["pending_handoff"] = HandoffApprovalRequest(
+                            target_agent=AgentRole(target),
+                            task_content=_latest_human_content(
+                                state.get("messages", [])
+                            ),
+                        )
+                    else:
+                        handoff_count += 1
+                        switch_count += 1
+                        emit(EventType.AGENT_SWITCHED, target)
                 else:
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
@@ -277,11 +313,115 @@ class CollaborativeAgentGraph:
 
         return RunnableLambda(node)
 
+    def _approve_handoff(self, state: AgentState) -> AgentState:
+        """暂停并提交分派决定；恢复时仅重放这个无外部副作用的 gate。"""
+        pending = state.get("pending_handoff")
+        if pending is None:
+            raise RuntimeError("handoff approval node requires a pending proposal")
+        proposal = HandoffApprovalRequest.model_validate(pending)
+        raw_decision = interrupt(proposal.model_dump(mode="json"))
+        decision = HandoffApprovalDecision.model_validate(raw_decision)
+        sequence = max(
+            (event.sequence for event in state.get("events", [])),
+            default=-1,
+        )
+
+        if decision.action is HandoffApprovalAction.REJECT:
+            # 拒绝不执行 Worker 或自动重规划；本轮以成功终止事件安全收口。
+            return cast(
+                AgentState,
+                {
+                    "next_agent": None,
+                    "pending_handoff": None,
+                    "run_error": None,
+                    "handoff_count": state.get("handoff_count", 0),
+                    "agent_switch_count": state.get("agent_switch_count", 0),
+                    "events": [
+                        RunEvent(
+                            event_type=EventType.RUN_COMPLETED,
+                            sequence=sequence + 1,
+                            session_id=state.get("session_id"),
+                            agent=AgentRole.SUPERVISOR.value,
+                            success=True,
+                        )
+                    ],
+                },
+            )
+
+        target = decision.target_agent or proposal.target_agent
+        handoff_count = state.get("handoff_count", 0)
+        switch_count = state.get("agent_switch_count", 0)
+        limit_error: RunError | None = None
+        if handoff_count + 1 > self.max_handoffs:
+            limit_error = RunError(
+                error_code=ErrorCode.GRAPH_HANDOFF_LIMIT,
+                message=f"handoff 次数超过上限：{self.max_handoffs}",
+                agent=AgentRole.SUPERVISOR.value,
+            )
+        elif switch_count + 1 > self.max_agent_switches:
+            limit_error = RunError(
+                error_code=ErrorCode.GRAPH_SWITCH_LIMIT,
+                message=f"Agent 切换次数超过上限：{self.max_agent_switches}",
+                agent=AgentRole.SUPERVISOR.value,
+            )
+        if limit_error is not None:
+            return cast(
+                AgentState,
+                {
+                    "next_agent": None,
+                    "pending_handoff": None,
+                    "run_error": limit_error,
+                    "handoff_count": handoff_count,
+                    "agent_switch_count": switch_count,
+                    "events": [
+                        RunEvent(
+                            event_type=EventType.RUN_FAILED,
+                            sequence=sequence + 1,
+                            session_id=state.get("session_id"),
+                            agent=AgentRole.SUPERVISOR.value,
+                            success=False,
+                            error_code=limit_error.error_code,
+                        )
+                    ],
+                },
+            )
+
+        updates: dict[str, object] = {
+            "next_agent": target.value,
+            "pending_handoff": None,
+            "run_error": None,
+            "handoff_count": handoff_count + 1,
+            "agent_switch_count": switch_count + 1,
+            "events": [
+                RunEvent(
+                    event_type=EventType.AGENT_SWITCHED,
+                    sequence=sequence + 1,
+                    session_id=state.get("session_id"),
+                    agent=target.value,
+                    success=True,
+                )
+            ],
+        }
+        if decision.task_content is not None:
+            task_context = state.get("task_context")
+            updates["task_context"] = (
+                TaskContext(description=decision.task_content)
+                if task_context is None
+                else TaskContext.model_validate(task_context).model_copy(
+                    update={"description": decision.task_content}
+                )
+            )
+            # 追加而非替换原始消息，既保留审计历史，也让 Worker 看到最新任务。
+            updates["messages"] = [HumanMessage(content=decision.task_content)]
+        return cast(AgentState, updates)
+
     @staticmethod
     def _route(state: AgentState) -> str:
         """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
         if state.get("run_error") is not None:
             return "end"
+        if state.get("pending_handoff") is not None:
+            return _HANDOFF_APPROVAL_NODE
         next_agent = state.get("next_agent")
         if next_agent in {role.value for role in AgentRole}:
             return next_agent
@@ -308,13 +448,19 @@ class CollaborativeAgentGraph:
         with self._persistence_lock:
             snapshot = app.get_state(config)
             if snapshot.next:
-                raise RuntimeError("存在待恢复执行，请先调用 resume()")
+                resume_method = (
+                    "resume_handoff()" if snapshot.interrupts else "resume()"
+                )
+                raise RuntimeError(
+                    f"存在待恢复执行，请先调用 {resume_method}"
+                )
             if snapshot.values:
                 state = cast(
                     AgentState,
                     {
                         "messages": [HumanMessage(content=user_input)],
                         "next_agent": None,
+                        "pending_handoff": None,
                         "run_error": None,
                         "handoff_count": 0,
                         "agent_switch_count": 0,
@@ -330,7 +476,7 @@ class CollaborativeAgentGraph:
         session_id: str,
         user_id: str | None = None,
     ) -> AgentState:
-        """恢复当前用户会话中尚未完成的持久化执行。"""
+        """恢复普通 pending；动态人工断点必须由 resume_handoff 提交决定。"""
         config = self._thread_config(session_id, user_id)
         if self.checkpointer is None:
             raise ValueError("resume requires a configured checkpointer")
@@ -339,7 +485,53 @@ class CollaborativeAgentGraph:
             snapshot = app.get_state(config)
             if not snapshot.values or not snapshot.next:
                 raise ValueError("当前会话没有待恢复执行")
+            # next 同时表示普通 pending 与动态 interrupt；仅后者要求人工决定。
+            if snapshot.interrupts:
+                raise ValueError(
+                    "当前会话等待人工 handoff 决策，请调用 resume_handoff()"
+                )
             return cast(AgentState, app.invoke(None, config=config))
+
+    def resume_handoff(
+        self,
+        session_id: str,
+        decision: HandoffApprovalDecision,
+        user_id: str | None = None,
+    ) -> AgentState:
+        """校验 Interrupt ID，并恢复等待人工决定的 handoff gate。"""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError("resume_handoff requires a configured checkpointer")
+        app = self.build()
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            pending = _pending_handoff_from_snapshot(snapshot)
+            if not snapshot.next or pending is None:
+                raise ValueError("当前会话没有待人工确认的 handoff 断点")
+            current_id = pending.interrupt_id
+            if decision.interrupt_id != current_id:
+                raise ValueError("interrupt_id 与当前 handoff 断点不匹配")
+            command: Command[str] = Command(
+                resume={
+                    current_id: decision.model_dump(mode="json"),
+                }
+            )
+            return cast(AgentState, app.invoke(command, config=config))
+
+    def get_pending_handoff(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> PendingHandoffApproval | None:
+        """从 checkpoint 返回可公开恢复的 handoff 断点；无待确认时返回 None。"""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError(
+                "get_pending_handoff requires a configured checkpointer"
+            )
+        app = self.build()
+        with self._persistence_lock:
+            return _pending_handoff_from_snapshot(app.get_state(config))
 
     @staticmethod
     def _thread_config(session_id: str, user_id: str | None) -> RunnableConfig:
@@ -405,6 +597,40 @@ def _handoff_target(tool_results: Sequence[ToolResult]) -> str | None:
         if result.tool_name == "handoff" and result.success:
             return result.output
     return None
+
+
+def _latest_human_content(messages: Sequence[BaseMessage]) -> str:
+    """读取本轮最近用户指令，作为人工确认时展示的初始任务。"""
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return str(message.content)
+    return ""
+
+
+def _interrupt_identifier(pending_interrupt: object) -> str:
+    """兼容 LangGraph 0.4 的 interrupt_id 与新版 id 字段。"""
+    identifier = getattr(pending_interrupt, "id", None)
+    if identifier is None:
+        identifier = getattr(pending_interrupt, "interrupt_id", None)
+    if not isinstance(identifier, str) or not identifier:
+        raise RuntimeError("LangGraph interrupt 缺少稳定标识")
+    return identifier
+
+
+def _pending_handoff_from_snapshot(
+    snapshot: StateSnapshot,
+) -> PendingHandoffApproval | None:
+    """把 checkpoint 内部 interrupt 与 proposal 合成为稳定公开视图。"""
+    values = cast(AgentState, snapshot.values)
+    pending = values.get("pending_handoff")
+    if pending is None:
+        return None
+    if len(snapshot.interrupts) != 1:
+        raise RuntimeError("待确认 handoff 必须对应且仅对应一个 interrupt")
+    return PendingHandoffApproval(
+        interrupt_id=_interrupt_identifier(snapshot.interrupts[0]),
+        request=HandoffApprovalRequest.model_validate(pending),
+    )
 
 
 __all__ = ["CollaborativeAgentGraph", "handoff"]

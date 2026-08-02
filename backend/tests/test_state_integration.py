@@ -1,9 +1,17 @@
 """验证 AgentState 与 LangGraph StateGraph 的集成."""
 
+import pytest
 from langgraph.graph import END, StateGraph
+from pydantic import ValidationError
 
 from core.events import ErrorCode, EventType, RunError, RunEvent
-from core.state import AgentState, create_initial_state
+from core.state import (
+    AgentRole,
+    AgentState,
+    HandoffApprovalAction,
+    HandoffApprovalDecision,
+    create_initial_state,
+)
 
 
 def supervisor_node(state: AgentState) -> dict:
@@ -34,6 +42,38 @@ def test_initial_state_has_runtime_defaults() -> None:
     assert state["run_error"] is None
     assert state["handoff_count"] == 0
     assert state["agent_switch_count"] == 0
+    assert state["pending_handoff"] is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"action": HandoffApprovalAction.MODIFY},
+        {
+            "action": HandoffApprovalAction.CONFIRM,
+            "target_agent": AgentRole.EVALUATOR,
+        },
+        {
+            "action": HandoffApprovalAction.MODIFY,
+            "target_agent": AgentRole.SUPERVISOR,
+        },
+        {
+            "action": HandoffApprovalAction.MODIFY,
+            "task_content": "   ",
+        },
+    ],
+    ids=[
+        "modify-without-changes",
+        "confirm-with-changes",
+        "supervisor-target",
+        "blank-task",
+    ],
+)
+def test_handoff_approval_decision_rejects_invalid_combinations(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        HandoffApprovalDecision(interrupt_id="interrupt-1", **values)
 
 
 def test_runtime_fields_use_expected_reducers() -> None:

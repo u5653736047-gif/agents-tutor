@@ -103,9 +103,9 @@
   - [x] 已实现基于模型 Tool Call 的 conditional edge 动态路由。
   - [ ] 复杂请求的显式任务分解和结果聚合策略尚未实现。
   - [ ] LangGraph Send API / fan-out 子代理并行尚未实现。
-- [ ] 1.1.4 实现人机交互断点（Human-in-the-loop）
-  - 关键决策点暂停等待用户确认
-  - 支持用户中途修正 Agent 行为
+- [x] 1.1.4 实现人机交互断点（Human-in-the-loop）
+  - [x] Supervisor handoff 分派前可暂停，并通过 checkpoint 跨进程恢复确认。
+  - [x] 用户可确认、拒绝，或修改目标 Agent / 任务内容后继续。
 
 #### 1.2 工具系统
 

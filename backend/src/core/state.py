@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .events import ErrorCode, RunError, RunEvent
 
@@ -53,6 +53,14 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class HandoffApprovalAction(StrEnum):
+    """人工对 Supervisor 分派提案的处理动作。"""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+    MODIFY = "modify"
+
+
 # ─────────────────────────────────────────────
 # Pydantic 子模型（嵌套结构）
 # ─────────────────────────────────────────────
@@ -75,6 +83,72 @@ class TaskContext(BaseModel):
         description="扩展元数据（难度级别、学科标签、关联知识点等）",
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class HandoffApprovalRequest(BaseModel):
+    """等待人工确认的 Supervisor 分派提案。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_agent: AgentRole
+    task_content: str
+
+    @field_validator("target_agent")
+    @classmethod
+    def target_must_be_worker(cls, target: AgentRole) -> AgentRole:
+        if target is AgentRole.SUPERVISOR:
+            raise ValueError("handoff target must be a worker agent")
+        return target
+
+
+class HandoffApprovalDecision(BaseModel):
+    """带中断标识的人工分派决定，防止陈旧确认误用。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interrupt_id: str = Field(min_length=1)
+    action: HandoffApprovalAction
+    target_agent: AgentRole | None = None
+    task_content: str | None = None
+
+    @field_validator("interrupt_id")
+    @classmethod
+    def interrupt_id_must_not_be_blank(cls, interrupt_id: str) -> str:
+        if not interrupt_id.strip():
+            raise ValueError("interrupt_id must not be blank")
+        return interrupt_id
+
+    @field_validator("target_agent")
+    @classmethod
+    def target_must_be_worker(cls, target: AgentRole | None) -> AgentRole | None:
+        if target is AgentRole.SUPERVISOR:
+            raise ValueError("handoff target must be a worker agent")
+        return target
+
+    @field_validator("task_content")
+    @classmethod
+    def task_content_must_not_be_blank(cls, task_content: str | None) -> str | None:
+        if task_content is not None and not task_content.strip():
+            raise ValueError("task_content must not be blank")
+        return task_content
+
+    @model_validator(mode="after")
+    def action_matches_changes(self) -> HandoffApprovalDecision:
+        has_changes = self.target_agent is not None or self.task_content is not None
+        if self.action is HandoffApprovalAction.MODIFY and not has_changes:
+            raise ValueError("modify requires target_agent or task_content")
+        if self.action is not HandoffApprovalAction.MODIFY and has_changes:
+            raise ValueError("only modify accepts target_agent or task_content")
+        return self
+
+
+class PendingHandoffApproval(BaseModel):
+    """公开给调用方的待确认断点标识与分派提案。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interrupt_id: str = Field(min_length=1)
+    request: HandoffApprovalRequest
 
 
 class ToolResult(BaseModel):
@@ -118,7 +192,8 @@ class AgentState(TypedDict, total=False):
     - messages: 追加合并（由 langgraph add_messages 处理去重与按 ID 更新）
     - tool_results、events: 追加合并（operator.add 拼接列表）
     - task_context、extra: 后写覆盖，但作为跨轮持久字段保留
-    - next_agent、run_error、handoff_count、agent_switch_count: 后写覆盖，每轮开始重置
+    - next_agent、pending_handoff、run_error、handoff_count、agent_switch_count:
+      后写覆盖，每轮开始重置
     - 其余字段: 后写覆盖（last-write-wins）
 
     total=False 使所有字段变为可选，允许节点仅返回部分更新（partial update）。
@@ -139,6 +214,9 @@ class AgentState(TypedDict, total=False):
 
     # 路由决策：Supervisor 输出的下一步目标节点名称
     next_agent: Annotated[str | None, _replace]
+
+    # Supervisor 已提出、尚未由人工确认的分派；checkpoint 是唯一事实来源。
+    pending_handoff: Annotated[HandoffApprovalRequest | None, _replace]
 
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
@@ -185,6 +263,7 @@ def create_initial_state(
         messages=[],
         current_agent=None,
         next_agent=None,
+        pending_handoff=None,
         task_context=None,
         tool_results=[],
         session_id=session_id,

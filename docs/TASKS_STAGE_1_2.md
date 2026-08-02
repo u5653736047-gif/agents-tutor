@@ -143,7 +143,7 @@
   路径按原子消息组线性扫描，checkpoint 仍保留完整历史。独立 review 无
   Critical/Important；最终全量测试 217 通过，ruff、mypy strict 干净。
 
-### S1-T3 人机交互断点（Human-in-the-loop）
+### [x] S1-T3 人机交互断点（Human-in-the-loop）
 
 - 对应总清单：1.1.4
 - 范围：`src/core/graph_builder.py`、`state.py`、`sessions.py`，基于 LangGraph
@@ -156,6 +156,12 @@
   - 无 checkpointer 时给出明确错误，不允许静默跳过断点。
   - 测试覆盖：中断触发、确认后继续、用户修改指令生效、进程重建后恢复。
 - 依赖：Sprint 0 完成。
+- 完成备注：2026-08-02；支持配置在 Supervisor handoff 分派前进入独立
+  `handoff_approval` gate，确认后分派、拒绝后安全结束，修改目标或任务时新指令会
+  实际进入 Worker 上下文。普通 pending 继续由 `resume()` 恢复，动态人工断点由
+  `get_pending_handoff()` + `resume_handoff()` 以 Interrupt ID 安全恢复；SQLite
+  进程重建与 LangGraph 0.4/1.2 Interrupt ID 兼容路径均有回归测试。独立 review
+  无 Critical/Important；最终全量测试 235 通过，ruff、mypy strict 干净。
 
 ### S1-T4 Supervisor 显式任务分解
 
@@ -435,7 +441,7 @@
 ### M1 框架就绪（Sprint 0 + Sprint 1 完成后检查）
 
 - [ ] 协调者能分解复杂请求、分派给至少 2 个子 Agent 并汇总结果（S1-T4/T5）。
-- [ ] 关键决策点可暂停等待人工确认并恢复（S1-T3）。
+- [x] 关键决策点可暂停等待人工确认并恢复（S1-T3）。
 - [x] 工具超时受控、上下文按 Token 预算裁剪（S1-T1/T2）。
 - [x] 三项质量门禁通过，DeepSeek 真实链路冒烟通过（S0-T3/T4）。
 
