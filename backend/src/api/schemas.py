@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.json_schema import models_json_schema
 
 
@@ -73,7 +73,9 @@ class ApiErrorCode(str, Enum):
     """Stable HTTP API errors not emitted by a graph run."""
 
     INVALID_REQUEST = "invalid_request"
+    INTERNAL_ERROR = "internal_error"
     SESSION_ALREADY_EXISTS = "session_already_exists"
+    SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
 
 
@@ -114,6 +116,21 @@ class ErrorResponse(ContractModel):
     detail: ErrorDetail
 
 
+class ChatRequest(ContractModel):
+    """One synchronous user message for a session."""
+
+    session_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
+    @field_validator("session_id", "message")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        """Reject whitespace-only values before they reach Core or persistence."""
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
 class Message(ContractModel):
     """A safe user or assistant message."""
 
@@ -141,7 +158,7 @@ class RunEvent(ContractModel):
 class RunError(ContractModel):
     """A stable, sanitized error response for a completed run."""
 
-    error_code: ErrorCode
+    error_code: ErrorCode | ApiErrorCode
     message: str
     agent: AgentRole | None = None
 
@@ -215,6 +232,7 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     CreateSessionRequest,
     ErrorDetail,
     ErrorResponse,
+    ChatRequest,
     Message,
     RunEvent,
     RunError,

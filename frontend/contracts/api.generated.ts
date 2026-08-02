@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/chat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Chat
+         * @description Run one synchronous collaboration turn in a worker thread.
+         */
+        post: operations["chat_chat_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -100,7 +120,17 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "session_already_exists" | "session_not_found";
+        ApiErrorCode: "invalid_request" | "internal_error" | "session_already_exists" | "session_busy" | "session_not_found";
+        /**
+         * ChatRequest
+         * @description One synchronous user message for a session.
+         */
+        ChatRequest: {
+            /** Message */
+            message: string;
+            /** Session Id */
+            session_id: string;
+        };
         /**
          * ChatResponse
          * @description The synchronous chat response contract reserved for W0-T4.
@@ -181,11 +211,6 @@ export interface components {
         ErrorResponse: {
             detail: components["schemas"]["ErrorDetail"];
         };
-        /** HTTPValidationError */
-        HTTPValidationError: {
-            /** Detail */
-            detail?: components["schemas"]["ValidationError"][];
-        };
         /**
          * HandoffRequest
          * @description The information a user reviews before a worker handoff.
@@ -238,7 +263,8 @@ export interface components {
         RunError: {
             /** @default null */
             agent?: components["schemas"]["AgentRole"] | null;
-            error_code: components["schemas"]["ErrorCode"];
+            /** Error Code */
+            error_code: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"];
             /** Message */
             message: string;
         };
@@ -354,19 +380,6 @@ export interface components {
             success: boolean;
             target_agent: components["schemas"]["WorkerAgentRole"];
         };
-        /** ValidationError */
-        ValidationError: {
-            /** Context */
-            ctx?: Record<string, never>;
-            /** Input */
-            input?: unknown;
-            /** Location */
-            loc: (string | number)[];
-            /** Message */
-            msg: string;
-            /** Error Type */
-            type: string;
-        };
         /**
          * WorkerAgentRole
          * @description Roles that can receive a handoff or task-plan step.
@@ -382,6 +395,50 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    chat_chat_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     healthz_healthz_get: {
         parameters: {
             query?: never;
@@ -426,13 +483,13 @@ export interface operations {
                     "application/json": components["schemas"]["Session"][];
                 };
             };
-            /** @description Validation Error */
+            /** @description Unprocessable Entity */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };
@@ -488,13 +545,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Unprocessable Entity */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };
@@ -539,13 +596,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Unprocessable Entity */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };
@@ -590,13 +647,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Unprocessable Entity */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };

@@ -34,3 +34,31 @@ def test_openapi_includes_the_bridge_contract_models() -> None:
     assert "task_plan" in chat_response["properties"]
     assert "references" not in chat_response.get("required", [])
     assert "task_plan" not in chat_response.get("required", [])
+
+
+def test_chat_validation_error_uses_the_public_error_contract() -> None:
+    openapi = create_app().openapi()
+    responses = openapi["paths"]["/chat"]["post"]["responses"]
+
+    assert (
+        responses["422"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ErrorResponse"
+    )
+
+
+def test_session_validation_errors_use_the_public_error_contract() -> None:
+    openapi = create_app().openapi()
+    operations = (
+        openapi["paths"]["/sessions"]["post"],
+        openapi["paths"]["/sessions"]["get"],
+        openapi["paths"]["/sessions/{session_id}/archive"]["post"],
+        openapi["paths"]["/sessions/{session_id}/messages"]["get"],
+    )
+
+    for operation in operations:
+        assert (
+            operation["responses"]["422"]["content"]["application/json"]["schema"][
+                "$ref"
+            ]
+            == "#/components/schemas/ErrorResponse"
+        )

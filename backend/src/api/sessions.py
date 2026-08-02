@@ -24,12 +24,17 @@ from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionRecord, SessionStore
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+VALIDATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+}
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **VALIDATION_ERROR_RESPONSES,
     status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse},
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
     status.HTTP_409_CONFLICT: {"model": ErrorResponse},
 }
 LOOKUP_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **VALIDATION_ERROR_RESPONSES,
     status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse},
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
 }
@@ -150,7 +155,11 @@ def create_session(
     return _session_response(record)
 
 
-@router.get("", response_model=list[Session])
+@router.get(
+    "",
+    response_model=list[Session],
+    responses=VALIDATION_ERROR_RESPONSES,
+)
 def list_sessions(
     request: Request,
     user_id: Annotated[str | None, Depends(current_user_id)],

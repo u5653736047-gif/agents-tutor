@@ -11,10 +11,13 @@ from pathlib import Path
 from typing import cast
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
+from api.chat import router as chat_router
 from api.openapi import install_openapi_contract
+from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
 from api.sessions import router as session_router
 from core.graph_builder import CollaborativeAgentGraph
 from core.models import DeepSeekSettings, create_deepseek_model
@@ -62,8 +65,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Create the API application."""
     app = FastAPI(lifespan=lifespan)
+    app.state.chat_session_locks = {}
     install_openapi_contract(app)
+    app.include_router(chat_router)
     app.include_router(session_router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        _request: Request, _error: RequestValidationError
+    ) -> JSONResponse:
+        """Avoid returning validation inputs or framework-specific error details."""
+        error = ErrorResponse(
+            detail=ErrorDetail(
+                error_code=ApiErrorCode.INVALID_REQUEST,
+                message="Request is invalid.",
+            )
+        )
+        return JSONResponse(status_code=422, content=error.model_dump(mode="json"))
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
