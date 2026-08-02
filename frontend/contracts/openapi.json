@@ -1,0 +1,635 @@
+{
+  "components": {
+    "schemas": {
+      "AgentRole": {
+        "description": "Public collaborative-agent roles.",
+        "enum": [
+          "supervisor",
+          "teaching_assistant",
+          "learning_assistant",
+          "evaluator"
+        ],
+        "title": "AgentRole",
+        "type": "string"
+      },
+      "ChatResponse": {
+        "additionalProperties": false,
+        "description": "The synchronous chat response contract reserved for W0-T4.",
+        "properties": {
+          "current_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Message"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "pending_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingHandoff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "references": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Citation"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "References"
+          },
+          "run_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "task_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskPlan"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "task_results": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TaskResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Results"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ChatResponse",
+        "type": "object"
+      },
+      "Citation": {
+        "additionalProperties": false,
+        "description": "A safe reference placeholder for future retrieval-backed responses.",
+        "properties": {
+          "chunk_id": {
+            "title": "Chunk Id",
+            "type": "string"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document_id",
+          "source",
+          "chunk_id"
+        ],
+        "title": "Citation",
+        "type": "object"
+      },
+      "ErrorCode": {
+        "description": "Stable API error codes aligned with the current Core classification.",
+        "enum": [
+          "tool_unknown",
+          "tool_unauthorized",
+          "tool_invalid_arguments",
+          "tool_execution_failed",
+          "tool_timeout",
+          "model_call_failed",
+          "react_iteration_limit",
+          "graph_handoff_limit",
+          "graph_switch_limit",
+          "graph_invalid_target",
+          "graph_aggregation_invalid",
+          "agent_output_invalid"
+        ],
+        "title": "ErrorCode",
+        "type": "string"
+      },
+      "HandoffRequest": {
+        "additionalProperties": false,
+        "description": "The information a user reviews before a worker handoff.",
+        "properties": {
+          "plan_step_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Step Sequence"
+          },
+          "target_agent": {
+            "$ref": "#/components/schemas/WorkerAgentRole"
+          },
+          "task_content": {
+            "title": "Task Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_agent",
+          "task_content"
+        ],
+        "title": "HandoffRequest",
+        "type": "object"
+      },
+      "Message": {
+        "additionalProperties": false,
+        "description": "A safe user or assistant message.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created At"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MessageRole"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "Message",
+        "type": "object"
+      },
+      "MessageRole": {
+        "description": "Safe message roles exposed to API clients.",
+        "enum": [
+          "user",
+          "assistant"
+        ],
+        "title": "MessageRole",
+        "type": "string"
+      },
+      "PendingHandoff": {
+        "additionalProperties": false,
+        "description": "A handoff paused for a future confirmation or rejection.",
+        "properties": {
+          "interrupt_id": {
+            "title": "Interrupt Id",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/HandoffRequest"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "request"
+        ],
+        "title": "PendingHandoff",
+        "type": "object"
+      },
+      "RunError": {
+        "additionalProperties": false,
+        "description": "A stable, sanitized error response for a completed run.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "error_code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error_code",
+          "message"
+        ],
+        "title": "RunError",
+        "type": "object"
+      },
+      "RunEvent": {
+        "additionalProperties": false,
+        "description": "A safe incremental event emitted during one run.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "degraded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Degraded"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Duration Ms"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "event_type": {
+            "$ref": "#/components/schemas/StreamEventType"
+          },
+          "plan_step_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Step Sequence"
+          },
+          "sequence": {
+            "minimum": 0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "success": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Success"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Name"
+          }
+        },
+        "required": [
+          "event_type",
+          "sequence"
+        ],
+        "title": "RunEvent",
+        "type": "object"
+      },
+      "Session": {
+        "additionalProperties": false,
+        "description": "A session visible to its owner.",
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "session_id",
+          "user_id",
+          "created_at",
+          "archived"
+        ],
+        "title": "Session",
+        "type": "object"
+      },
+      "StreamEventType": {
+        "description": "Public event protocol reserved for future streaming support.",
+        "enum": [
+          "thinking",
+          "tool_call",
+          "tool_result",
+          "message_end",
+          "agent_switch",
+          "error",
+          "done"
+        ],
+        "title": "StreamEventType",
+        "type": "string"
+      },
+      "TaskPlan": {
+        "additionalProperties": false,
+        "description": "A task plan reserved for future chat responses.",
+        "properties": {
+          "current_step_index": {
+            "minimum": 0,
+            "title": "Current Step Index",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskPlanStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/TaskPlanStep"
+            },
+            "minItems": 2,
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "steps",
+          "current_step_index",
+          "status"
+        ],
+        "title": "TaskPlan",
+        "type": "object"
+      },
+      "TaskPlanStatus": {
+        "description": "Public task-plan status values.",
+        "enum": [
+          "active",
+          "completed",
+          "cancelled",
+          "failed"
+        ],
+        "title": "TaskPlanStatus",
+        "type": "string"
+      },
+      "TaskPlanStep": {
+        "additionalProperties": false,
+        "description": "One planned worker task.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "sequence": {
+            "minimum": 1,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "target_agent": {
+            "$ref": "#/components/schemas/WorkerAgentRole"
+          }
+        },
+        "required": [
+          "sequence",
+          "description",
+          "target_agent"
+        ],
+        "title": "TaskPlanStep",
+        "type": "object"
+      },
+      "TaskResult": {
+        "additionalProperties": false,
+        "description": "A completed or failed task-plan step.",
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output"
+          },
+          "step_sequence": {
+            "minimum": 1,
+            "title": "Step Sequence",
+            "type": "integer"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          },
+          "target_agent": {
+            "$ref": "#/components/schemas/WorkerAgentRole"
+          }
+        },
+        "required": [
+          "step_sequence",
+          "target_agent",
+          "success"
+        ],
+        "title": "TaskResult",
+        "type": "object"
+      },
+      "WorkerAgentRole": {
+        "description": "Roles that can receive a handoff or task-plan step.",
+        "enum": [
+          "teaching_assistant",
+          "learning_assistant",
+          "evaluator"
+        ],
+        "title": "WorkerAgentRole",
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "title": "FastAPI",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Healthz Healthz Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz"
+      }
+    }
+  },
+  "x-generated-note": "AUTO-GENERATED: DO NOT EDIT MANUALLY."
+}

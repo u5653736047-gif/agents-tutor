@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
+from api.openapi import install_openapi_contract
 from core.graph_builder import CollaborativeAgentGraph
 from core.models import DeepSeekSettings, create_deepseek_model
 from core.nodes.react_agent import ChatModel
@@ -60,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Create the API application."""
     app = FastAPI(lifespan=lifespan)
+    install_openapi_contract(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],

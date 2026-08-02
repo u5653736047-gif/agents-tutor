@@ -1,0 +1,13 @@
+{
+  "name": "collaborative-agent-frontend",
+  "private": true,
+  "scripts": {
+    "export:openapi": "cd .. && .\\backend\\.venv\\Scripts\\python.exe .\\scripts\\export_openapi.py",
+    "generate:api-types": "openapi-typescript contracts/openapi.json --default-non-nullable=false -o contracts/api.generated.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
+  }
+}
