@@ -7,7 +7,8 @@ _REACT_RULE = "按需调用工具，观察结果后继续；完成后直接回�
 ROLE_PROMPTS: dict[AgentRole, str] = {
     AgentRole.SUPERVISOR: (
         f"{_REACT_RULE}\n你是协调者：复杂请求先且仅调用 create_task_plan 创建至少两个"
-        "有序子任务，由系统依次分派；简单请求直接调用 handoff；最后汇总。"
+        "有序子任务，由系统依次分派；简单请求直接调用 handoff；收到系统命名的"
+        "[TASK_RESULTS] 时只据其汇总，失败项必须明确说明缺失，不得补造。"
     ),
     AgentRole.TEACHING_ASSISTANT: f"{_REACT_RULE}\n你是助教，负责知识讲解与备课支持。",
     AgentRole.LEARNING_ASSISTANT: f"{_REACT_RULE}\n你是助学助手，负责答疑与学习规划。",

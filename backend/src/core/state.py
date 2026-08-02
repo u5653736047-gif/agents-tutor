@@ -117,6 +117,7 @@ class TaskPlanStep(BaseModel):
             raise ValueError("plan step description must not be blank")
         return description
 
+
 class TaskPlan(BaseModel):
     """可持久化、可审计的 Supervisor 有序任务计划。"""
 
@@ -152,6 +153,40 @@ class TaskPlan(BaseModel):
             and self.current_step_index != step_count
         ):
             raise ValueError("completed plan must consume every step")
+        return self
+
+
+class TaskStepResult(BaseModel):
+    """一个计划步骤的终态执行结果，不包含异常正文或工具参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_sequence: int = Field(ge=1)
+    target_agent: WorkerAgentRole
+    success: bool
+    output: str | None = None
+    error_code: ErrorCode | None = None
+
+    @field_validator("output")
+    @classmethod
+    def output_must_not_be_blank(cls, output: str | None) -> str | None:
+        if output is not None and not output.strip():
+            raise ValueError("successful task result output must not be blank")
+        return output
+
+    @model_validator(mode="after")
+    def outcome_fields_must_match_success(self) -> TaskStepResult:
+        if self.success:
+            if self.output is None or self.error_code is not None:
+                raise ValueError("successful task result requires only output")
+        elif self.output is not None or self.error_code is None:
+            raise ValueError("failed task result requires only error_code")
+        elif self.error_code not in {
+            ErrorCode.MODEL_CALL_FAILED,
+            ErrorCode.REACT_ITERATION_LIMIT,
+            ErrorCode.AGENT_OUTPUT_INVALID,
+        }:
+            raise ValueError("task result error_code is not locally recoverable")
         return self
 
 
@@ -263,7 +298,7 @@ class AgentState(TypedDict, total=False):
     - messages: 追加合并（由 langgraph add_messages 处理去重与按 ID 更新）
     - tool_results、events: 追加合并（operator.add 拼接列表）
     - task_context、extra: 后写覆盖，但作为跨轮持久字段保留
-    - task_plan: 后写覆盖；新用户轮次清空，历史 checkpoint 保留旧计划
+    - task_plan、task_results: 后写覆盖；新用户轮次清空，历史 checkpoint 保留
     - next_agent、pending_handoff、run_error、handoff_count、agent_switch_count:
       后写覆盖，每轮开始重置
     - 其余字段: 后写覆盖（last-write-wins）
@@ -294,8 +329,11 @@ class AgentState(TypedDict, total=False):
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
 
-    # 当前用户轮次的显式有序任务计划；步骤结果由后续聚合任务扩展。
+    # 当前用户轮次的显式有序任务计划，是结果 sequence/目标映射的事实来源。
     task_plan: Annotated[TaskPlan | None, _replace]
+
+    # 当前计划的终态步骤结果；串行执行时整表原子替换，避免重放追加重复项。
+    task_results: Annotated[list[TaskStepResult], _replace]
 
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计
@@ -341,6 +379,7 @@ def create_initial_state(
         pending_handoff=None,
         task_context=None,
         task_plan=None,
+        task_results=[],
         tool_results=[],
         session_id=session_id,
         user_id=user_id,

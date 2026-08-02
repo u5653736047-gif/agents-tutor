@@ -13,6 +13,8 @@ class EventType(StrEnum):
     TOOL_STARTED = "tool_started"
     TOOL_COMPLETED = "tool_completed"
     AGENT_SWITCHED = "agent_switched"
+    TASK_RESULT_ARCHIVED = "task_result_archived"
+    TASK_RESULTS_AGGREGATED = "task_results_aggregated"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
 
@@ -30,6 +32,8 @@ class ErrorCode(StrEnum):
     GRAPH_HANDOFF_LIMIT = "graph_handoff_limit"
     GRAPH_SWITCH_LIMIT = "graph_switch_limit"
     GRAPH_INVALID_TARGET = "graph_invalid_target"
+    GRAPH_AGGREGATION_INVALID = "graph_aggregation_invalid"
+    AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
 
 class RunEvent(BaseModel):
@@ -45,6 +49,8 @@ class RunEvent(BaseModel):
     success: bool | None = None
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | None = None
+    plan_step_sequence: int | None = Field(default=None, ge=1)
+    degraded: bool | None = None
 
 
 class RunError(BaseModel):

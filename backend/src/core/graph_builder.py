@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Hashable, Mapping, Sequence
 from threading import RLock
 from typing import Literal, cast
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -30,6 +36,7 @@ from .state import (
     TaskPlan,
     TaskPlanStatus,
     TaskPlanStep,
+    TaskStepResult,
     ToolResult,
     create_initial_state,
 )
@@ -39,6 +46,7 @@ WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
 _TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
+_TASK_RESULTS_MARKER = "[TASK_RESULTS]"
 
 
 class _TaskPlanInput(BaseModel):
@@ -230,7 +238,94 @@ class CollaborativeAgentGraph:
                     },
                 )
 
-            result = agent.run(state)
+            preflight_plan, preflight_error = _planned_worker_preflight(
+                state,
+                agent.role,
+            )
+            if preflight_error is not None:
+                sequence = max(
+                    (event.sequence for event in state.get("events", [])),
+                    default=-1,
+                )
+                preflight_updates: dict[str, object] = {
+                    "next_agent": None,
+                    "run_error": preflight_error,
+                    "events": [
+                        RunEvent(
+                            event_type=EventType.RUN_FAILED,
+                            sequence=sequence + 1,
+                            session_id=state.get("session_id"),
+                            agent=agent.role.value,
+                            success=False,
+                            error_code=preflight_error.error_code,
+                        )
+                    ],
+                }
+                if preflight_plan is not None:
+                    preflight_updates["task_plan"] = preflight_plan.model_copy(
+                        update={"status": TaskPlanStatus.FAILED}
+                    )
+                return cast(AgentState, preflight_updates)
+
+            aggregation_results: list[TaskStepResult] | None = None
+            run_state = state
+            if agent.role is AgentRole.SUPERVISOR:
+                try:
+                    aggregation_results = _ready_task_results(state)
+                except ValueError:
+                    plan = _task_plan_from_state(state)
+                    error = RunError(
+                        error_code=ErrorCode.GRAPH_AGGREGATION_INVALID,
+                        message="任务结果与计划不一致，无法安全聚合",
+                        agent=agent.role.value,
+                    )
+                    sequence = max(
+                        (event.sequence for event in state.get("events", [])),
+                        default=-1,
+                    )
+                    aggregation_failure_updates: dict[str, object] = {
+                        "next_agent": None,
+                        "run_error": error,
+                        "events": [
+                            RunEvent(
+                                event_type=EventType.TASK_RESULTS_AGGREGATED,
+                                sequence=sequence + 1,
+                                session_id=state.get("session_id"),
+                                agent=agent.role.value,
+                                success=False,
+                                error_code=error.error_code,
+                            ),
+                            RunEvent(
+                                event_type=EventType.RUN_FAILED,
+                                sequence=sequence + 2,
+                                session_id=state.get("session_id"),
+                                agent=agent.role.value,
+                                success=False,
+                                error_code=error.error_code,
+                            ),
+                        ],
+                    }
+                    if plan is not None:
+                        aggregation_failure_updates["task_plan"] = plan.model_copy(
+                            update={"status": TaskPlanStatus.FAILED}
+                        )
+                    return cast(AgentState, aggregation_failure_updates)
+                if aggregation_results is not None:
+                    plan = _task_plan_from_state(state)
+                    if plan is None:
+                        raise RuntimeError("aggregation requires a task plan")
+                    run_state = cast(
+                        AgentState,
+                        {
+                            **state,
+                            "messages": [
+                                *state.get("messages", []),
+                                _task_results_message(plan, aggregation_results),
+                            ],
+                        },
+                    )
+
+            result = agent.run(run_state)
 
             updates = dict(result.updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
@@ -241,6 +336,7 @@ class CollaborativeAgentGraph:
             replacing_plan = new_plan is not None and existing_plan is not None
             if new_plan is not None and existing_plan is None:
                 updates["task_plan"] = new_plan
+                updates["task_results"] = []
             events = cast(list[RunEvent], updates.get("events", []))
             sequence = max(
                 (
@@ -256,6 +352,8 @@ class CollaborativeAgentGraph:
                 *,
                 success: bool = True,
                 error_code: ErrorCode | None = None,
+                plan_step_sequence: int | None = None,
+                degraded: bool | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -267,6 +365,8 @@ class CollaborativeAgentGraph:
                         agent=event_agent,
                         success=success,
                         error_code=error_code,
+                        plan_step_sequence=plan_step_sequence,
+                        degraded=degraded,
                     )
                 )
 
@@ -284,6 +384,16 @@ class CollaborativeAgentGraph:
                     updates["task_plan"] = plan.model_copy(
                         update={"status": TaskPlanStatus.FAILED}
                     )
+                if aggregation_results is not None:
+                    emit(
+                        EventType.TASK_RESULTS_AGGREGATED,
+                        AgentRole.SUPERVISOR.value,
+                        success=False,
+                        error_code=error.error_code,
+                        degraded=any(
+                            not item.success for item in aggregation_results
+                        ),
+                    )
                 emit(
                     EventType.RUN_FAILED,
                     agent.role.value,
@@ -295,7 +405,21 @@ class CollaborativeAgentGraph:
                 updates["events"] = events
                 return cast(AgentState, updates)
 
-            if result.error is not None:
+            planned_worker = (
+                agent.role is not AgentRole.SUPERVISOR
+                and plan is not None
+                and plan.status is TaskPlanStatus.ACTIVE
+            )
+            recoverable_planned_error = (
+                planned_worker
+                and result.error is not None
+                and result.error.error_code
+                in {
+                    ErrorCode.MODEL_CALL_FAILED,
+                    ErrorCode.REACT_ITERATION_LIMIT,
+                }
+            )
+            if result.error is not None and not recoverable_planned_error:
                 return fail(result.error)
             if replacing_plan:
                 return fail(
@@ -370,6 +494,40 @@ class CollaborativeAgentGraph:
                         switch_count += 1
                         emit(EventType.AGENT_SWITCHED, target)
                 elif plan is None or plan.status is not TaskPlanStatus.ACTIVE:
+                    if aggregation_results is not None:
+                        if plan is None:
+                            raise RuntimeError("aggregation requires a task plan")
+                        generated = cast(
+                            list[BaseMessage],
+                            updates.get("messages", []),
+                        )
+                        fallback_used = _terminal_agent_output(generated) is None
+                        if fallback_used:
+                            updates["messages"] = _replace_terminal_ai_output(
+                                generated,
+                                _deterministic_aggregation(
+                                    plan,
+                                    aggregation_results,
+                                ),
+                            )
+                            events = _mark_agent_completion_invalid(
+                                events,
+                                AgentRole.SUPERVISOR,
+                            )
+                        has_missing_results = any(
+                            not item.success for item in aggregation_results
+                        )
+                        if has_missing_results and not fallback_used:
+                            updates["messages"] = _append_missing_results_notice(
+                                generated,
+                                plan,
+                                aggregation_results,
+                            )
+                        emit(
+                            EventType.TASK_RESULTS_AGGREGATED,
+                            agent.role.value,
+                            degraded=has_missing_results or fallback_used,
+                        )
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
                 if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
@@ -385,6 +543,41 @@ class CollaborativeAgentGraph:
                                 agent=agent.role.value,
                             )
                         )
+                    try:
+                        existing_results = _task_results_from_state(state)
+                        _validate_task_result_prefix(plan, existing_results)
+                    except ValueError:
+                        return fail(
+                            RunError(
+                                error_code=ErrorCode.GRAPH_AGGREGATION_INVALID,
+                                message="已有任务结果与计划游标不一致",
+                                agent=agent.role.value,
+                            )
+                        )
+                    output = (
+                        None
+                        if result.error is not None
+                        else _terminal_agent_output(result.messages)
+                    )
+                    result_error_code = (
+                        result.error.error_code
+                        if result.error is not None
+                        else None
+                    )
+                    if result_error_code is None and output is None:
+                        result_error_code = ErrorCode.AGENT_OUTPUT_INVALID
+                        events = _mark_agent_completion_invalid(
+                            events,
+                            agent.role,
+                        )
+                    step_result = TaskStepResult(
+                        step_sequence=step.sequence,
+                        target_agent=step.target_agent,
+                        success=result_error_code is None,
+                        output=output,
+                        error_code=result_error_code,
+                    )
+                    task_results = [*existing_results, step_result]
                     next_index = plan.current_step_index + 1
                     next_status = (
                         TaskPlanStatus.COMPLETED
@@ -398,6 +591,14 @@ class CollaborativeAgentGraph:
                         }
                     )
                     updates["task_plan"] = plan
+                    updates["task_results"] = task_results
+                    emit(
+                        EventType.TASK_RESULT_ARCHIVED,
+                        agent.role.value,
+                        success=step_result.success,
+                        error_code=step_result.error_code,
+                        plan_step_sequence=step.sequence,
+                    )
                 if switch_count + 1 > self.max_agent_switches:
                     return fail(
                         RunError(
@@ -679,6 +880,7 @@ class CollaborativeAgentGraph:
                         "next_agent": None,
                         "pending_handoff": None,
                         "task_plan": None,
+                        "task_results": [],
                         "run_error": None,
                         "handoff_count": 0,
                         "agent_switch_count": 0,
@@ -844,6 +1046,203 @@ def _task_plan_for_proposal(
     if step.sequence != proposal.plan_step_sequence:
         raise RuntimeError("planned handoff no longer matches current step")
     return plan
+
+
+def _task_results_from_state(state: AgentState) -> list[TaskStepResult]:
+    return [
+        TaskStepResult.model_validate(result)
+        for result in state.get("task_results", [])
+    ]
+
+
+def _planned_worker_preflight(
+    state: AgentState,
+    role: AgentRole,
+) -> tuple[TaskPlan | None, RunError | None]:
+    plan = _task_plan_from_state(state)
+    if role is AgentRole.SUPERVISOR or plan is None:
+        return plan, None
+    if plan.status is not TaskPlanStatus.ACTIVE:
+        return plan, None
+    step = plan.steps[plan.current_step_index]
+    if step.target_agent is not role:
+        return plan, RunError(
+            error_code=ErrorCode.GRAPH_INVALID_TARGET,
+            message=f"当前 Worker 与计划步骤目标不一致：{role.value}",
+            agent=role.value,
+        )
+    try:
+        _validate_task_result_prefix(plan, _task_results_from_state(state))
+    except ValueError:
+        return plan, RunError(
+            error_code=ErrorCode.GRAPH_AGGREGATION_INVALID,
+            message="已有任务结果与计划游标不一致",
+            agent=role.value,
+        )
+    return plan, None
+
+
+def _validate_task_result_prefix(
+    plan: TaskPlan,
+    results: Sequence[TaskStepResult],
+) -> None:
+    """结果必须是当前计划从第一步开始的连续、同角色前缀。"""
+    if len(results) != plan.current_step_index:
+        raise ValueError("task result count does not match plan cursor")
+    for result, step in zip(
+        results,
+        plan.steps[: len(results)],
+        strict=True,
+    ):
+        if (
+            result.step_sequence != step.sequence
+            or result.target_agent is not step.target_agent
+        ):
+            raise ValueError("task result does not match plan step")
+
+
+def _ready_task_results(state: AgentState) -> list[TaskStepResult] | None:
+    plan = _task_plan_from_state(state)
+    if plan is None or plan.status is not TaskPlanStatus.COMPLETED:
+        return None
+    results = _task_results_from_state(state)
+    _validate_task_result_prefix(plan, results)
+    if len(results) != len(plan.steps):
+        raise ValueError("completed plan is missing task results")
+    return results
+
+
+def _terminal_agent_output(messages: Sequence[BaseMessage]) -> str | None:
+    """仅接收本次 ReAct 执行的终态文本 AIMessage。"""
+    if not messages:
+        return None
+    message = messages[-1]
+    if not isinstance(message, AIMessage) or message.tool_calls:
+        return None
+    output = message.text.strip()
+    return output or None
+
+
+def _task_results_message(
+    plan: TaskPlan,
+    results: Sequence[TaskStepResult],
+) -> SystemMessage:
+    payload = [
+        {
+            "step_sequence": result.step_sequence,
+            "description": step.description,
+            "target_agent": result.target_agent.value,
+            "success": result.success,
+            "output": result.output,
+            "error_code": (
+                result.error_code.value if result.error_code is not None else None
+            ),
+        }
+        for step, result in zip(plan.steps, results, strict=True)
+    ]
+    return SystemMessage(
+        content=(
+            f"{_TASK_RESULTS_MARKER}\n"
+            f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        ),
+        name="task_results",
+    )
+
+
+def _deterministic_aggregation(
+    plan: TaskPlan,
+    results: Sequence[TaskStepResult],
+) -> str:
+    completed = [
+        (
+            f"#{result.step_sequence} "
+            f"{plan.steps[result.step_sequence - 1].description}：{result.output}"
+        )
+        for result in results
+        if result.success and result.output is not None
+    ]
+    sections = [
+        "已完成部分：",
+        "\n".join(completed) if completed else "无",
+    ]
+    failed = [result for result in results if not result.success]
+    if failed:
+        notices = [
+            (
+                f"#{result.step_sequence} "
+                f"{plan.steps[result.step_sequence - 1].description}"
+                f"（{result.error_code.value}）"
+            )
+            for result in failed
+            if result.error_code is not None
+        ]
+        sections.extend(["", f"未完成子任务：{'；'.join(notices)}"])
+    return "\n".join(sections)
+
+
+def _replace_terminal_ai_output(
+    messages: Sequence[BaseMessage],
+    content: str,
+) -> list[BaseMessage]:
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if isinstance(message, AIMessage) and not message.tool_calls:
+            updated[index] = message.model_copy(update={"content": content})
+            return updated
+    raise RuntimeError("aggregation completed without a terminal AIMessage")
+
+
+def _append_missing_results_notice(
+    messages: Sequence[BaseMessage],
+    plan: TaskPlan,
+    results: Sequence[TaskStepResult],
+) -> list[BaseMessage]:
+    failed = [result for result in results if not result.success]
+    notices = [
+        (
+            f"#{result.step_sequence} "
+            f"{plan.steps[result.step_sequence - 1].description}"
+            f"（{result.error_code.value}）"
+        )
+        for result in failed
+        if result.error_code is not None
+    ]
+    notice = f"未完成子任务：{'；'.join(notices)}"
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if isinstance(message, AIMessage) and not message.tool_calls:
+            answer = message.text.strip()
+            content = (
+                f"已完成部分：\n{answer}\n\n{notice}"
+                if answer
+                else f"已完成部分：无\n\n{notice}"
+            )
+            updated[index] = message.model_copy(update={"content": content})
+            return updated
+    raise RuntimeError("aggregation completed without a terminal AIMessage")
+
+
+def _mark_agent_completion_invalid(
+    events: Sequence[RunEvent],
+    role: AgentRole,
+) -> list[RunEvent]:
+    updated = list(events)
+    for index in range(len(updated) - 1, -1, -1):
+        event = updated[index]
+        if (
+            event.event_type is EventType.AGENT_COMPLETED
+            and event.agent == role.value
+        ):
+            updated[index] = event.model_copy(
+                update={
+                    "success": False,
+                    "error_code": ErrorCode.AGENT_OUTPUT_INVALID,
+                }
+            )
+            return updated
+    raise RuntimeError("agent output validation requires a completion event")
 
 
 def _latest_human_content(messages: Sequence[BaseMessage]) -> str:

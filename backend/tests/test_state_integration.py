@@ -12,6 +12,7 @@ from core.state import (
     HandoffApprovalDecision,
     TaskPlan,
     TaskPlanStatus,
+    TaskStepResult,
     create_initial_state,
 )
 
@@ -46,6 +47,77 @@ def test_initial_state_has_runtime_defaults() -> None:
     assert state["agent_switch_count"] == 0
     assert state["pending_handoff"] is None
     assert state["task_plan"] is None
+    assert state["task_results"] == []
+
+
+def test_task_step_result_enforces_success_and_failure_contracts() -> None:
+    success = TaskStepResult(
+        step_sequence=1,
+        target_agent=AgentRole.TEACHING_ASSISTANT,
+        success=True,
+        output="教学结果",
+    )
+    failure = TaskStepResult(
+        step_sequence=2,
+        target_agent=AgentRole.EVALUATOR,
+        success=False,
+        error_code=ErrorCode.MODEL_CALL_FAILED,
+    )
+
+    assert success.output == "教学结果"
+    assert success.error_code is None
+    assert failure.output is None
+    assert failure.error_code is ErrorCode.MODEL_CALL_FAILED
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "step_sequence": 1,
+            "target_agent": AgentRole.TEACHING_ASSISTANT,
+            "success": True,
+            "output": "   ",
+        },
+        {
+            "step_sequence": 1,
+            "target_agent": AgentRole.TEACHING_ASSISTANT,
+            "success": True,
+            "output": "结果",
+            "error_code": ErrorCode.MODEL_CALL_FAILED,
+        },
+        {
+            "step_sequence": 1,
+            "target_agent": AgentRole.TEACHING_ASSISTANT,
+            "success": False,
+        },
+        {
+            "step_sequence": 1,
+            "target_agent": AgentRole.TEACHING_ASSISTANT,
+            "success": False,
+            "output": "不可靠的局部结果",
+            "error_code": ErrorCode.MODEL_CALL_FAILED,
+        },
+        {
+            "step_sequence": 1,
+            "target_agent": AgentRole.SUPERVISOR,
+            "success": True,
+            "output": "非法目标",
+        },
+    ],
+    ids=[
+        "blank-success",
+        "success-with-error",
+        "failure-without-error",
+        "failure-with-output",
+        "supervisor-target",
+    ],
+)
+def test_task_step_result_rejects_invalid_contracts(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        TaskStepResult(**values)
 
 
 def test_task_plan_normalizes_and_preserves_structured_steps() -> None:

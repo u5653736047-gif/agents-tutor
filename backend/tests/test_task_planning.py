@@ -423,6 +423,7 @@ def test_new_user_turn_clears_completed_plan_before_simple_dispatch() -> None:
 
     assert len(model.calls) == 9
     assert result["task_plan"] is None
+    assert result["task_results"] == []
     assert result["handoff_count"] == 1
     assert result["agent_switch_count"] == 2
 

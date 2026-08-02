@@ -38,6 +38,8 @@ def test_run_event_serializes_only_safe_fields() -> None:
         "success",
         "duration_ms",
         "error_code",
+        "plan_step_sequence",
+        "degraded",
     }
 
 
