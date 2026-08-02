@@ -102,7 +102,9 @@ def test_lifespan_builds_and_releases_shared_runtime(
 
     async def verify_runtime() -> None:
         async with app.router.lifespan_context(app):
-            assert isinstance(getattr(app.state, "graph", None), CollaborativeAgentGraph)
+            graph = getattr(app.state, "graph", None)
+            assert isinstance(graph, CollaborativeAgentGraph)
+            assert graph.interrupt_before_handoff is True
             assert isinstance(getattr(app.state, "session_store", None), SessionStore)
 
     asyncio.run(verify_runtime())

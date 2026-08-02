@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import models_json_schema
 
 
@@ -74,6 +74,7 @@ class ApiErrorCode(str, Enum):
 
     INVALID_REQUEST = "invalid_request"
     INTERNAL_ERROR = "internal_error"
+    HANDOFF_NOT_PENDING = "handoff_not_pending"
     SESSION_ALREADY_EXISTS = "session_already_exists"
     SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
@@ -178,6 +179,48 @@ class PendingHandoff(ContractModel):
     request: HandoffRequest
 
 
+class PendingHandoffResponse(ContractModel):
+    """The current handoff approval state for one session."""
+
+    session_id: str
+    pending_handoff: PendingHandoff | None = None
+
+
+class HandoffDecisionAction(str, Enum):
+    """Approval actions supported by the skeleton API."""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+class HandoffDecisionRequest(ContractModel):
+    """A confirmation or rejection for one pending handoff interrupt."""
+
+    interrupt_id: str = Field(min_length=1)
+    action: HandoffDecisionAction
+    target_agent: WorkerAgentRole | None = Field(
+        default=None,
+        description="Reserved for a future modification workflow.",
+    )
+    task_content: str | None = Field(
+        default=None,
+        description="Reserved for a future modification workflow.",
+    )
+
+    @field_validator("interrupt_id")
+    @classmethod
+    def reject_blank_interrupt_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def reject_modification_fields(self) -> HandoffDecisionRequest:
+        """Reserve modification fields without implementing that workflow yet."""
+        if self.target_agent is not None or self.task_content is not None:
+            raise ValueError("handoff modifications are not supported")
+        return self
+
 class Citation(ContractModel):
     """A safe reference placeholder for future retrieval-backed responses."""
 
@@ -214,7 +257,7 @@ class TaskResult(ContractModel):
 
 
 class ChatResponse(ContractModel):
-    """The synchronous chat response contract reserved for W0-T4."""
+    """The synchronous response contract shared by chat and approval routes."""
 
     session_id: str
     message: Message | None = None
@@ -238,6 +281,8 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     RunError,
     HandoffRequest,
     PendingHandoff,
+    PendingHandoffResponse,
+    HandoffDecisionRequest,
     Citation,
     TaskPlanStep,
     TaskPlan,

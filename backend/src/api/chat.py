@@ -62,7 +62,7 @@ def _graph(request: Request) -> CollaborativeAgentGraph:
     return cast(CollaborativeAgentGraph, request.app.state.graph)
 
 
-def _session_lock(
+def session_lock(
     request: Request, session_id: str, user_id: str | None
 ) -> asyncio.Lock:
     locks = cast(
@@ -197,20 +197,38 @@ def _ensure_session(session_store: SessionStore, session_id: str, user_id: str |
             raise
 
 
-async def _pending_handoff(
+async def pending_handoff_for_session(
     graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
 ) -> PendingHandoff | None:
     pending = await run_in_threadpool(graph.get_pending_handoff, session_id, user_id)
     return _public_pending_handoff(pending)
 
 
-def _session_busy_response(session_id: str, message: str) -> ChatResponse:
+def session_busy_response(session_id: str, message: str) -> ChatResponse:
     return ChatResponse(
         session_id=session_id,
         run_error=RunError(
             error_code=ApiErrorCode.SESSION_BUSY,
             message=message,
         ),
+    )
+
+
+async def chat_response_for_state(
+    graph: CollaborativeAgentGraph,
+    state: AgentState,
+    session_id: str,
+    user_id: str | None,
+    previous_state: AgentState | None,
+) -> ChatResponse:
+    """Convert one completed graph transition into the public chat contract."""
+    return ChatResponse(
+        session_id=session_id,
+        message=_final_assistant_message(state, _previous_message_count(previous_state)),
+        events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
+        run_error=_public_run_error(state.get("run_error")),
+        pending_handoff=await pending_handoff_for_session(graph, session_id, user_id),
+        current_agent=_public_agent(state.get("current_agent")),
     )
 
 
@@ -223,26 +241,26 @@ async def chat(
     """Run one synchronous collaboration turn in a worker thread."""
     graph = _graph(request)
     session_store = _session_store(request)
-    session_lock = _session_lock(request, payload.session_id, user_id)
-    if session_lock.locked():
-        return _session_busy_response(
+    active_session_lock = session_lock(request, payload.session_id, user_id)
+    if active_session_lock.locked():
+        return session_busy_response(
             payload.session_id,
             "Another request is already running for this session.",
         )
 
-    async with session_lock:
+    async with active_session_lock:
         await run_in_threadpool(_ensure_session, session_store, payload.session_id, user_id)
         previous_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id
         )
-        previous_sequence = _previous_sequence(previous_state)
-        previous_message_count = _previous_message_count(previous_state)
         try:
             state = await run_in_threadpool(
                 graph.run, payload.message, payload.session_id, user_id
             )
         except RuntimeError as error:
-            pending_handoff = await _pending_handoff(graph, payload.session_id, user_id)
+            pending_handoff = await pending_handoff_for_session(
+                graph, payload.session_id, user_id
+            )
             if pending_handoff is not None or str(error).startswith(
                 PENDING_RESUME_ERROR_PREFIX
             ):
@@ -270,11 +288,10 @@ async def chat(
                 ),
             )
 
-        return ChatResponse(
-            session_id=payload.session_id,
-            message=_final_assistant_message(state, previous_message_count),
-            events=_public_events(state.get("events", []), previous_sequence),
-            run_error=_public_run_error(state.get("run_error")),
-            pending_handoff=await _pending_handoff(graph, payload.session_id, user_id),
-            current_agent=_public_agent(state.get("current_agent")),
+        return await chat_response_for_state(
+            graph,
+            state,
+            payload.session_id,
+            user_id,
+            previous_state,
         )

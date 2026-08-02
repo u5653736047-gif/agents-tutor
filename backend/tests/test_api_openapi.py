@@ -62,3 +62,35 @@ def test_session_validation_errors_use_the_public_error_contract() -> None:
             ]
             == "#/components/schemas/ErrorResponse"
         )
+
+
+def test_handoff_routes_expose_only_the_minimal_approval_contract() -> None:
+    openapi = create_app().openapi()
+    schemas = openapi["components"]["schemas"]
+    handoff_path = openapi["paths"]["/sessions/{session_id}/handoff"]
+
+    assert (
+        handoff_path["get"]["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]["$ref"]
+        == "#/components/schemas/PendingHandoffResponse"
+    )
+    assert (
+        handoff_path["post"]["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]["$ref"]
+        == "#/components/schemas/ChatResponse"
+    )
+    assert (
+        handoff_path["post"]["responses"]["409"]["content"]["application/json"][
+            "schema"
+        ]["$ref"]
+        == "#/components/schemas/ErrorResponse"
+    )
+    assert schemas["HandoffDecisionAction"]["enum"] == ["confirm", "reject"]
+    assert set(schemas["HandoffDecisionRequest"]["properties"]) == {
+        "action",
+        "interrupt_id",
+        "target_agent",
+        "task_content",
+    }

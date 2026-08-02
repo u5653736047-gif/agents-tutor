@@ -85,6 +85,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sessions/{session_id}/handoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Pending Handoff
+         * @description Return the current user's pending handoff, if any.
+         */
+        get: operations["get_pending_handoff_sessions__session_id__handoff_get"];
+        put?: never;
+        /**
+         * Decide Handoff
+         * @description Confirm or reject the current handoff, then return its graph transition.
+         */
+        post: operations["decide_handoff_sessions__session_id__handoff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions/{session_id}/messages": {
         parameters: {
             query?: never;
@@ -120,7 +144,7 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "internal_error" | "session_already_exists" | "session_busy" | "session_not_found";
+        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found";
         /**
          * ChatRequest
          * @description One synchronous user message for a session.
@@ -133,7 +157,7 @@ export interface components {
         };
         /**
          * ChatResponse
-         * @description The synchronous chat response contract reserved for W0-T4.
+         * @description The synchronous response contract shared by chat and approval routes.
          */
         ChatResponse: {
             /** @default null */
@@ -212,6 +236,32 @@ export interface components {
             detail: components["schemas"]["ErrorDetail"];
         };
         /**
+         * HandoffDecisionAction
+         * @description Approval actions supported by the skeleton API.
+         * @enum {string}
+         */
+        HandoffDecisionAction: "confirm" | "reject";
+        /**
+         * HandoffDecisionRequest
+         * @description A confirmation or rejection for one pending handoff interrupt.
+         */
+        HandoffDecisionRequest: {
+            action: components["schemas"]["HandoffDecisionAction"];
+            /** Interrupt Id */
+            interrupt_id: string;
+            /**
+             * @description Reserved for a future modification workflow.
+             * @default null
+             */
+            target_agent?: components["schemas"]["WorkerAgentRole"] | null;
+            /**
+             * Task Content
+             * @description Reserved for a future modification workflow.
+             * @default null
+             */
+            task_content?: string | null;
+        };
+        /**
          * HandoffRequest
          * @description The information a user reviews before a worker handoff.
          */
@@ -255,6 +305,16 @@ export interface components {
             /** Interrupt Id */
             interrupt_id: string;
             request: components["schemas"]["HandoffRequest"];
+        };
+        /**
+         * PendingHandoffResponse
+         * @description The current handoff approval state for one session.
+         */
+        PendingHandoffResponse: {
+            /** @default null */
+            pending_handoff?: components["schemas"]["PendingHandoff"] | null;
+            /** Session Id */
+            session_id: string;
         };
         /**
          * RunError
@@ -589,6 +649,112 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_pending_handoff_sessions__session_id__handoff_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingHandoffResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    decide_handoff_sessions__session_id__handoff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HandoffDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

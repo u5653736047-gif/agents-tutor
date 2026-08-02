@@ -17,6 +17,7 @@
         "enum": [
           "invalid_request",
           "internal_error",
+          "handoff_not_pending",
           "session_already_exists",
           "session_busy",
           "session_not_found"
@@ -48,7 +49,7 @@
       },
       "ChatResponse": {
         "additionalProperties": false,
-        "description": "The synchronous chat response contract reserved for W0-T4.",
+        "description": "The synchronous response contract shared by chat and approval routes.",
         "properties": {
           "current_agent": {
             "anyOf": [
@@ -263,6 +264,60 @@
         "title": "ErrorResponse",
         "type": "object"
       },
+      "HandoffDecisionAction": {
+        "description": "Approval actions supported by the skeleton API.",
+        "enum": [
+          "confirm",
+          "reject"
+        ],
+        "title": "HandoffDecisionAction",
+        "type": "string"
+      },
+      "HandoffDecisionRequest": {
+        "additionalProperties": false,
+        "description": "A confirmation or rejection for one pending handoff interrupt.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/HandoffDecisionAction"
+          },
+          "interrupt_id": {
+            "minLength": 1,
+            "title": "Interrupt Id",
+            "type": "string"
+          },
+          "target_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerAgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reserved for a future modification workflow."
+          },
+          "task_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reserved for a future modification workflow.",
+            "title": "Task Content"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "action"
+        ],
+        "title": "HandoffDecisionRequest",
+        "type": "object"
+      },
       "HandoffRequest": {
         "additionalProperties": false,
         "description": "The information a user reviews before a worker handoff.",
@@ -364,6 +419,32 @@
           "request"
         ],
         "title": "PendingHandoff",
+        "type": "object"
+      },
+      "PendingHandoffResponse": {
+        "additionalProperties": false,
+        "description": "The current handoff approval state for one session.",
+        "properties": {
+          "pending_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingHandoff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "PendingHandoffResponse",
         "type": "object"
       },
       "RunError": {
@@ -1030,6 +1111,172 @@
         "summary": "Archive Session",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/handoff": {
+      "get": {
+        "description": "Return the current user's pending handoff, if any.",
+        "operationId": "get_pending_handoff_sessions__session_id__handoff_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingHandoffResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Get Pending Handoff",
+        "tags": [
+          "handoffs"
+        ]
+      },
+      "post": {
+        "description": "Confirm or reject the current handoff, then return its graph transition.",
+        "operationId": "decide_handoff_sessions__session_id__handoff_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HandoffDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Decide Handoff",
+        "tags": [
+          "handoffs"
         ]
       }
     },
