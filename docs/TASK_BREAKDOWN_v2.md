@@ -137,7 +137,7 @@
   - [ ] PostgreSQL checkpointer 尚未实现。
 - [ ] **（部分完成）** 1.3.2 上下文窗口管理
   - [x] 已实现按消息数量裁剪，并保留完整 Tool Call/ToolMessage 关系。
-  - [ ] Token 级计数和预算控制尚未实现。
+  - [x] 已实现 Token 级计数和预算控制，可与消息数量限制叠加（S1-T2）。
   - [ ] 长对话摘要压缩尚未实现。
 - [x] 1.3.3 多会话隔离
   - [x] 按 `user_id + session_id` 生成无碰撞 thread key。

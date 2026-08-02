@@ -44,6 +44,10 @@ class FailingModel:
         raise RuntimeError("secret=/srv/private/model-token")
 
 
+def count_context_messages(messages: Sequence[BaseMessage]) -> int:
+    return len(messages)
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -51,6 +55,7 @@ class FailingModel:
         ("max_handoffs", -1),
         ("max_agent_switches", 0),
         ("max_context_messages", 2),
+        ("max_context_tokens", 0),
         ("tool_timeout_seconds", 0),
     ],
 )
@@ -65,9 +70,15 @@ def test_graph_forwards_context_window_to_every_agent() -> None:
     builder = CollaborativeAgentGraph(
         model=ScriptedModel([]),
         max_context_messages=7,
+        max_context_tokens=100,
+        context_token_counter=count_context_messages,
     )
 
     assert {agent.max_context_messages for agent in builder.agents.values()} == {7}
+    assert {agent.max_context_tokens for agent in builder.agents.values()} == {100}
+    assert {
+        agent.context_token_counter for agent in builder.agents.values()
+    } == {count_context_messages}
 
 
 def test_graph_forwards_tool_timeout_configuration_to_shared_executor() -> None:

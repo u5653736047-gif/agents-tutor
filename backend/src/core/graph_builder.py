@@ -13,6 +13,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
@@ -39,6 +40,8 @@ class CollaborativeAgentGraph:
         tools: Sequence[BaseTool] = (),
         max_iterations: int = 5,
         max_context_messages: int | None = None,
+        max_context_tokens: int | None = None,
+        context_token_counter: MessageTokenCounter | None = None,
         tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
         tool_timeouts: Mapping[str, float] | None = None,
         tool_permissions: Mapping[str, Collection[AgentRole]] | None = None,
@@ -87,6 +90,8 @@ class CollaborativeAgentGraph:
             registry=registry,
             max_iterations=max_iterations,
             max_context_messages=max_context_messages,
+            max_context_tokens=max_context_tokens,
+            context_token_counter=context_token_counter,
             tool_timeout_seconds=tool_timeout_seconds,
             tool_timeouts=tool_timeouts,
         )

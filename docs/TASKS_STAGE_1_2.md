@@ -124,7 +124,7 @@
   `TOOL_TIMEOUT` Observation 并保留耗时/审计事件，ReAct 可继续完成回答；独立
   review 无 Critical/Important，最终全量测试 195 通过，ruff、mypy strict 干净。
 
-### S1-T2 Token 级上下文预算
+### [x] S1-T2 Token 级上下文预算
 
 - 对应总清单：1.3.2（Token 计数与预算控制部分）
 - 范围：`src/core/context.py`、图与节点工厂的裁剪配置。
@@ -137,6 +137,11 @@
     前确认必要性。
   - 测试覆盖：预算裁剪触发、组完整性、与消息数裁剪叠加。
 - 依赖：Sprint 0 完成。与 S1-T1 可并行。
+- 完成备注：2026-08-02；默认使用 `langchain-core` 的离线近似计数器
+  `count_tokens_approximately(chars_per_token=1.0)`，无需新增依赖，并支持注入精确
+  计数器；每轮模型调用均对 System、完整历史视图和当轮 ReAct 消息重新预算，默认
+  路径按原子消息组线性扫描，checkpoint 仍保留完整历史。独立 review 无
+  Critical/Important；最终全量测试 217 通过，ruff、mypy strict 干净。
 
 ### S1-T3 人机交互断点（Human-in-the-loop）
 
@@ -431,7 +436,7 @@
 
 - [ ] 协调者能分解复杂请求、分派给至少 2 个子 Agent 并汇总结果（S1-T4/T5）。
 - [ ] 关键决策点可暂停等待人工确认并恢复（S1-T3）。
-- [ ] 工具超时受控、上下文按 Token 预算裁剪（S1-T1/T2）。
+- [x] 工具超时受控、上下文按 Token 预算裁剪（S1-T1/T2）。
 - [x] 三项质量门禁通过，DeepSeek 真实链路冒烟通过（S0-T3/T4）。
 
 ### M2 知识闭环（Sprint 2 + Sprint 3 完成后检查）

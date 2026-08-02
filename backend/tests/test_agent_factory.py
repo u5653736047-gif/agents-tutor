@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 
@@ -32,6 +34,10 @@ def double(value: int) -> int:
     return value * 2
 
 
+def count_context_messages(messages: Sequence[BaseMessage]) -> int:
+    return len(messages)
+
+
 def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     model = BindableModel()
 
@@ -40,6 +46,8 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
         tools=[double],
         max_iterations=3,
         max_context_messages=7,
+        max_context_tokens=100,
+        context_token_counter=count_context_messages,
     )
 
     assert set(agents) == set(AgentRole)
@@ -48,6 +56,10 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     assert len({id(agent.tool_executor) for agent in agents.values()}) == 1
     assert {agent.max_iterations for agent in agents.values()} == {3}
     assert {agent.max_context_messages for agent in agents.values()} == {7}
+    assert {agent.max_context_tokens for agent in agents.values()} == {100}
+    assert {
+        agent.context_token_counter for agent in agents.values()
+    } == {count_context_messages}
     for role, agent in agents.items():
         assert agent.system_prompt == ROLE_PROMPTS[role]
     assert max(map(len, ROLE_PROMPTS.values())) <= 80

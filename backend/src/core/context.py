@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately
+
+MessageTokenCounter = Callable[[Sequence[BaseMessage]], int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,21 +17,52 @@ class ContextWindow:
 
     messages: tuple[BaseMessage, ...]
     trimmed_count: int
+    token_count: int | None = None
+
+
+def count_context_tokens(messages: Sequence[BaseMessage]) -> int:
+    """离线估算角色、正文及工具元数据，中文按一字符一 Token 保守计数。"""
+    return count_tokens_approximately(messages, chars_per_token=1.0)
 
 
 def trim_message_history(
     messages: Sequence[BaseMessage],
-    max_messages: int,
+    max_messages: int | None = None,
+    *,
+    max_tokens: int | None = None,
+    token_counter: MessageTokenCounter | None = None,
+    prefix_messages: Sequence[BaseMessage] = (),
 ) -> ContextWindow:
-    """保留最近历史，同时维持用户消息和工具调用关系。"""
-    if max_messages < 3:
+    """保留最近历史，同时维持用户消息和工具调用关系。
+
+    ``prefix_messages`` 只参与 Token 预算，不会写入返回的历史窗口。
+    """
+    if max_messages is not None and max_messages < 3:
         raise ValueError("max_messages must be at least 3")
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
 
     history = list(messages)
     if not history:
-        return ContextWindow(messages=(), trimmed_count=0)
+        empty_token_count = (
+            _count_tokens(
+                token_counter or count_context_tokens,
+                tuple(prefix_messages),
+            )
+            if max_tokens is not None
+            else None
+        )
+        return ContextWindow(
+            messages=(),
+            trimmed_count=0,
+            token_count=empty_token_count,
+        )
 
-    selected = set(range(max(0, len(history) - max_messages), len(history)))
+    selected = (
+        set(range(len(history)))
+        if max_messages is None
+        else set(range(max(0, len(history) - max_messages), len(history)))
+    )
     latest_human = next(
         (
             index
@@ -37,7 +71,7 @@ def trim_message_history(
         ),
         None,
     )
-    hard_limit = max_messages
+    hard_limit = len(history) if max_messages is None else max_messages
     if latest_human is not None and latest_human not in selected:
         selected.add(latest_human)
         hard_limit += 1
@@ -56,11 +90,121 @@ def trim_message_history(
         else:
             selected.update(group)
 
+    token_count: int | None = None
+    if max_tokens is not None:
+        selected, token_count = _trim_by_tokens(
+            history,
+            selected,
+            tool_groups,
+            latest_human,
+            max_tokens,
+            token_counter,
+            prefix_messages,
+        )
+
     kept = tuple(history[index] for index in sorted(selected))
+    if max_tokens is not None and token_count is None:
+        token_count = _count_tokens(
+            token_counter or count_context_tokens,
+            (*prefix_messages, *kept),
+        )
     return ContextWindow(
         messages=kept,
         trimmed_count=len(history) - len(kept),
+        token_count=token_count,
     )
+
+
+def _trim_by_tokens(
+    history: Sequence[BaseMessage],
+    selected: set[int],
+    tool_groups: dict[int, set[int]],
+    latest_human: int | None,
+    max_tokens: int,
+    token_counter: MessageTokenCounter | None,
+    prefix_messages: Sequence[BaseMessage],
+) -> tuple[set[int], int | None]:
+    """从最近原子消息组向前选择；最近用户消息即使超预算也保持必留。"""
+    mandatory = (
+        {latest_human}
+        if latest_human is not None and latest_human in selected
+        else set()
+    )
+    kept = set(mandatory)
+    grouped_indexes: set[int] = set()
+    units: list[set[int]] = []
+    for group in tool_groups.values():
+        if group <= selected:
+            units.append(group)
+            grouped_indexes.update(group)
+    units.extend({index} for index in selected - grouped_indexes)
+    units.sort(key=max, reverse=True)
+
+    if token_counter is None:
+        return _trim_by_additive_default(
+            history,
+            mandatory,
+            units,
+            max_tokens,
+            prefix_messages,
+        )
+
+    for unit in units:
+        if not unit.isdisjoint(mandatory):
+            continue
+        candidate = kept | unit
+        candidate_messages = (
+            *prefix_messages,
+            *(history[index] for index in sorted(candidate)),
+        )
+        if _count_tokens(token_counter, candidate_messages) > max_tokens:
+            break
+        kept.update(unit)
+    return kept, None
+
+
+def _trim_by_additive_default(
+    history: Sequence[BaseMessage],
+    mandatory: set[int],
+    units: Sequence[set[int]],
+    max_tokens: int,
+    prefix_messages: Sequence[BaseMessage],
+) -> tuple[set[int], int]:
+    """利用默认逐消息可加计数器在线性扫描中选择原子单元。"""
+    kept = set(mandatory)
+    mandatory_messages = tuple(
+        history[index] for index in sorted(mandatory)
+    )
+    running_count = count_context_tokens(
+        (*prefix_messages, *mandatory_messages)
+    )
+
+    for unit in units:
+        if not unit.isdisjoint(mandatory):
+            continue
+        unit_messages = tuple(history[index] for index in sorted(unit))
+        # 默认估算器逐消息向上取整，完整列表等于各消息计数之和。
+        unit_count = count_context_tokens(unit_messages)
+        if running_count + unit_count > max_tokens:
+            break
+        kept.update(unit)
+        running_count += unit_count
+    return kept, running_count
+
+
+def _count_tokens(
+    token_counter: MessageTokenCounter,
+    messages: Sequence[BaseMessage],
+) -> int:
+    """验证可注入计数器的稳定返回边界。"""
+    token_count = token_counter(messages)
+    if (
+        isinstance(token_count, bool)
+        or not isinstance(token_count, int)
+        or token_count < 0
+    ):
+        raise ValueError("token_counter must return a non-negative integer")
+    return token_count
 
 
 def _tool_groups(
@@ -109,4 +253,9 @@ def _tool_groups(
     return groups, incomplete_parents, orphan_results
 
 
-__all__ = ["ContextWindow", "trim_message_history"]
+__all__ = [
+    "ContextWindow",
+    "MessageTokenCounter",
+    "count_context_tokens",
+    "trim_message_history",
+]

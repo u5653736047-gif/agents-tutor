@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Event, Lock
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from core.events import ErrorCode
@@ -63,6 +63,10 @@ def _human_contents(messages: Sequence[BaseMessage]) -> list[str]:
     return [str(message.content) for message in messages if isinstance(message, HumanMessage)]
 
 
+def _one_token_per_context_message(messages: Sequence[BaseMessage]) -> int:
+    return sum(not isinstance(message, SystemMessage) for message in messages)
+
+
 def test_checkpointer_continues_the_same_user_session() -> None:
     model = ScriptedModel([AIMessage(content="first answer"), AIMessage(content="second answer")])
     graph = CollaborativeAgentGraph(model=model, checkpointer=InMemorySaver())
@@ -72,6 +76,45 @@ def test_checkpointer_continues_the_same_user_session() -> None:
 
     assert _human_contents(model.calls[1]) == ["first question", "second question"]
     assert _human_contents(result["messages"]) == ["first question", "second question"]
+
+
+def test_token_trim_keeps_complete_checkpoint_history() -> None:
+    model = ScriptedModel(
+        [AIMessage(content="first answer"), AIMessage(content="second answer")]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        max_context_tokens=1,
+        context_token_counter=_one_token_per_context_message,
+    )
+
+    graph.run("first question", session_id="token-session", user_id="user-1")
+    result = graph.run(
+        "second question",
+        session_id="token-session",
+        user_id="user-1",
+    )
+
+    visible_second_call = [
+        message
+        for message in model.calls[1]
+        if not isinstance(message, SystemMessage)
+    ]
+    assert [
+        (message.type, str(message.content)) for message in visible_second_call
+    ] == [("human", "second question")]
+    expected = [
+        ("human", "first question"),
+        ("ai", "first answer"),
+        ("human", "second question"),
+        ("ai", "second answer"),
+    ]
+    history = graph.get_history("token-session", user_id="user-1")
+    assert [(message.type, str(message.content)) for message in history] == expected
+    assert [
+        (message.type, str(message.content)) for message in result["messages"]
+    ] == expected
 
 
 def test_get_state_and_history_read_the_latest_checkpoint() -> None:

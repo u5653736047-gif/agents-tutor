@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
+from typing import cast
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
-from core.context import ContextWindow, trim_message_history
+import core.context as context_module
+from core.context import ContextWindow, count_context_tokens, trim_message_history
 
 
 def _tool_call(call_id: str | None) -> dict[str, object]:
@@ -17,6 +26,11 @@ def _tool_call(call_id: str | None) -> dict[str, object]:
         "id": call_id,
         "type": "tool_call",
     }
+
+
+def _content_token_count(messages: Sequence[BaseMessage]) -> int:
+    """用正文字符数提供确定性的测试 Token 计数。"""
+    return sum(len(str(message.content)) for message in messages)
 
 
 @pytest.mark.parametrize("max_messages", [-1, 0, 2])
@@ -39,6 +53,208 @@ def test_short_history_returns_immutable_copy_without_trimming() -> None:
     assert window.messages is not history
     with pytest.raises(FrozenInstanceError):
         window.trimmed_count = 1
+
+
+def test_token_budget_trims_oldest_history() -> None:
+    latest_human = HumanMessage(content="new")
+    latest_answer = AIMessage(content="ok")
+    history: list[BaseMessage] = [
+        HumanMessage(content="old question"),
+        AIMessage(content="old answer"),
+        latest_human,
+        latest_answer,
+    ]
+
+    window = trim_message_history(
+        history,
+        max_tokens=5,
+        token_counter=_content_token_count,
+    )
+
+    assert window.messages == (latest_human, latest_answer)
+    assert window.trimmed_count == 2
+    assert window.token_count == 5
+
+
+def test_default_token_counter_is_conservative_and_counts_tool_metadata() -> None:
+    short = [HumanMessage(content="你好")]
+    long = [HumanMessage(content="你好世界")]
+    plain_ai = AIMessage(content="")
+    tool_ai = AIMessage(content="", tool_calls=[_tool_call("call-1")])
+    tool_result = ToolMessage(content="ok", tool_call_id="call-1")
+    short_id_result = ToolMessage(content="ok", tool_call_id="x")
+    long_id_result = ToolMessage(content="ok", tool_call_id="call-id-long")
+
+    short_count = count_context_tokens(short)
+
+    assert isinstance(short_count, int)
+    assert count_context_tokens(short) == short_count
+    assert count_context_tokens(long) > short_count
+    assert count_context_tokens([SystemMessage(content="system")]) > 0
+    assert count_context_tokens([tool_ai]) > count_context_tokens([plain_ai])
+    assert count_context_tokens([tool_ai, tool_result]) > count_context_tokens(
+        [tool_ai]
+    )
+    assert count_context_tokens([long_id_result]) > count_context_tokens(
+        [short_id_result]
+    )
+
+
+def test_default_token_counter_scans_history_linearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_counter = context_module.count_tokens_approximately
+    observed_message_count = 0
+
+    def recording_counter(
+        messages: Sequence[BaseMessage],
+        *,
+        chars_per_token: float = 4.0,
+    ) -> int:
+        nonlocal observed_message_count
+        observed_message_count += len(messages)
+        return original_counter(messages, chars_per_token=chars_per_token)
+
+    monkeypatch.setattr(
+        context_module,
+        "count_tokens_approximately",
+        recording_counter,
+    )
+    history: list[BaseMessage] = [
+        *(AIMessage(content=f"answer-{index}") for index in range(128)),
+        HumanMessage(content="latest question"),
+    ]
+
+    window = trim_message_history(history, max_tokens=1_000_000)
+
+    assert window.messages == tuple(history)
+    assert observed_message_count <= len(history) * 2
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [True, -1, 1.5, "1"],
+    ids=["bool", "negative", "float", "string"],
+)
+def test_token_counter_rejects_invalid_return_value(
+    invalid_value: object,
+) -> None:
+    def invalid_counter(_: Sequence[BaseMessage]) -> int:
+        return cast(int, invalid_value)
+
+    with pytest.raises(
+        ValueError,
+        match="token_counter must return a non-negative integer",
+    ):
+        trim_message_history(
+            [HumanMessage(content="question")],
+            max_tokens=10,
+            token_counter=invalid_counter,
+        )
+
+
+def test_token_budget_always_keeps_latest_human_message() -> None:
+    latest_human = HumanMessage(content="oversized question")
+
+    window = trim_message_history(
+        [latest_human],
+        max_messages=None,
+        max_tokens=1,
+        token_counter=_content_token_count,
+    )
+
+    assert window.messages == (latest_human,)
+    assert window.token_count == len("oversized question")
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "keep_group"),
+    [(6, True), (5, False)],
+)
+def test_token_budget_keeps_or_drops_complete_tool_group(
+    max_tokens: int,
+    keep_group: bool,
+) -> None:
+    latest_human = HumanMessage(content="h")
+    request = AIMessage(
+        content="",
+        tool_calls=[_tool_call("call-1"), _tool_call("call-2")],
+    )
+    first_result = ToolMessage(content="11", tool_call_id="call-1")
+    second_result = ToolMessage(content="22", tool_call_id="call-2")
+    final_answer = AIMessage(content="f")
+    history: list[BaseMessage] = [
+        latest_human,
+        request,
+        first_result,
+        second_result,
+        final_answer,
+    ]
+
+    window = trim_message_history(
+        history,
+        max_messages=None,
+        max_tokens=max_tokens,
+        token_counter=_content_token_count,
+    )
+
+    expected = tuple(history) if keep_group else (latest_human, final_answer)
+    assert window.messages == expected
+    assert (request in window.messages) is keep_group
+    assert (first_result in window.messages) is keep_group
+    assert (second_result in window.messages) is keep_group
+
+
+def test_token_only_window_drops_orphan_tool_message() -> None:
+    orphan = ToolMessage(content="orphan", tool_call_id="missing")
+    human = HumanMessage(content="h")
+    answer = AIMessage(content="a")
+
+    window = trim_message_history(
+        [orphan, human, answer],
+        max_messages=None,
+        max_tokens=20,
+        token_counter=_content_token_count,
+    )
+
+    assert window.messages == (human, answer)
+    assert window.trimmed_count == 1
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected_indexes"),
+    [
+        (100, (2, 3, 4)),
+        (2, (2, 4)),
+    ],
+    ids=["message-limit", "token-limit"],
+)
+def test_message_and_token_limits_use_stricter_window(
+    max_tokens: int,
+    expected_indexes: tuple[int, ...],
+) -> None:
+    history: list[BaseMessage] = [
+        HumanMessage(content="o"),
+        AIMessage(content="a"),
+        HumanMessage(content="n"),
+        AIMessage(content="LLLL"),
+        AIMessage(content="r"),
+    ]
+
+    window = trim_message_history(
+        history,
+        max_messages=3,
+        max_tokens=max_tokens,
+        token_counter=_content_token_count,
+    )
+
+    assert window.messages == tuple(history[index] for index in expected_indexes)
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1])
+def test_trim_message_history_rejects_non_positive_token_budget(
+    max_tokens: int,
+) -> None:
+    with pytest.raises(ValueError, match="max_tokens"):
+        trim_message_history([], max_messages=None, max_tokens=max_tokens)
 
 
 def test_short_history_drops_leading_orphan_tool_message() -> None:

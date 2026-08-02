@@ -7,6 +7,7 @@ from typing import cast
 
 from langchain_core.tools import BaseTool
 
+from ..context import MessageTokenCounter
 from ..state import AgentRole
 from ..tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolExecutor, ToolRegistry
 from .prompts import ROLE_PROMPTS
@@ -20,6 +21,8 @@ def create_agent_nodes(
     registry: ToolRegistry | None = None,
     max_iterations: int = 5,
     max_context_messages: int | None = None,
+    max_context_tokens: int | None = None,
+    context_token_counter: MessageTokenCounter | None = None,
     tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     tool_timeouts: Mapping[str, float] | None = None,
 ) -> dict[AgentRole, ReActAgentNode]:
@@ -39,6 +42,8 @@ def create_agent_nodes(
             tool_executor=tool_executor,
             max_iterations=max_iterations,
             max_context_messages=max_context_messages,
+            max_context_tokens=max_context_tokens,
+            context_token_counter=context_token_counter,
         )
         for role, prompt in ROLE_PROMPTS.items()
     }
