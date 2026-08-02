@@ -4,6 +4,7 @@ import { LoaderCircle } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
+import { AssistantMarkdown } from "@/components/assistant-markdown";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ChatResponse, Message } from "@/lib/api-client";
 import { useChatStore } from "@/stores/chat-store";
@@ -53,9 +54,13 @@ export function ConversationContent({
               }
             >
               {!isUser ? <AssistantBadge agent={message.agent} /> : null}
-              <p className={isUser ? "whitespace-pre-wrap" : "mt-2 whitespace-pre-wrap"}>
-                {message.content}
-              </p>
+              {isUser ? (
+                <p className="whitespace-pre-wrap">{message.content}</p>
+              ) : (
+                <div className="mt-2">
+                  <AssistantMarkdown content={message.content} />
+                </div>
+              )}
             </div>
           </article>
         );
