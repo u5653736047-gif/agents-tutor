@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 from api.openapi import install_openapi_contract
+from api.sessions import router as session_router
 from core.graph_builder import CollaborativeAgentGraph
 from core.models import DeepSeekSettings, create_deepseek_model
 from core.nodes.react_agent import ChatModel
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
     """Create the API application."""
     app = FastAPI(lifespan=lifespan)
     install_openapi_contract(app)
+    app.include_router(session_router)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],

@@ -69,6 +69,14 @@ class ErrorCode(str, Enum):
     AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
 
+class ApiErrorCode(str, Enum):
+    """Stable HTTP API errors not emitted by a graph run."""
+
+    INVALID_REQUEST = "invalid_request"
+    SESSION_ALREADY_EXISTS = "session_already_exists"
+    SESSION_NOT_FOUND = "session_not_found"
+
+
 class TaskPlanStatus(str, Enum):
     """Public task-plan status values."""
 
@@ -85,6 +93,25 @@ class Session(ContractModel):
     user_id: str | None
     created_at: datetime
     archived: bool
+
+
+class CreateSessionRequest(ContractModel):
+    """Optional client-selected ID for a new session."""
+
+    session_id: str | None = None
+
+
+class ErrorDetail(ContractModel):
+    """A sanitized stable API error."""
+
+    error_code: ApiErrorCode
+    message: str
+
+
+class ErrorResponse(ContractModel):
+    """FastAPI's standard error envelope."""
+
+    detail: ErrorDetail
 
 
 class Message(ContractModel):
@@ -185,6 +212,9 @@ class ChatResponse(ContractModel):
 
 CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     Session,
+    CreateSessionRequest,
+    ErrorDetail,
+    ErrorResponse,
     Message,
     RunEvent,
     RunError,
