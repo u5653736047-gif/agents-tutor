@@ -37,20 +37,21 @@ def trim_message_history(
         ),
         None,
     )
-    if latest_human is not None:
+    hard_limit = max_messages
+    if latest_human is not None and latest_human not in selected:
         selected.add(latest_human)
+        hard_limit += 1
 
-    tool_parents, tool_children = _tool_relationships(history)
-    for index in tuple(selected):
-        if not isinstance(history[index], ToolMessage):
+    tool_groups, incomplete_parents, orphan_results = _tool_groups(history)
+    selected.difference_update(orphan_results)
+    for parent, group in tool_groups.items():
+        if selected.isdisjoint(group):
             continue
-        parent = tool_parents.get(index)
-        if parent is None:
-            selected.remove(index)
-            continue
-        # max_messages 是目标窗口；完整工具组和最新用户消息可使结果略大。
-        selected.add(parent)
-        selected.update(tool_children[parent])
+        # Tool Call 必须整组保留，缺失或越界则整组删除。
+        if parent in incomplete_parents or len(selected | group) > hard_limit:
+            selected.difference_update(group)
+        else:
+            selected.update(group)
 
     kept = tuple(history[index] for index in sorted(selected))
     return ContextWindow(
@@ -59,30 +60,44 @@ def trim_message_history(
     )
 
 
-def _tool_relationships(
+def _tool_groups(
     messages: Sequence[BaseMessage],
-) -> tuple[dict[int, int], dict[int, set[int]]]:
-    """将工具结果关联到此前声明对应调用 ID 的 AI 消息。"""
+) -> tuple[dict[int, set[int]], set[int], set[int]]:
+    """收集工具调用原子组、不完整父消息和孤立结果。"""
     call_parents: dict[str, int] = {}
-    tool_parents: dict[int, int] = {}
-    tool_children: dict[int, set[int]] = {}
+    expected_ids: dict[int, set[str]] = {}
+    observed_ids: dict[int, set[str]] = {}
+    groups: dict[int, set[int]] = {}
+    orphan_results: set[int] = set()
 
     for index, message in enumerate(messages):
-        if isinstance(message, AIMessage):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            groups[index] = {index}
+            expected_ids[index] = set()
+            observed_ids[index] = set()
             for tool_call in message.tool_calls:
                 call_id = tool_call.get("id")
                 if call_id:
-                    call_parents[str(call_id)] = index
+                    normalized_id = str(call_id)
+                    expected_ids[index].add(normalized_id)
+                    call_parents[normalized_id] = index
             continue
         if not isinstance(message, ToolMessage):
             continue
-        parent = call_parents.get(str(message.tool_call_id))
+        normalized_id = str(message.tool_call_id)
+        parent = call_parents.get(normalized_id)
         if parent is None:
+            orphan_results.add(index)
             continue
-        tool_parents[index] = parent
-        tool_children.setdefault(parent, set()).add(index)
+        groups[parent].add(index)
+        observed_ids[parent].add(normalized_id)
 
-    return tool_parents, tool_children
+    incomplete_parents = {
+        parent
+        for parent, expected in expected_ids.items()
+        if not expected or not expected.issubset(observed_ids[parent])
+    }
+    return groups, incomplete_parents, orphan_results
 
 
 __all__ = ["ContextWindow", "trim_message_history"]

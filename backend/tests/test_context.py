@@ -98,7 +98,7 @@ def test_trim_keeps_complete_multi_tool_call_group() -> None:
         final_answer,
     ]
 
-    window = trim_message_history(history, max_messages=3)
+    window = trim_message_history(history, max_messages=4)
 
     assert window.messages == (
         latest_human,
@@ -107,6 +107,71 @@ def test_trim_keeps_complete_multi_tool_call_group() -> None:
         second_result,
         final_answer,
     )
+    assert window.trimmed_count == 2
+
+
+def test_trim_drops_incomplete_multi_tool_call_group() -> None:
+    latest_human = HumanMessage(content="look up both")
+    request = AIMessage(
+        content="",
+        tool_calls=[_tool_call("call-1"), _tool_call("call-2")],
+    )
+    first_result = ToolMessage(content="one", tool_call_id="call-1")
+    final_answer = AIMessage(content="partial answer")
+    history: list[BaseMessage] = [
+        HumanMessage(content="old"),
+        latest_human,
+        request,
+        first_result,
+        final_answer,
+    ]
+
+    window = trim_message_history(history, max_messages=3)
+
+    assert window.messages == (latest_human, final_answer)
+    assert window.trimmed_count == 3
+
+
+def test_trim_drops_complete_tool_group_when_expansion_exceeds_hard_limit() -> None:
+    latest_human = HumanMessage(content="look up four")
+    request = AIMessage(
+        content="",
+        tool_calls=[_tool_call(f"call-{number}") for number in range(4)],
+    )
+    results = [
+        ToolMessage(content=str(number), tool_call_id=f"call-{number}")
+        for number in range(4)
+    ]
+    final_answer = AIMessage(content="combined")
+    history: list[BaseMessage] = [
+        HumanMessage(content="old"),
+        latest_human,
+        request,
+        *results,
+        final_answer,
+    ]
+
+    window = trim_message_history(history, max_messages=3)
+
+    assert window.messages == (latest_human, final_answer)
+    assert len(window.messages) <= 4
+    assert window.trimmed_count == 6
+
+
+def test_latest_human_in_recent_tail_does_not_expand_hard_limit() -> None:
+    latest_human = HumanMessage(content="latest")
+    history: list[BaseMessage] = [
+        HumanMessage(content="old"),
+        AIMessage(content="old answer"),
+        AIMessage(content="recent context"),
+        latest_human,
+        AIMessage(content="final answer"),
+    ]
+
+    window = trim_message_history(history, max_messages=3)
+
+    assert window.messages == tuple(history[-3:])
+    assert len(window.messages) <= 3
     assert window.trimmed_count == 2
 
 
