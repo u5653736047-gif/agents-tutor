@@ -629,11 +629,22 @@
 
 ### M2 知识闭环（Sprint 2 + Sprint 3 完成后检查）
 
-- [ ] 基于 `data/books/` 教材内容回答 AI 学科问题，回答带规范化引用且
+- [x] 基于 `data/books/` 教材内容回答 AI 学科问题，回答带规范化引用且
       引用真实性经校验（S2-T4/T5、S3-T1）。
-- [ ] 答疑链路走通「意图识别 → 分层讲解 → 检索增强 → 引用 → 评价」全流程
+- [x] 答疑链路走通「意图识别 → 分层讲解 → 检索增强 → 引用 → 评价」全流程
       （S2-T1/T2/T3）。
-- [ ] 语义检索 + 混合检索在线，词法单路可降级（S3-T4/T5）。
+- [x] 语义检索 + 混合检索在线，词法单路可降级（S3-T4/T5）。
+
+> M2 完成记录（2026-08-03）：三项全部达成。S2-T4 消息元数据引用（真实
+> SearchHit Citation、chunk_id 去重保序、零命中不伪造）+ S2-T5 真实性校验
+> （伪造/越界剔除、removed 明细进评价结果）；S3-T1 全量入库 4/5 本（verify
+> 8/8 命中；ml-lihang 扫描版 PDF 阻塞，标记 blocked 待文本版，见 S3-T1
+> 完成备注）；S2-T1/T2/T3 打通意图识别（五类意图+不明追问拦截）→ 分层
+> 讲解（StudentLevel 动态 prompt）→ 检索增强（search_knowledge 真实链路）
+> → 引用（references 元数据）→ 评价（EvaluationResult 双维度+结论+理由，
+> 事件脱敏）；S3-T4 向量索引（Embedding 协议 + SQLite BLOB 持久化重载，
+> 选型见 docs/EMBEDDING_SELECTION.md）+ S3-T5 混合检索（RRF 融合为默认，
+> 词法单路降级）。全量测试 531 通过，ruff、mypy strict（33 文件）干净。
 
 ---
 
