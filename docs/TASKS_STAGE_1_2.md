@@ -548,7 +548,7 @@
   独立 review 无 Critical/Important，3 个 Minor（清洗入 try、空白
   短路）已处理并复审放行。
 
-### S4-T2 重排序
+### [x] S4-T2 重排序
 
 - 对应总清单：2.3.1（Cross-Encoder 重排序部分）
 - 范围：检索服务层。
@@ -557,6 +557,24 @@
     重排提供方可替换，测试用替身。
   - 构造用例证明重排后首位命中率优于融合排序基线。
 - 依赖：S4-T1。
+- 完成备注：2026-08-03；`retrieval.py` 扩展重排步骤：
+  `Reranker` 协议（`rerank(query, hits, top_k) -> list[SearchHit]`，
+  query 为原始用户问题、返回为 hits 的重排/子集）+ `IdentityReranker`
+  默认（未注入 = 不重排，候选窗口 ≥ top_k 时「先截候选再截 top_k」≡
+  「直接截 top_k」，零回归）；流程：初检（单路或多路 max 合并）→ 截
+  候选窗口 max(top_k×2,10) → 重排 → 截断最终 Top-K；空返回 = 重排器
+  合法裁决（透传空结果，与改写器「空→降级」刻意不对称）；降级仅两类
+  （抛异常/返回类型不合法 → 保持初检 + warning）；替身 `_OverlapReranker`
+  （query 词与 content 重合数重打分、同分保持初检相对顺序——有直接
+  单测锁定，因词法 0 分跳过语义使端到端同分反序场景不可构造）；
+  Cross-Encoder/LLM 重排器留协议扩展点（上层注入，避免检索层耦合
+  Agent 模型层）。`KnowledgeService(reranker=...)` 注入接入。新增 11
+  个测试（首位变化优于基线、截断在重排后、候选窗口透传、Identity
+  零回归、替身确定性、与多路组合、过滤先于初检与重排、异常/类型
+  不合法/空返回三降级路径、注入可替换），全量 555 通过，ruff、mypy
+  strict（34 文件）干净；独立 review 无 Critical/Important，5 个
+  Minor（空返回语义澄清、calls 三元组、caplog 对称、协议 docstring、
+  平局测试重写）已处理并复审放行。
 
 ### S4-T3 自适应 RAG 策略
 

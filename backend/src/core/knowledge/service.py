@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from .chunking import chunk_documents, chunk_documents_semantic
 from .index import KnowledgeIndex
 from .models import KnowledgeChunk, KnowledgeDocument, SearchHit
-from .retrieval import QueryRewriter, multi_query_search
+from .retrieval import QueryRewriter, Reranker, multi_query_search
 
 # 可选分块策略（S3-T2）：
 # - "character"：字符窗口分块（默认，S3-T1 起的行为，保持不变）；
@@ -28,6 +28,7 @@ class KnowledgeService:
         max_chunk_size: int = 2000,
         min_chunk_size: int = 200,
         rewriter: QueryRewriter | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         """初始化服务。
 
@@ -45,6 +46,13 @@ class KnowledgeService:
           改写为多个变体、每变体各检索一次、按 chunk_id 去重后以
           max 分数合并排序（协议与语义详见 retrieval.py 模块注释；
           改写失败自动降级为原始 query 单路，不抛错）。
+        - reranker（S4-T2）：重排器，可选。None 表示默认
+          IdentityReranker——不重排，行为与 S4-T1 完全一致（零回归）；
+          传入自定义重排器后，每次 search 会先做初检（单路或多路
+          合并）、截出候选窗口 max(top_k×2, 10)，再把候选交给重排器
+          重新排序，最后按重排后的顺序截断 top_k（协议与语义详见
+          retrieval.py 模块注释第 7 节；重排失败自动保持初检结果，
+          不抛错）。
         """
         if chunking not in _CHUNKING_STRATEGIES:
             raise ValueError("chunking must be 'character' or 'semantic'")
@@ -55,6 +63,7 @@ class KnowledgeService:
         self._max_chunk_size = max_chunk_size
         self._min_chunk_size = min_chunk_size
         self._rewriter = rewriter
+        self._reranker = reranker
 
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
@@ -111,6 +120,13 @@ class KnowledgeService:
         失败自动降级为原始 query 单路检索，不抛错（语义详见
         retrieval.py 模块注释第 3/4/5 节）。
 
+        S4-T2 重排序（面向初学者）：search 的流程是「初检 → 重排 →
+        截断」。默认不重排（IdentityReranker 零回归，结果与 S4-T1
+        逐项一致）；注入重排器后，初检合并结果先截出候选窗口
+        （max(top_k×2, 10) 名）交给重排器重新排序，再按重排后的顺序
+        截断最终 top_k；重排失败自动保持初检结果，不抛错（语义详见
+        retrieval.py 模块注释第 7 节）。
+
         过滤语义（S3-T3，面向初学者）：metadata_filter 是「键 → 值」
         字典，例如 {"source": "ml-zhouzhihua", "difficulty": "intermediate"}
         表示「只在这本书、这个难度里检索」。规则：
@@ -133,6 +149,7 @@ class KnowledgeService:
             query,
             top_k,
             rewriter=self._rewriter,
+            reranker=self._reranker,
             metadata_filter=metadata_filter,
         )
 
