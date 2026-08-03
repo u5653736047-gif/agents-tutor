@@ -54,6 +54,18 @@
    与代码块做最小保护（不被从中间截断）。策略透传给
    KnowledgeService 的 chunking 参数；两种策略产出的 chunk 坐标
    （document_id/page/start/end）语义一致，均可回溯到原文。
+8. 向量索引（S3-T4，可选）
+   --vector 开关：入库时同步把每个分块写入独立的向量库
+   （默认 data/vector_knowledge.db，与词法库 data/knowledge.db 并列，
+   都在 data/ 下、不进 git）。向量库存分块原文 + 归一化后的向量
+   （Embedding 默认内置哈希替身，离线零依赖；真实语义模型接入方式见
+   docs/EMBEDDING_SELECTION.md）。向量索引与词法索引是两份独立数据：
+   - 已入库的书（完成标记存在）带 --vector 重跑时，自动从词法库读出
+     该书全部分块补写向量（增量构建，不重新解析 PDF）；
+   - --force --vector 重入库时，词法与向量同步整文档替换；
+   - --verify 仍走词法索引（词法结果不变，向量检索正确性由测试覆盖）。
+   语义检索与词法检索的并存关系、协议设计见 core/knowledge/vector_index.py
+   模块注释与选型文档。
 """
 
 from __future__ import annotations
@@ -66,10 +78,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
+from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import iter_pdf_pages
 from core.knowledge.models import KnowledgeDocument
 from core.knowledge.service import KnowledgeService
+from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
 
 # ── 路径与常量约定 ───────────────────────────────────────────────
 # 脚本位于 backend/scripts/，向上两级即仓库根；数据目录与数据库都放在
@@ -78,6 +92,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = Path(__file__).resolve().parent / "knowledge_manifest.json"
 DEFAULT_BOOKS_DIR = REPO_ROOT / "data" / "books"
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "knowledge.db"
+DEFAULT_VECTOR_DB_PATH = REPO_ROOT / "data" / "vector_knowledge.db"
 
 # 逻辑 source 标识的合法形式：小写字母开头，只含小写字母/数字/连字符，
 # 且连字符不能出现在首尾或连续出现（如 ml-、ml--a 均非法）。
@@ -294,6 +309,7 @@ def ingest_book(
     page_loader: PageLoader | None = None,
     progress: Callable[[int, int], None] | None = None,
     chunking: str = "character",
+    vector_index: SqliteVectorKnowledgeIndex | None = None,
 ) -> IngestResult:
     """入库一本书，返回入库结果。
 
@@ -301,20 +317,32 @@ def ingest_book(
     1. 阻塞书（清单 blocked 字段非空）直接返回 blocked，不解析不入库
        （含 --force；数据源不可用时强制入库只会报错，恢复方式见模块注释）；
     2. 默认模式：已有完成标记 → 直接跳过（不重新解析，节省大文件时间）；
+       若同时提供了 vector_index 且该书在向量库中还没有分块，则从词法库
+       读出已有 chunk 补写向量（增量构建向量索引，无需重新解析 PDF）；
     3. --force：先清除完成标记再重新入库，中途失败则无标记，
        下次默认运行会重新尝试（断点续跑语义）；
     4. 解析全部页 → 注入学科/难度/书名 metadata → 一次性 add_documents
        （S0-T2 整文档替换：旧 chunk 先删后插，无残留）；
+       若提供了 vector_index：同步维护向量库（先删该书旧向量再写新向量，
+       与词法库的整文档替换语义一致——向量索引是独立数据，需手动同步）；
     5. 全部成功后才写完成标记。
 
     分块策略（S3-T2）：chunking 参数（"character" 默认 | "semantic"）
     透传给 KnowledgeService 构造，与 CLI --chunking 一一对应；
     默认 character 与 S3-T1 行为完全一致。
+
+    向量索引（S3-T4）：vector_index 参数可选，传入时该书的向量分块
+    与词法分块同步写入；不传则纯词法入库（与 S3-T1 行为完全一致）。
     """
     if book.blocked:
         return IngestResult(book_source=book.source, status="blocked")
 
     if not force and index.is_document_complete(book.source):
+        if vector_index is not None and not vector_index.has_document(book.source):
+            # 增量补建向量（S3-T4）：词法库已入库但向量库缺失——例如
+            # 先前入库未带 --vector。直接从词法库读出该书的全部 chunk
+            # 原样补写向量索引，不重新解析 PDF（大文件省时关键）。
+            vector_index.upsert(index.chunks_of_document(book.source))
         return IngestResult(book_source=book.source, status="skipped")
 
     if force:
@@ -335,6 +363,12 @@ def ingest_book(
 
     service = KnowledgeService(index, chunking=chunking)
     chunks = service.add_documents(pages)
+    if vector_index is not None:
+        # 向量索引与词法索引是两份独立数据（不同数据库文件），整文档替换
+        # 语义需要手动同步：先删该书旧向量，再写入新向量（与上方
+        # add_documents 内部「先删后插」的顺序一致，中途失败不残留旧版）。
+        vector_index.delete_document(book.source)
+        vector_index.upsert(chunks)
     index.mark_document_complete(
         book.source, chunk_count=len(chunks), page_count=len(pages)
     )
@@ -453,6 +487,21 @@ def main(argv: list[str] | None = None) -> int:
         "semantic=按章节标题/段落边界，并保护公式与代码块不被截断。"
         "注意：完成标记不记录策略，更换策略后需加 --force 重新入库",
     )
+    parser.add_argument(
+        "--vector",
+        action="store_true",
+        help="同步构建向量索引（S3-T4）：每个分块额外写入向量库，检索可命中"
+        "同义表述。默认 Embedding 用内置哈希替身（离线零依赖，语义能力有限，"
+        "选型与真实语义模型接入方式见 docs/EMBEDDING_SELECTION.md）。"
+        "词法库已入库而向量库缺失时（先前未带 --vector 入库），"
+        "本开关会自动从词法库补建向量，无需 --force 重新解析",
+    )
+    parser.add_argument(
+        "--vector-db",
+        type=Path,
+        default=DEFAULT_VECTOR_DB_PATH,
+        help="向量索引数据库路径（默认 data/vector_knowledge.db，随 data/ 不进 git）",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.top_k <= 10:
@@ -467,6 +516,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     index = SqliteKnowledgeIndex(args.db)
+    # S3-T4：向量库只在「入库/补建」路径打开，--verify 分支不构造——
+    # 否则 --vector --verify 会白白创建一个空的向量库文件。
+    # Embedding 提供方默认 HashEmbeddingProvider（离线零依赖）；
+    # 想换真实语义模型（fastembed + bge-small-zh-v1.5）时，把下面的
+    # provider 换成 FastEmbedProvider() 即可（协议可替换；注意不同
+    # 模型维度可能不同，更换后需 --force 重建向量库，见
+    # core/knowledge/embedding.py 与 docs/EMBEDDING_SELECTION.md）。
+    vector_index: SqliteVectorKnowledgeIndex | None = None
     try:
         if args.verify:
             service = KnowledgeService(index)
@@ -502,6 +559,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0 if failed == 0 else 1
 
+        # --vector：走到这里说明不是 --verify 分支（verify 已在上方
+        # return），此时才打开向量库，避免空库文件被创建。
+        if args.vector:
+            vector_index = SqliteVectorKnowledgeIndex(
+                args.vector_db, provider=HashEmbeddingProvider()
+            )
+
         failed_books: list[str] = []
         blocked_count = 0
         total_books = len(books)
@@ -516,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
                     force=args.force,
                     progress=_print_progress,
                     chunking=args.chunking,
+                    vector_index=vector_index,
                 )
             except ValueError as exc:
                 # 单本书失败只影响它自己：无完成标记，下次默认运行会自动重试；
@@ -553,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         index.close()
+        if vector_index is not None:
+            vector_index.close()
 
 
 if __name__ == "__main__":

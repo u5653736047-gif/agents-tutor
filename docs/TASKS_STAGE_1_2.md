@@ -457,7 +457,7 @@
   一致），全量 496 通过，ruff、mypy strict（30 文件）干净；独立 review 无
   Critical/Important，6 个 Minor 已处理并复审放行。
 
-### S3-T4 Embedding 选型与向量索引
+### [x] S3-T4 Embedding 选型与向量索引
 
 - 对应总清单：2.2.3（Embedding 接入、向量库接入部分）
 - 范围：`src/core/knowledge/index.py`（新增实现）、`pyproject.toml`、ingest 脚本。
@@ -470,6 +470,23 @@
   - 新增依赖全部写入 `pyproject.toml` 并锁定；测试不依赖外部网络服务
     （外部 Embedding API 用替身封装）。
 - 依赖：S3-T3。
+- 完成备注：2026-08-03；选型书面结论见
+  `docs/EMBEDDING_SELECTION.md`（embedding 四候选三维对比 + 向量库对比）：
+  embedding 推荐 fastembed+bge-small-zh（离线、~100MB 缓存、无 torch），
+  项目默认 `HashEmbeddingProvider`（zlib.crc32 字符特征、零依赖、跨进程
+  确定），`FastEmbedProvider` 为可选适配器（协议预留替换点）；向量库不选
+  Chroma（重依赖），自研 SQLite BLOB（float32）+ 内存矩阵（1.5 万×256
+  维≈15MB），`data/vector_knowledge.db` 随 data/ 不入 git。`EmbeddingProvider`
+  协议与 `KnowledgeIndex` 协议并存，`KnowledgeService` 仅依赖协议（挂
+  向量索引即走向量）；ingest `--vector` 可选（默认哈希替身），已入库书
+  增量补建不重新解析 PDF；语义用例（土豆→马铃薯、CNN→卷积神经网络）
+  词法 0 命中、向量 top1 命中（替身证明链路，真实模型验证路径写入文档）。
+  维度防护：重载校验维度与 provider 一致（不一致 ValueError 提示
+  --force 重建），`_dot` 长度断言防静默截断；更换 embedding provider
+  需 --force 重建（文档与注释已注明）。零新增依赖（pyproject 未动），
+  全部测试离线。新增 19 个测试，全量 518 通过，ruff、mypy strict
+  （32 文件）干净；独立 review 无 Critical，I-1（维度重载防护）与
+  5 个 Minor 已处理并复审放行。
 
 ### S3-T5 混合检索
 

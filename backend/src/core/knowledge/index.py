@@ -111,11 +111,11 @@ def _metadata_where_clause(
        标量时返回 0 行还是 1 行（不同 SQLite 版本行为可能不同），
        OR 双分支的结果都正确——字符串值由 json_extract 分支命中，
        列表值由 json_each 分支命中，两者互不依赖。
-    3. 不用独立列：metadata 键集会随领域字段扩展（S3-T3 已 7 个键，
-       S3-T4 还会加 embedding 相关字段），独立列需要 ALTER TABLE
-       迁移旧库且键集固定；JSON1 是 Python 内置 sqlite3 自带能力，
-       无需迁移。数万级 chunk 的过滤开销可控（全表扫描打分本就要
-       读每一行）。
+    3. 不用独立列：metadata 键集会随领域字段扩展（S3-T3 已 7 个键），
+       独立列需要 ALTER TABLE 迁移旧库且键集固定；向量不进 metadata——
+       S3-T4 起向量由向量索引的独立 BLOB 列存储（见 vector_index.py）。
+       JSON1 是 Python 内置 sqlite3 自带能力，无需迁移。数万级 chunk
+       的过滤开销可控（全表扫描打分本就要读每一行）。
     4. 防注入：键名已通过 _METADATA_KEY_PATTERN 白名单校验，拼进
        JSON path 安全；值一律用绑定参数。
     """
@@ -414,6 +414,44 @@ class SqliteKnowledgeIndex:
             "DELETE FROM ingest_marks WHERE document_id = ?", (document_id,)
         )
         self._conn.commit()
+
+    def chunks_of_document(self, document_id: str) -> list[KnowledgeChunk]:
+        """读取某个 document_id 的全部分块（含 metadata 反序列化）。
+
+        S3-T4 用途（面向初学者）：向量索引是独立于词法索引的另一份
+        数据。当词法库已入库、向量库缺失时（例如先前入库没有带
+        --vector），ingest 脚本用本方法把已有分块原样读出来补写向量
+        索引，无需重新解析 PDF（详见 ingest_books.py 的 --vector 说明）。
+        按 (start, chunk_id) 排序，保证多次读取顺序稳定。
+        """
+        rows = self._conn.execute(
+            "SELECT chunk_id, document_id, content, source, page, start, end, "
+            "metadata_json FROM chunks WHERE document_id = ? "
+            "ORDER BY start, chunk_id",
+            (document_id,),
+        )
+        return [
+            KnowledgeChunk(
+                chunk_id=chunk_id,
+                document_id=stored_document_id,
+                content=content,
+                source=source,
+                page=page,
+                start=start,
+                end=end,
+                metadata=json.loads(metadata_json),
+            )
+            for (
+                chunk_id,
+                stored_document_id,
+                content,
+                source,
+                page,
+                start,
+                end,
+                metadata_json,
+            ) in rows
+        ]
 
     def close(self) -> None:
         """关闭底层数据库连接。"""
