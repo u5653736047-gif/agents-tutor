@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
+import { ChatInput } from "@/components/chat-input";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ChatResponse, Message } from "@/lib/api-client";
 import { useChatStore } from "@/stores/chat-store";
@@ -93,14 +94,21 @@ export function ConversationPanel() {
   }, [isSending, messages, runError]);
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto" data-slot="message-list">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
-        <ConversationContent
-          isSending={isSending}
-          messages={messages}
-          runError={runError ?? null}
-        />
-        <div data-slot="conversation-end" ref={endRef} />
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto" data-slot="message-list">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
+          <ConversationContent
+            isSending={isSending}
+            messages={messages}
+            runError={runError ?? null}
+          />
+          <div data-slot="conversation-end" ref={endRef} />
+        </div>
+      </div>
+      <div className="border-t border-border px-8 py-4" data-slot="chat-input-area">
+        <div className="mx-auto w-full max-w-3xl">
+          <ChatInput />
+        </div>
       </div>
     </div>
   );
