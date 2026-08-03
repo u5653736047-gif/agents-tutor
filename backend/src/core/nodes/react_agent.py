@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
-from ..context import trim_message_history
+from ..context import (
+    MessageTokenCounter,
+    trim_message_history,
+)
 from ..events import ErrorCode, EventType, RunError, RunEvent
 from ..state import AgentRole, AgentState, ToolResult
 from ..tools import ToolExecutor
@@ -45,36 +48,35 @@ class ReActAgentNode:
         tool_executor: ToolExecutor | None = None,
         max_iterations: int = 5,
         max_context_messages: int | None = None,
+        max_context_tokens: int | None = None,
+        context_token_counter: MessageTokenCounter | None = None,
+        # S2-T2 分层讲解：可选的「按状态动态构建系统提示词」钩子。
+        # 为 None 时用构造时固定的 system_prompt（默认行为，既有单元
+        # 测试契约不变）；提供时每个 ReAct 轮次都会用当前 state 重新
+        # 生成提示词，让 learning_assistant 能按 state["level"] 切换
+        # 讲解深度（见 factory.py 与 prompts.learning_assistant_system_prompt）。
+        prompt_builder: Callable[[AgentState], str] | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
         if max_context_messages is not None and max_context_messages < 3:
             raise ValueError("max_context_messages must be at least 3")
+        if max_context_tokens is not None and max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be positive")
         self.role = role
         self.system_prompt = system_prompt
         self.model = model
         self.tool_executor = tool_executor or ToolExecutor()
         self.max_iterations = max_iterations
         self.max_context_messages = max_context_messages
+        self.max_context_tokens = max_context_tokens
+        self.context_token_counter = context_token_counter
+        self.prompt_builder = prompt_builder
 
     def run(self, state: AgentState) -> ReActResult:
         """运行到模型给出最终回答，或达到最大轮数。"""
         persisted_history = list(state.get("messages", []))
-        if self.max_context_messages is None:
-            history = list(persisted_history)
-            context_trimmed = 0
-        else:
-            context_window = trim_message_history(
-                persisted_history,
-                self.max_context_messages,
-            )
-            history = list(context_window.messages)
-            context_trimmed = context_window.trimmed_count
-        extra = {
-            **state.get("extra", {}),
-            "context_trimmed": context_trimmed,
-            "context_message_count": len(history),
-        }
+        extra = dict(state.get("extra", {}))
         generated: list[BaseMessage] = []
         tool_results: list[ToolResult] = []
         events: list[RunEvent] = []
@@ -84,6 +86,44 @@ class ReActAgentNode:
         )
         session_id = state.get("session_id")
         started_at = perf_counter()
+        # S2-T2 分层讲解：有 prompt_builder 时按当前状态动态生成系统
+        # 提示词（如 learning_assistant 按 state["level"] 分层讲解），
+        # 否则沿用构造时固定的 system_prompt——默认行为与改动前完全一致。
+        system_prompt = (
+            self.system_prompt
+            if self.prompt_builder is None
+            else self.prompt_builder(state)
+        )
+        system_message = SystemMessage(content=system_prompt)
+
+        def model_context() -> list[BaseMessage]:
+            combined = [*persisted_history, *generated]
+            if (
+                self.max_context_messages is None
+                and self.max_context_tokens is None
+            ):
+                history = combined
+                trimmed_count = 0
+                token_count = None
+            else:
+                # 预算覆盖完整消息视图；绑定工具 Schema 不属于历史窗口。
+                context_window = trim_message_history(
+                    combined,
+                    self.max_context_messages,
+                    max_tokens=self.max_context_tokens,
+                    token_counter=self.context_token_counter,
+                    prefix_messages=(system_message,),
+                )
+                history = list(context_window.messages)
+                trimmed_count = context_window.trimmed_count
+                token_count = context_window.token_count
+            extra["context_trimmed"] = trimmed_count
+            extra["context_message_count"] = len(history)
+            if token_count is None:
+                extra.pop("context_token_count", None)
+            else:
+                extra["context_token_count"] = token_count
+            return [system_message, *history]
 
         def emit(event_type: EventType, **values: Any) -> None:
             nonlocal sequence
@@ -101,11 +141,7 @@ class ReActAgentNode:
         emit(EventType.AGENT_STARTED)
 
         for iteration in range(1, self.max_iterations + 1):
-            messages = [
-                SystemMessage(content=self.system_prompt),
-                *history,
-                *generated,
-            ]
+            messages = model_context()
             try:
                 response = self.model.invoke(messages)
             except Exception:  # noqa: BLE001 - 模型边界只公开稳定错误分类

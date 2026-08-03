@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from threading import Event
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 
 from core.events import ErrorCode, EventType, RunError, RunEvent
@@ -48,6 +55,10 @@ def tool_call(name: str, call_id: str = "call-1") -> dict[str, object]:
     return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
 
 
+def _one_token_per_context_message(messages: Sequence[BaseMessage]) -> int:
+    return sum(not isinstance(message, SystemMessage) for message in messages)
+
+
 @pytest.mark.parametrize("max_iterations", [0, -1])
 def test_react_agent_rejects_non_positive_iteration_limit(
     max_iterations: int,
@@ -72,6 +83,50 @@ def test_react_agent_rejects_too_small_context_window(
             model=ScriptedModel([]),
             max_context_messages=max_context_messages,
         )
+
+
+@pytest.mark.parametrize("max_context_tokens", [0, -1])
+def test_react_agent_rejects_non_positive_token_budget(
+    max_context_tokens: int,
+) -> None:
+    with pytest.raises(ValueError, match="max_context_tokens"):
+        ReActAgentNode(
+            role=AgentRole.SUPERVISOR,
+            system_prompt="supervisor",
+            model=ScriptedModel([]),
+            max_context_tokens=max_context_tokens,
+        )
+
+
+def test_react_agent_does_not_count_tokens_without_token_budget() -> None:
+    counter_calls = 0
+
+    def exploding_counter(_: Sequence[BaseMessage]) -> int:
+        nonlocal counter_calls
+        counter_calls += 1
+        raise AssertionError("token counter must not be called")
+
+    model = ScriptedModel([AIMessage(content="answer")])
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=model,
+        max_context_messages=3,
+        context_token_counter=exploding_counter,
+    )
+    state = create_initial_state()
+    state["messages"] = [
+        HumanMessage(content="old"),
+        AIMessage(content="old answer"),
+        HumanMessage(content="latest"),
+        AIMessage(content="recent"),
+    ]
+
+    result = agent.run(state)
+
+    assert result.error is None
+    assert counter_calls == 0
+    assert "context_token_count" not in result.updates["extra"]
 
 
 def test_react_agent_trims_only_model_context_and_merges_extra_metrics() -> None:
@@ -185,6 +240,148 @@ def test_react_agent_feeds_tool_observation_back_to_model() -> None:
     assert result.metadata["iterations"] == 2
 
 
+def test_react_agent_reapplies_token_budget_with_generated_tool_group() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("double")]),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.TEACHING_ASSISTANT,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+        max_context_tokens=3,
+        context_token_counter=_one_token_per_context_message,
+    )
+    old_question = HumanMessage(content="old question")
+    old_answer = AIMessage(content="old answer")
+    latest_question = HumanMessage(content="latest question")
+    state = create_initial_state()
+    state["messages"] = [old_question, old_answer, latest_question]
+    original = list(state["messages"])
+
+    result = agent.run(state)
+
+    first_context = [
+        message
+        for message in model.calls[0]
+        if not isinstance(message, SystemMessage)
+    ]
+    second_context = [
+        message
+        for message in model.calls[1]
+        if not isinstance(message, SystemMessage)
+    ]
+    assert first_context == [old_question, old_answer, latest_question]
+    assert len(second_context) == 3
+    assert second_context[0] is latest_question
+    assert isinstance(second_context[1], AIMessage)
+    assert second_context[1].tool_calls[0]["id"] == "call-1"
+    assert isinstance(second_context[2], ToolMessage)
+    assert second_context[2].tool_call_id == "call-1"
+    assert second_context[2].content == "6"
+    assert old_question not in second_context
+    assert old_answer not in second_context
+    assert _one_token_per_context_message(model.calls[0]) <= 3
+    assert _one_token_per_context_message(model.calls[1]) <= 3
+    assert state["messages"] == original
+    assert [message.type for message in result.messages] == ["ai", "tool", "ai"]
+    assert result.updates["extra"] == {
+        "context_trimmed": 2,
+        "context_message_count": 3,
+        "context_token_count": 3,
+    }
+
+
+def test_react_agent_includes_system_message_in_token_count() -> None:
+    counted_contexts: list[tuple[BaseMessage, ...]] = []
+
+    def recording_counter(messages: Sequence[BaseMessage]) -> int:
+        counted_contexts.append(tuple(messages))
+        return len(messages)
+
+    agent = ReActAgentNode(
+        role=AgentRole.EVALUATOR,
+        system_prompt="system",
+        model=ScriptedModel([AIMessage(content="answer")]),
+        max_context_tokens=10,
+        context_token_counter=recording_counter,
+    )
+    state = create_initial_state()
+    state["messages"] = [HumanMessage(content="question")]
+
+    result = agent.run(state)
+
+    assert counted_contexts
+    assert all(
+        isinstance(messages[0], SystemMessage) for messages in counted_contexts
+    )
+    assert result.updates["extra"]["context_token_count"] == 2
+
+
+def test_react_agent_observes_timeout_and_continues_to_final_answer() -> None:
+    entered = Event()
+    release = Event()
+    finished = Event()
+
+    @tool
+    def blocking_tool() -> str:
+        """等待测试释放后才结束。"""
+        entered.set()
+        release.wait(timeout=2)
+        finished.set()
+        return "late result"
+
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("blocking_tool")]),
+            AIMessage(content="已识别工具超时，继续回答"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.TEACHING_ASSISTANT,
+        system_prompt="你是助教。",
+        model=model,
+        tool_executor=ToolExecutor(
+            [blocking_tool],
+            tool_timeout_seconds=0.25,
+        ),
+    )
+
+    try:
+        result = agent.run(create_initial_state())
+
+        assert entered.is_set()
+        assert finished.is_set() is False
+        assert result.error is None
+        assert result.metadata["iterations"] == 2
+        assert result.updates["messages"][-1].content == "已识别工具超时，继续回答"
+        assert any(
+            isinstance(message, ToolMessage)
+            and message.content == "错误：工具执行超时"
+            for message in model.calls[1]
+        )
+        tool_result = result.updates["tool_results"][0]
+        assert tool_result.error_code is ErrorCode.TOOL_TIMEOUT
+        assert tool_result.duration_ms is not None
+        tool_completed = next(
+            event
+            for event in result.updates["events"]
+            if event.event_type is EventType.TOOL_COMPLETED
+        )
+        assert tool_completed.success is False
+        assert tool_completed.error_code is ErrorCode.TOOL_TIMEOUT
+        assert tool_completed.duration_ms == tool_result.duration_ms
+        assert result.updates["events"][-1].event_type is EventType.AGENT_COMPLETED
+        assert result.updates["events"][-1].success is True
+    finally:
+        release.set()
+        finished.wait(timeout=1)
+    assert finished.is_set()
+
+
 def test_react_agent_emits_safe_ordered_events_after_history() -> None:
     model = ScriptedModel(
         [
@@ -232,6 +429,13 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "success",
         "duration_ms",
         "error_code",
+        "plan_step_sequence",
+        "degraded",
+        # S2-T1：INTENT_DETECTED 事件携带的意图值，默认 None 向后兼容
+        "intent",
+        # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论摘要，
+        # 默认 None 向后兼容（旧事件与未评价轮次不携带）
+        "evaluation_verdict",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
 

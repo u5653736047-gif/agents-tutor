@@ -51,6 +51,20 @@ python scripts/verify_deepseek_react.py
 脚本要求 `.env` 提供 `DEEPSEEK_MODEL`、`DEEPSEEK_BASE_URL` 和
 `DEEPSEEK_API_KEY`，执行过程中不会打印 API Key。
 
+### 2026-08-02 真实 DeepSeek 冒烟
+
+在允许外部网络访问的环境中运行验证脚本，脱敏日志如下：
+
+```text
+model=deepseek-v4-flash
+iterations=2
+tools=['double']
+answer=42
+```
+
+结论：真实模型完成两轮 ReAct，先调用 `double(21)`，读取工具结果后输出 `42`；
+模型决策、工具调用与最终回答链路均通过，运行过程未输出 API Key。
+
 ## 知识工具接入
 
 `create_search_knowledge_tool(service)` 返回普通 LangChain 工具。现有

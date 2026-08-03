@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from math import isfinite
 from time import perf_counter
 from typing import Any, cast
 
@@ -17,12 +19,15 @@ from ..state import AgentRole, ToolResult
 from .registry import ToolRegistry
 
 UNKNOWN_TOOL_NAME = "unknown_tool"
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+_TOOL_WORKER_COUNT = 4
 
 _SAFE_ERRORS = {
     ErrorCode.TOOL_UNKNOWN: "未注册工具",
     ErrorCode.TOOL_UNAUTHORIZED: "当前角色无权调用该工具",
     ErrorCode.TOOL_INVALID_ARGUMENTS: "工具参数无效",
     ErrorCode.TOOL_EXECUTION_FAILED: "工具执行失败",
+    ErrorCode.TOOL_TIMEOUT: "工具执行超时",
 }
 
 
@@ -42,6 +47,8 @@ class ToolExecutor:
         tools: Sequence[BaseTool] | ToolRegistry = (),
         *,
         registry: ToolRegistry | None = None,
+        tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        tool_timeouts: Mapping[str, float] | None = None,
     ) -> None:
         if isinstance(tools, ToolRegistry):
             if registry is not None:
@@ -52,6 +59,28 @@ class ToolExecutor:
         elif tools:
             raise ValueError("不能同时指定工具列表和工具注册表")
         self.registry = registry
+        self._tool_timeout_seconds = _validate_timeout(
+            tool_timeout_seconds,
+            "tool_timeout_seconds",
+        )
+        configured_timeouts = dict(tool_timeouts or {})
+        registered_names = {tool.name for tool in self.registry.list_tools()}
+        unknown_names = set(configured_timeouts) - registered_names
+        if unknown_names:
+            names = ", ".join(sorted(unknown_names))
+            raise ValueError(f"tool_timeouts 包含未注册工具：{names}")
+        self._tool_timeouts = {
+            name: _validate_timeout(timeout, f"tool_timeouts[{name!r}]")
+            for name, timeout in configured_timeouts.items()
+        }
+        self._pool = ThreadPoolExecutor(
+            max_workers=_TOOL_WORKER_COUNT,
+            thread_name_prefix="tool-executor",
+        )
+
+    def timeout_seconds_for(self, tool_name: str) -> float:
+        """返回指定工具的超时秒数，未覆盖时使用全局配置。"""
+        return self._tool_timeouts.get(tool_name, self._tool_timeout_seconds)
 
     def public_tool_name(self, tool_call: Mapping[str, Any]) -> str:
         """只公开注册表中的规范名称，避免模型生成名称进入持久状态。"""
@@ -92,8 +121,18 @@ class ToolExecutor:
                 error_code = ErrorCode.TOOL_EXECUTION_FAILED
             else:
                 try:
-                    output = _to_text(tool.invoke(dict(args)))
-                    success = True
+                    future = self._pool.submit(tool.invoke, dict(args))
+                    done, _ = wait(
+                        {future},
+                        timeout=self.timeout_seconds_for(tool.name),
+                    )
+                    if not done:
+                        # 只能取消尚未开始的任务；运行中的线程会自行结束，不做危险强杀。
+                        future.cancel()
+                        error_code = ErrorCode.TOOL_TIMEOUT
+                    else:
+                        output = _to_text(future.result())
+                        success = True
                 except Exception:  # noqa: BLE001 - 工具边界只公开稳定错误分类
                     error_code = ErrorCode.TOOL_EXECUTION_FAILED
 
@@ -116,6 +155,13 @@ class ToolExecutor:
             name=tool_name,
         )
         return ToolExecution(message=message, result=result)
+
+
+def _validate_timeout(value: float, field_name: str) -> float:
+    """超时必须是有限正数，避免立即超时或永久等待。"""
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be finite and positive")
+    return float(value)
 
 
 def _to_text(value: Any) -> str:

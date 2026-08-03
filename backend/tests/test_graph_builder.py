@@ -7,11 +7,18 @@ from collections.abc import Sequence
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
 
+import core.graph_builder as graph_builder_module
 from core.events import ErrorCode, EventType, RunError
 from core.graph_builder import CollaborativeAgentGraph
 from core.nodes.react_agent import ReActAgentNode
-from core.state import AgentRole, create_initial_state
+from core.state import (
+    AgentRole,
+    HandoffApprovalAction,
+    HandoffApprovalDecision,
+    create_initial_state,
+)
 
 
 @tool
@@ -44,6 +51,34 @@ class FailingModel:
         raise RuntimeError("secret=/srv/private/model-token")
 
 
+def count_context_messages(messages: Sequence[BaseMessage]) -> int:
+    return len(messages)
+
+
+def handoff_response(target: str = "teaching_assistant") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "handoff",
+                "args": {"target": target},
+                "id": "handoff-approval",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def test_interrupt_identifier_supports_langgraph_0_4_shape() -> None:
+    class LegacyInterrupt:
+        interrupt_id = "legacy-interrupt"
+
+    assert (
+        graph_builder_module._interrupt_identifier(LegacyInterrupt())
+        == "legacy-interrupt"
+    )
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -51,6 +86,8 @@ class FailingModel:
         ("max_handoffs", -1),
         ("max_agent_switches", 0),
         ("max_context_messages", 2),
+        ("max_context_tokens", 0),
+        ("tool_timeout_seconds", 0),
     ],
 )
 def test_graph_rejects_non_positive_limits(option: str, value: int) -> None:
@@ -64,9 +101,209 @@ def test_graph_forwards_context_window_to_every_agent() -> None:
     builder = CollaborativeAgentGraph(
         model=ScriptedModel([]),
         max_context_messages=7,
+        max_context_tokens=100,
+        context_token_counter=count_context_messages,
     )
 
     assert {agent.max_context_messages for agent in builder.agents.values()} == {7}
+    assert {agent.max_context_tokens for agent in builder.agents.values()} == {100}
+    assert {
+        agent.context_token_counter for agent in builder.agents.values()
+    } == {count_context_messages}
+
+
+def test_handoff_interrupt_requires_checkpointer() -> None:
+    model = ScriptedModel([])
+
+    with pytest.raises(ValueError, match=r"interrupt_before_handoff.*checkpointer"):
+        CollaborativeAgentGraph(
+            model=model,
+            interrupt_before_handoff=True,
+        )
+
+    assert model.calls == []
+
+
+def test_handoff_interrupts_before_worker_dispatch() -> None:
+    model = ScriptedModel(
+        [handoff_response(), AIMessage(content="分派提案已生成")]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "approval-paused"
+    user_id = "user-1"
+
+    paused = graph.run("请解释梯度下降", session_id, user_id)
+    snapshot = graph.build().get_state(graph._thread_config(session_id, user_id))
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    proposal = paused["pending_handoff"]
+
+    assert len(model.calls) == 2
+    assert all("协调者" in str(call[0].content) for call in model.calls)
+    assert snapshot.next == ("handoff_approval",)
+    assert len(snapshot.interrupts) == 1
+    assert snapshot.interrupts[0].value == {
+        "target_agent": "teaching_assistant",
+        "task_content": "请解释梯度下降",
+    }
+    assert proposal is not None
+    assert proposal.target_agent is AgentRole.TEACHING_ASSISTANT
+    assert proposal.task_content == "请解释梯度下降"
+    assert pending is not None
+    assert pending.interrupt_id == graph_builder_module._interrupt_identifier(
+        snapshot.interrupts[0]
+    )
+    assert pending.request == proposal
+    assert paused["handoff_count"] == 0
+    assert paused["agent_switch_count"] == 0
+    assert len(paused["tool_results"]) == 1
+    assert not any(
+        event.event_type is EventType.AGENT_SWITCHED
+        for event in paused["events"]
+    )
+
+
+def test_confirmed_handoff_dispatches_once_and_finishes() -> None:
+    model = ScriptedModel(
+        [
+            handoff_response(),
+            AIMessage(content="分派提案已生成"),
+            AIMessage(content="教学结果"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "approval-confirmed"
+    user_id = "user-1"
+    graph.run("请解释梯度下降", session_id, user_id)
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert pending is not None
+    decision = HandoffApprovalDecision(
+        interrupt_id=pending.interrupt_id,
+        action=HandoffApprovalAction.CONFIRM,
+    )
+
+    result = graph.resume_handoff(session_id, decision, user_id=user_id)
+
+    assert [
+        "协调者" if "协调者" in str(call[0].content) else "助教"
+        for call in model.calls
+    ] == ["协调者", "协调者", "助教", "协调者"]
+    assert len(result["tool_results"]) == 1
+    assert result["pending_handoff"] is None
+    assert result["handoff_count"] == 1
+    assert result["agent_switch_count"] == 2
+    assert result["messages"][-1].content == "最终汇总"
+    assert [event.sequence for event in result["events"]] == list(
+        range(len(result["events"]))
+    )
+    assert sum(
+        event.event_type is EventType.AGENT_SWITCHED
+        and event.agent == AgentRole.TEACHING_ASSISTANT.value
+        for event in result["events"]
+    ) == 1
+
+
+def test_rejected_handoff_terminates_without_worker_dispatch() -> None:
+    model = ScriptedModel(
+        [handoff_response(), AIMessage(content="分派提案已生成")]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "approval-rejected"
+    user_id = "user-1"
+    graph.run("请解释梯度下降", session_id, user_id)
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert pending is not None
+    decision = HandoffApprovalDecision(
+        interrupt_id=pending.interrupt_id,
+        action=HandoffApprovalAction.REJECT,
+    )
+
+    result = graph.resume_handoff(session_id, decision, user_id=user_id)
+
+    assert len(model.calls) == 2
+    assert result["pending_handoff"] is None
+    assert result["next_agent"] is None
+    assert result["handoff_count"] == 0
+    assert result["agent_switch_count"] == 0
+    assert result["run_error"] is None
+    assert result["events"][-1].event_type is EventType.RUN_COMPLETED
+    assert graph.build().get_state(
+        graph._thread_config(session_id, user_id)
+    ).interrupts == ()
+
+
+def test_modified_handoff_applies_new_target_and_task() -> None:
+    model = ScriptedModel(
+        [
+            handoff_response(),
+            AIMessage(content="分派提案已生成"),
+            AIMessage(content="评价结果"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        checkpointer=InMemorySaver(),
+        interrupt_before_handoff=True,
+    )
+    session_id = "approval-modified"
+    user_id = "user-1"
+    graph.run("请解释梯度下降", session_id, user_id)
+    pending = graph.get_pending_handoff(session_id, user_id=user_id)
+    assert pending is not None
+    decision = HandoffApprovalDecision(
+        interrupt_id=pending.interrupt_id,
+        action=HandoffApprovalAction.MODIFY,
+        target_agent=AgentRole.EVALUATOR,
+        task_content="只检查引用完整性",
+    )
+
+    result = graph.resume_handoff(session_id, decision, user_id=user_id)
+
+    evaluator_call = model.calls[2]
+    assert "评价助手" in str(evaluator_call[0].content)
+    assert [
+        str(message.content)
+        for message in evaluator_call
+        if isinstance(message, HumanMessage)
+    ] == ["请解释梯度下降", "只检查引用完整性"]
+    assert result["task_context"] is not None
+    assert result["task_context"].description == "只检查引用完整性"
+    switched = [
+        event.agent
+        for event in result["events"]
+        if event.event_type is EventType.AGENT_SWITCHED
+    ]
+    assert switched == ["evaluator", "supervisor"]
+
+
+def test_graph_forwards_tool_timeout_configuration_to_shared_executor() -> None:
+    builder = CollaborativeAgentGraph(
+        model=ScriptedModel([]),
+        tools=[double],
+        tool_permissions={"double": {AgentRole.EVALUATOR}},
+        tool_timeout_seconds=2.0,
+        tool_timeouts={"double": 0.25},
+    )
+
+    executors = {id(agent.tool_executor) for agent in builder.agents.values()}
+    executor = next(iter(builder.agents.values())).tool_executor
+
+    assert len(executors) == 1
+    assert executor.timeout_seconds_for("double") == 0.25
+    assert executor.timeout_seconds_for("handoff") == 2.0
 
 
 def test_graph_registry_limits_handoff_to_supervisor() -> None:
@@ -83,6 +320,10 @@ def test_graph_registry_limits_handoff_to_supervisor() -> None:
     assert len(registries) == 1
     assert registry.is_authorized("handoff", AgentRole.SUPERVISOR)
     assert not registry.is_authorized("handoff", AgentRole.TEACHING_ASSISTANT)
+    assert registry.is_authorized("create_task_plan", AgentRole.SUPERVISOR)
+    assert not registry.is_authorized(
+        "create_task_plan", AgentRole.TEACHING_ASSISTANT
+    )
     assert registry.is_authorized("double", AgentRole.EVALUATOR)
     assert not registry.is_authorized("double", AgentRole.SUPERVISOR)
 
@@ -106,7 +347,16 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
         tool_permissions={},
     )
 
-    assert [tool.name for tool in builder.registry.list_tools()] == ["handoff"]
+    assert [tool.name for tool in builder.registry.list_tools()] == [
+        "handoff",
+        "create_task_plan",
+        # S2-T1：意图识别工具与既有调度工具一起暴露给 Supervisor
+        "detect_intent",
+        # S2-T2：学生水平画像工具（仅 Supervisor 可用，与 detect_intent 同约定）
+        "detect_level",
+        # S2-T3：结构化评价工具（仅 evaluator 可用，与 detect_intent 同约定）
+        "submit_evaluation",
+    ]
 
 
 def test_graph_rejects_none_permission_for_business_tool() -> None:
@@ -130,7 +380,9 @@ def test_graph_accepts_explicit_empty_role_set() -> None:
     )
 
 
-@pytest.mark.parametrize("permission_name", ["doubl", "handoff"])
+@pytest.mark.parametrize(
+    "permission_name", ["doubl", "handoff", "create_task_plan"]
+)
 def test_graph_rejects_permissions_for_non_business_tools(
     permission_name: str,
 ) -> None:

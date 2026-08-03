@@ -1,0 +1,99 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+:root {
+  --brand: oklch(0.546 0.245 262.88);
+  --brand-foreground: oklch(0.985 0.002 247.84);
+  --neutral-50: oklch(0.985 0.002 247.84);
+  --neutral-100: oklch(0.951 0.009 264.37);
+  --neutral-200: oklch(0.89 0.012 264.37);
+  --neutral-300: oklch(0.81 0.016 264.37);
+  --neutral-400: oklch(0.67 0.02 264.37);
+  --neutral-500: oklch(0.507 0.022 264.37);
+  --neutral-600: oklch(0.4 0.022 264.37);
+  --neutral-700: oklch(0.31 0.021 264.37);
+  --neutral-800: oklch(0.255 0.019 264.37);
+  --neutral-900: oklch(0.205 0.017 264.37);
+  --role-supervisor: oklch(0.546 0.245 262.88);
+  --role-teaching-assistant: oklch(0.52 0.12 193);
+  --role-learning-assistant: oklch(0.57 0.14 153);
+  --role-evaluator: oklch(0.66 0.14 75);
+  --app-font-sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+  --background: var(--neutral-50);
+  --foreground: var(--neutral-900);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--neutral-900);
+  --primary: var(--brand);
+  --primary-foreground: var(--brand-foreground);
+  --muted: var(--neutral-100);
+  --muted-foreground: var(--neutral-500);
+  --border: var(--neutral-200);
+  --destructive: oklch(0.577 0.245 27.33);
+  --app-radius-sm: 0.375rem;
+  --app-radius-md: 0.625rem;
+  --app-radius-lg: 0.875rem;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-neutral-50: var(--neutral-50);
+  --color-neutral-100: var(--neutral-100);
+  --color-neutral-200: var(--neutral-200);
+  --color-neutral-300: var(--neutral-300);
+  --color-neutral-400: var(--neutral-400);
+  --color-neutral-500: var(--neutral-500);
+  --color-neutral-600: var(--neutral-600);
+  --color-neutral-700: var(--neutral-700);
+  --color-neutral-800: var(--neutral-800);
+  --color-neutral-900: var(--neutral-900);
+  --color-role-supervisor: var(--role-supervisor);
+  --color-role-teaching-assistant: var(--role-teaching-assistant);
+  --color-role-learning-assistant: var(--role-learning-assistant);
+  --color-role-evaluator: var(--role-evaluator);
+  --font-sans: var(--app-font-sans);
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1.25rem;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.625rem;
+  --text-title: 1.5rem;
+  --text-title--line-height: 2rem;
+  --text-display: 2rem;
+  --text-display--line-height: 2.5rem;
+  --radius-sm: var(--app-radius-sm);
+  --radius-md: var(--app-radius-md);
+  --radius-lg: var(--app-radius-lg);
+  --spacing-1: var(--space-1);
+  --spacing-2: var(--space-2);
+  --spacing-3: var(--space-3);
+  --spacing-4: var(--space-4);
+  --spacing-6: var(--space-6);
+  --spacing-8: var(--space-8);
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--app-font-sans);
+}
