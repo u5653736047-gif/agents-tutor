@@ -14,6 +14,8 @@
 - 可选模型上下文裁剪，checkpoint 仍保留完整历史
 - 文本/PDF 加载、确定性分块、内存检索与可追溯引用工具
 - Python 代码沙箱执行、LaTeX 公式校验/MathML 转换、SQLite 学习记录读写工具
+- 作业批改闭环：PDF 上传解析、客观题自动批阅 + 主观题评分建议、学情诊断
+- 备课素材：测验/教案结构化骨架生成，内容由 Agent 模型填充
 - 工具级超时控制，超时归类为 `TOOL_TIMEOUT` 结构化错误
 - 使用项目根目录 `.env` 接入 DeepSeek
 - pytest、Ruff 和 mypy 质量检查
