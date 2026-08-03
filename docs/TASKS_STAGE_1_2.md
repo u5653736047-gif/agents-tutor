@@ -262,7 +262,7 @@
   ruff、mypy strict（30 文件）干净；独立 review 无 Critical，I-1 边界明示
   与 5 个 Minor 已处理并复审放行。
 
-### S2-T2 助学 Agent 分层讲解
+### [x] S2-T2 助学 Agent 分层讲解
 
 - 对应总清单：2.1.3（分层答疑部分）
 - 范围：`nodes/prompts.py`、`state.py`（学生水平画像的最小字段）。
@@ -274,6 +274,16 @@
   - 无水平信息时默认中等深度并在回答中说明可调整。
   - 测试用确定性替身模型断言不同水平的输出结构差异，不依赖真实模型玄学。
 - 依赖：S2-T1。
+- 完成备注：2026-08-03；`StudentLevel`（basic/advanced/unknown）写入
+  `state["level"]`（存字符串，跨轮保留的学生画像——与 intent 每轮重置
+  语义相反，仅 detect_level 时覆盖）；learning_assistant 经
+  `prompt_builder` 钩子每轮按 level 动态生成 system prompt（锚点词
+  basic「生活化类比」/ advanced「严谨推导」可确定性断言），其余 Agent
+  不受影响（钩子默认 None）；无水平归一 unknown 默认中等深度并说明可
+  调整；detect_level 仅 Supervisor 可调。新增 21 个测试（含枚举-指导词
+  一致性守卫、动态 prompt 长度/token 预算守卫、旧 checkpoint 无 level
+  通道退化路径），全量 360 通过，ruff、mypy strict（30 文件）干净；
+  独立 review 无 Critical/Important，5 个 Minor 已处理并复审放行。
 
 ### S2-T3 评价 Agent 基础评价规则
 

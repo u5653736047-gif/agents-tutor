@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
@@ -50,6 +50,12 @@ class ReActAgentNode:
         max_context_messages: int | None = None,
         max_context_tokens: int | None = None,
         context_token_counter: MessageTokenCounter | None = None,
+        # S2-T2 分层讲解：可选的「按状态动态构建系统提示词」钩子。
+        # 为 None 时用构造时固定的 system_prompt（默认行为，既有单元
+        # 测试契约不变）；提供时每个 ReAct 轮次都会用当前 state 重新
+        # 生成提示词，让 learning_assistant 能按 state["level"] 切换
+        # 讲解深度（见 factory.py 与 prompts.learning_assistant_system_prompt）。
+        prompt_builder: Callable[[AgentState], str] | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
@@ -65,6 +71,7 @@ class ReActAgentNode:
         self.max_context_messages = max_context_messages
         self.max_context_tokens = max_context_tokens
         self.context_token_counter = context_token_counter
+        self.prompt_builder = prompt_builder
 
     def run(self, state: AgentState) -> ReActResult:
         """运行到模型给出最终回答，或达到最大轮数。"""
@@ -79,7 +86,15 @@ class ReActAgentNode:
         )
         session_id = state.get("session_id")
         started_at = perf_counter()
-        system_message = SystemMessage(content=self.system_prompt)
+        # S2-T2 分层讲解：有 prompt_builder 时按当前状态动态生成系统
+        # 提示词（如 learning_assistant 按 state["level"] 分层讲解），
+        # 否则沿用构造时固定的 system_prompt——默认行为与改动前完全一致。
+        system_prompt = (
+            self.system_prompt
+            if self.prompt_builder is None
+            else self.prompt_builder(state)
+        )
+        system_message = SystemMessage(content=system_prompt)
 
         def model_context() -> list[BaseMessage]:
             combined = [*persisted_history, *generated]

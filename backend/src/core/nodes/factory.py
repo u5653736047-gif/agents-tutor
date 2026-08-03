@@ -10,7 +10,7 @@ from langchain_core.tools import BaseTool
 from ..context import MessageTokenCounter
 from ..state import AgentRole
 from ..tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolExecutor, ToolRegistry
-from .prompts import ROLE_PROMPTS
+from .prompts import ROLE_PROMPTS, learning_assistant_system_prompt
 from .react_agent import ChatModel, ReActAgentNode
 
 
@@ -44,6 +44,14 @@ def create_agent_nodes(
             max_context_messages=max_context_messages,
             max_context_tokens=max_context_tokens,
             context_token_counter=context_token_counter,
+            # S2-T2 分层讲解：只有助学 Agent 需要按状态动态调整提示词
+            # （按 state["level"] 学生水平分层，见 prompts.py）；其余角色
+            # 传 None，沿用静态 system_prompt，行为与改动前完全一致。
+            prompt_builder=(
+                (lambda state: learning_assistant_system_prompt(state.get("level")))
+                if role is AgentRole.LEARNING_ASSISTANT
+                else None
+            ),
         )
         for role, prompt in ROLE_PROMPTS.items()
     }

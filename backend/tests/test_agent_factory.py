@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 
 from core.nodes.factory import create_agent_nodes
-from core.nodes.prompts import ROLE_PROMPTS
+from core.nodes.prompts import ROLE_PROMPTS, learning_assistant_system_prompt
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole
 from core.tools import ToolRegistry
@@ -64,8 +64,25 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
         assert agent.system_prompt == ROLE_PROMPTS[role]
     # S2-T1：Supervisor 提示词新增了意图识别约定（detect_intent 与五类意图
     # 的路由说明），长度上限从 160 放宽到 400，其余角色提示词远低于此。
-    assert max(map(len, ROLE_PROMPTS.values())) <= 400
+    # S2-T2：Supervisor 提示词又新增了学生水平识别约定（detect_level 的
+    # 调用时机），上限再放宽到 500；其余角色提示词仍远低于此。
+    assert max(map(len, ROLE_PROMPTS.values())) <= 500
     assert model.bind_count == 1
+
+
+def test_learning_assistant_dynamic_prompt_length_is_bounded() -> None:
+    """S2-T2：动态水平提示词（静态角色卡 + 水平锚点 + 档位指导词）总长受控。
+
+    ROLE_PROMPTS 长度上限只覆盖静态角色卡；动态水平段按 state["level"]
+    每轮追加（见 prompts.learning_assistant_system_prompt），这里锁
+    「叠加后」的总长——现状最长约 176 字符（unknown 档），上限取 220
+    留 44 字符余量，防止未来指导词膨胀撑爆上下文预算。
+    """
+    lengths = [
+        len(learning_assistant_system_prompt(level))
+        for level in (None, "basic", "advanced")
+    ]
+    assert max(lengths) <= 220
 
 
 def test_factory_accepts_and_shares_registry() -> None:

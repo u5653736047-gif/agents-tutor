@@ -73,6 +73,32 @@ class Intent(StrEnum):
     UNCLEAR = "unclear"
 
 
+class StudentLevel(StrEnum):
+    """学生水平画像分类（S2-T2 分层讲解）。
+
+    为什么需要这个枚举（对应验收标准「至少 基础/进阶 两档 + 默认未知」）：
+    - 助学 Agent（learning_assistant）的讲解深度按学生水平分层：基础
+      BASIC 重直觉类比、进阶 ADVANCED 重推导与边界条件、未知 UNKNOWN
+      默认中等深度并说明可调整；
+    - 枚举把「学生自评/模型识别」的自由文本收敛为稳定、可校验的标签，
+      与 Intent 一样写入 state["level"]（枚举值字符串，见 AgentState.level
+      注释）与 task_context.level 快照；
+    - 可扩展：新增档位只需在此追加枚举值，并在 nodes/prompts.py 的
+      _LEVEL_GUIDANCE 中补充对应讲解策略，不需要改图结构。
+
+    与 Intent 的关键差异（生命周期语义，这是 S2-T2 的核心设计）：
+    - Intent 是「本轮意图」：每轮重新识别，run() 在新用户轮次重置；
+    - StudentLevel 是「跨轮保留的学生画像」：新轮不重置，仅当模型再次
+      调用 detect_level（学生自报新水平）时才覆盖；首次提问无水平信息
+      时保持 None，读取侧（prompts.learning_assistant_system_prompt）
+      按 UNKNOWN 归一处理（默认中等深度）。
+    """
+
+    BASIC = "basic"
+    ADVANCED = "advanced"
+    UNKNOWN = "unknown"
+
+
 # ─────────────────────────────────────────────
 # 助手消息的 Agent 角色元数据
 # ─────────────────────────────────────────────
@@ -181,6 +207,12 @@ class TaskContext(BaseModel):
     # - task_context.intent 是自由字符串的任务上下文快照（跨轮持久，
     #   供 Worker/聚合读取），保留宽松约束以便容纳历史数据与未来扩展。
     intent: str = Field(default="", description="用户意图分类标签（自由字符串快照）")
+    # S2-T2 学生水平：与 state["level"] 的约束差异是有意的（同 intent 模式）：
+    # - state["level"] 是严格校验后的 StudentLevel 枚举值字符串（跨轮保留的
+    #   权威画像，见 AgentState.level 注释）；
+    # - task_context.level 是自由字符串的任务上下文快照（随任务分派写入，
+    #   供 Worker/聚合读取），保留宽松约束以便容纳历史数据与未来扩展。
+    level: str = Field(default="", description="学生水平标签（自由字符串快照）")
     description: str = Field(default="", description="任务自然语言描述")
     subtasks: list[str] = Field(default_factory=list, description="分解后的子任务列表")
     status: TaskStatus = Field(default=TaskStatus.PENDING)
@@ -440,6 +472,36 @@ class AgentState(TypedDict, total=False):
     # 意图不明（UNCLEAR）时的追问逻辑见 graph_builder._wrap 的拦截说明。
     intent: Annotated[str | None, _replace]
 
+    # --- 学生水平画像（S2-T2） ---
+    # 学生水平（StudentLevel 枚举的 value 字符串）；last-write-wins，
+    # 由 detect_level 工具结果经 _wrap 校验后写入。
+    #
+    # 为什么存字符串而不是 StudentLevel 枚举：
+    # 与 intent 同一理由——checkpoint 的 msgpack 序列化对自定义枚举有
+    # 类型注册依赖（未注册类型当前仅警告、未来版本会阻断），存枚举值
+    # 字符串永远是 msgpack 原生类型；读取方需要枚举时用
+    # StudentLevel(state["level"]) 转换（StrEnum 与字符串的 == 比较
+    # 天然成立，测试断言不受影响）。
+    #
+    # 与 intent 字段的异同（这是 S2-T2 的关键设计，务必区分）：
+    # - 相同点：都写在 state 而非只发事件（随 checkpoint 持久化），
+    #   都是「模型识别结果经 _wrap 校验后的权威值」，都存枚举值字符串；
+    # - 不同点（重置 vs 保留）：intent 是「本轮意图」，run() 在新用户
+    #   轮次重置为 None、每轮重新识别；level 是「跨轮保留的学生画像」，
+    #   run() 的重置列表刻意不含 level——只有模型再次调用 detect_level
+    #   （学生自报新水平）时才覆盖旧值，新轮不重置。
+    #   为什么语义不同：意图回答「这一轮用户想干什么」，属于单轮；
+    #   水平回答「这个学生是谁」，属于跨轮持续的画像，若每轮重置，
+    #   已建立的水平画像会丢失，分层讲解也随之失效。
+    # - 首次提问无水平信息：level 保持 None（初始默认），读取侧按
+    #   StudentLevel.UNKNOWN 处理（默认中等深度讲解，见 prompts.py）。
+    #
+    # 为什么放 state 而不是只放 task_context：state 是跨轮画像的权威
+    # 来源，无论本轮是否分派任务都保留（直接回答轮同样记录学生水平）；
+    # task_context.level 只是分派时的快照（与 task_context.intent 同构），
+    # 供 Worker 读取。
+    level: Annotated[str | None, _replace]
+
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
@@ -493,6 +555,9 @@ def create_initial_state(
         next_agent=None,
         pending_handoff=None,
         intent=None,
+        # S2-T2 学生水平画像：初始为 None（「尚未识别任何水平」），
+        # 跨轮保留、不随新轮重置；读取侧按 StudentLevel.UNKNOWN 归一。
+        level=None,
         task_context=None,
         task_plan=None,
         task_results=[],

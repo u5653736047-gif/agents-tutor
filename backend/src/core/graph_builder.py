@@ -33,6 +33,7 @@ from .state import (
     HandoffApprovalRequest,
     Intent,
     PendingHandoffApproval,
+    StudentLevel,
     TaskContext,
     TaskPlan,
     TaskPlanStatus,
@@ -108,6 +109,37 @@ def detect_intent(intent: Intent, reason: str = "") -> str:
     )
 
 
+class _LevelInput(BaseModel):
+    """仅暴露给模型的水平识别输入，level 取值由 StudentLevel 枚举严格约束。
+
+    与 _IntentInput 同一约定：extra="forbid" 防止模型夹带任意字段，
+    非法水平值会在工具执行层被 TOOL_INVALID_ARGUMENTS 拒绝，
+    不会进入 ToolResult 审计记录。
+    reason 不设长度硬约束：超长理由由工具函数截断（见 detect_level），
+    避免 schema 校验失败导致整个水平识别丢失。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: StudentLevel
+    reason: str = ""
+
+
+@tool(args_schema=_LevelInput)
+def detect_level(level: StudentLevel, reason: str = "") -> str:
+    """识别或更新学生水平画像（学生自报基础/进阶时调用），返回分类标签。"""
+    # 与 detect_intent 同构：LangChain 工具执行时 args 里的 level 是
+    # 字符串而非 StudentLevel 实例，这里显式转换保证输出永远是规范值
+    # （schema 校验已保证值合法，转换不会失败）。
+    # reason 截断到 200 字符：审计字段有界，超长理由不丢失水平识别。
+    # 返回 JSON 而非裸枚举值：ToolResult.output 是审计记录，JSON 里同时
+    # 保留水平与理由，_level_from_results 只取 level 字段。
+    return json.dumps(
+        {"level": StudentLevel(level).value, "reason": reason[:200]},
+        ensure_ascii=False,
+    )
+
+
 class CollaborativeAgentGraph:
     """注册四个同构 ReAct Agent，并负责它们之间的路由。"""
 
@@ -165,6 +197,12 @@ class CollaborativeAgentGraph:
         # 与 handoff / create_task_plan 一样由模型在 ReAct 循环中调用。
         registry.register(
             detect_intent,
+            allowed_roles={AgentRole.SUPERVISOR},
+        )
+        # S2-T2 学生水平画像：detect_level 仅 Supervisor 可用（与
+        # detect_intent 同一约定），由模型在学生自报水平时调用。
+        registry.register(
+            detect_level,
             allowed_roles={AgentRole.SUPERVISOR},
         )
         for business_tool in tools:
@@ -427,23 +465,49 @@ class CollaborativeAgentGraph:
             ):
                 target = None
                 new_plan = None
+            # ── S2-T2 学生水平画像：解析模型识别的水平并写入 state ──
+            # 与 intent 的生命周期语义相反（这是本任务的关键设计）：
+            # - intent 每轮重置、只属于「本轮」（run() 重置列表含 intent）；
+            # - level 是「跨轮保留的学生画像」：本轮未调用 detect_level
+            #   时保留 checkpoint 中的旧值（run() 的重置列表刻意不含
+            #   level），首次提问无水平信息时为 None，读取侧按
+            #   StudentLevel.UNKNOWN 归一（默认中等深度）。
+            # 写入不依赖「确定分派」：学生自报水平即使本轮直接回答
+            # （无 handoff/计划），也应记录进画像——跨轮画像要为后续
+            # 轮次的分层讲解服务，这正是「保留而非重置」的意义。
+            level = _level_from_results(tool_results)
+            if level is not None:
+                updates["level"] = level.value
             # 意图识别结果同步进跨轮持久字段 task_context.intent：
             # Worker 与聚合阶段可读取意图标签做针对性工作，同时保留审计轨迹。
             # 仅在确定分派（非 UNCLEAR、确有目标或计划）时写入，避免「直接回答
             # 澄清问题」这类无任务轮次污染任务上下文。
+            # 水平画像在同一处、同一条件同步进 task_context.level（与
+            # task_context.intent 同构的快照）：本轮新识别的水平优先，
+            # 否则沿用 state 中保留的旧画像——保证分派给 Worker 的任务
+            # 上下文始终携带「为哪个水平的学生讲解」，而 state["level"]
+            # 仍是权威来源。
             if (
                 intent is not None
                 and intent is not Intent.UNCLEAR
                 and (target is not None or new_plan is not None)
             ):
-                existing_context = state.get("task_context")
-                updates["task_context"] = (
-                    TaskContext(intent=intent.value)
-                    if existing_context is None
-                    else TaskContext.model_validate(existing_context).model_copy(
-                        update={"intent": intent.value}
-                    )
+                current_level = (
+                    level.value if level is not None else state.get("level")
                 )
+                existing_context = state.get("task_context")
+                if existing_context is None:
+                    updates["task_context"] = TaskContext(
+                        intent=intent.value,
+                        level=current_level or "",
+                    )
+                else:
+                    context_update: dict[str, str] = {"intent": intent.value}
+                    if current_level is not None:
+                        context_update["level"] = current_level
+                    updates["task_context"] = TaskContext.model_validate(
+                        existing_context
+                    ).model_copy(update=context_update)
             plan = existing_plan or new_plan
             replacing_plan = new_plan is not None and existing_plan is not None
             if new_plan is not None and existing_plan is None:
@@ -1013,6 +1077,10 @@ class CollaborativeAgentGraph:
                         # S2-T1：每轮重新识别意图，旧意图随新轮清除，
                         # 避免上一轮的意图误导本轮路由。
                         "intent": None,
+                        # S2-T2：这里刻意不重置 level——学生水平是「跨轮
+                        # 保留的画像」（与 intent 相反），只有模型再次调用
+                        # detect_level 时才覆盖；若随新轮重置，已建立的
+                        # 水平画像会丢失，分层讲解也随之失效。
                         "task_plan": None,
                         "task_results": [],
                         "run_error": None,
@@ -1141,7 +1209,14 @@ class CollaborativeAgentGraph:
         return list(state.get("messages", []))
 
     def get_node_info(self) -> dict[str, dict[str, str]]:
-        """返回节点身份与 Prompt，便于调试和展示。"""
+        """返回节点身份与 Prompt，便于调试和展示。
+
+        注意：返回的是静态系统提示词（ROLE_PROMPTS 角色卡）。S2-T2 起，
+        助学 Agent（learning_assistant）的讲解深度按学生水平分层，其运行时
+        实际发给模型的 system prompt 是静态卡 + 「[当前学生水平:...]」动态
+        水平段（见 prompts.learning_assistant_system_prompt，按
+        state["level"] 每轮生成）；如需查看完整提示词，请对该角色调用该函数。
+        """
         return {
             role.value: {
                 "role": role.value,
@@ -1172,6 +1247,25 @@ def _intent_from_results(tool_results: Sequence[ToolResult]) -> Intent | None:
             try:
                 payload = json.loads(result.output)
                 return Intent(str(payload["intent"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+    return None
+
+
+def _level_from_results(tool_results: Sequence[ToolResult]) -> StudentLevel | None:
+    """只读取本次 Supervisor 成功调用的最后一个 detect_level 结果。
+
+    与 _intent_from_results 同一哲学（写入端严格、读取端宽容）：
+    解析失败返回 None 而非抛错，本轮退化为「水平未知」，不击穿运行。
+    与意图的关键差异：返回 None 只表示「本轮未更新水平画像」，
+    不会清空 checkpoint 中已保留的旧水平（跨轮保留语义，见 state.py
+    AgentState.level 注释）——是否覆盖旧值由调用方决定。
+    """
+    for result in reversed(tool_results):
+        if result.tool_name == "detect_level" and result.success:
+            try:
+                payload = json.loads(result.output)
+                return StudentLevel(str(payload["level"]))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return None
     return None
@@ -1441,4 +1535,10 @@ def _pending_handoff_from_snapshot(
     )
 
 
-__all__ = ["CollaborativeAgentGraph", "create_task_plan", "detect_intent", "handoff"]
+__all__ = [
+    "CollaborativeAgentGraph",
+    "create_task_plan",
+    "detect_intent",
+    "detect_level",
+    "handoff",
+]
