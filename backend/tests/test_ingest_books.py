@@ -32,6 +32,7 @@ from ingest_books import (
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.models import KnowledgeDocument
 from core.knowledge.service import KnowledgeService
+from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
 
 # ── 小工具：构造清单 JSON 与占位书文件 ────────────────────────────
 
@@ -777,3 +778,222 @@ def test_main_semantic_chunking_flag(tmp_path: Path) -> None:
         assert hit.chunk.metadata["chunking"] == "semantic"
     finally:
         reopened.close()
+
+
+# ── S3-T4 embedding provider 选择（--provider hash | fastembed）──
+
+
+class _StubFastEmbedProvider:
+    """fastembed 的测试替身：512 维确定性向量，不联网不加载模型。
+
+    真实 FastEmbedProvider 首次构造会联网下载 bge-small-zh-v1.5 模型
+    （约 100MB），CI/无网环境不可用；替身保持 512 维与真实模型一致，
+    用于验证 --provider fastembed 的传参路径与维度语义。
+    """
+
+    instances = 0  # 构造计数：验证「向量库不存在时不应构造 provider」
+
+    def __init__(self) -> None:
+        type(self).instances += 1
+        self.dimension = 512
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vector = [0.0] * self.dimension
+        vector[0] = 1.0  # 非零向量：归一化不会除零
+        return [list(vector) for _ in texts]
+
+
+@pytest.fixture
+def stub_fastembed(monkeypatch: pytest.MonkeyPatch) -> type[_StubFastEmbedProvider]:
+    """把 ingest_books.FastEmbedProvider 换成测试替身（不联网、可计数）。"""
+    _StubFastEmbedProvider.instances = 0
+    monkeypatch.setattr("ingest_books.FastEmbedProvider", _StubFastEmbedProvider)
+    return _StubFastEmbedProvider
+
+
+def test_main_provider_rejects_invalid_value(tmp_path: Path) -> None:
+    """--provider 非法值：argparse choices 拒绝，退出码 2（SystemExit）。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--books-dir",
+                str(books_dir),
+                "--db",
+                str(db_path),
+                "--vector-db",
+                str(tmp_path / "vector_knowledge.db"),
+                "--provider",
+                "bogus",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("provider", ["hash", "fastembed"])
+def test_main_verify_accepts_provider_values(
+    tmp_path: Path,
+    stub_fastembed: type[_StubFastEmbedProvider],
+    provider: str,
+) -> None:
+    """--verify 接受合法 provider 值；向量库不存在时不构造 provider。
+
+    fastembed 首次构造会联网下载模型——向量库文件不存在时检索注定
+    降级为纯词法，此时不应构造 provider（替身构造计数保持 0，证明
+    不会白白触发下载）。
+
+    注意：verify 只验证检索不写入，必须先入库（词法库有数据，词法
+    检索才有命中基础）；不带 --vector 入库则向量库不会被创建，正
+    是「向量库不存在」的验证前提。
+    """
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    # 先入库（词法库有数据，verify 的词法检索才有命中基础）；不带
+    # --vector，向量库不会被创建 → 向量库不存在 → verify 走纯词法。
+    assert main(common) == 0
+    assert main([*common, "--verify", "--provider", provider]) == 0
+    assert _StubFastEmbedProvider.instances == 0
+
+
+def test_main_fastembed_provider_end_to_end(
+    tmp_path: Path, stub_fastembed: type[_StubFastEmbedProvider]
+) -> None:
+    """fastembed 全流程：入库建 512 维向量库 → 同 provider verify 混合检索。
+
+    验证 --provider 传参正确性：向量库以所选 provider 的维度写入，
+    --verify 用同一 provider 能打开并走混合检索（PASS）。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 1) --vector --provider fastembed：入库成功，向量库以 512 维写入。
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 0
+    assert vector_db.exists()
+    # 用同维度替身重开向量库：构造时维度守卫校验通过（不抛错）即证明
+    # 库内向量是 512 维（hash 为 256 维，会因维度不符而拒绝打开）。
+    reopened = SqliteVectorKnowledgeIndex(vector_db, provider=_StubFastEmbedProvider())
+    reopened.close()
+
+    # 2) --verify --provider fastembed：同一 provider 打开向量库 → 混合检索 PASS。
+    assert main([*common, "--verify", "--provider", "fastembed"]) == 0
+
+
+def test_main_verify_with_fastembed_degrades_on_hash_built_vector_db(
+    tmp_path: Path, stub_fastembed: type[_StubFastEmbedProvider]
+) -> None:
+    """hash 建的 256 维向量库 + fastembed verify：维度不匹配 → 降级纯词法。
+
+    verify 允许降级：旧维度库打不开时自动退回词法单路，不报错、
+    退出码 0 仍成立（与 hybrid.py open_vector_index_if_available
+    的降级语义一致）；真正换 provider 需 --force 重建向量库。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 先用默认 hash（256 维）建向量库。
+    assert main([*common, "--vector"]) == 0
+    # 再用 fastembed（512 维）verify：维度不匹配 → 自动降级纯词法 → 仍 PASS。
+    assert main([*common, "--verify", "--provider", "fastembed"]) == 0
+
+
+class _ExplodingFastEmbedProvider:
+    """构造即抛 RuntimeError 的 fastembed 替身：模拟未安装/模型下载失败。"""
+
+    def __init__(self) -> None:
+        raise RuntimeError("fastembed 未安装或模型下载失败")
+
+
+def test_main_vector_with_fastembed_build_failure_returns_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """fastembed 构造失败（未安装/下载失败）：显式报错退出码 2，不静默回退哈希。
+
+    用户显式选了 fastembed，静默换回哈希会与库维度错位——必须让用户
+    看到失败原因而不是悄悄降级。
+    """
+    monkeypatch.setattr("ingest_books.FastEmbedProvider", _ExplodingFastEmbedProvider)
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 2
+    captured = capsys.readouterr()
+    assert "错误:" in captured.err
+    assert "fastembed" in captured.err
+
+
+def test_main_vector_with_fastembed_against_hash_vector_db_returns_2(
+    tmp_path: Path,
+    stub_fastembed: type[_StubFastEmbedProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """旧维度（hash 256 维）向量库 + fastembed --vector：显式报错退出码 2。
+
+    维度守卫发生在打开旧库的构造期（早于 --force 清完成标记），
+    --force 无法绕过——必须删除向量库文件或改用新的 --vector-db 路径
+    重建（错误提示明确给出该指引，且不 traceback 崩溃）。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 先用默认 hash（256 维）建向量库。
+    assert main([*common, "--vector"]) == 0
+    # 换 fastembed（512 维）带 --vector 重开旧库：维度不匹配 → 显式报错
+    # 退出码 2（不 traceback 崩溃）；旧向量库文件保留、未被破坏。
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 2
+    assert vector_db.exists()
+    captured = capsys.readouterr()
+    assert "删除向量库文件" in captured.err
+    assert "--force" in captured.err

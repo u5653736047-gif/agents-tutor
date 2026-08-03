@@ -6,6 +6,7 @@
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --force
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --verify
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --chunking semantic
+    $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --vector --provider fastembed
 
 设计说明（按功能模块）：
 1. 入库流程
@@ -69,6 +70,16 @@
    - --verify 默认走混合检索（S3-T5）：词法路必开，向量库文件存在
      才启用（open_vector_index_if_available，打不开自动降级，详见
      core/knowledge/hybrid.py 模块注释）。
+   embedding provider 选择（--provider 参数）：hash（默认）是内置
+     字符哈希替身（256 维，离线零依赖，语义能力有限的降级方案）；
+     fastembed 是真实语义模型 BAAI/bge-small-zh-v1.5（512 维，首次
+     使用联网下载模型约 100MB，之后完全离线）。两者维度不同：更换
+     provider 后旧向量库打开时维度校验不过：--vector 路径显式报错，
+     需删除向量库文件（或改用新的 --vector-db 路径）后重建——--force
+     无法绕过维度守卫（守卫发生在打开旧库时，早于清完成标记）；
+     --verify 遇旧维度库会自动降级为纯词法（不报错，验证本来允许
+     降级），详见 core/knowledge/embedding.py 与
+     docs/EMBEDDING_SELECTION.md。
    语义检索与词法检索的并存关系、协议设计见 core/knowledge/vector_index.py
    模块注释与选型文档。
 """
@@ -78,12 +89,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from core.knowledge.embedding import HashEmbeddingProvider
+from core.knowledge.embedding import (
+    EmbeddingProvider,
+    FastEmbedProvider,
+    HashEmbeddingProvider,
+)
 from core.knowledge.hybrid import HybridKnowledgeIndex, open_vector_index_if_available
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import iter_pdf_pages
@@ -441,6 +457,22 @@ def verify_cases(
 # ── 命令行入口 ───────────────────────────────────────────────────
 
 
+def _make_provider(name: str) -> EmbeddingProvider:
+    """按 --provider 名称构造 embedding provider（hash 默认 | fastembed 真实语义）。
+
+    - hash（默认）：内置字符哈希替身，256 维，离线零依赖，语义能力
+      有限（降级方案，见 embedding.py 模块注释）；
+    - fastembed：真实语义模型 BAAI/bge-small-zh-v1.5，512 维；首次
+      构造会联网下载模型（约 100MB，一次性），之后完全离线缓存。
+    两者维度不同：更换 provider 后旧向量库打开时维度校验失败，需
+    删除向量库文件（或改用新的 --vector-db 路径）后重新入库重建——
+    --force 无法绕过维度守卫（详见 embedding.py 与选型文档）。
+    """
+    if name == "fastembed":
+        return FastEmbedProvider()
+    return HashEmbeddingProvider()
+
+
 def _print_progress(page: int, total: int) -> None:
     """解析进度回调：每 _PROGRESS_EVERY 页打印一次，最后一页必打印。"""
     if page % _PROGRESS_EVERY == 0 or page == total:
@@ -503,6 +535,17 @@ def main(argv: list[str] | None = None) -> int:
         "本开关会自动从词法库补建向量，无需 --force 重新解析",
     )
     parser.add_argument(
+        "--provider",
+        choices=["hash", "fastembed"],
+        default="hash",
+        help="向量 embedding 提供方（默认 hash，离线零依赖）：hash=内置"
+        "字符哈希替身（256 维，语义能力有限，降级方案）；fastembed=真实"
+        "语义模型 BAAI/bge-small-zh-v1.5（512 维，首次使用联网下载模型"
+        "约 100MB，之后完全离线）。注意：两者维度不同，更换后旧向量库"
+        "不匹配：需删除向量库文件（或改用新的 --vector-db 路径）后重建"
+        "（--force 无法绕过维度守卫）",
+    )
+    parser.add_argument(
         "--vector-db",
         type=Path,
         default=DEFAULT_VECTOR_DB_PATH,
@@ -526,24 +569,40 @@ def main(argv: list[str] | None = None) -> int:
     # --verify 分支用 open_vector_index_if_available「存在才打开」——
     # 文件不存在时返回 None（不会白白创建空库文件），检索自动降级
     # 为词法单路（S3-T5 混合检索的降级语义，见 hybrid.py 模块注释）。
-    # Embedding 提供方默认 HashEmbeddingProvider（离线零依赖）。
-    # 想换真实语义模型（fastembed + bge-small-zh-v1.5）时有两个接入点：
-    # - --vector 入库/补建路径：换下方 SqliteVectorKnowledgeIndex 的
-    #   provider 参数为 FastEmbedProvider()（协议可替换）；
-    # - --verify 混合检索路径：open_vector_index_if_available 默认在
-    #   core/knowledge/hybrid.py 内部取 HashEmbeddingProvider，换模型
-    #   需给该工厂传 provider 参数（或改 hybrid.py 的默认值）。
-    # 注意不同模型维度可能不同，更换后需 --force 重建向量库，见
-    # core/knowledge/embedding.py 与 docs/EMBEDDING_SELECTION.md。
+    # embedding provider 由 --provider 参数选择（默认 hash 内置哈希
+    # 替身；fastembed 为真实语义模型，差异见 _make_provider）。
+    # 构造时机：只有真正需要向量路时才构造——fastembed 首次构造会
+    # 联网下载模型（约 100MB），--verify 时向量库文件不存在则检索
+    # 注定降级为纯词法，此时构造只会白白触发下载。
+    # 更换 provider 后维度可能不同（hash=256 / fastembed=512），旧
+    # 向量库打开时会维度校验失败：--vector 路径显式报错并提示删除
+    # 向量库文件/改用新 --vector-db（--force 无法绕过——维度守卫在
+    # 打开旧库时触发，早于清完成标记），--verify 路径由
+    # open_vector_index_if_available 捕获并降级为纯词法（不报错），
+    # 详见 embedding.py 与选型文档。
+    need_provider = args.vector or (args.verify and args.vector_db.exists())
+    provider: EmbeddingProvider | None = None
+    try:
+        if need_provider:
+            provider = _make_provider(args.provider)
+    except RuntimeError as exc:
+        # fastembed 未安装或模型下载失败：显式报错而不是静默退回哈希
+        # ——用户显式选了 fastembed，静默换 provider 会与库维度错位。
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
     vector_index: SqliteVectorKnowledgeIndex | None = None
     try:
         if args.verify:
             # S3-T5：混合检索是 --verify 的默认路径——词法库必开，
             # 向量库「文件存在才打开」（从未 --vector 入库则文件不存在，
             # 自动降级为纯词法，不抛错，行为与 S3-T1 完全一致）；打开
-            # 失败（如换过 embedding provider 导致维度不匹配）同样降级，
-            # 详见 core/knowledge/hybrid.py 的 open_vector_index_if_available。
-            vector_index = open_vector_index_if_available(args.vector_db)
+            # 失败（如向量库维度与当前 provider 不匹配——换过 provider
+            # 未重建）同样降级为纯词法，详见 hybrid.py 的
+            # open_vector_index_if_available。provider 透传 --provider
+            # 的选择：旧维度库打不开时降级，不阻断验证（verify 允许降级）。
+            vector_index = open_vector_index_if_available(
+                args.vector_db, provider=provider
+            )
             service = KnowledgeService(HybridKnowledgeIndex(index, vector_index))
             # 阻塞书（数据源不可用）不参与验证：其用例保留在清单里，
             # 待 blocked 标记移除后自动恢复验证。
@@ -578,11 +637,30 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if failed == 0 else 1
 
         # --vector：走到这里说明不是 --verify 分支（verify 已在上方
-        # return），此时才打开向量库，避免空库文件被创建。
+        # return），此时才打开向量库，避免空库文件被创建。provider
+        # 由 --provider 选择（hash 默认；fastembed 为真实语义模型，
+        # 512 维——更换 provider 后旧库维度不匹配，打开时报错：需删除
+        # 向量库文件（或改用新的 --vector-db 路径）后重建，--force 无法
+        # 绕过维度守卫，见 vector_index 的维度守卫）。
         if args.vector:
-            vector_index = SqliteVectorKnowledgeIndex(
-                args.vector_db, provider=HashEmbeddingProvider()
-            )
+            try:
+                vector_index = SqliteVectorKnowledgeIndex(
+                    args.vector_db,
+                    provider=provider if provider is not None else HashEmbeddingProvider(),
+                )
+            except (ValueError, sqlite3.Error, OSError) as exc:
+                # 维度守卫/库损坏发生在打开旧库的构造期（_load_all），
+                # 早于 --force 清完成标记——因此 --force 无法绕过：必须
+                # 删除旧向量库文件或改用新的 --vector-db 路径重建。
+                # 注意：构造失败时 __init__ 已自行关闭连接（防泄漏），
+                # 此处 vector_index 仍为 None，finally 不会重复 close。
+                print(
+                    f"错误: 向量库维度与所选 provider 不匹配或库损坏: {exc}\n"
+                    "请删除向量库文件（或改用新的 --vector-db 路径）后重新运行；"
+                    "--force 无法绕过维度守卫",
+                    file=sys.stderr,
+                )
+                return 2
 
         failed_books: list[str] = []
         blocked_count = 0
