@@ -211,6 +211,30 @@
   - 测试覆盖：并行分派、并发写状态无串扰、上限触发降级为串行。
 - 依赖：S1-T5。优先级低，M1 出口不强制要求；如实现风险大可推迟到 Sprint 5。
 
+### [x] S1-T7 历史消息 Agent 角色元数据
+
+- 对应总清单：阶段三桥接清单 `docs/TASKS_STAGE_3_BRIDGE.md` W1-T7 的 core 侧支撑
+  （该任务阻塞于「core 持久化历史无法恢复助手消息的产出 Agent 角色」）。
+- 范围：`src/core/state.py`、`graph_builder.py` 及新增测试
+  `tests/test_agent_role_metadata.py`。
+- 验收标准：
+  - 所有进入会话持久化历史的助手消息携带产出它的 Agent 角色，经 SQLite
+    checkpointer 序列化往返、进程重建 / 新图实例重载后 `get_history()` 仍可
+    恢复该角色。
+  - 角色语义正确：单 Agent 回答标自身角色；Supervisor 多子任务聚合回答标
+    supervisor；多轮 handoff 各助手消息标各自产出角色、互不污染。
+  - HumanMessage / ToolMessage 不注入角色；消息 content 与类型不变，现有
+    行为零回归。
+- 依赖：S1-T5。
+- 完成备注：2026-08-03；注入点选 `_wrap`（消息写入 `state["messages"]` 的
+  唯一闸口），用 `AIMessage.additional_kwargs["agent"]` 经 JsonPlusSerializer
+  （msgpack 基）随 checkpoint 持久化，聚合改写经 `model_copy` 保留元数据。
+  独立 review 无 Critical/Important，3 个 Minor 已修复并复审放行；最终全量
+  测试 322 通过，ruff 干净，mypy strict（30 个源文件）零问题。
+  衔接说明：API 层 `sessions.py::_safe_agent` 需改为优先消费
+  `core.state.message_agent_role()` 才能让 `Message.agent` 生效——该改动属
+  桥接清单（`backend/src/api/`）范围，是 W1-T7 重跑的前置步骤，另行提交。
+
 ---
 
 ## Sprint 2：最小教学答疑闭环

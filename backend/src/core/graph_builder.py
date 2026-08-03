@@ -39,6 +39,7 @@ from .state import (
     TaskStepResult,
     ToolResult,
     create_initial_state,
+    with_agent_role,
 )
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 
@@ -328,6 +329,36 @@ class CollaborativeAgentGraph:
             result = agent.run(run_state)
 
             updates = dict(result.updates)
+            # ── 注入「产出 Agent 角色」元数据：写入会话历史的唯一闸口 ──
+            # _wrap 节点是本次执行所有消息进入 state["messages"]（进而进入
+            # checkpointer 持久化）的唯一入口，因此在这里统一给助手消息
+            # 打上角色标记，一处覆盖最终回答与带 tool_calls 的中间助手消息。
+            #
+            # 为什么选这个注入点而不是 ReActAgentNode 内部：
+            # 1) ReActAgentNode 是模型边界，其生成的消息会作为下一轮模型
+            #    输入；在内部注入会让带角色标记的消息污染模型看到的上下文，
+            #    在这里注入则消息仅写入持久化历史——当前 OpenAI 兼容
+            #    provider 不会将该键透传给模型 API；若未来接入会透传
+            #    additional_kwargs 的 provider，需重新评估该注入点。
+            # 2) ReActAgentNode 的单元测试断言 additional_kwargs 精确相等
+            #    （test_react_agent.py::test_react_agent_preserves_*），
+            #    注入放在图层面既不改变节点语义，也不破坏单元契约。
+            # 3) 未来新增图节点只要走 _wrap，就不会漏标角色。
+            #
+            # 边界情况：
+            # - 只处理 AIMessage；HumanMessage（用户输入/任务描述）与
+            #   ToolMessage（工具返回）不是助手产出，一律不注入。
+            # - 失败轮次（模型调用失败、迭代超限）已产生的助手消息同样
+            #   注入，保证历史里每条 AI 消息都有确定的产出者。
+            # - 后续聚合逻辑（_replace_terminal_ai_output 等）用 model_copy
+            #   仅替换 content，会原样保留 additional_kwargs，因此 Supervisor
+            #   聚合的最终回答仍携带 supervisor 角色，不会因改内容而丢失。
+            updates["messages"] = [
+                with_agent_role(message, agent.role)
+                if isinstance(message, AIMessage)
+                else message
+                for message in cast(list[BaseMessage], updates.get("messages", []))
+            ]
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             target = _handoff_target(tool_results)
             new_plan = _task_plan_from_results(tool_results)
@@ -994,7 +1025,13 @@ class CollaborativeAgentGraph:
         session_id: str,
         user_id: str | None = None,
     ) -> list[BaseMessage]:
-        """Return the persisted messages for a user session."""
+        """Return the persisted messages for a user session.
+
+        返回的消息与改动前完全同构：类型与 content 不变，只是助手消息
+        （AIMessage）的 additional_kwargs 新增了 AGENT_ROLE_METADATA_KEY
+        键。调用方可用 core.state.message_agent_role(message) 读出产出该
+        消息的 Agent 角色（枚举值），用于前端角色徽章等展示。
+        """
         state = self.get_state(session_id, user_id)
         if state is None:
             return []
@@ -1188,6 +1225,8 @@ def _replace_terminal_ai_output(
     for index in range(len(updated) - 1, -1, -1):
         message = updated[index]
         if isinstance(message, AIMessage) and not message.tool_calls:
+            # model_copy 仅替换 content，additional_kwargs 原样保留——
+            # 因此 _wrap 注入的 agent 角色元数据在聚合改写内容后不丢失。
             updated[index] = message.model_copy(update={"content": content})
             return updated
     raise RuntimeError("aggregation completed without a terminal AIMessage")
@@ -1219,6 +1258,8 @@ def _append_missing_results_notice(
                 if answer
                 else f"已完成部分：无\n\n{notice}"
             )
+            # 与 _replace_terminal_ai_output 同理：仅替换 content，
+            # additional_kwargs（含 agent 角色元数据）原样保留。
             updated[index] = message.model_copy(update={"content": content})
             return updated
     raise RuntimeError("aggregation completed without a terminal AIMessage")

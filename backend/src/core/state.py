@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, TypedDict
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -41,6 +41,61 @@ class AgentRole(StrEnum):
     TEACHING_ASSISTANT = "teaching_assistant"
     LEARNING_ASSISTANT = "learning_assistant"
     EVALUATOR = "evaluator"
+
+
+# ─────────────────────────────────────────────
+# 助手消息的 Agent 角色元数据
+# ─────────────────────────────────────────────
+
+# 所有进入会话持久化历史的助手消息（AIMessage）都会在写入状态前，
+# 于 additional_kwargs 中写入「产出该消息的 Agent 角色」。
+#
+# 为什么用 additional_kwargs 而不是消息的 name 字段：
+# - additional_kwargs 是 LangChain 消息的标准附加字段，LangGraph 的
+#   SQLite checkpointer 默认使用 JsonPlusSerializer（msgpack 基）序列化
+#   消息时会原样保留该字段，因此进程重建、状态重载后 get_history()
+#   读出的消息仍能恢复角色（这是验收核心，测试 test_agent_role_metadata
+#   覆盖序列化往返）。
+# - name 字段会被部分模型 API 当作说话人标识透传给模型，且现有代码
+#   已用 name 标记 task_results 系统消息，占用它会引入语义混叠。
+#
+# 写入端严格（只写 AgentRole 的合法枚举值），读取端宽容（见
+# message_agent_role）：宁可返回 None 也不让异常数据击穿前端。
+AGENT_ROLE_METADATA_KEY = "agent"
+
+
+def with_agent_role(message: AIMessage, role: AgentRole) -> AIMessage:
+    """返回携带产出 Agent 角色的 AIMessage 副本（不修改原对象）。
+
+    为什么返回副本而非就地修改：
+    - 模型返回的 AIMessage 对象可能被调用方复用（如再次作为模型输入），
+      就地修改会污染模型看到的历史；
+    - model_copy 只替换 additional_kwargs，content、tool_calls、
+      response_metadata 等字段原样保留，因此不会改变对外消息内容。
+    既有 additional_kwargs（如模型返回的 provider 元数据）也会保留，
+    只新增 AGENT_ROLE_METADATA_KEY 一个键。
+    """
+    additional_kwargs = dict(message.additional_kwargs)
+    additional_kwargs[AGENT_ROLE_METADATA_KEY] = role.value
+    return message.model_copy(update={"additional_kwargs": additional_kwargs})
+
+
+def message_agent_role(message: BaseMessage) -> AgentRole | None:
+    """从消息元数据读出产出它的 Agent 角色；无法确定时返回 None。
+
+    设计取舍：
+    - HumanMessage / ToolMessage / SystemMessage 不注入角色，
+      读出的 None 表示「该消息没有角色」而非数据错误；
+    - 键存在但值非法（历史脏数据、未来枚举变更）时同样返回 None，
+      保证 get_history() 的消费者（前端角色徽章）不会因异常崩溃。
+    """
+    raw = message.additional_kwargs.get(AGENT_ROLE_METADATA_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return AgentRole(raw)
+    except ValueError:
+        return None
 
 
 WorkerAgentRole = Literal[
