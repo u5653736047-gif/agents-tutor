@@ -98,6 +98,12 @@ def test_lifespan_builds_and_releases_shared_runtime(
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
     monkeypatch.setenv("API_SESSION_STORE_PATH", str(tmp_path / "sessions.sqlite3"))
     monkeypatch.setenv("API_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite3"))
+    # 工作单 T2：知识库默认路径现按仓库根 data/ 解析（真实入库库）。
+    # 本测试保持自包含：与 session/checkpoint 一样显式指向 tmp——
+    # 词法空库自动建表、向量库不存在自动降级，均不影响图构造断言；
+    # 也不依赖仓库根是否已入库、不触发 fastembed 模型加载。
+    monkeypatch.setenv("API_KNOWLEDGE_DB_PATH", str(tmp_path / "knowledge.db"))
+    monkeypatch.setenv("API_VECTOR_DB_PATH", str(tmp_path / "vector_knowledge.db"))
     app = create_app()
 
     async def verify_runtime() -> None:

@@ -13,8 +13,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from api.app import create_app
 from core.events import EventType, RunEvent
+from core.knowledge.models import Citation as CoreCitation
 from core.sessions import SessionStore
 from core.state import (
+    REFERENCES_METADATA_KEY,
     AgentRole,
     HandoffApprovalAction,
     HandoffApprovalDecision,
@@ -379,3 +381,69 @@ def test_approval_rejects_reserved_modification_fields(tmp_path: Path) -> None:
         "detail": {"error_code": "invalid_request", "message": "Request is invalid."}
     }
     assert graph.resume_inputs == []
+
+
+def test_confirm_handoff_response_carries_references_from_the_final_message(
+    tmp_path: Path,
+) -> None:
+    """审批确认路径复用 chat_response_for_state，同样填充 references。"""
+    previous_message = HumanMessage(content="original request")
+    answer = AIMessage(
+        content="continued answer",
+        additional_kwargs={
+            REFERENCES_METADATA_KEY: [
+                CoreCitation(
+                    document_id="algebra",
+                    source="algebra.txt",
+                    page=1,
+                    chunk_id="chunk-algebra-1",
+                ).model_dump(mode="json")
+            ]
+        },
+    )
+    previous_event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=0,
+        session_id="session-1",
+        agent="supervisor",
+    )
+    graph = ApprovalGraph(
+        {
+            "messages": [previous_message, answer],
+            "events": [
+                previous_event,
+                RunEvent(
+                    event_type=EventType.RUN_COMPLETED,
+                    sequence=1,
+                    session_id="session-1",
+                    success=True,
+                ),
+            ],
+            "current_agent": "teaching_assistant",
+            "run_error": None,
+        },
+        previous_state={"messages": [previous_message], "events": [previous_event]},
+        pending_handoff=_pending_handoff(),
+    )
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {"interrupt_id": "interrupt-1", "action": "confirm"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["references"] == [
+        {
+            "document_id": "algebra",
+            "source": "algebra.txt",
+            "page": 1,
+            "chunk_id": "chunk-algebra-1",
+        }
+    ]

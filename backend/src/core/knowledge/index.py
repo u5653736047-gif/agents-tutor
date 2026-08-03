@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -164,7 +165,11 @@ class KnowledgeIndex(Protocol):
 
 
 class InMemoryKnowledgeIndex:
-    """Simple lexical index for local development and deterministic tests."""
+    """内存词法索引：仅测试/单线程使用（生产装配用 SqliteKnowledgeIndex）。
+
+    无锁且不持久化：并发 upsert/search 会产生竞态；若未来流入并发路径
+    需加锁（对齐 SqliteKnowledgeIndex 的 RLock 模式）。
+    """
 
     def __init__(self) -> None:
         self._chunks: dict[str, KnowledgeChunk] = {}
@@ -233,42 +238,61 @@ class SqliteKnowledgeIndex:
     """
 
     def __init__(self, db_path: str | Path) -> None:
-        self._conn = sqlite3.connect(str(db_path))
-        # WAL 模式下读操作不阻塞写操作，对脚本与后续检索并发更友好。
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # 线程安全说明（为什么 check_same_thread=False + 为什么还要 RLock）：
+        # 1. 索引在 FastAPI lifespan（主线程）里创建，而 graph.run 的工具
+        #    调用跑在 FastAPI 工作线程池（run_in_threadpool）——SQLite 默认
+        #    拒绝跨线程使用连接（check_same_thread=True），工作线程一调用
+        #    就抛 ProgrammingError（T2 冒烟因此全部 tool_execution_failed）。
+        #    与 core/persistence.py 的 checkpointer 先例保持一致：允许跨线程。
+        # 2. check_same_thread=False 只是「允许」跨线程，连接本身仍然不是
+        #    线程安全的：两个线程同时 execute 同一连接会数据错乱甚至崩溃，
+        #    所以所有访问 self._conn 的操作必须用 RLock 串行化。
+        # 3. 锁的粒度：只锁「共享状态（连接）访问」部分——游标创建 +
+        #    execute + fetch 的完整序列，纯计算（打分排序）在锁外做，
+        #    避免长持有锁；RLock 可重入，方法间互调（如 __init__ →
+        #    _create_tables）不会死锁。
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        with self._lock:
+            # WAL 模式下读操作不阻塞写操作，对脚本与后续检索并发更友好。
+            self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
 
     def _create_tables(self) -> None:
-        # chunk 表：一条记录一个分块，chunk_id 为主键（整文档替换时覆盖）。
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks (
-                chunk_id TEXT PRIMARY KEY,
-                document_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT NOT NULL,
-                page INTEGER,
-                start INTEGER NOT NULL,
-                end INTEGER NOT NULL,
-                metadata_json TEXT NOT NULL
+        # 访问 self._conn，加锁串行化（原因见 __init__ 的线程安全说明）。
+        with self._lock:
+            # chunk 表：一条记录一个分块，chunk_id 为主键（整文档替换时覆盖）。
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    page INTEGER,
+                    start INTEGER NOT NULL,
+                    end INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        # ingest_marks 表：整本书入库成功的完成标记（续跑跳过依据）。
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ingest_marks (
-                document_id TEXT PRIMARY KEY,
-                chunk_count INTEGER NOT NULL,
-                page_count INTEGER NOT NULL,
-                completed_at TEXT NOT NULL
+            # ingest_marks 表：整本书入库成功的完成标记（续跑跳过依据）。
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingest_marks (
+                    document_id TEXT PRIMARY KEY,
+                    chunk_count INTEGER NOT NULL,
+                    page_count INTEGER NOT NULL,
+                    completed_at TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        self._conn.commit()
+            self._conn.commit()
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
         """插入分块：同 chunk_id 直接覆盖（INSERT OR REPLACE），单事务原子提交。"""
+        # 行数据构造是纯计算（不碰连接），放锁外；锁内只做
+        # execute + commit 的完整写序列（原因见 __init__ 线程安全说明）。
         rows = [
             (
                 chunk.chunk_id,
@@ -282,20 +306,22 @@ class SqliteKnowledgeIndex:
             )
             for chunk in chunks
         ]
-        self._conn.executemany(
-            "INSERT OR REPLACE INTO chunks "
-            "(chunk_id, document_id, content, source, page, start, end, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO chunks "
+                "(chunk_id, document_id, content, source, page, start, end, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
 
     def delete_document(self, document_id: str) -> None:
         """删除某个 document_id 的全部 chunk（整文档替换语义的删除半段）。"""
-        self._conn.execute(
-            "DELETE FROM chunks WHERE document_id = ?", (document_id,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM chunks WHERE document_id = ?", (document_id,)
+            )
+            self._conn.commit()
 
     def search(
         self,
@@ -318,18 +344,22 @@ class SqliteKnowledgeIndex:
             return []
 
         normalized = _validate_metadata_filter(metadata_filter)
-        if normalized:
-            where, params = _metadata_where_clause(normalized)
-            rows = self._conn.execute(
-                "SELECT chunk_id, document_id, content, source, page, start, end, "
-                f"metadata_json FROM chunks WHERE {where}",
-                params,
-            )
-        else:
-            rows = self._conn.execute(
-                "SELECT chunk_id, document_id, content, source, page, start, end, "
-                "metadata_json FROM chunks"
-            )
+        # 锁内完成「游标创建 + execute + fetch」完整序列：fetchall 一次性
+        # 取出数据快照后立即释放锁，打分排序在锁外进行——既保证同一连接
+        # 不被并发操作（迭代途中别的线程写库会出错），又不持锁做长循环。
+        with self._lock:
+            if normalized:
+                where, params = _metadata_where_clause(normalized)
+                rows = self._conn.execute(
+                    "SELECT chunk_id, document_id, content, source, page, start, end, "
+                    f"metadata_json FROM chunks WHERE {where}",
+                    params,
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT chunk_id, document_id, content, source, page, start, end, "
+                    "metadata_json FROM chunks"
+                ).fetchall()
 
         scored: list[tuple[float, str, KnowledgeChunk]] = []
         for row in rows:
@@ -383,9 +413,10 @@ class SqliteKnowledgeIndex:
 
     def is_document_complete(self, document_id: str) -> bool:
         """该 document_id 是否已有「整本入库成功」的完成标记。"""
-        row = self._conn.execute(
-            "SELECT 1 FROM ingest_marks WHERE document_id = ?", (document_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM ingest_marks WHERE document_id = ?", (document_id,)
+            ).fetchone()
         return row is not None
 
     def mark_document_complete(
@@ -396,24 +427,26 @@ class SqliteKnowledgeIndex:
         page_count: int,
     ) -> None:
         """写入完成标记（幂等：重复调用直接覆盖旧标记）。"""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO ingest_marks "
-            "(document_id, chunk_count, page_count, completed_at) VALUES (?, ?, ?, ?)",
-            (
-                document_id,
-                chunk_count,
-                page_count,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ingest_marks "
+                "(document_id, chunk_count, page_count, completed_at) VALUES (?, ?, ?, ?)",
+                (
+                    document_id,
+                    chunk_count,
+                    page_count,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            self._conn.commit()
 
     def clear_document_complete(self, document_id: str) -> None:
         """清除完成标记：--force 重入库前调用，保证中途失败不会误跳过。"""
-        self._conn.execute(
-            "DELETE FROM ingest_marks WHERE document_id = ?", (document_id,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM ingest_marks WHERE document_id = ?", (document_id,)
+            )
+            self._conn.commit()
 
     def chunks_of_document(self, document_id: str) -> list[KnowledgeChunk]:
         """读取某个 document_id 的全部分块（含 metadata 反序列化）。
@@ -424,12 +457,15 @@ class SqliteKnowledgeIndex:
         索引，无需重新解析 PDF（详见 ingest_books.py 的 --vector 说明）。
         按 (start, chunk_id) 排序，保证多次读取顺序稳定。
         """
-        rows = self._conn.execute(
-            "SELECT chunk_id, document_id, content, source, page, start, end, "
-            "metadata_json FROM chunks WHERE document_id = ? "
-            "ORDER BY start, chunk_id",
-            (document_id,),
-        )
+        # 锁内 execute + fetchall 取快照（同一连接不容并发操作），
+        # 反序列化构造对象是纯计算，放锁外。
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chunk_id, document_id, content, source, page, start, end, "
+                "metadata_json FROM chunks WHERE document_id = ? "
+                "ORDER BY start, chunk_id",
+                (document_id,),
+            ).fetchall()
         return [
             KnowledgeChunk(
                 chunk_id=chunk_id,
@@ -455,7 +491,8 @@ class SqliteKnowledgeIndex:
 
     def close(self) -> None:
         """关闭底层数据库连接。"""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def _lexical_terms(text: str) -> set[str]:

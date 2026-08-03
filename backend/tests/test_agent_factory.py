@@ -66,6 +66,10 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     # 的路由说明），长度上限从 160 放宽到 400，其余角色提示词远低于此。
     # S2-T2：Supervisor 提示词又新增了学生水平识别约定（detect_level 的
     # 调用时机），上限再放宽到 500；其余角色提示词仍远低于此。
+    # S4-T2：learning_assistant / teaching_assistant 新增检索约定
+    # （search_knowledge 先检索再作答/生成，见
+    # test_worker_prompts_define_retrieval_contract），当前最长仍为
+    # Supervisor（约 412 字符），learning_assistant 约 224，均低于 500。
     assert max(map(len, ROLE_PROMPTS.values())) <= 500
     assert model.bind_count == 1
 
@@ -75,14 +79,35 @@ def test_learning_assistant_dynamic_prompt_length_is_bounded() -> None:
 
     ROLE_PROMPTS 长度上限只覆盖静态角色卡；动态水平段按 state["level"]
     每轮追加（见 prompts.learning_assistant_system_prompt），这里锁
-    「叠加后」的总长——现状最长约 176 字符（unknown 档），上限取 220
-    留 44 字符余量，防止未来指导词膨胀撑爆上下文预算。
+    「叠加后」的总长——现状最长约 290 字符（basic 档：静态角色卡 224
+    + 水平锚点与换行 16 + basic 指导词 50），上限取 340 留 50 字符
+    余量，防止未来指导词膨胀撑爆上下文预算。
     """
     lengths = [
         len(learning_assistant_system_prompt(level))
         for level in (None, "basic", "advanced")
     ]
-    assert max(lengths) <= 220
+    assert max(lengths) <= 340
+
+
+def test_worker_prompts_define_retrieval_contract() -> None:
+    """S4-T2：答疑与备课角色提示词写明检索约定（先检索再作答/生成）。
+
+    search_knowledge 已注入 learning_assistant 与 teaching_assistant
+    （授权见 api/app.py），但工具在列表里不等于模型知道何时该用——
+    线上冒烟实测答疑轮模型跳过检索、直接编造「已完成知识库检索」的
+    幻觉回答。提示词必须写明：教材/知识性任务先调用工具再作答/生成，
+    无命中时如实说明「知识库未覆盖」（与 S4-T3 阈值语义一致）。
+    """
+    learning = ROLE_PROMPTS[AgentRole.LEARNING_ASSISTANT]
+    teaching = ROLE_PROMPTS[AgentRole.TEACHING_ASSISTANT]
+    assert "search_knowledge" in learning  # 明确点名检索工具
+    assert "检索" in learning
+    assert "知识库未覆盖" in learning  # 无命中时如实说明，不强行作答
+    assert "编造" in learning  # 禁止凭空编造教材内容
+    assert "search_knowledge" in teaching
+    assert "检索" in teaching
+    assert "凭空编写" in teaching  # 备课禁止脱离教材凭空编写
 
 
 def test_factory_accepts_and_shares_registry() -> None:

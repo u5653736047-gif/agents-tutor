@@ -52,6 +52,7 @@ import json
 import math
 import sqlite3
 import struct
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -155,8 +156,10 @@ def _rank_hits(
 
 
 class InMemoryVectorKnowledgeIndex:
-    """内存向量索引：EmbeddingProvider + 余弦相似度排序（测试/开发用）。
+    """内存向量索引：EmbeddingProvider + 余弦相似度排序（仅测试/单线程使用）。
 
+    无锁且不持久化：生产装配用 SqliteVectorKnowledgeIndex；若未来流入
+    并发路径需加锁（对齐 SqliteVectorKnowledgeIndex 的 RLock 模式）。
     用法（面向初学者）：构造时传入一个 EmbeddingProvider（协议，
     可替换——测试注入替身，生产注入 HashEmbeddingProvider 或
     FastEmbedProvider），之后与词法索引的用法完全一致：
@@ -224,38 +227,59 @@ class SqliteVectorKnowledgeIndex:
     """
 
     def __init__(self, db_path: str | Path, provider: EmbeddingProvider) -> None:
-        self._conn = sqlite3.connect(str(db_path))
-        # WAL 模式与词法库一致：读写并发更友好。
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._create_tables()
+        # 线程安全说明（与词法 SqliteKnowledgeIndex 完全一致，见 index.py）：
+        # 1. 索引在 FastAPI lifespan（主线程）创建，工具调用在工作线程池
+        #    执行——必须 check_same_thread=False，否则跨线程使用直接抛
+        #    ProgrammingError（T2 冒烟即因此全部 tool_execution_failed）；
+        #    与 core/persistence.py 的 checkpointer 先例保持一致。
+        # 2. check_same_thread=False 只是「允许」跨线程，连接本身不是线程
+        #    安全的，必须用 RLock 串行化所有 self._conn 访问。
+        # 3. 本类除了连接还有共享状态：内存矩阵 self._chunks/_vectors
+        #    （search 读、upsert/delete 写）。锁的粒度是「共享状态访问」
+        #    ——连接操作与内存矩阵更新在同一临界区内，保证 upsert 返回后
+        #    search 立刻看到新数据；embedding、打分排序等纯计算在锁外。
+        #    RLock 可重入，方法间互调（__init__ → _create_tables/_load_all）
+        #    不会死锁。
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        with self._lock:
+            # WAL 模式与词法库一致：读写并发更友好。
+            self._conn.execute("PRAGMA journal_mode=WAL")
         self._provider = provider
         self._chunks: dict[str, KnowledgeChunk] = {}
         self._vectors: dict[str, list[float]] = {}
         try:
+            # 建表与加载同属初始化阶段，统一纳入 try：任一失败都在
+            # 下面关闭连接再重抛（防御不对称——建表失败同样会泄漏
+            # 连接，处理与 _load_all 失败时完全一致）。
+            self._create_tables()
             self._load_all()
         except Exception:
-            # 加载失败（如维度校验不过）时关闭连接再重抛，避免连接泄漏。
-            self._conn.close()
+            # 建表或加载失败（如维度校验不过）时关闭连接再重抛，避免连接泄漏。
+            with self._lock:
+                self._conn.close()
             raise
 
     def _create_tables(self) -> None:
         """建表：chunk_vectors 在词法 chunks 表结构上加 vector BLOB 列。"""
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunk_vectors (
-                chunk_id TEXT PRIMARY KEY,
-                document_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT NOT NULL,
-                page INTEGER,
-                start INTEGER NOT NULL,
-                end INTEGER NOT NULL,
-                metadata_json TEXT NOT NULL,
-                vector BLOB NOT NULL
+        # 访问 self._conn，加锁串行化（原因见 __init__ 线程安全说明）。
+        with self._lock:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_vectors (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    page INTEGER,
+                    start INTEGER NOT NULL,
+                    end INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    vector BLOB NOT NULL
+                )
+                """
             )
-            """
-        )
-        self._conn.commit()
+            self._conn.commit()
 
     def _load_all(self) -> None:
         """构造时把整库读入内存：检索在内存矩阵上进行（见模块注释第 3 节）。
@@ -266,43 +290,49 @@ class SqliteVectorKnowledgeIndex:
         长度不一致，点积会被 _dot 拒绝而不是静默截断。此时必须 --force
         重新入库重建向量库（选型文档与 FastEmbedProvider 注释均有说明）。
         """
-        rows = self._conn.execute(
-            "SELECT chunk_id, document_id, content, source, page, start, end, "
-            "metadata_json, vector FROM chunk_vectors"
-        )
-        for row in rows:
-            (
-                chunk_id,
-                document_id,
-                content,
-                source,
-                page,
-                start,
-                end,
-                metadata_json,
-                vector_blob,
-            ) = row
-            vector = _unpack_vector(vector_blob)
-            if len(vector) != self._provider.dimension:
-                raise ValueError(
-                    f"向量库维度 {len(vector)} 与当前 embedding provider 的 "
-                    f"dimension {self._provider.dimension} 不一致：请用 --force "
-                    "重新入库重建向量库（更换 embedding provider 后维度可能变化）"
-                )
-            self._chunks[chunk_id] = KnowledgeChunk(
-                chunk_id=chunk_id,
-                document_id=document_id,
-                content=content,
-                source=source,
-                page=page,
-                start=start,
-                end=end,
-                metadata=json.loads(metadata_json),
+        # 锁内完成整库读取 + 内存矩阵填充：连接访问与内存矩阵更新必须
+        # 在同一临界区（构造阶段无并发，加锁是为了与 upsert/delete 的
+        # 更新路径保持同一模式，防止未来重载路径并发调用）。
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chunk_id, document_id, content, source, page, start, end, "
+                "metadata_json, vector FROM chunk_vectors"
             )
-            self._vectors[chunk_id] = vector
+            for row in rows:
+                (
+                    chunk_id,
+                    document_id,
+                    content,
+                    source,
+                    page,
+                    start,
+                    end,
+                    metadata_json,
+                    vector_blob,
+                ) = row
+                vector = _unpack_vector(vector_blob)
+                if len(vector) != self._provider.dimension:
+                    raise ValueError(
+                        f"向量库维度 {len(vector)} 与当前 embedding provider 的 "
+                        f"dimension {self._provider.dimension} 不一致：请用 --force "
+                        "重新入库重建向量库（更换 embedding provider 后维度可能变化）"
+                    )
+                self._chunks[chunk_id] = KnowledgeChunk(
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    content=content,
+                    source=source,
+                    page=page,
+                    start=start,
+                    end=end,
+                    metadata=json.loads(metadata_json),
+                )
+                self._vectors[chunk_id] = vector
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
         """插入分块：批量 embed → 归一化 → 写 BLOB 并同步内存，同 ID 覆盖。"""
+        # embed 与行数据构造是纯计算（不碰共享状态），放锁外；
+        # 锁内完成 SQL 写 + 内存矩阵更新，保证返回后立刻可检索。
         chunk_list = list(chunks)
         contents = [chunk.content for chunk in chunk_list]
         vectors = self._provider.embed(contents)
@@ -321,34 +351,38 @@ class SqliteVectorKnowledgeIndex:
             )
             for chunk, vector in zip(chunk_list, vectors)
         ]
-        self._conn.executemany(
-            "INSERT OR REPLACE INTO chunk_vectors "
-            "(chunk_id, document_id, content, source, page, start, end, "
-            "metadata_json, vector) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
-        # 同步内存矩阵，保证写入后立刻可检索（不重新读库）。
-        for chunk, vector in zip(chunk_list, vectors):
-            self._chunks[chunk.chunk_id] = chunk
-            self._vectors[chunk.chunk_id] = _normalize(vector)
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO chunk_vectors "
+                "(chunk_id, document_id, content, source, page, start, end, "
+                "metadata_json, vector) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+            # 同步内存矩阵（与 SQL 同一临界区）：写入后立刻可检索
+            # （不重新读库），且不会让并发 search 看到半更新状态。
+            for chunk, vector in zip(chunk_list, vectors):
+                self._chunks[chunk.chunk_id] = chunk
+                self._vectors[chunk.chunk_id] = _normalize(vector)
 
     def delete_document(self, document_id: str) -> None:
         """删除某个 document_id 的全部向量分块（SQL + 内存同步删除）。"""
-        self._conn.execute(
-            "DELETE FROM chunk_vectors WHERE document_id = ?", (document_id,)
-        )
-        self._conn.commit()
-        self._chunks = {
-            chunk_id: chunk
-            for chunk_id, chunk in self._chunks.items()
-            if chunk.document_id != document_id
-        }
-        self._vectors = {
-            chunk_id: vector
-            for chunk_id, vector in self._vectors.items()
-            if chunk_id in self._chunks
-        }
+        # SQL 删除与内存矩阵删除在同一临界区，避免 search 读到不一致状态。
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM chunk_vectors WHERE document_id = ?", (document_id,)
+            )
+            self._conn.commit()
+            self._chunks = {
+                chunk_id: chunk
+                for chunk_id, chunk in self._chunks.items()
+                if chunk.document_id != document_id
+            }
+            self._vectors = {
+                chunk_id: vector
+                for chunk_id, vector in self._vectors.items()
+                if chunk_id in self._chunks
+            }
 
     def search(
         self,
@@ -361,9 +395,15 @@ class SqliteVectorKnowledgeIndex:
         if not query.strip() or top_k <= 0:
             return []
         query_vector = _normalize(self._provider.embed([query])[0])
+        # 锁内浅拷贝内存矩阵快照后立即释放锁，打分在锁外：既防止并发
+        # upsert/delete 修改字典导致迭代崩溃/读到半更新状态，又不持锁
+        # 做全库打分循环（1.5 万条浅拷贝仅毫秒级，打分才是大头）。
+        with self._lock:
+            chunks = dict(self._chunks)
+            vectors = dict(self._vectors)
         return _rank_hits(
-            self._chunks,
-            self._vectors,
+            chunks,
+            vectors,
             query_vector,
             top_k,
             _validate_metadata_filter(metadata_filter),
@@ -375,15 +415,17 @@ class SqliteVectorKnowledgeIndex:
         供 ingest 脚本判断「词法已入库但向量缺失」的增量补建场景
         （详见 ingest_books.py 的 --vector 说明）。
         """
-        row = self._conn.execute(
-            "SELECT 1 FROM chunk_vectors WHERE document_id = ? LIMIT 1",
-            (document_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM chunk_vectors WHERE document_id = ? LIMIT 1",
+                (document_id,),
+            ).fetchone()
         return row is not None
 
     def close(self) -> None:
         """关闭底层数据库连接（进程退出前调用，与词法库用法一致）。"""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def _pack_vector(vector: list[float]) -> bytes:

@@ -50,6 +50,9 @@ npm install
 | `NEXT_PUBLIC_API_BASE_URL` | 可选，前端 API 地址；默认 `http://127.0.0.1:8000`。 |
 | `API_SESSION_STORE_PATH` | 可选，会话 SQLite 文件；默认根目录 `data/api_sessions.sqlite3`。 |
 | `API_CHECKPOINT_PATH` | 可选，图 checkpoint SQLite 文件；默认根目录 `data/api_checkpoints.sqlite3`。 |
+| `API_KNOWLEDGE_DB_PATH` | 可选，知识库词法 SQLite 文件；默认根目录 `data/knowledge.db`（由 ingest 脚本生成，永不降级的底线检索）。 |
+| `API_VECTOR_DB_PATH` | 可选，知识库向量 SQLite 文件；默认根目录 `data/vector_knowledge.db`；不可用（文件不存在 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断启动。 |
+| `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
 
 然后在 Windows PowerShell 的仓库根目录运行一条命令：
 
@@ -91,12 +94,16 @@ Graph 自动同步。归档只让默认会话列表隐藏该记录，不会删�
 
 ## 知识检索
 
-当前知识层使用轻量内存索引，无需学科文档或向量数据库即可测试。调用方加载或
-直接构造 `KnowledgeDocument`，交给 `KnowledgeService`，再通过
+知识层以 SQLite 词法索引为基础（默认 `data/knowledge.db`，由 ingest 脚本
+生成，永不降级的底线检索），按查询词与分块内容的命中情况打分排序。
+`--vector` 可选生成向量索引（默认 `data/vector_knowledge.db`），可用时默认
+检索路径为词法 + 向量混合：两路结果按 RRF 融合排序（S3-T5）；向量索引
+不可用（文件缺失 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断
+启动——相关环境变量见上文表格 `API_KNOWLEDGE_*`。调用方加载或直接构造
+`KnowledgeDocument`，交给 `KnowledgeService`，再通过
 `create_search_knowledge_tool()` 封装为 `search_knowledge` 工具。接入 Graph 时
 应使用 `tool_permissions` 显式授权助教、助学和评价角色；零命中只返回空结果，
-不会生成 Citation。内存索引不提供跨进程持久化，后续可按 `KnowledgeIndex`
-协议替换实现。同一 `document_id` 重导入会替换旧分块；同一 PDF 的多页应在
+不会生成 Citation。同一 `document_id` 重导入会替换旧分块；同一 PDF 的多页应在
 一次 `add_documents()` 调用中提交。
 
 核心架构说明见

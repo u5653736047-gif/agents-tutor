@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -514,3 +515,75 @@ def test_ingest_book_syncs_and_backfills_vector_index(tmp_path: Path) -> None:
             vector.close()
     finally:
         lexical.close()
+
+
+def test_sqlite_vector_index_thread_safe_concurrent_access(tmp_path: Path) -> None:
+    """多线程并发访问向量索引不崩溃、结果正确（T2 线程安全回归）。
+
+    背景（面向初学者）：与词法 SqliteKnowledgeIndex 相同——索引在
+    lifespan 主线程创建、工具调用在工作线程池执行。修复前工作线程
+    一调用就抛 ProgrammingError；无锁时并发 upsert 还会让 search 在
+    遍历内存矩阵（_chunks/_vectors 字典）时崩溃或读到半更新状态。
+    这里 8 个线程并发 upsert/search/has_document/delete_document，
+    任何崩溃都会让本测试失败（修复前必失败）。
+    """
+    provider = HashEmbeddingProvider()
+    index = SqliteVectorKnowledgeIndex(tmp_path / "vector.db", provider=provider)
+    documents = 8
+    rounds = 10
+
+    def worker(doc_id: int) -> None:
+        prefix = f"doc-{doc_id}"
+        for round_no in range(rounds):
+            chunk_id = f"{prefix}-{round_no}"
+            # 查询词含线程内唯一 token（自身 chunk 相似度最高）；再用
+            # metadata_filter 限定本线程的 source——其它线程的写入不参与
+            # 排序，断言确定且不受哈希桶碰撞影响。
+            index.upsert(
+                [
+                    _chunk(
+                        chunk_id,
+                        f"marker{doc_id}-{round_no} 马铃薯",
+                        document_id=prefix,
+                    )
+                ]
+            )
+            hits = index.search(
+                f"marker{doc_id}-{round_no}",
+                top_k=10,
+                metadata_filter={"source": f"{prefix}.txt"},
+            )
+            assert any(hit.chunk.chunk_id == chunk_id for hit in hits)
+            assert index.has_document(prefix)
+        # 整文档删除：SQL 与内存矩阵在同一临界区同步清空。
+        index.delete_document(prefix)
+        assert not index.has_document(prefix)
+        # 删除后重新写入：delete/upsert 交替后数据仍一致。
+        final_id = f"{prefix}-final"
+        index.upsert(
+            [
+                _chunk(
+                    final_id,
+                    f"marker{doc_id}-final 马铃薯",
+                    document_id=prefix,
+                )
+            ]
+        )
+        assert index.has_document(prefix)
+
+    try:
+        with ThreadPoolExecutor(max_workers=documents) as pool:
+            list(pool.map(worker, range(documents)))
+
+        # 主线程复核：过滤后每个 doc 只剩 final 分块，且可被检索到。
+        for doc_id in range(documents):
+            prefix = f"doc-{doc_id}"
+            assert index.has_document(prefix)
+            hits = index.search(
+                f"marker{doc_id}-final",
+                top_k=10,
+                metadata_filter={"source": f"{prefix}.txt"},
+            )
+            assert [hit.chunk.chunk_id for hit in hits] == [f"{prefix}-final"]
+    finally:
+        index.close()

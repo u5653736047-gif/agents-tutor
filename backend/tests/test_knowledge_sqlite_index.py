@@ -8,6 +8,7 @@ metadata JSON 往返。
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -171,3 +172,59 @@ def test_metadata_json_roundtrip(index: SqliteKnowledgeIndex) -> None:
     hit = index.search("支持向量机", top_k=5)[0]
 
     assert hit.chunk.metadata == metadata
+
+
+def test_sqlite_index_thread_safe_concurrent_access(
+    index: SqliteKnowledgeIndex,
+) -> None:
+    """多线程并发访问不崩溃、结果正确（T2 线程安全回归）。
+
+    背景（面向初学者）：索引在 FastAPI lifespan（主线程）创建，而
+    工具调用跑在 FastAPI 工作线程池——修复前（没有 check_same_thread
+    =False）工作线程一调用就抛 ProgrammingError；即使允许跨线程，
+    没有 RLock 串行化时并发操作同一连接也会数据错乱/崩溃。这里用
+    线程池模拟真实并发：主线程建索引（fixture），8 个线程并发
+    upsert/search/delete/chunks_of_document/完成标记操作，任何崩溃
+    都会让本测试失败（修复前必失败）。
+    """
+    documents = 8
+    rounds = 15
+
+    def worker(doc_id: int) -> None:
+        prefix = f"doc-{doc_id}"
+        for round_no in range(rounds):
+            # 每轮先整文档删除再写入：并发 delete + upsert 竞争同一连接。
+            index.delete_document(prefix)
+            chunk_id = f"{prefix}-{round_no}"
+            # 查询词用线程内唯一 token（marker{doc_id}-{round_no}）：
+            # 刚写入的 chunk 分数最高，top_k=3 必能命中，断言确定。
+            index.upsert(
+                [
+                    _chunk(
+                        chunk_id,
+                        f"marker{doc_id}-{round_no} force mass",
+                        document_id=prefix,
+                    )
+                ]
+            )
+            hits = index.search(f"marker{doc_id}-{round_no}", top_k=3)
+            assert any(hit.chunk.chunk_id == chunk_id for hit in hits)
+            # chunks_of_document 只含本线程的 doc（各线程 doc 互不干扰）。
+            assert [c.chunk_id for c in index.chunks_of_document(prefix)] == [chunk_id]
+        # 完成标记的写入/查询也走同一把锁（并发下互不干扰）。
+        index.mark_document_complete(prefix, chunk_count=rounds, page_count=1)
+        assert index.is_document_complete(prefix)
+
+    with ThreadPoolExecutor(max_workers=documents) as pool:
+        list(pool.map(worker, range(documents)))
+
+    # 主线程复核：每个 doc 只剩最后一轮的分块，完成标记都在。
+    for doc_id in range(documents):
+        prefix = f"doc-{doc_id}"
+        assert index.is_document_complete(prefix)
+        assert [
+            c.chunk_id for c in index.chunks_of_document(prefix)
+        ] == [f"{prefix}-{rounds - 1}"]
+    # 清除标记同样走锁，主线程再验证一次。
+    index.clear_document_complete("doc-0")
+    assert not index.is_document_complete("doc-0")

@@ -14,8 +14,14 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from api.app import create_app
 from core.events import ErrorCode, EventType, RunError, RunEvent
+from core.knowledge.models import Citation as CoreCitation
 from core.sessions import SessionStore
-from core.state import AgentRole, HandoffApprovalRequest, PendingHandoffApproval
+from core.state import (
+    REFERENCES_METADATA_KEY,
+    AgentRole,
+    HandoffApprovalRequest,
+    PendingHandoffApproval,
+)
 
 
 class ChatGraph:
@@ -374,3 +380,230 @@ def test_whitespace_chat_fields_are_rejected_before_graph_execution(
         "detail": {"error_code": "invalid_request", "message": "Request is invalid."}
     }
     assert graph.run_inputs == []
+
+
+# ── ChatResponse.references（T2 冒烟收尾：引用契约生效） ──────────────
+
+
+def _cited_answer(content: str, *, page: int | None = None) -> AIMessage:
+    """构造挂载 references 元数据的助手消息，模拟真实检索挂载。
+
+    元数据格式与 core 的 _attach_references 一致：REFERENCES_METADATA_KEY
+    指向 core Citation 的 model_dump(mode="json") dict 列表。
+    """
+    citation = CoreCitation(
+        document_id="algebra",
+        source="algebra.txt",
+        page=page,
+        chunk_id="chunk-algebra-1",
+    )
+    return AIMessage(
+        content=content,
+        additional_kwargs={REFERENCES_METADATA_KEY: [citation.model_dump(mode="json")]},
+    )
+
+
+def test_chat_fills_references_from_the_final_message_metadata(tmp_path: Path) -> None:
+    """最终消息自带引用 → 响应 references 直接透传（core/API 字段同名）。"""
+    first = CoreCitation(
+        document_id="algebra", source="algebra.txt", page=3, chunk_id="chunk-a"
+    )
+    second = CoreCitation(
+        document_id="stats", source="stats.txt", page=None, chunk_id="chunk-b"
+    )
+    answer = AIMessage(
+        content="检索作答",
+        additional_kwargs={
+            REFERENCES_METADATA_KEY: [
+                first.model_dump(mode="json"),
+                second.model_dump(mode="json"),
+            ]
+        },
+    )
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="请检索"), answer],
+            "events": [],
+            "current_agent": "learning_assistant",
+            "run_error": None,
+            "pending_handoff": None,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "请检索"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["references"] == [
+        {
+            "document_id": "algebra",
+            "source": "algebra.txt",
+            "page": 3,
+            "chunk_id": "chunk-a",
+        },
+        {
+            "document_id": "stats",
+            "source": "stats.txt",
+            "page": None,
+            "chunk_id": "chunk-b",
+        },
+    ]
+
+
+def test_chat_references_are_none_when_the_final_message_has_none(tmp_path: Path) -> None:
+    """最终消息无引用元数据 → 响应 references 为 None（无引用不携带）。"""
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="普通问题"), AIMessage(content="普通回答")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "普通问题"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["references"] is None
+
+
+def test_chat_references_are_none_when_metadata_is_all_invalid(tmp_path: Path) -> None:
+    """references 键存在但内容全非法 → core 归一化为空列表 → API 归一化为 None。
+
+    脏数据防御链路：message_references 逐项跳过非法引用（缺必填字段
+    chunk_id），列表无任何可解析项时返回空列表；_api_citations 再把
+    空列表归一化为 None——与「无引用就不携带」的契约一致。
+    """
+    graph = ChatGraph(
+        {
+            "messages": [
+                HumanMessage(content="请检索"),
+                AIMessage(
+                    content="检索作答",
+                    additional_kwargs={
+                        REFERENCES_METADATA_KEY: [
+                            {"document_id": "algebra", "source": "algebra.txt"},
+                        ]
+                    },
+                ),
+            ],
+            "events": [],
+            "current_agent": "learning_assistant",
+            "run_error": None,
+            "pending_handoff": None,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "请检索"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["references"] is None
+
+
+def test_chat_falls_back_to_the_most_recent_cited_message_for_aggregated_answers(
+    tmp_path: Path,
+) -> None:
+    """supervisor 聚合回答不带引用 → 回退取本轮最近的带引用 worker 作答。
+
+    对应真实冒烟链路：learning_assistant 检索作答（带引用）→ supervisor
+    汇总（不带引用）。响应 message 是汇总，references 回退到检索作答。
+    """
+    worker_answer = _cited_answer("检索作答")
+    summary = AIMessage(content="汇总：检索作答")
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="请检索"), worker_answer, summary],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "请检索"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "汇总：检索作答"
+    assert response.json()["references"] == [
+        {
+            "document_id": "algebra",
+            "source": "algebra.txt",
+            "page": None,
+            "chunk_id": "chunk-algebra-1",
+        }
+    ]
+
+
+def test_chat_does_not_leak_references_from_previous_rounds(tmp_path: Path) -> None:
+    """引用只取本轮新增消息，历史轮次的引用不跨轮次渲染。"""
+    previous_messages = [HumanMessage(content="旧问题"), _cited_answer("旧回答")]
+    graph = ChatGraph(
+        {
+            "messages": [
+                *previous_messages,
+                HumanMessage(content="新问题"),
+                AIMessage(content="新回答"),
+            ],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        },
+        previous_state={"messages": previous_messages},
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "新问题"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "新回答"
+    assert response.json()["references"] is None
+
+
+def test_chat_run_error_responses_carry_no_references(tmp_path: Path) -> None:
+    """本轮没有作答消息（run_error 提前终止）→ references 为 None。"""
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="请评估")],
+            "events": [
+                RunEvent(
+                    event_type=EventType.RUN_FAILED,
+                    sequence=0,
+                    session_id="session-1",
+                    agent="supervisor",
+                    success=False,
+                    error_code=ErrorCode.MODEL_CALL_FAILED,
+                )
+            ],
+            "current_agent": "supervisor",
+            "run_error": RunError(
+                error_code=ErrorCode.MODEL_CALL_FAILED,
+                message="internal secret details",
+                agent="supervisor",
+            ),
+            "pending_handoff": None,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "请评估"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["message"] is None
+    assert response.json()["references"] is None

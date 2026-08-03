@@ -724,7 +724,14 @@
   - API 测试：空库返回空 hits；注入文档后可检索并返回 citation 与截断摘要；
     绝对路径不泄漏；top_k 越界 → 422。
 - 依赖：无（core 检索能力已就绪；知识库数据填充为外部依赖，空库可验收）。
-- 完成备注：
+- 完成备注：KnowledgeService 装配与 search_knowledge 注入已由工作单 T2
+  （2026-08-03）完成：lifespan 构建 SqliteKnowledgeIndex →
+  open_vector_index_if_available（不可用自动降级词法，不阻断启动）→
+  HybridKnowledgeIndex → KnowledgeService → create_search_knowledge_tool，
+  注入 CollaborativeAgentGraph（tools/tool_permissions 授权
+  learning_assistant + teaching_assistant），关闭时释放；环境变量
+  API_KNOWLEDGE_DB_PATH / API_VECTOR_DB_PATH / API_KNOWLEDGE_EMBEDDING
+  （auto/hash）。本任务（POST /knowledge/search 端点）仍待实现。
 
 ### [ ] D6-T4 前端检索测试面板（教师端）
 
