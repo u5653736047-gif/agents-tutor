@@ -576,7 +576,7 @@
   Minor（空返回语义澄清、calls 三元组、caplog 对称、协议 docstring、
   平局测试重写）已处理并复审放行。
 
-### S4-T3 自适应 RAG 策略
+### [x] S4-T3 自适应 RAG 策略
 
 - 对应总清单：2.3.2
 - 范围：检索服务层 / Agent 工具层。
@@ -588,6 +588,32 @@
   - 多轮检索：首次不足时自动 refine query 重检，重检次数有上限并写入事件。
   - 测试覆盖以上三条路径。
 - 依赖：S4-T2。
+- 完成备注：2026-08-03；`policy.py` 新增
+  `RetrievalPolicy` 协议 + `RetrievalDecision(retrieve, reason)`（可解释
+  载体）+ `AlwaysRetrievalPolicy` 默认 + `HeuristicRetrievalPolicy`
+  （五条规则按序：空查询/无实质内容/寒暄**整句相等**（不误伤「你好，
+  什么是SVM」）/纯计算（剥疑问尾缀+可选问号，含中文不命中）/过短
+  ≤1 字符；宁多勿漏，纯数字查询漏检取舍已注释）；`retrieval.py` 新增
+  `adaptive_search` 编排：`QueryRefiner` 协议（独立于 QueryRewriter——
+  时机与返回形态不同）+ `RetrievalRound`/`RetrievalMetadata`/
+  `AdaptiveSearchResult`；**阈值口径（关键设计）**：SearchHit.score 量纲
+  随索引（词法=命中词数/RRF≈0.0164 起步/余弦 [0,1]），编排层不感知索引
+  类型，故 `relevance_threshold=None` 默认不启用（零回归），启用时由
+  调用方按索引量纲配置（注释给建议口径），未达标 hits 照常返回 +
+  `threshold_met=False` 由上层 Agent 决策「知识库未覆盖」；多轮 refine：
+  上限 `max_refine_rounds=2`（可配置 ≤10 成本软上限），每轮记录
+  query/top_score/hit_count 与 refine_history/stopped_reason；降级：
+  policy 异常→需要检索（宁多勿漏）、refiner 异常/空白/非 str→停止重检
+  （同一索引确定性重检无信息增益）；**事件口径**：knowledge 包零依赖
+  core/events.py，重检次数等由 `RetrievalMetadata` 承载（事件源数据
+  齐备），工具/图层接线转换事件属后续细节（tools.py 仍走 search()）。
+  默认（policy=None/threshold=None/refiner=None）退化为单轮
+  multi_query_search 逐项一致零回归。新增 29 个测试（寒暄/纯计算边界、
+  阈值判定、多轮 refine 轮数与历史精确断言、上限生效、六种降级形态、
+  refiner 仅阈值启用时生效、参数校验），全量 585 通过，ruff、mypy
+  strict（35 文件）干净；独立 review 无 Critical/Important，4 个
+  Minor（正则漏判修正、成本上限、refiner 生效语义锁定、取舍注释）
+  已处理并复审放行。
 
 ---
 

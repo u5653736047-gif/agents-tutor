@@ -7,7 +7,15 @@ from collections.abc import Iterable
 from .chunking import chunk_documents, chunk_documents_semantic
 from .index import KnowledgeIndex
 from .models import KnowledgeChunk, KnowledgeDocument, SearchHit
-from .retrieval import QueryRewriter, Reranker, multi_query_search
+from .policy import RetrievalPolicy
+from .retrieval import (
+    AdaptiveSearchResult,
+    QueryRefiner,
+    QueryRewriter,
+    Reranker,
+    adaptive_search,
+    multi_query_search,
+)
 
 # 可选分块策略（S3-T2）：
 # - "character"：字符窗口分块（默认，S3-T1 起的行为，保持不变）；
@@ -29,6 +37,10 @@ class KnowledgeService:
         min_chunk_size: int = 200,
         rewriter: QueryRewriter | None = None,
         reranker: Reranker | None = None,
+        policy: RetrievalPolicy | None = None,
+        refiner: QueryRefiner | None = None,
+        relevance_threshold: float | None = None,
+        max_refine_rounds: int = 2,
     ) -> None:
         """初始化服务。
 
@@ -53,9 +65,38 @@ class KnowledgeService:
           重新排序，最后按重排后的顺序截断 top_k（协议与语义详见
           retrieval.py 模块注释第 7 节；重排失败自动保持初检结果，
           不抛错）。
+        - policy（S4-T3）：检索必要性策略，可选，仅 adaptive_search
+          使用。None 表示默认 AlwaysRetrievalPolicy——总是检索，行为
+          与 S4-T2 完全一致（零回归）；传入 HeuristicRetrievalPolicy
+          等实现后，寒暄、纯计算等简单问题判定为「不需要检索」，
+          直接返回空结果 + 元数据（规则与理由详见 policy.py 模块
+          注释；判定失败自动降级为需要检索，不抛错）。
+        - refiner（S4-T3）：查询精化器，可选，仅 adaptive_search
+          使用。None 表示不重检——阈值未达标时单轮停止（零回归）；
+          传入精化器后，未达标会 refine 出新查询重检（上限见
+          max_refine_rounds；精化失败自动停止重检，不抛错，语义详见
+          retrieval.py 模块注释第 8 节）。
+        - relevance_threshold（S4-T3）：相关性阈值，可选，仅
+          adaptive_search 使用。None 表示不启用阈值判定（默认，零
+          回归——不注入阈值时行为与 S4-T2 完全一致）；启用时必须
+          > 0，且按当前索引的 SearchHit.score 量纲取值（词法 = 命中
+          词数、RRF = 融合分、余弦 = 相似度，量纲问题与建议口径详见
+          retrieval.py 模块注释第 8 节第 2 点）。
+        - max_refine_rounds（S4-T3）：重检次数上限（默认 2，可配置；
+          须 ≥ 0 且 ≤ 10），仅 refiner 非 None 时生效。上限 10 是
+          成本软上限：每轮重检 = 一次完整检索（未来 LLM 精化器还有
+          模型调用），上限过高会让单次查询成本失控。
         """
         if chunking not in _CHUNKING_STRATEGIES:
             raise ValueError("chunking must be 'character' or 'semantic'")
+        if relevance_threshold is not None and relevance_threshold <= 0:
+            raise ValueError("relevance_threshold must be positive when enabled")
+        if max_refine_rounds < 0:
+            raise ValueError("max_refine_rounds must be >= 0")
+        # 成本软上限：与 adaptive_search 的校验一致（每轮重检 = 一次
+        # 完整检索，上限过高成本失控）。
+        if max_refine_rounds > 10:
+            raise ValueError("max_refine_rounds must be <= 10")
         self._index = index
         self._chunk_size = chunk_size
         self._overlap = overlap
@@ -64,6 +105,10 @@ class KnowledgeService:
         self._min_chunk_size = min_chunk_size
         self._rewriter = rewriter
         self._reranker = reranker
+        self._policy = policy
+        self._refiner = refiner
+        self._relevance_threshold = relevance_threshold
+        self._max_refine_rounds = max_refine_rounds
 
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
@@ -150,6 +195,58 @@ class KnowledgeService:
             top_k,
             rewriter=self._rewriter,
             reranker=self._reranker,
+            metadata_filter=metadata_filter,
+        )
+
+    def adaptive_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        metadata_filter: dict[str, str] | None = None,
+    ) -> AdaptiveSearchResult:
+        """自适应检索（S4-T3）：必要性判断 → 检索 → 阈值判定 → 多轮重检。
+
+        （面向初学者）search 是「固定单轮检索」；本方法是 S4-T3 的
+        自适应编排入口，流程与语义详见 retrieval.py 的 adaptive_search
+        与模块注释第 8 节，构造时注入的 policy / refiner /
+        relevance_threshold / max_refine_rounds 在此生效：
+
+        1. 必要性判断（policy，默认 AlwaysRetrievalPolicy——总是检索，
+           零回归）：寒暄、纯计算等简单问题判定为「不需要检索」→
+           返回空结果 + 元数据（needed=False，reason 说明为什么），
+           上层直接作答；
+        2. 检索：与 search 完全相同的 multi_query_search 链路
+           （rewriter / reranker / metadata_filter 原样透传）；
+        3. 阈值判定（relevance_threshold，默认 None 不启用）：本轮
+           最高分 < 阈值 → 未达标。未达标时结果照常返回，但元数据
+           threshold_met=False——上层不应把结果当证据注入，应向
+           用户说明「知识库未覆盖」而非强行作答；
+        4. 多轮重检（refiner + max_refine_rounds，默认不重检）：未
+           达标 → refine 出新查询 → 重检 → 再判定，达到上限仍未达标
+           → 停止。每轮检索与精化历史记录在返回的 RetrievalMetadata
+           （rounds / refine_history / stopped_reason）里，由上层
+           （工具/图）转成事件——检索层不依赖 core/events.py。
+
+        返回：AdaptiveSearchResult（hits + RetrievalMetadata），hits
+        的形态与 search 一致（分数、排序、citation 语义不变）。所有
+        失败路径（policy / refiner 异常）都不抛错（降级语义详见
+        retrieval.py 的 _safe_policy / _safe_refine）。
+        """
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        if not 1 <= top_k <= 10:
+            raise ValueError("top_k must be between 1 and 10")
+        return adaptive_search(
+            self._index,
+            query,
+            top_k,
+            policy=self._policy,
+            rewriter=self._rewriter,
+            reranker=self._reranker,
+            refiner=self._refiner,
+            relevance_threshold=self._relevance_threshold,
+            max_refine_rounds=self._max_refine_rounds,
             metadata_filter=metadata_filter,
         )
 
