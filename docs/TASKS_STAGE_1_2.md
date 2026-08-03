@@ -376,7 +376,7 @@
 > 目标：把 `data/books/` 的教材变成可检索、可过滤、语义可达的知识底座。
 > 与 Sprint 2 可按人力并行，但 S2-T4 的引用展示在语义检索接入后需复测。
 
-### S3-T1 知识源整理与批量入库
+### [x] S3-T1 知识源整理与批量入库
 
 - 对应总清单：2.2.1
 - 范围：`data/books/`、新增 ingest 脚本（`backend/scripts/`）、知识清单文件。
@@ -387,6 +387,22 @@
     大文件（如 190MB 的 AIMA）解析有进度反馈与失败续跑能力。
   - 入库后针对每本书各构造至少 1 个检索用例并命中正确来源。
 - 依赖：Sprint 0 完成。
+- 完成备注：2026-08-03；`backend/scripts/knowledge_manifest.json`（5 本
+  书：source 逻辑标识 + file/title/authors/subjects/difficulty + 每本 2
+  个检索用例）与 `ingest_books.py`（--books/--force/--verify/--top-k 等，
+  逐书容错、退出码 0/1/2）；core 只加不改：`SqliteKnowledgeIndex`（零新
+  依赖，检索语义与 InMemory 逐行一致）+ `iter_pdf_pages` 惰性逐页生成器
+  （进度回调）。幂等：chunk_id 内容坐标派生 + 整文档替换（S0-T2 语义）；
+  续跑：完成标记整本成功后才写，失败不留标记自动重试，`--force` 重入库。
+  实测：ml-zhouzhihua 441 页 610 chunk；全量 5 本处理退出码 0，verify
+  8/8 通过（每本 ≥2 用例命中正确来源，含主题重叠书查询词加限定调整）。
+  **阻塞记录（数据源）**：ml-lihang《机器学习方法》PDF 为扫描版（无文本
+  层，pypdf 无法提取），经确认暂时排除并标记 `blocked:
+  scanned-pdf-no-text-layer`（ingest/verify 自动跳过、不计失败；恢复 =
+  提供文本版 PDF 后移除 blocked 字段重新入库）。新增 34 个测试（含真实
+  小 PDF e2e、blocked 短路），全量 438 通过，ruff、mypy strict（30 文件）
+  干净；独立 review 无 Critical，2 个前置（.gitignore 加 `data/`、全量
+  verify 收官）已落实。
 
 ### S3-T2 语义分块
 

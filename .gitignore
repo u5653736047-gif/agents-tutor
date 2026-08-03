@@ -24,3 +24,6 @@ Thumbs.db
 
 # Env
 .env
+
+# Runtime data (knowledge source PDFs and SQLite stores stay out of git)
+data/

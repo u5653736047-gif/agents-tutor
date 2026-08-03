@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "description": "AI 学科教材知识源清单（S3-T1 批量入库的权威配置）。字段约定：source 为对外暴露的逻辑来源标识（S0-T1 脱敏语义：绝不携带文件系统路径），同时用作 document_id 与入库完成标记键；file 为 data/books/ 下的实际文件名（PDF 本体不进 git，仅清单入库）；difficulty 取值 beginner/intermediate/advanced；verify 为每本书的检索用例（query 为查询词，expected_source 为期望命中的逻辑 source）。",
+  "books": [
+    {
+      "source": "ml-zhouzhihua",
+      "file": "机器学习 Machine Learning (Chinese Edition) (Zhou Zhihua 周志华) (z-library.sk  1lib.sk  z-lib.sk)(1).pdf",
+      "title": "机器学习",
+      "authors": ["周志华"],
+      "subjects": ["机器学习"],
+      "difficulty": "intermediate",
+      "verify": [
+        {
+          "query": "支持向量机 间隔 核函数",
+          "expected_source": "ml-zhouzhihua"
+        },
+        {
+          "query": "集成学习 基学习器",
+          "expected_source": "ml-zhouzhihua"
+        }
+      ]
+    },
+    {
+      "source": "ml-lihang",
+      "file": "机器学习方法 (李航) (z-library.sk  1lib.sk  z-lib.sk).pdf",
+      "title": "机器学习方法",
+      "authors": ["李航"],
+      "subjects": ["机器学习", "统计学习"],
+      "difficulty": "intermediate",
+      "blocked": "scanned-pdf-no-text-layer",
+      "verify": [
+        {
+          "query": "条件随机场 概率 标注",
+          "expected_source": "ml-lihang"
+        },
+        {
+          "query": "感知机 误分类点",
+          "expected_source": "ml-lihang"
+        }
+      ]
+    },
+    {
+      "source": "dl-goodfellow",
+      "file": "深度学习 (伊恩·古德费洛 (Ian Goodfellow etc.) (z-library.sk  1lib.sk  z-lib.sk)(1).pdf",
+      "title": "深度学习",
+      "authors": ["伊恩·古德费洛", "约书亚·本吉奥", "亚伦·库维尔"],
+      "subjects": ["深度学习"],
+      "difficulty": "advanced",
+      "verify": [
+        {
+          "query": "自编码器 重构 隐变量",
+          "expected_source": "dl-goodfellow"
+        },
+        {
+          "query": "反向传播 链式法则 雅可比",
+          "expected_source": "dl-goodfellow"
+        }
+      ]
+    },
+    {
+      "source": "dl-d2l",
+      "file": "动手学深度学习-PyTorch(第二版) (Aston Zhang  Zachary C. Lipton  李沐 etc.) (z-library.sk  1lib.sk  z-lib.sk)(1).pdf",
+      "title": "动手学深度学习（PyTorch 第二版）",
+      "authors": ["Aston Zhang", "Zachary C. Lipton", "李沐", "Alexander J. Smola"],
+      "subjects": ["深度学习"],
+      "difficulty": "beginner",
+      "verify": [
+        {
+          "query": "softmax 回归 交叉熵",
+          "expected_source": "dl-d2l"
+        },
+        {
+          "query": "注意力机制 查询 键",
+          "expected_source": "dl-d2l"
+        }
+      ]
+    },
+    {
+      "source": "ai-russell",
+      "file": "人工智能：现代方法（第4版）（精装版） (Stuart Russell) (z-library.sk  1lib.sk  z-lib.sk).pdf",
+      "title": "人工智能：现代方法（第4版）",
+      "authors": ["Stuart Russell", "Peter Norvig"],
+      "subjects": ["人工智能"],
+      "difficulty": "intermediate",
+      "verify": [
+        {
+          "query": "约束满足问题 回溯搜索",
+          "expected_source": "ai-russell"
+        },
+        {
+          "query": "启发式搜索 评估函数",
+          "expected_source": "ai-russell"
+        }
+      ]
+    }
+  ]
+}
