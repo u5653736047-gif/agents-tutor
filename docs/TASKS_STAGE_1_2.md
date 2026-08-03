@@ -303,14 +303,16 @@
   与 tool_results 一致直接存模型）+ `EVALUATION_COMPLETED` 事件（只带
   verdict 摘要，reason 正文不落事件，双层截断 200 保审计有界）；评价经
   evaluator 节点 `submit_evaluation` 工具（仅 evaluator 可调）在轮末统一
-  解析，不新增图节点；证据只记工具名（S2-T4 引入 Citation 后按类型过滤）。
+  解析，不新增图节点；证据只记工具名（「按类型过滤」随 S2-T4 评估后
+  未落地：过滤会破坏既有替身断言，保持宽口径——成功且有输出的非
+  submit_evaluation 工具，引用的结构化校验由 S2-T4 references 承担）。
   新增 14 个测试（事实错误→fail、存疑→questionable、引用缺失标记、
   正确→pass、checkpoint 持久化与重置、计划模式、脱敏、非法值容错），
   全量 374 通过，ruff、mypy strict（30 文件）干净；独立 review 无
   Critical/Important，6 个 Minor（注释明示失败轮次语义/设计边界、
   角色守卫等）已处理并复审放行。
 
-### S2-T4 最终回答引用插入
+### [x] S2-T4 最终回答引用插入
 
 - 对应总清单：2.3.3（引用插入部分）
 - 范围：`nodes/prompts.py`、`nodes/react_agent.py` 或后处理层、知识工具
@@ -323,6 +325,22 @@
   - 未使用检索证据的回答不携带引用，保持「零命中不伪造引用」语义。
   - 测试覆盖：有检索必带引用、无检索无引用、引用列表与命中一一对应。
 - 依赖：S0-T1（逻辑来源标识）、S2-T1。
+- 完成备注：2026-08-03；引用经消息元数据
+  `additional_kwargs["references"]`（`with_references`/`message_references`，
+  与 S1-T7 角色元数据同机制，SQLite checkpoint 往返可恢复；值存
+  `Citation.model_dump(mode="json")` dict 列表，msgpack 原生类型）随消息
+  同生命周期持久化。来源为工具执行链路的真实 SearchHit Citation（白名单
+  `_CITATION_TOOL_NAMES={"search_knowledge"}`，无模型伪造路径），挂在
+  本轮最后一个无 tool_calls 的终端 AI 消息，按 chunk_id 去重保序；
+  零命中/解析失败不注入键。**交付口径（重要）**：引用按「每条作答消息」
+  渲染——使用证据作答的 Worker 消息带引用，Supervisor 聚合回答由拼接
+  生成、本身未检索故不带引用（D3-T5 前端消费 `ChatResponse.references`
+  时按消息读取，勿只读最后一条）；骨架期不在回答文本注入编号脚注，
+  文本渲染由前端按元数据完成（→ D3-T5）。新增 10 个测试（真实
+  search_knowledge 工具链路 + 对照式断言），全量 384 通过，ruff、mypy
+  strict（30 文件）干净；独立 review 无 Critical，口径确认项已记录，
+  2 个 Minor 已修复并复审放行。维护点：测试对照依赖词法索引确定性，
+  Sprint 3 换向量索引后需复核。
 
 ### S2-T5 引用真实性校验
 

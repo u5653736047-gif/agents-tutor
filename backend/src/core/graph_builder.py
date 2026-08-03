@@ -19,10 +19,17 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot, interrupt
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
+from .knowledge.models import Citation
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
 from .state import (
@@ -44,6 +51,7 @@ from .state import (
     ToolResult,
     create_initial_state,
     with_agent_role,
+    with_references,
 )
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 
@@ -52,6 +60,13 @@ CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
 _TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
 _TASK_RESULTS_MARKER = "[TASK_RESULTS]"
+
+# ── S2-T4 引用收集：产出结构化引用的检索工具名集合 ──
+# 这是「按证据类型过滤检索类工具」的依据：只有这些工具的成功输出才会
+# 被解析出 Citation 并挂到最终回答（见 _citations_from_tool_results 注释）。
+# 新增检索类工具时在此追加工具名即可，无需改其他代码；读取侧
+# （message_references）不依赖此常量，直接读消息元数据。
+_CITATION_TOOL_NAMES = frozenset({"search_knowledge"})
 
 
 class _TaskPlanInput(BaseModel):
@@ -498,6 +513,18 @@ class CollaborativeAgentGraph:
                 for message in cast(list[BaseMessage], updates.get("messages", []))
             ]
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
+            # ── S2-T4 结构化引用：把本轮检索命中挂到终端回答 ──
+            # 注入时机：与角色元数据同一闸口（_wrap 是消息写入持久化历史
+            # 的唯一入口），在角色注入之后、聚合改写之前执行——聚合改写
+            # （_replace_terminal_ai_output 等）用 model_copy 保留
+            # additional_kwargs，因此引用与角色一样不会因内容改写丢失。
+            # 收集时机与来源见 _citations_from_tool_results 注释（与
+            # S2-T3 evidence_tool_names 同源：只读本轮新增的工具结果，
+            # 按 _CITATION_TOOL_NAMES 过滤检索类工具）。
+            updates["messages"] = _attach_references(
+                cast(list[BaseMessage], updates["messages"]),
+                tool_results,
+            )
             target = _handoff_target(tool_results)
             new_plan = _task_plan_from_results(tool_results)
             existing_plan = _task_plan_from_state(state)
@@ -661,10 +688,16 @@ class CollaborativeAgentGraph:
             if evaluation_input is not None:
                 # 证据工具名：本轮成功且有输出的工具结果，排除评价工具本身；
                 # 保持出现顺序去重（dict.fromkeys），保证审计列表稳定可读。
-                # 骨架期取舍：范围偏宽——凡成功有输出的业务工具都算「证据」
-                # （可能含非检索类业务工具），不区分类型；S2-T4 引入 Citation
-                # 结构化引用后，此处应按证据类型（Citation/检索类工具）过滤，
-                # 只记录真正的检索证据来源。
+                # 骨架期取舍（S2-T4 确认后的决定）：范围偏宽——凡成功有
+                # 输出的业务工具都算「证据」（可能含非检索类业务工具），
+                # 不区分类型；S2-T3 预留的「按证据类型（Citation/检索类
+                # 工具）过滤」未落地，原因有二：1) 检索类工具
+                # （search_knowledge）天然满足「成功且有输出」，已被纳入
+                # 评价证据，行为无需改变；2) 保持向后兼容、不破坏 S2-T3
+                # 已交付行为（既有测试断言证据名含替身检索工具 retrieve）。
+                # 引用的结构化校验由 S2-T4 的 references 元数据承担
+                # （终端回答 additional_kwargs["references"]，读取入口
+                # message_references），评价侧继续只记工具名、不记正文。
                 evidence_tools = list(
                     dict.fromkeys(
                         result.tool_name
@@ -1369,6 +1402,99 @@ class CollaborativeAgentGraph:
         }
 
 
+def _citations_from_tool_results(
+    tool_results: Sequence[ToolResult],
+) -> list[Citation]:
+    """从本轮工具结果中收集检索命中的结构化引用（S2-T4）。
+
+    收集时机与来源（与 S2-T3 evidence_tool_names 同源思路）：
+    tool_results 是 _wrap 收到的 updates["tool_results"]——即本次 Agent
+    轮内新增的工具结果，不是跨轮历史累积，因此「本轮」的界定天然准确，
+    不会把上一轮或历史轮的检索引用混入本轮回答。
+
+    识别规则（按证据类型过滤检索类工具）：
+    - 工具名在 _CITATION_TOOL_NAMES 中，且执行成功、输出非空；
+    - 输出是 search_knowledge 的固定 JSON 结构（{"found":..., "hits":
+      [{"content","score","citation"}]}），逐项取 "citation" 还原为
+      Citation——SearchHit 本就含 Citation（knowledge/models.py），工具
+      输出原样带出，这里只做读取还原，不重新构造、不伪造。
+
+    去重与编号：按 chunk_id 去重（同一 chunk 可能被多次检索命中），
+    保持工具结果出现顺序——编号稳定可预期（前端渲染的引用序号与列表
+    下标一一对应）。去重只按 chunk_id：同一文档的不同 chunk 是不同引用。
+
+    零命中不伪造的实现路径：未调用检索工具 / 检索无命中（found=False
+    或 hits 为空）→ 返回空列表，调用方（_attach_references）不注入
+    references 键，回答不带引用；单个结果解析失败（脏数据）逐项跳过
+    （读取端宽容，与 _intent_from_results 同一哲学），不会击穿运行。
+    """
+    citations: list[Citation] = []
+    seen_chunk_ids: set[str] = set()
+    for result in tool_results:
+        if (
+            result.tool_name not in _CITATION_TOOL_NAMES
+            or not result.success
+            or not result.output
+        ):
+            continue
+        try:
+            payload = json.loads(result.output)
+        except (TypeError, ValueError):
+            # ValueError 已覆盖 json.JSONDecodeError（其父类），
+            # 无需重复列举；解析失败视为脏数据，跳过该工具结果。
+            continue
+        hits = payload.get("hits") if isinstance(payload, dict) else None
+        if not isinstance(hits, list):
+            continue
+        for hit in hits:
+            raw = hit.get("citation") if isinstance(hit, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            try:
+                citation = Citation.model_validate(raw)
+            except (TypeError, ValidationError):
+                continue
+            if citation.chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(citation.chunk_id)
+            citations.append(citation)
+    return citations
+
+
+def _attach_references(
+    messages: Sequence[BaseMessage],
+    tool_results: Sequence[ToolResult],
+) -> list[BaseMessage]:
+    """把本轮检索命中的引用挂到本轮终端回答消息上（S2-T4）。
+
+    注入目标：本轮（本次 Agent 轮）最后一个无 tool_calls 的 AIMessage
+    ——即「使用检索证据作答」的那条最终回答；中间带 tool_calls 的助手
+    消息（工具调用请求）与 HumanMessage/ToolMessage 一律不挂。
+
+    多轮协作口径（本任务的实现决定，写入注释）：每个 Agent 轮独立结算
+    ——Worker 检索后作答，其回答消息携带引用；Supervisor 聚合回答由
+    子任务输出拼接生成（_deterministic_aggregation），本身未执行检索，
+    故不带引用，前端按消息渲染引用（与角色徽章同机制）。聚合改写
+    （_replace_terminal_ai_output / _append_missing_results_notice）用
+    model_copy 仅替换 content、原样保留 additional_kwargs，因此先注入
+    的引用不会因聚合改写丢失（与角色元数据同一保障）。
+
+    边界：无检索命中 → 原样返回，消息不带 references 键（「零命中不
+    伪造」）；检索命中但本轮没有终端回答（如模型一直调用工具直到迭代
+    超限）→ 没有可挂的消息，同样原样返回——回答不存在时引用无意义。
+    """
+    citations = _citations_from_tool_results(tool_results)
+    if not citations:
+        return list(messages)
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if isinstance(message, AIMessage) and not message.tool_calls:
+            updated[index] = with_references(message, citations)
+            return updated
+    return updated
+
+
 def _handoff_target(tool_results: Sequence[ToolResult]) -> str | None:
     """只读取本次 Agent 调用产生的 handoff 结果。"""
     for result in reversed(tool_results):
@@ -1619,7 +1745,8 @@ def _replace_terminal_ai_output(
         message = updated[index]
         if isinstance(message, AIMessage) and not message.tool_calls:
             # model_copy 仅替换 content，additional_kwargs 原样保留——
-            # 因此 _wrap 注入的 agent 角色元数据在聚合改写内容后不丢失。
+            # 因此 _wrap 注入的 agent 角色元数据与 S2-T4 的引用元数据
+            # （references）在聚合改写内容后都不丢失。
             updated[index] = message.model_copy(update={"content": content})
             return updated
     raise RuntimeError("aggregation completed without a terminal AIMessage")
@@ -1652,7 +1779,8 @@ def _append_missing_results_notice(
                 else f"已完成部分：无\n\n{notice}"
             )
             # 与 _replace_terminal_ai_output 同理：仅替换 content，
-            # additional_kwargs（含 agent 角色元数据）原样保留。
+            # additional_kwargs（含 agent 角色元数据与 S2-T4 引用元数据）
+            # 原样保留。
             updated[index] = message.model_copy(update={"content": content})
             return updated
     raise RuntimeError("aggregation completed without a terminal AIMessage")

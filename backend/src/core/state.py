@@ -21,9 +21,17 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .events import ErrorCode, RunError, RunEvent
+from .knowledge.models import Citation
 
 # ─────────────────────────────────────────────
 # 枚举定义
@@ -189,6 +197,91 @@ def message_agent_role(message: BaseMessage) -> AgentRole | None:
         return AgentRole(raw)
     except ValueError:
         return None
+
+
+# ─────────────────────────────────────────────
+# 助手消息的结构化引用元数据（S2-T4 最终回答引用插入）
+# ─────────────────────────────────────────────
+
+# 当 Agent 使用检索工具（search_knowledge 等）的证据作答时，最终回答
+# 消息会在 additional_kwargs 中写入「本轮检索命中的结构化引用列表」，
+# 供前端渲染引用与评价 Agent 校验（API 层 ChatResponse.references
+# 字段的消费属 D3-T5，读取入口就是本模块的 message_references——
+# API 层只需从 get_history() 的最后一条助手消息读出即可，零改动接入）。
+#
+# 为什么用 additional_kwargs（消息元数据）而不是独立的 state 通道：
+# 1) 引用是「这条回答用了哪些证据」的随消息属性——挂在消息上与内容
+#    同生命周期、同序列化路径，get_history() 读出的消息天然携带，
+#    前端按消息渲染引用与角色徽章（AGENT_ROLE_METADATA_KEY）同机制；
+#    若放 state 独立通道，消息与引用会分离存储，恢复历史时还要按轮次
+#    重新配对，API 层消费改动更大；
+# 2) additional_kwargs 是 LangChain 消息的标准附加字段，LangGraph 的
+#    SQLite checkpointer（JsonPlusSerializer，msgpack 基）序列化消息时
+#    原样保留——与角色元数据是同一已验证路径（test_agent_role_metadata
+#    覆盖序列化往返），进程重建后 get_history() 仍能恢复引用列表；
+# 3) 值存 dict 列表而非 Citation 对象列表：additional_kwargs 里的值
+#    必须是 msgpack 原生类型才能保证序列化往返无自定义类型注册依赖
+#    （与 intent/level 存枚举值字符串同理），因此写入端把 Citation
+#    转 model_dump(mode="json") 的 dict，读取端用 Citation.model_validate
+#    宽容还原。
+#
+# 写入端严格（只接受 Citation 模型，输出固定 JSON 结构），读取端宽容
+# （见 message_references）：宁可返回 None 也不让异常数据击穿前端。
+REFERENCES_METADATA_KEY = "references"
+
+
+def with_references(
+    message: AIMessage,
+    citations: Sequence[Citation],
+) -> AIMessage:
+    """返回携带结构化引用列表的 AIMessage 副本（不修改原对象）。
+
+    与 with_agent_role 同一副本语义（理由相同）：模型返回的 AIMessage
+    可能被调用方复用（如再次作为模型输入），就地修改会污染模型看到的
+    历史；model_copy 只替换 additional_kwargs，content、tool_calls、
+    response_metadata 等字段原样保留，既有 additional_kwargs（如 provider
+    元数据、AGENT_ROLE_METADATA_KEY）也保留，只新增
+    REFERENCES_METADATA_KEY 一个键。
+    引用以 dict 列表形式写入（见上方模块注释第 3 点），保证 checkpoint
+    序列化往返无需类型注册。
+
+    空序列防御（接口契约完整性）：citations 为空时原样返回消息、不注入
+    空的 references 键——「无引用就不携带引用」是 S2-T4 的零命中语义，
+    空键会与「有引用但列表为空」的脏状态混淆。当前唯一调用方
+    _attach_references 在收集为空时根本不会调用本函数（保证传入非空），
+    此防御面向未来新增调用方，避免意外写入空键。
+    """
+    if not citations:
+        return message
+    additional_kwargs = dict(message.additional_kwargs)
+    additional_kwargs[REFERENCES_METADATA_KEY] = [
+        citation.model_dump(mode="json") for citation in citations
+    ]
+    return message.model_copy(update={"additional_kwargs": additional_kwargs})
+
+
+def message_references(message: BaseMessage) -> list[Citation] | None:
+    """从消息元数据读出结构化引用列表；无法确定时返回 None。
+
+    读取端宽容（与 message_agent_role 同一哲学）：
+    - 键缺失或值不是列表 → None，表示「该消息没有引用」而非数据错误；
+    - 列表内的非法项（历史脏数据、未来字段变更）逐项跳过，合法项照常
+      返回；列表本身合法但无任何可解析项时返回空列表——保证
+      get_history() 的消费者（前端引用渲染、API 层 references 组装）
+      不会因异常崩溃。
+    """
+    raw = message.additional_kwargs.get(REFERENCES_METADATA_KEY)
+    if not isinstance(raw, list):
+        return None
+    citations: list[Citation] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            citations.append(Citation.model_validate(item))
+        except ValidationError:
+            continue
+    return citations
 
 
 WorkerAgentRole = Literal[
