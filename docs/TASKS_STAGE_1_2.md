@@ -488,7 +488,7 @@
   （32 文件）干净；独立 review 无 Critical，I-1（维度重载防护）与
   5 个 Minor 已处理并复审放行。
 
-### S3-T5 混合检索
+### [x] S3-T5 混合检索
 
 - 对应总清单：2.2.3（向量 + BM25 + 元数据过滤混合检索部分）
 - 范围：`src/core/knowledge/index.py`、`service.py`。
@@ -498,6 +498,23 @@
   - 构造用例证明融合排序在两路各自失效场景下优于单路。
   - 混合检索成为 `search_knowledge` 工具的默认路径，词法单路保留为降级选项。
 - 依赖：S3-T4。
+- 完成备注：2026-08-03；`hybrid.py` 新增
+  `HybridKnowledgeIndex`（实现 KnowledgeIndex 协议）：RRF 融合
+  （Σ 1/(k+rank)，k=60 可调，同分按 chunk_id，候选窗口
+  max(top_k×2, 10)）——选 RRF 因两路量纲不可比、零调参、确定可手算；
+  metadata_filter 透传两路（先过滤后融合，复用 S3-T3 语义）；
+  `open_vector_index_if_available` 降级工厂（文件不存在不创建 / 打不开
+  返回 None / 成功启用）；vector=None 时完全透传词法路（分数排序逐项
+  一致）；词法路为永不降级底线（by_chunk_id 取词法对象）。默认路径：
+  `search_knowledge` 工具注入式设计（不改），core 内构造点
+  ingest `--verify` 已接入混合索引（当前无向量库自动降级词法，行为
+  不变），未来装配点 `KnowledgeService(HybridKnowledgeIndex(...))`
+  一行接入（测试 6 锁定）。两路失效场景用例：场景 A 词法失效
+  （土豆→马铃薯词法 0 命中、混合 top1 命中）、场景 B 向量失效
+  （apple-pie 词法命中+向量正交反例，混合两路各救一项）。新增 13 个
+  测试，全量 531 通过，ruff、mypy strict（33 文件）干净；独立 review
+  无 Critical/Important，5 个 Minor（含 by_chunk_id 词法优先行为修正、
+  e2e 测试 --vector-db 隔离）已处理并复审放行。
 
 ---
 

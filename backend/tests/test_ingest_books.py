@@ -585,6 +585,11 @@ def test_main_end_to_end_ingest_reingest_and_verify(tmp_path: Path) -> None:
         str(books_dir),
         "--db",
         str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则 --verify 会探测到开发者本地
+        # 的向量库（存在与否决定混合/降级路径），测试确定性受损。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
     ]
 
     assert main(common) == 0
@@ -635,6 +640,11 @@ def test_main_skips_blocked_book_and_verify_still_succeeds(tmp_path: Path) -> No
         str(books_dir),
         "--db",
         str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则 --verify 会探测到开发者本地
+        # 的向量库（存在与否决定混合/降级路径），测试确定性受损。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
     ]
 
     # ingest：ml-a 入库、ml-b 阻塞跳过（占位 PDF 未被解析）→ 退出码 0。
@@ -653,6 +663,11 @@ def test_main_verify_failure_exit_code(tmp_path: Path) -> None:
         str(books_dir),
         "--db",
         str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则 --verify 会探测到开发者本地
+        # 的向量库（存在与否决定混合/降级路径），测试确定性受损。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
     ]
     # 先正常入库并验证通过（此时 books_dir 里是真实小 PDF）。
     assert main(common) == 0
@@ -746,6 +761,11 @@ def test_main_semantic_chunking_flag(tmp_path: Path) -> None:
         str(books_dir),
         "--db",
         str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则 --verify 会探测到开发者本地
+        # 的向量库（存在与否决定混合/降级路径），测试确定性受损。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
     ]
 
     assert main([*common, "--chunking", "semantic"]) == 0

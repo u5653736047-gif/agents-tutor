@@ -38,9 +38,12 @@
    本脚本无需额外逻辑——清单注入字段与规则提取字段合起来构成完整的
    领域元数据（字段约定见 core/knowledge/models.py 模块注释）。
 5. 检索用例验证（--verify）
-   遍历清单中每本书的 verify 用例：执行词法检索，若期望命中的逻辑
-   source 出现在前 top_k 个结果中即 PASS，否则 FAIL；退出码 0 表示全部
-   通过，1 表示存在失败用例。
+   遍历清单中每本书的 verify 用例：执行混合检索（S3-T5 起）——词法
+   库必开，向量库文件存在时词法 + 向量两路按 RRF 融合排序（能命中
+   同义表述），向量库不存在或打不开时自动降级为纯词法（行为与
+   S3-T1 完全一致，不抛错）。期望命中的逻辑 source 出现在前 top_k
+   个结果中即 PASS，否则 FAIL；退出码 0 表示全部通过，1 表示存在
+   失败用例。
 6. blocked 阻塞语义
    清单条目可带 "blocked": "<原因字符串>" 标记某本书当前不可入库
    （例如扫描版 PDF 无文本层，pypdf 提取不到内容）。被标记的书：
@@ -63,7 +66,9 @@
    - 已入库的书（完成标记存在）带 --vector 重跑时，自动从词法库读出
      该书全部分块补写向量（增量构建，不重新解析 PDF）；
    - --force --vector 重入库时，词法与向量同步整文档替换；
-   - --verify 仍走词法索引（词法结果不变，向量检索正确性由测试覆盖）。
+   - --verify 默认走混合检索（S3-T5）：词法路必开，向量库文件存在
+     才启用（open_vector_index_if_available，打不开自动降级，详见
+     core/knowledge/hybrid.py 模块注释）。
    语义检索与词法检索的并存关系、协议设计见 core/knowledge/vector_index.py
    模块注释与选型文档。
 """
@@ -79,6 +84,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from core.knowledge.embedding import HashEmbeddingProvider
+from core.knowledge.hybrid import HybridKnowledgeIndex, open_vector_index_if_available
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import iter_pdf_pages
 from core.knowledge.models import KnowledgeDocument
@@ -516,17 +522,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     index = SqliteKnowledgeIndex(args.db)
-    # S3-T4：向量库只在「入库/补建」路径打开，--verify 分支不构造——
-    # 否则 --vector --verify 会白白创建一个空的向量库文件。
-    # Embedding 提供方默认 HashEmbeddingProvider（离线零依赖）；
-    # 想换真实语义模型（fastembed + bge-small-zh-v1.5）时，把下面的
-    # provider 换成 FastEmbedProvider() 即可（协议可替换；注意不同
-    # 模型维度可能不同，更换后需 --force 重建向量库，见
-    # core/knowledge/embedding.py 与 docs/EMBEDDING_SELECTION.md）。
+    # S3-T4：向量库在「入库/补建」路径（--vector）显式打开；
+    # --verify 分支用 open_vector_index_if_available「存在才打开」——
+    # 文件不存在时返回 None（不会白白创建空库文件），检索自动降级
+    # 为词法单路（S3-T5 混合检索的降级语义，见 hybrid.py 模块注释）。
+    # Embedding 提供方默认 HashEmbeddingProvider（离线零依赖）。
+    # 想换真实语义模型（fastembed + bge-small-zh-v1.5）时有两个接入点：
+    # - --vector 入库/补建路径：换下方 SqliteVectorKnowledgeIndex 的
+    #   provider 参数为 FastEmbedProvider()（协议可替换）；
+    # - --verify 混合检索路径：open_vector_index_if_available 默认在
+    #   core/knowledge/hybrid.py 内部取 HashEmbeddingProvider，换模型
+    #   需给该工厂传 provider 参数（或改 hybrid.py 的默认值）。
+    # 注意不同模型维度可能不同，更换后需 --force 重建向量库，见
+    # core/knowledge/embedding.py 与 docs/EMBEDDING_SELECTION.md。
     vector_index: SqliteVectorKnowledgeIndex | None = None
     try:
         if args.verify:
-            service = KnowledgeService(index)
+            # S3-T5：混合检索是 --verify 的默认路径——词法库必开，
+            # 向量库「文件存在才打开」（从未 --vector 入库则文件不存在，
+            # 自动降级为纯词法，不抛错，行为与 S3-T1 完全一致）；打开
+            # 失败（如换过 embedding provider 导致维度不匹配）同样降级，
+            # 详见 core/knowledge/hybrid.py 的 open_vector_index_if_available。
+            vector_index = open_vector_index_if_available(args.vector_db)
+            service = KnowledgeService(HybridKnowledgeIndex(index, vector_index))
             # 阻塞书（数据源不可用）不参与验证：其用例保留在清单里，
             # 待 blocked 标记移除后自动恢复验证。
             blocked_books = [book for book in books if book.blocked]
