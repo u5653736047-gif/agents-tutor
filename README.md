@@ -13,6 +13,8 @@
 - 可选 SQLite 持久化，按 `user_id + session_id` 逻辑分区
 - 可选模型上下文裁剪，checkpoint 仍保留完整历史
 - 文本/PDF 加载、确定性分块、内存检索与可追溯引用工具
+- Python 代码沙箱执行、LaTeX 公式校验/MathML 转换、SQLite 学习记录读写工具
+- 工具级超时控制，超时归类为 `TOOL_TIMEOUT` 结构化错误
 - 使用项目根目录 `.env` 接入 DeepSeek
 - pytest、Ruff 和 mypy 质量检查
 
