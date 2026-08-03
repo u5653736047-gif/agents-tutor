@@ -278,7 +278,7 @@
 > `scripts/start-stage3.ps1` 一条命令启动双端。前端 lint / typecheck / build
 > 与后端 pytest / ruff / mypy 门禁全绿。
 
-### W1-T8 产出细节任务清单
+### [x] W1-T8 产出细节任务清单
 
 - 范围：新建 `docs/TASKS_STAGE_3_DETAILS.md`。骨架搭完后，只有你最清楚框架
   里留了哪些扩展点——把「要补什么」写成可执行的清单交给下一个 agent。
@@ -294,16 +294,27 @@
     「骨架修复项」一节，不与细节项混淆。
 - 依赖：W1-T7（骨架验收跑通后再总结，避免清单与实现脱节）。
 
+> 完成记录（2026-08-03）：`docs/TASKS_STAGE_3_DETAILS.md` 已产出（D1–D7 共
+> 37 个原子任务 + 骨架修复项 F1–F5 + M3 出口检查与勾选同步约定），落点均经
+> 独立审查抽查核实（精确到文件、行号、契约字段），1 个 Important（top_k
+> 上限与 core 对齐）与 6 个 Minor 已修订并复审放行。骨架验收通过后移交
+> 接力棒：由另一个 agent 执行本细节清单。
+
 ---
 
 ## 骨架验收（出口检查）
 
-- [ ] 一条命令启动双端，浏览器可完成完整聊天闭环（W1-T7）。
-- [ ] 助手回答带来源 Agent 角色徽章，多 Agent 切换可区分（W1-T4）。
-- [ ] 待审批 handoff 可确认 / 拒绝并继续运行（W0-T5）。
-- [ ] 会话可创建、列表、归档、历史回溯（W0-T3、W1-T3）。
-- [ ] 细节清单 `docs/TASKS_STAGE_3_DETAILS.md` 已产出且满足 W1-T8 验收标准。
-- [ ] 后端三项门禁 + 前端三项门禁全绿（全程）。
+- [x] 一条命令启动双端，浏览器可完成完整聊天闭环（W1-T7）。
+- [x] 助手回答带来源 Agent 角色徽章，多 Agent 切换可区分（W1-T4）。
+- [x] 待审批 handoff 可确认 / 拒绝并继续运行（W0-T5）。
+- [x] 会话可创建、列表、归档、历史回溯（W0-T3、W1-T3）。
+- [x] 细节清单 `docs/TASKS_STAGE_3_DETAILS.md` 已产出且满足 W1-T8 验收标准。
+- [x] 后端三项门禁 + 前端三项门禁全绿（全程）。
+
+> 出口检查完成记录（2026-08-03）：六项全部通过。W1-T7 真实 DeepSeek 联调
+> 覆盖创建会话 → 角色徽章回答（supervisor / learning_assistant 可区分）→
+> handoff confirm / reject → 刷新历史回溯 → 归档；后端 pytest 324 /
+> ruff / mypy strict 与前端 lint / typecheck / build 全绿。
 
 骨架验收通过后，移交接力棒：由另一个 agent 执行
 `docs/TASKS_STAGE_3_DETAILS.md`。
