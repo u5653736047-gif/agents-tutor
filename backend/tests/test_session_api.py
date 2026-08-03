@@ -193,6 +193,118 @@ def test_history_projects_only_safe_user_and_assistant_messages(tmp_path: Path) 
     assert "internal payload" not in response.text
 
 
+def test_history_prefers_agent_role_metadata_over_name(tmp_path: Path) -> None:
+    # 构造带角色元数据的历史消息（模拟 a6b31a3 之后 core 写入的 checkpoint）：
+    # additional_kwargs["agent"] 是产出角色的稳定来源。这里故意把 name 设成
+    # 另一个角色值，验证元数据优先于 name（模型返回的 AIMessage 从不设 name，
+    # 但即使设了也不应覆盖元数据）。
+    histories = {
+        ("session-1", "user-1"): [
+            HumanMessage(content="你好"),
+            AIMessage(
+                content="督导回答",
+                additional_kwargs={"agent": "supervisor"},
+                name="learning_assistant",
+            ),
+        ]
+    }
+    app, store = _session_app(tmp_path, HistoryGraph(histories))
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _request(
+                app,
+                "GET",
+                "/sessions/session-1/messages",
+                headers={"X-User-Id": "user-1"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"role": "user", "content": "你好", "agent": None, "created_at": None},
+        {
+            "role": "assistant",
+            "content": "督导回答",
+            "agent": "supervisor",
+            "created_at": None,
+        },
+    ]
+
+
+def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
+    tmp_path: Path,
+) -> None:
+    # 旧数据（a6b31a3 之前）没有角色元数据，覆盖五种回退/降级场景：
+    # 1. 无元数据但 name 是合法角色 → 回退读取 name；
+    # 2. 无元数据也无 name → 降级为 None（前端显示「助手」徽章）；
+    # 3. 元数据值非法（脏数据）→ core 宽容读取返回 None，再回退 name；
+    # 4. 元数据非法且 name 也缺失/非法 → 无路可退，降级为 None；
+    # 5. 无元数据且 name 是非角色字符串 → 同样降级为 None。
+    histories = {
+        ("session-1", "user-1"): [
+            HumanMessage(content="旧问题"),
+            AIMessage(content="旧回答", name="evaluator"),
+            AIMessage(content="更旧的回答"),
+            AIMessage(
+                content="脏数据回答",
+                additional_kwargs={"agent": "ghost_role"},
+                name="teaching_assistant",
+            ),
+            AIMessage(
+                content="脏数据且无合法回退",
+                additional_kwargs={"agent": "ghost_role"},
+            ),
+            AIMessage(content="name 非法", name="not_a_role"),
+        ]
+    }
+    app, store = _session_app(tmp_path, HistoryGraph(histories))
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _request(
+                app,
+                "GET",
+                "/sessions/session-1/messages",
+                headers={"X-User-Id": "user-1"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"role": "user", "content": "旧问题", "agent": None, "created_at": None},
+        {
+            "role": "assistant",
+            "content": "旧回答",
+            "agent": "evaluator",
+            "created_at": None,
+        },
+        {"role": "assistant", "content": "更旧的回答", "agent": None, "created_at": None},
+        {
+            "role": "assistant",
+            "content": "脏数据回答",
+            "agent": "teaching_assistant",
+            "created_at": None,
+        },
+        {
+            "role": "assistant",
+            "content": "脏数据且无合法回退",
+            "agent": None,
+            "created_at": None,
+        },
+        {
+            "role": "assistant",
+            "content": "name 非法",
+            "agent": None,
+            "created_at": None,
+        },
+    ]
+
+
 def test_session_routes_publish_pydantic_contracts_in_openapi() -> None:
     openapi = create_app().openapi()
     create_responses = openapi["paths"]["/sessions"]["post"]["responses"]

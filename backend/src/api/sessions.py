@@ -22,6 +22,7 @@ from api.schemas import (
 )
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionRecord, SessionStore
+from core.state import message_agent_role
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 VALIDATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -89,12 +90,45 @@ def _owned_session(
 
 
 def _safe_agent(message: BaseMessage) -> AgentRole | None:
+    """读取消息产出 Agent 角色：角色元数据优先，name 回退，最终降级为 None。"""
+
+    # ── 第一步：优先读 core 的角色元数据 ────────────────────────────
+    # core 提交 a6b31a3 之后，所有进入持久化历史的 AIMessage 都会经
+    # core.state.with_agent_role 在 additional_kwargs["agent"] 中写入
+    # 产出它的 Agent 角色，并随 checkpoint 序列化往返保留。这是刷新历史
+    # 时判断「这条回答出自哪个 Agent」的稳定来源；而 message.name 在模型
+    # 返回的 AIMessage 上从不被设置（现有实现因此恒为 null，前端只能显示
+    # 「助手」降级徽章）。core 的读取函数 message_agent_role 是宽容读取：
+    # 非助手消息 / 键缺失 / 值非法一律返回 None，不会因脏数据崩溃。
+    role = message_agent_role(message)
+    if role is not None:
+        # core.state.AgentRole 与 api.schemas.AgentRole 的字符串值完全
+        # 一致（supervisor / teaching_assistant / learning_assistant /
+        # evaluator），这里只做值透传，不重复定义映射。
+        try:
+            return AgentRole(role.value)
+        except ValueError:
+            # ── 防御：两份枚举是独立定义 ──────────────────────────
+            # core 与 api 的 AgentRole 是各自维护的枚举。若未来 core
+            # 新增角色成员而 api 未同步，message_agent_role 会返回一个
+            # core 合法、api 无法构造的值，硬构造将抛未捕获 ValueError
+            # 变成 HTTP 500。这里与 name 回退的降级语义对齐：返回 None，
+            # 让前端显示「助手」徽章，而不是让异常击穿接口。
+            return None
+
+    # ── 第二步：name 回退，兼容旧 checkpoint 数据 ──────────────────
+    # a6b31a3 之前持久化的历史消息没有角色元数据；老实现从 message.name
+    # 读取角色（少数手工构造的消息会设置 name）。保留该回退路径，让旧会话
+    # 刷新后仍能显示具体 Agent 角色，而不是一律降级。
     name = message.name
     if not isinstance(name, str):
         return None
     try:
         return AgentRole(name)
     except ValueError:
+        # ── 降级语义 ──────────────────────────────────────────────
+        # 元数据缺失且 name 非法（脏数据）时返回 None：接口不报错，
+        # 前端据此显示「助手」降级徽章，保证任何历史数据都能正常渲染。
         return None
 
 
