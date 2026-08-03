@@ -522,7 +522,7 @@
 
 > 目标：在「能检索」之上做到「检得准、该检才检」。
 
-### S4-T1 Query 改写与多路检索
+### [x] S4-T1 Query 改写与多路检索
 
 - 对应总清单：2.3.1（Query 改写、多路联合检索部分）
 - 范围：检索服务层（位置自选，建议独立于 index 的查询编排层）。
@@ -531,6 +531,22 @@
   - 改写模型调用失败时降级为原始 query 单路检索。
   - 测试覆盖：多变体合并去重、降级路径、与混合检索组合。
 - 依赖：S3-T5。
+- 完成备注：2026-08-03；`retrieval.py` 新增查询编排层：
+  `QueryRewriter` 协议（可注入可替换）+ `IdentityQueryRewriter` 默认
+  （单变体 ≡ 直接索引 search，分数/排序/citation 逐项一致，零回归）；
+  `multi_query_search` 多变体联合检索——每变体各检索一次（词法/混合
+  按 service 配置），`dict[chunk_id]` 去重、**max 分数合并**（同打分
+  函数量纲一致可直比；不用 RRF——那是 hybrid 为跨量纲设计的；不用
+  加权/首命中），同分按 chunk_id，候选窗口 max(top_k×2,10)，metadata
+  _filter 透传每变体；降级语义：改写器抛异常 / 返回 None / 含非 str
+  元素 / 空 / 全空白 → 原始 query 单路 + warning（清洗与类型校验全部
+  在 try 内）；空白 query 短路不打误报日志；LLM 改写器只做协议扩展点
+  （真实实现由上层注入，避免检索层耦合 Agent 模型层；变体上限由上层
+  保证）。`KnowledgeService(rewriter=...)` 注入接入。新增 13 个测试
+  （合并去重/max 非首命/降级三路径/混合组合 RRF 精确分/过滤透传/
+  零回归等价），全量 544 通过，ruff、mypy strict（34 文件）干净；
+  独立 review 无 Critical/Important，3 个 Minor（清洗入 try、空白
+  短路）已处理并复审放行。
 
 ### S4-T2 重排序
 

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from .chunking import chunk_documents, chunk_documents_semantic
 from .index import KnowledgeIndex
 from .models import KnowledgeChunk, KnowledgeDocument, SearchHit
+from .retrieval import QueryRewriter, multi_query_search
 
 # 可选分块策略（S3-T2）：
 # - "character"：字符窗口分块（默认，S3-T1 起的行为，保持不变）；
@@ -26,6 +27,7 @@ class KnowledgeService:
         chunking: str = "character",
         max_chunk_size: int = 2000,
         min_chunk_size: int = 200,
+        rewriter: QueryRewriter | None = None,
     ) -> None:
         """初始化服务。
 
@@ -37,6 +39,12 @@ class KnowledgeService:
         - chunk_size / overlap：仅 character 策略使用（窗口大小与重叠）；
         - max_chunk_size / min_chunk_size：仅 semantic 策略使用
           （目标块大小上限；超长段落切分时「最近行边界」取舍的最小值）。
+        - rewriter（S4-T1）：查询改写器，可选。None 表示默认
+          IdentityQueryRewriter——不改写，检索行为与 S3 完全一致
+          （零回归）；传入自定义改写器后，每次 search 会把 query
+          改写为多个变体、每变体各检索一次、按 chunk_id 去重后以
+          max 分数合并排序（协议与语义详见 retrieval.py 模块注释；
+          改写失败自动降级为原始 query 单路，不抛错）。
         """
         if chunking not in _CHUNKING_STRATEGIES:
             raise ValueError("chunking must be 'character' or 'semantic'")
@@ -46,6 +54,7 @@ class KnowledgeService:
         self._chunking = chunking
         self._max_chunk_size = max_chunk_size
         self._min_chunk_size = min_chunk_size
+        self._rewriter = rewriter
 
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
@@ -95,6 +104,13 @@ class KnowledgeService:
     ) -> list[SearchHit]:
         """Validate public search inputs, then delegate ranking to the index.
 
+        S4-T1 多路检索编排（面向初学者）：search 现在走 retrieval.py
+        的 multi_query_search——默认不改写（Identity 零回归，结果与
+        S3 逐项一致）；注入改写器后，query 会被改写为多个变体、每个
+        变体各检索一次、按 chunk_id 去重后以 max 分数合并排序；改写
+        失败自动降级为原始 query 单路检索，不抛错（语义详见
+        retrieval.py 模块注释第 3/4/5 节）。
+
         过滤语义（S3-T3，面向初学者）：metadata_filter 是「键 → 值」
         字典，例如 {"source": "ml-zhouzhihua", "difficulty": "intermediate"}
         表示「只在这本书、这个难度里检索」。规则：
@@ -104,13 +120,21 @@ class KnowledgeService:
           见 models.py 模块注释）；
         - 过滤在打分排序之前生效（索引层实现），top_k 截断发生在
           过滤之后——过滤后不足 top_k 个就返回全部匹配；
-        - 没有任何匹配时返回空列表（不报错）。
+        - 没有任何匹配时返回空列表（不报错）；
+        - 多路检索下过滤条件透传给每一个变体，被过滤的 chunk 不会
+          进入任何变体、自然也不进合并结果（与单路语义一致）。
         """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
-        return self._index.search(query, top_k, metadata_filter=metadata_filter)
+        return multi_query_search(
+            self._index,
+            query,
+            top_k,
+            rewriter=self._rewriter,
+            metadata_filter=metadata_filter,
+        )
 
 
 __all__ = ["KnowledgeService"]
