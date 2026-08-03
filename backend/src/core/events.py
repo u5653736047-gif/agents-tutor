@@ -24,6 +24,15 @@ class EventType(StrEnum):
     # （随 checkpoint 持久化，供审计读取）——与「事件不记录敏感正文」的
     # 仓库惯例一致（RunEvent 无 content/arguments 字段，见该类注释）。
     EVALUATION_COMPLETED = "evaluation_completed"
+    # S4-T3 检索决策：search_knowledge 工具的检索元数据由 core 侧
+    # （graph_builder._wrap）解析后发出（agent=调用检索工具的角色，
+    # tool_name="search_knowledge"，字段见 RunEvent 的 retrieval_* 注释）。
+    # 为什么在 core 侧转换而不是让 knowledge 包直接 emit：knowledge 包
+    # 刻意零依赖 core/events.py（见 retrieval.py 模块注释第 8 节第 4 点），
+    # 检索层只把决策汇总成 RetrievalMetadata 随结果返回，由本事件承载
+    # 决策摘要供评价 Agent 与审计链路核对——「知识库未覆盖」这类结论
+    # 不应只在工具输出里一闪而过，事件通道随 checkpoint 持久化。
+    RETRIEVAL_DECISION = "retrieval_decision"
     TASK_RESULT_ARCHIVED = "task_result_archived"
     TASK_RESULTS_AGGREGATED = "task_results_aggregated"
     RUN_COMPLETED = "run_completed"
@@ -72,6 +81,21 @@ class RunEvent(BaseModel):
     # 被评价内容的细节，属敏感正文；完整结论存 state["evaluation"] 供
     # 审计读取）。默认 None 向后兼容——旧事件与未评价轮次不携带该字段。
     evaluation_verdict: str | None = None
+    # ── S4-T3 检索决策字段（RETRIEVAL_DECISION 事件携带）──
+    # 来源：graph_builder._wrap 从 search_knowledge 成功 ToolResult 的
+    # JSON metadata 解析（转换在 core 侧，knowledge 包零依赖本模块）。
+    # 脱敏原则：事件只记「决策摘要」，不记查询正文——每轮查询文本已在
+    # 工具调用参数与 tool_results 审计中，事件再记一遍会造成双重存储
+    # 且可能泄露用户问题细节（need_reason 是策略给出的判定理由，属
+    # 决策摘要的一部分，原样携带以便审计者核对「为何不检索」）。
+    # 全部默认 None 向后兼容：旧事件、未启用自适应检索的轮次不携带。
+    retrieval_rounds: int | None = Field(default=None, ge=0)
+    retrieval_threshold_met: bool | None = None
+    retrieval_stopped_reason: str | None = None
+    retrieval_hit_count: int | None = Field(default=None, ge=0)
+    retrieval_top_score: float | None = Field(default=None, ge=0)
+    retrieval_needed: bool | None = None
+    retrieval_need_reason: str | None = None
 
 
 class RunError(BaseModel):

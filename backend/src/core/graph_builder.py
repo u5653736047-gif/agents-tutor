@@ -628,6 +628,17 @@ class CollaborativeAgentGraph:
                 degraded: bool | None = None,
                 event_intent: str | None = None,
                 event_verdict: str | None = None,
+                # S4-T3 检索决策：RETRIEVAL_DECISION 事件携带的工具名与
+                # 决策摘要字段（语义见 events.py 的 retrieval_* 注释）。
+                # 全部默认 None，既有调用方零改动、旧事件不携带。
+                event_tool_name: str | None = None,
+                retrieval_needed: bool | None = None,
+                retrieval_need_reason: str | None = None,
+                retrieval_threshold_met: bool | None = None,
+                retrieval_stopped_reason: str | None = None,
+                retrieval_rounds: int | None = None,
+                retrieval_hit_count: int | None = None,
+                retrieval_top_score: float | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -643,6 +654,14 @@ class CollaborativeAgentGraph:
                         degraded=degraded,
                         intent=event_intent,
                         evaluation_verdict=event_verdict,
+                        tool_name=event_tool_name,
+                        retrieval_needed=retrieval_needed,
+                        retrieval_need_reason=retrieval_need_reason,
+                        retrieval_threshold_met=retrieval_threshold_met,
+                        retrieval_stopped_reason=retrieval_stopped_reason,
+                        retrieval_rounds=retrieval_rounds,
+                        retrieval_hit_count=retrieval_hit_count,
+                        retrieval_top_score=retrieval_top_score,
                     )
                 )
 
@@ -661,6 +680,34 @@ class CollaborativeAgentGraph:
                     EventType.INTENT_DETECTED,
                     agent.role.value,
                     event_intent=intent.value,
+                )
+
+            # ── S4-T3 检索决策事件：把 search_knowledge 元数据转成事件 ──
+            # 转换位置为什么在这里（core 侧 _wrap 而非 knowledge 包）：
+            # knowledge 包刻意零依赖 core/events.py（零耦合方向见
+            # retrieval.py 模块注释第 8 节第 4 点）——工具结果里的
+            # metadata 是纯 JSON 结构，由本文件解析成 RunEvent 追加进
+            # events 通道（随 checkpoint 持久化，供评价 Agent 与审计
+            # 链路读取「检索是否达标、为何停止」）。
+            # 脱敏：事件只记决策摘要，不记查询正文（正文已在工具调用
+            # 参数与 tool_results 审计中）——与 evaluation 事件「只记
+            # 结论摘要」同一原则。每个 search_knowledge 成功结果发一个
+            # 事件（agent=当前角色、tool_name="search_knowledge"），
+            # 序列号由 emit 闭包统一递增，与既有事件顺序自洽。
+            # 未启用自适应（工具输出无 metadata）→ 解析结果为空，
+            # 不发任何事件——「默认零回归、无新事件」由此保证。
+            for decision in _retrieval_decisions_from_results(tool_results):
+                emit(
+                    EventType.RETRIEVAL_DECISION,
+                    agent.role.value,
+                    event_tool_name="search_knowledge",
+                    retrieval_needed=decision["needed"],
+                    retrieval_need_reason=decision["need_reason"],
+                    retrieval_threshold_met=decision["threshold_met"],
+                    retrieval_stopped_reason=decision["stopped_reason"],
+                    retrieval_rounds=decision["rounds"],
+                    retrieval_hit_count=decision["hit_count"],
+                    retrieval_top_score=decision["top_score"],
                 )
 
             # ── S2-T3 评价结论：解析 submit_evaluation 结果并写入 state/事件 ──
@@ -1822,6 +1869,98 @@ def _evaluation_from_results(
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return None
     return None
+
+
+def _retrieval_decisions_from_results(
+    tool_results: Sequence[ToolResult],
+) -> list[dict[str, Any]]:
+    """从本轮 search_knowledge 成功结果解析检索决策元数据（S4-T3）。
+
+    与 _intent_from_results 同一哲学（写入端严格、读取端宽容）：
+    - 只处理 tool_name == "search_knowledge" 且 success、输出非空的
+      结果（复用 _CITATION_TOOL_NAMES 常量，新增检索类工具时一处
+      生效）；
+    - 输出是工具固定的 JSON 结构，metadata 键缺失（未启用自适应
+      的旧路径输出）→ 跳过，不发事件——这是「默认零回归、无新
+      事件」的落点（工具未注入 adaptive 配置时输出不含 metadata，
+      历史 ToolResult 同样兼容）；
+    - 解析失败 / 字段类型不合法 → 跳过该结果（脏数据不击穿运行，
+      与 _intent_from_results 的宽容读取一致）；
+    - 数值字段值域不合法（rounds / hit_count / top_score 为负数）→
+      按 0 兜底，不跳过整条：负数只影响该字段，决策字段（needed /
+      threshold_met / stopped_reason）仍可读；若原样透传，emit 时
+      RunEvent 的 ge=0 校验会抛 ValidationError 击穿 _wrap（该 emit
+      不在 try 内），故必须在解析层先兜底（I-1 修复，与「脏数据不
+      击穿」承诺一致）。
+
+    脱敏：只取决策摘要字段（needed / need_reason / threshold_met /
+    stopped_reason / rounds / hit_count / top_score），不取每轮
+    query——查询正文已在工具调用参数与 tool_results 审计中，事件
+    载荷不重复记录（与 events.py 的 retrieval_* 字段注释同一口径）。
+    """
+    decisions: list[dict[str, Any]] = []
+    for result in tool_results:
+        if (
+            result.tool_name not in _CITATION_TOOL_NAMES
+            or not result.success
+            or not result.output
+        ):
+            continue
+        try:
+            payload = json.loads(result.output)
+        except (TypeError, ValueError):
+            # ValueError 已覆盖 json.JSONDecodeError（其父类），
+            # 解析失败视为脏数据，跳过该工具结果。
+            continue
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(metadata, dict):
+            # 无 metadata 键 = 未启用自适应检索（旧路径输出），
+            # 不发检索决策事件。
+            continue
+        needed = metadata.get("needed")
+        rounds = metadata.get("rounds")
+        if not isinstance(needed, bool) or not (
+            isinstance(rounds, int) and not isinstance(rounds, bool)
+        ):
+            # 核心字段缺失/类型不合法 → 脏数据，跳过（宽容读取）。
+            continue
+        threshold_met = metadata.get("threshold_met")
+        hit_count = metadata.get("hit_count")
+        top_score = metadata.get("top_score")
+        need_reason = metadata.get("need_reason")
+        stopped_reason = metadata.get("stopped_reason")
+        decisions.append(
+            {
+                "needed": needed,
+                "need_reason": need_reason if isinstance(need_reason, str) else "",
+                "threshold_met": (
+                    threshold_met if isinstance(threshold_met, bool) else None
+                ),
+                "stopped_reason": (
+                    stopped_reason if isinstance(stopped_reason, str) else ""
+                ),
+                # 值域兜底（I-1）：类型合法但数值为负（脏数据）时按 0
+                # 兜底——原样透传会让 RunEvent 的 ge=0 校验抛
+                # ValidationError 击穿 _wrap（emit 不在 try 内）。
+                # 选择「按 0 兜底」而非「跳过整条」：负数只影响该字段，
+                # 决策字段仍可读，粒度最细（见函数 docstring）。
+                # 用 max(x, 0) 表达「下限 0」而非三元式（ruff FURB136）。
+                "rounds": max(rounds, 0),
+                "hit_count": (
+                    max(hit_count, 0)
+                    if isinstance(hit_count, int)
+                    and not isinstance(hit_count, bool)
+                    else 0
+                ),
+                "top_score": (
+                    max(top_score, 0.0)
+                    if isinstance(top_score, (int, float))
+                    and not isinstance(top_score, bool)
+                    else 0.0
+                ),
+            }
+        )
+    return decisions
 
 
 def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | None:

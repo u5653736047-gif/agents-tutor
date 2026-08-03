@@ -204,6 +204,9 @@ class KnowledgeService:
         top_k: int = 5,
         *,
         metadata_filter: dict[str, str] | None = None,
+        policy: RetrievalPolicy | None = None,
+        relevance_threshold: float | None = None,
+        refiner: QueryRefiner | None = None,
     ) -> AdaptiveSearchResult:
         """自适应检索（S4-T3）：必要性判断 → 检索 → 阈值判定 → 多轮重检。
 
@@ -228,6 +231,21 @@ class KnowledgeService:
            （rounds / refine_history / stopped_reason）里，由上层
            （工具/图）转成事件——检索层不依赖 core/events.py。
 
+        S4-T3 工具层注入（本任务的扩展）：policy / relevance_threshold
+        / refiner 三个参数允许调用方（如 create_search_knowledge_tool）
+        按次覆盖构造时配置——None 表示沿用构造时配置（默认，零回归），
+        非 None 表示本次调用改用注入值。为什么需要覆盖：工具装配方
+        （api 层）构造 service 时可能没有检索配置，工具自身却允许
+        装配方注入自适应配置（见 tools.py 注释）；没有这个覆盖口，
+        工具注入的配置就无法生效。校验与降级语义与构造时配置一致
+        （relevance_threshold > 0、上限校验在 retrieval.adaptive_search
+        内部兜底）。
+        边界（M-2）：None 恒表示「沿用构造时配置」，本方法不提供
+        「覆盖为空（显式关闭）」的通道——如需在工具层关闭构造时
+        已配置的 relevance_threshold / refiner（如临时退化为单轮
+        检索），请修改 service 构造配置或另建 service 实例，避免
+        None 语义歧义。
+
         返回：AdaptiveSearchResult（hits + RetrievalMetadata），hits
         的形态与 search 一致（分数、排序、citation 语义不变）。所有
         失败路径（policy / refiner 异常）都不抛错（降级语义详见
@@ -241,11 +259,16 @@ class KnowledgeService:
             self._index,
             query,
             top_k,
-            policy=self._policy,
+            # 覆盖语义：非 None 用调用方注入值，None 沿用构造时配置。
+            policy=policy if policy is not None else self._policy,
             rewriter=self._rewriter,
             reranker=self._reranker,
-            refiner=self._refiner,
-            relevance_threshold=self._relevance_threshold,
+            refiner=refiner if refiner is not None else self._refiner,
+            relevance_threshold=(
+                relevance_threshold
+                if relevance_threshold is not None
+                else self._relevance_threshold
+            ),
             max_refine_rounds=self._max_refine_rounds,
             metadata_filter=metadata_filter,
         )
