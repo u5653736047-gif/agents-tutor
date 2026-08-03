@@ -242,7 +242,7 @@
 > 目标：完成总清单建议顺序第 2 条——意图识别、分层讲解、评价规则、最终回答
 > Citation，打通「学生提问 → 路由 → 检索增强答疑 → 引用溯源 → 评价审计」链路。
 
-### S2-T1 Supervisor 教学意图识别
+### [x] S2-T1 Supervisor 教学意图识别
 
 - 对应总清单：2.1.1（意图识别部分）
 - 范围：`nodes/prompts.py`、`state.py`（意图字段）、`graph_builder.py` 路由。
@@ -252,6 +252,15 @@
   - 路由以意图为主要依据；意图不明时 Supervisor 追问澄清而非随意分派。
   - 准备一组覆盖各意图的测试用例（中文教学场景问题），分类与路由断言通过。
 - 依赖：Sprint 1 完成（复用任务分解/聚合状态字段）。与 Sprint 3 可并行。
+- 完成备注：2026-08-03；`Intent` 枚举（答疑/备课/评价/其他/不明）写入
+  `state["intent"]`（存字符串，对齐 `current_agent` 惯例，规避 langgraph
+  类型注册问题）与 `INTENT_DETECTED` 事件；Supervisor 经 `detect_intent`
+  工具识别，prompt 约定五类路由，意图不明时追问且运行时拦截 UNCLEAR 后
+  的强行分派（丢弃 handoff / create_task_plan），迭代超限走既有失败路径。
+  语义边界：拦截只覆盖「自报 UNCLEAR 仍强行分派」；跳过识别（intent=None）
+  与误报属既定兼容设计。新增 15 个测试（13 新 + 调整），全量 339 通过，
+  ruff、mypy strict（30 文件）干净；独立 review 无 Critical，I-1 边界明示
+  与 5 个 Minor 已处理并复审放行。
 
 ### S2-T2 助学 Agent 分层讲解
 

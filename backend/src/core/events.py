@@ -13,6 +13,11 @@ class EventType(StrEnum):
     TOOL_STARTED = "tool_started"
     TOOL_COMPLETED = "tool_completed"
     AGENT_SWITCHED = "agent_switched"
+    # S2-T1 意图识别：Supervisor 完成本轮意图分类后发出（agent=supervisor，
+    # intent=意图枚举值字符串）。事件是瞬时的运行时信号，权威值以 state["intent"]
+    # 为准（checkpoint 持久化）；消费方（api/chat.py 的 EVENT_TYPE_MAP 白名单）
+    # 对未映射的新事件类型安全跳过，因此新增类型不会破坏既有事件协议。
+    INTENT_DETECTED = "intent_detected"
     TASK_RESULT_ARCHIVED = "task_result_archived"
     TASK_RESULTS_AGGREGATED = "task_results_aggregated"
     RUN_COMPLETED = "run_completed"
@@ -51,6 +56,10 @@ class RunEvent(BaseModel):
     error_code: ErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
     degraded: bool | None = None
+    # S2-T1：INTENT_DETECTED 事件携带的意图枚举值（如 "lesson_prep"）。
+    # 放在事件本体而不是塞进 agent/tool_name，是为了让消费方按字段读取，
+    # 与 TOOL_COMPLETED 携带 tool_name 的既有约定保持一致。
+    intent: str | None = None
 
 
 class RunError(BaseModel):

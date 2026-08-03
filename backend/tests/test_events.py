@@ -40,6 +40,8 @@ def test_run_event_serializes_only_safe_fields() -> None:
         "error_code",
         "plan_step_sequence",
         "degraded",
+        # S2-T1：INTENT_DETECTED 事件携带的意图值，默认 None 向后兼容
+        "intent",
     }
 
 

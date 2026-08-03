@@ -62,7 +62,9 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     } == {count_context_messages}
     for role, agent in agents.items():
         assert agent.system_prompt == ROLE_PROMPTS[role]
-    assert max(map(len, ROLE_PROMPTS.values())) <= 160
+    # S2-T1：Supervisor 提示词新增了意图识别约定（detect_intent 与五类意图
+    # 的路由说明），长度上限从 160 放宽到 400，其余角色提示词远低于此。
+    assert max(map(len, ROLE_PROMPTS.values())) <= 400
     assert model.bind_count == 1
 
 

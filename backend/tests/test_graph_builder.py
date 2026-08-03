@@ -350,6 +350,8 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
     assert [tool.name for tool in builder.registry.list_tools()] == [
         "handoff",
         "create_task_plan",
+        # S2-T1：意图识别工具与既有调度工具一起暴露给 Supervisor
+        "detect_intent",
     ]
 
 

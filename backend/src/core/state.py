@@ -43,6 +43,36 @@ class AgentRole(StrEnum):
     EVALUATOR = "evaluator"
 
 
+class Intent(StrEnum):
+    """教学场景的用户意图分类（S2-T1 意图识别层）。
+
+    为什么需要这个枚举（对应验收标准「定义明确的意图集合」）：
+    - Supervisor 的分派决策（直接回答 / handoff 到 Worker / create_task_plan
+      分解）以意图为首要依据，枚举把「模型的自由文本判断」收敛为稳定、
+      可校验、可审计的标签；
+    - 枚举值（字符串形式，见 AgentState.intent 注释）会写入 state["intent"]
+      （随 checkpoint 持久化）与
+      INTENT_DETECTED 运行事件，前端与审计可据此回放「这一轮用户想干什么」；
+    - 可扩展：新增意图只需在此追加枚举值，并在 nodes/prompts.py 的
+      Supervisor 提示词中补充对应路由说明，不需要改图结构。
+
+    各值含义与 Supervisor 的默认路由（详细约定见 prompts.py）：
+    - ANSWER_QUESTION 答疑：学生提问求解答 → 直接回答，或转
+      learning_assistant（助学 Agent）做深入辅导/学习规划；
+    - LESSON_PREP 备课/讲解请求：生成教案/讲解材料 → teaching_assistant（助教）；
+    - EVALUATION 评价/批改：作业评价/批改 → evaluator（评价 Agent）；
+    - OTHER 其他：模型能确定但不在上述三类 → 直接回答；
+    - UNCLEAR 意图不明：模型无法确定 → Supervisor 必须追问澄清，
+      禁止 handoff 或 create_task_plan（graph_builder 有运行时兜底拦截）。
+    """
+
+    ANSWER_QUESTION = "answer_question"
+    LESSON_PREP = "lesson_prep"
+    EVALUATION = "evaluation"
+    OTHER = "other"
+    UNCLEAR = "unclear"
+
+
 # ─────────────────────────────────────────────
 # 助手消息的 Agent 角色元数据
 # ─────────────────────────────────────────────
@@ -145,7 +175,12 @@ class TaskContext(BaseModel):
     """
 
     task_id: str = Field(default_factory=lambda: uuid4().hex[:12])
-    intent: str = Field(default="", description="用户意图分类标签")
+    # 注意与 state["intent"] 的约束差异是有意的：
+    # - state["intent"] 是严格校验后的 Intent 枚举值字符串（每轮重置，
+    #   本轮意图的权威值，见 AgentState.intent 注释）；
+    # - task_context.intent 是自由字符串的任务上下文快照（跨轮持久，
+    #   供 Worker/聚合读取），保留宽松约束以便容纳历史数据与未来扩展。
+    intent: str = Field(default="", description="用户意图分类标签（自由字符串快照）")
     description: str = Field(default="", description="任务自然语言描述")
     subtasks: list[str] = Field(default_factory=list, description="分解后的子任务列表")
     status: TaskStatus = Field(default=TaskStatus.PENDING)
@@ -380,6 +415,31 @@ class AgentState(TypedDict, total=False):
     # Supervisor 已提出、尚未由人工确认的分派；checkpoint 是唯一事实来源。
     pending_handoff: Annotated[HandoffApprovalRequest | None, _replace]
 
+    # --- 意图识别（S2-T1） ---
+    # Supervisor 本轮识别出的用户意图（Intent 枚举的 value 字符串）；
+    # last-write-wins，由 detect_intent 工具结果经 _wrap 校验后写入，
+    # run() 在新用户轮次重置为 None。
+    #
+    # 为什么存字符串而不是 Intent 枚举：
+    # - checkpoint 会 msgpack 序列化 state 的全部通道，自定义枚举类型在
+    #   反序列化时依赖 langgraph 的「类型注册表」（未注册类型当前仅警告、
+    #   未来版本会阻断），存枚举值字符串则永远是 msgpack 原生类型，
+    #   彻底消除该版本风险；
+    # - 与既有惯例一致：current_agent 通道同样存 role.value 字符串而非
+    #   AgentRole 枚举；读取方需要枚举时用 Intent(state["intent"]) 转换即可
+    #   （StrEnum 与字符串的 == 比较天然成立，测试断言不受影响）。
+    #
+    # 为什么放在 state 而不是只发事件：
+    # 1) checkpoint 持久化——事件只存在于当次运行的 events 列表中，跨轮不可查；
+    #    state 字段随 checkpoint 保存，get_state()/恢复会话时仍能读到
+    #    上一轮的意图快照，是「审计」的事实来源；
+    # 2) 权威值——ToolResult 只记录「模型声称的意图」，state["intent"]
+    #    是 _wrap 校验后的权威分类，两者对照可以发现模型谎报或乱填；
+    # 3) 路由依据——Supervisor 分派（handoff / create_task_plan）时把意图
+    #    同步进 task_context.intent，供 Worker 与后续聚合读取。
+    # 意图不明（UNCLEAR）时的追问逻辑见 graph_builder._wrap 的拦截说明。
+    intent: Annotated[str | None, _replace]
+
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
@@ -432,6 +492,7 @@ def create_initial_state(
         current_agent=None,
         next_agent=None,
         pending_handoff=None,
+        intent=None,
         task_context=None,
         task_plan=None,
         task_results=[],

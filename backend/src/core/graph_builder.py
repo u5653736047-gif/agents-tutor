@@ -31,6 +31,7 @@ from .state import (
     HandoffApprovalAction,
     HandoffApprovalDecision,
     HandoffApprovalRequest,
+    Intent,
     PendingHandoffApproval,
     TaskContext,
     TaskPlan,
@@ -73,6 +74,38 @@ def handoff(target: WorkerRole) -> str:
 def create_task_plan(steps: list[TaskPlanStep]) -> str:
     """为需要至少两个有序子任务的复杂请求创建一次任务计划。"""
     return TaskPlan(steps=steps).model_dump_json()
+
+
+class _IntentInput(BaseModel):
+    """仅暴露给模型的意图分类输入，intent 取值由 Intent 枚举严格约束。
+
+    extra="forbid" 防止模型夹带任意字段（与 _TaskPlanInput 同一约定），
+    非法意图值会在工具执行层被 TOOL_INVALID_ARGUMENTS 拒绝，
+    不会进入 ToolResult 审计记录。
+    reason 不设长度硬约束：超长理由由工具函数截断（见 detect_intent），
+    避免 schema 校验失败导致整个意图识别丢失。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Intent
+    reason: str = ""
+
+
+@tool(args_schema=_IntentInput)
+def detect_intent(intent: Intent, reason: str = "") -> str:
+    """识别当前用户请求的教学意图，返回分类标签（决策前必调）。"""
+    # 注意：LangChain 工具执行时把 args 原样传入（intent 是字符串而非
+    # Intent 实例），因此这里用 Intent(intent) 显式转换——schema 校验
+    # 已保证值是合法枚举，此转换不会失败，且保证输出永远是规范值。
+    # reason 截断到 200 字符：审计字段有界（ToolResult.output 不膨胀），
+    # 且超长理由不会让工具调用失败、意图识别丢失。
+    # 返回 JSON 而非裸枚举值：ToolResult.output 是审计记录，
+    # JSON 里同时保留意图与理由，_intent_from_results 只取 intent 字段。
+    return json.dumps(
+        {"intent": Intent(intent).value, "reason": reason[:200]},
+        ensure_ascii=False,
+    )
 
 
 class CollaborativeAgentGraph:
@@ -126,6 +159,12 @@ class CollaborativeAgentGraph:
         registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})
         registry.register(
             create_task_plan,
+            allowed_roles={AgentRole.SUPERVISOR},
+        )
+        # S2-T1 意图识别：detect_intent 仅 Supervisor 可用，
+        # 与 handoff / create_task_plan 一样由模型在 ReAct 循环中调用。
+        registry.register(
+            detect_intent,
             allowed_roles={AgentRole.SUPERVISOR},
         )
         for business_tool in tools:
@@ -363,6 +402,48 @@ class CollaborativeAgentGraph:
             target = _handoff_target(tool_results)
             new_plan = _task_plan_from_results(tool_results)
             existing_plan = _task_plan_from_state(state)
+            # ── S2-T1 意图识别：解析模型分类，并对「意图不明」做分派拦截 ──
+            # 原理：detect_intent 是 Supervisor 决策前的必备工具（prompt 约定），
+            # 其成功结果经 _intent_from_results 校验后成为本轮权威意图。若模型
+            # 自报 UNCLEAR（无法确定）却仍试图 handoff 或 create_task_plan，
+            # 说明模型违背了「不明即追问」的约定；这里直接把分派动作丢弃
+            # （target/new_plan 置 None），让 ReAct 循环继续到模型输出澄清性
+            # 回答，从而做到「不随意分派」的运行时硬保障，而不只依赖 prompt。
+            #
+            # 边界：
+            # - 拦截只针对「模型自报 UNCLEAR 仍强行分派」这一种违约；
+            #   模型跳过 detect_intent（intent=None）或误报其他意图
+            #   （如把备课误报为答疑）属既定的兼容设计，不在此拦截——
+            #   前者兼容旧行为与历史替身，后者由 Worker 与评价链路兜底；
+            # - 模型在 UNCLEAR 后一直输出工具调用直到迭代超限，会走既有的
+            #   REACT_ITERATION_LIMIT 失败路径（fail 分支），不会无限循环；
+            # - 兼容旧行为：不调用 detect_intent 的模型（如历史测试替身）拿到
+            #   intent=None，不触发拦截，行为与 S2-T1 之前完全一致。
+            intent = _intent_from_results(tool_results)
+            if (
+                intent is Intent.UNCLEAR
+                and agent.role is AgentRole.SUPERVISOR
+                and (target is not None or new_plan is not None)
+            ):
+                target = None
+                new_plan = None
+            # 意图识别结果同步进跨轮持久字段 task_context.intent：
+            # Worker 与聚合阶段可读取意图标签做针对性工作，同时保留审计轨迹。
+            # 仅在确定分派（非 UNCLEAR、确有目标或计划）时写入，避免「直接回答
+            # 澄清问题」这类无任务轮次污染任务上下文。
+            if (
+                intent is not None
+                and intent is not Intent.UNCLEAR
+                and (target is not None or new_plan is not None)
+            ):
+                existing_context = state.get("task_context")
+                updates["task_context"] = (
+                    TaskContext(intent=intent.value)
+                    if existing_context is None
+                    else TaskContext.model_validate(existing_context).model_copy(
+                        update={"intent": intent.value}
+                    )
+                )
             plan = existing_plan or new_plan
             replacing_plan = new_plan is not None and existing_plan is not None
             if new_plan is not None and existing_plan is None:
@@ -385,6 +466,7 @@ class CollaborativeAgentGraph:
                 error_code: ErrorCode | None = None,
                 plan_step_sequence: int | None = None,
                 degraded: bool | None = None,
+                event_intent: str | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -398,7 +480,25 @@ class CollaborativeAgentGraph:
                         error_code=error_code,
                         plan_step_sequence=plan_step_sequence,
                         degraded=degraded,
+                        intent=event_intent,
                     )
+                )
+
+            # ── S2-T1 意图事件与状态写入 ──
+            # 事件是瞬时信号：消费方（api/chat.py 的 EVENT_TYPE_MAP 白名单）对
+            # 未映射的新事件类型安全跳过，因此 INTENT_DETECTED 目前只对内部
+            # 审计可见（state["events"]），前端流式协议不受影响；后续若要在
+            # 前端展示意图，只需在 api 层映射表补一行，无需改 core。
+            # state["intent"] 则是持久权威值（见 state.py 字段注释）。
+            # 注意两处都写 intent.value（字符串）：state 通道与事件字段都
+            # 只存 msgpack 原生类型，避免 checkpoint 对自定义枚举的反序列化
+            # 注册依赖；本函数内部的路由判断仍用 Intent 枚举（intent 变量）。
+            if intent is not None:
+                updates["intent"] = intent.value
+                emit(
+                    EventType.INTENT_DETECTED,
+                    agent.role.value,
+                    event_intent=intent.value,
                 )
 
             handoff_count = state.get("handoff_count", 0)
@@ -910,6 +1010,9 @@ class CollaborativeAgentGraph:
                         "messages": [HumanMessage(content=user_input)],
                         "next_agent": None,
                         "pending_handoff": None,
+                        # S2-T1：每轮重新识别意图，旧意图随新轮清除，
+                        # 避免上一轮的意图误导本轮路由。
+                        "intent": None,
                         "task_plan": None,
                         "task_results": [],
                         "run_error": None,
@@ -1053,6 +1156,24 @@ def _handoff_target(tool_results: Sequence[ToolResult]) -> str | None:
     for result in reversed(tool_results):
         if result.tool_name == "handoff" and result.success:
             return result.output
+    return None
+
+
+def _intent_from_results(tool_results: Sequence[ToolResult]) -> Intent | None:
+    """只读取本次 Supervisor 成功调用的最后一个 detect_intent 结果。
+
+    写入端严格（工具 schema 用 Intent 枚举校验 + 工具函数输出固定 JSON），
+    读取端宽容：解析失败返回 None 而非抛错——与 message_agent_role 的
+    哲学一致，宁可让本轮退化为「无意图」也不让脏数据击穿运行。
+    返回 None 表示模型未识别（或识别结果不可信），不会触发 UNCLEAR 拦截。
+    """
+    for result in reversed(tool_results):
+        if result.tool_name == "detect_intent" and result.success:
+            try:
+                payload = json.loads(result.output)
+                return Intent(str(payload["intent"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
     return None
 
 
@@ -1320,4 +1441,4 @@ def _pending_handoff_from_snapshot(
     )
 
 
-__all__ = ["CollaborativeAgentGraph", "create_task_plan", "handoff"]
+__all__ = ["CollaborativeAgentGraph", "create_task_plan", "detect_intent", "handoff"]

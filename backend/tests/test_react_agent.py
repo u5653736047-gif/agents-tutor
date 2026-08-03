@@ -431,6 +431,8 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "error_code",
         "plan_step_sequence",
         "degraded",
+        # S2-T1：INTENT_DETECTED 事件携带的意图值，默认 None 向后兼容
+        "intent",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
 
