@@ -433,6 +433,9 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "degraded",
         # S2-T1：INTENT_DETECTED 事件携带的意图值，默认 None 向后兼容
         "intent",
+        # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论摘要，
+        # 默认 None 向后兼容（旧事件与未评价轮次不携带）
+        "evaluation_verdict",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
 

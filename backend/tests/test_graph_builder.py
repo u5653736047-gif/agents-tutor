@@ -354,6 +354,8 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
         "detect_intent",
         # S2-T2：学生水平画像工具（仅 Supervisor 可用，与 detect_intent 同约定）
         "detect_level",
+        # S2-T3：结构化评价工具（仅 evaluator 可用，与 detect_intent 同约定）
+        "submit_evaluation",
     ]
 
 

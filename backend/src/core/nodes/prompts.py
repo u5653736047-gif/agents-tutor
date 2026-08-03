@@ -1,4 +1,4 @@
-"""四个角色的极简 Prompt，含 S2-T2 学生水平分层讲解策略。"""
+"""四个角色的极简 Prompt，含 S2-T2 学生水平分层讲解策略与 S2-T3 评价规则。"""
 
 from ..state import AgentRole, StudentLevel
 
@@ -28,7 +28,13 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "进阶水平重推导过程与边界条件；"
         "尚不清楚学生水平时默认中等深度，并主动说明可按需调整讲解深度。"
     ),
-    AgentRole.EVALUATOR: f"{_REACT_RULE}\n你是评价助手，负责检查回答质量。",
+    AgentRole.EVALUATOR: (
+        f"{_REACT_RULE}\n你是评价助手。必须基于本轮最终回答与检索证据"
+        "（工具观察结果）评价，禁止凭空评价；先调用 submit_evaluation "
+        "提交结构化结论：verdict 总结论、fact_accuracy 事实准确性、"
+        "citation_completeness 引用完整性（无检索证据引用时不得判通过）、"
+        "reason 理由；再给出简要评价文本。"
+    ),
 }
 
 # ─────────────────────────────────────────────

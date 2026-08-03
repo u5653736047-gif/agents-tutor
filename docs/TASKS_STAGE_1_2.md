@@ -285,7 +285,7 @@
   通道退化路径），全量 360 通过，ruff、mypy strict（30 文件）干净；
   独立 review 无 Critical/Important，5 个 Minor 已处理并复审放行。
 
-### S2-T3 评价 Agent 基础评价规则
+### [x] S2-T3 评价 Agent 基础评价规则
 
 - 对应总清单：2.1.4（事实准确性与引用完整性部分）
 - 范围：`nodes/prompts.py`、`events.py`（评价结果事件）、`state.py`。
@@ -296,6 +296,19 @@
   - 评价结论写入状态与事件，可被后续审计读取。
   - 测试覆盖：含事实错误回答被判存疑/不通过、引用缺失被标记、正确回答通过。
 - 依赖：S2-T1。与 S2-T2 可并行。
+- 完成备注：2026-08-03；`EvaluationVerdict`（pass/questionable/fail）+
+  `EvaluationDimension`（fact_accuracy/citation_completeness）+
+  `EvaluationResult`（verdict + 双维度 + reason + evidence_tool_names +
+  created_at）写入 `state["evaluation"]`（每轮重置，checkpoint 持久化，
+  与 tool_results 一致直接存模型）+ `EVALUATION_COMPLETED` 事件（只带
+  verdict 摘要，reason 正文不落事件，双层截断 200 保审计有界）；评价经
+  evaluator 节点 `submit_evaluation` 工具（仅 evaluator 可调）在轮末统一
+  解析，不新增图节点；证据只记工具名（S2-T4 引入 Citation 后按类型过滤）。
+  新增 14 个测试（事实错误→fail、存疑→questionable、引用缺失标记、
+  正确→pass、checkpoint 持久化与重置、计划模式、脱敏、非法值容错），
+  全量 374 通过，ruff、mypy strict（30 文件）干净；独立 review 无
+  Critical/Important，6 个 Minor（注释明示失败轮次语义/设计边界、
+  角色守卫等）已处理并复审放行。
 
 ### S2-T4 最终回答引用插入
 

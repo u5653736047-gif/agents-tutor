@@ -99,6 +99,43 @@ class StudentLevel(StrEnum):
     UNKNOWN = "unknown"
 
 
+class EvaluationVerdict(StrEnum):
+    """评价结论枚举（S2-T3 基础评价规则）。
+
+    语义（为什么是这三档，对应验收标准「通过/存疑/不通过」）：
+    - PASS 通过：回答的事实准确、引用完整，可以直接采纳；
+    - QUESTIONABLE 存疑：存在轻微瑕疵（个别表述不准、个别引用缺失），
+      需要学生或教师复核，但不至于整体否定；
+    - FAIL 不通过：存在事实错误或引用严重缺失，回答不可直接采纳。
+
+    枚举值（字符串形式，见 AgentState.evaluation 注释）会写入
+    state["evaluation"]（随 checkpoint 持久化）与
+    EVALUATION_COMPLETED 运行事件；单维度（事实准确性 / 引用完整性）
+    与总结论共用同一枚举，避免为「维度结论」再维护一套平行枚举。
+    与 Intent / StudentLevel 一样可扩展：新增档位只需追加枚举值。
+    """
+
+    PASS = "pass"
+    QUESTIONABLE = "questionable"
+    FAIL = "fail"
+
+
+class EvaluationDimension(StrEnum):
+    """评价维度枚举（S2-T3 骨架期两个最小可用维度）。
+
+    - FACT_ACCURACY 事实准确性：回答内容与检索证据/事实是否一致；
+    - CITATION_COMPLETENESS 引用完整性：回答是否引用了本轮检索证据
+      （无证据可引时该维度应判存疑/不通过，见 prompts.py evaluator
+      约定与 graph_builder.py submit_evaluation 注释）。
+
+    与 S2-T4（引用插入）的分工：本任务只做「评价规则」本身，能区分
+    「有引用 / 无引用」即可；Citation 字段的完整插入链路属 S2-T4。
+    """
+
+    FACT_ACCURACY = "fact_accuracy"
+    CITATION_COMPLETENESS = "citation_completeness"
+
+
 # ─────────────────────────────────────────────
 # 助手消息的 Agent 角色元数据
 # ─────────────────────────────────────────────
@@ -397,6 +434,54 @@ class ToolResult(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class EvaluationResult(BaseModel):
+    """评价 Agent 对一轮最终回答的结构化评价结论（S2-T3）。
+
+    骨架期最小可用字段（对应验收标准）：
+    - verdict 总结论（pass / questionable / fail，见 EvaluationVerdict 注释）；
+    - fact_accuracy / citation_completeness 两个维度的独立结论
+      （维度枚举见 EvaluationDimension 注释）；
+    - reason 理由字符串（由 submit_evaluation 工具截断，见 graph_builder.py）；
+    - evidence_tool_names 本轮检索证据的工具名列表——由核心层（_wrap）在
+      解析 submit_evaluation 结果时自动组装（不是模型填写的），记录
+      「这次评价基于哪些检索证据」，构成「不凭空评价」的可审计闭环：
+      审计者看到证据工具列表 + 工具结果（state["tool_results"]）即可核对
+      评价是否真的有依据。
+
+    为什么 evaluation 结论放在 state 而不是只发事件（与 intent/level 同构）：
+    1) checkpoint 持久化——事件只存在于当次运行的 events 列表中，跨轮不可查；
+       state["evaluation"] 随 checkpoint 保存，get_state()/恢复会话后仍能
+       读到上一轮的评价结论，是「后续审计读取」的事实来源；
+    2) 脱敏分工——state 存完整结论（含 reason），事件只记录 verdict 摘要
+       （见 events.py EVALUATION_COMPLETED 注释），二者对照即可在事件流
+       上做轻量回放、在状态里做完整审计。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: EvaluationVerdict = Field(description="总结论：通过/存疑/不通过")
+    fact_accuracy: EvaluationVerdict = Field(description="事实准确性维度结论")
+    citation_completeness: EvaluationVerdict = Field(
+        description="引用完整性维度结论"
+    )
+    reason: str = Field(default="", description="评价理由（工具层已截断，有界）")
+    # 核心层组装：本轮成功执行的检索/业务工具名（不含 submit_evaluation 本身），
+    # 只记工具名不记输出正文——正文仍在 state["tool_results"] 中按工具结果审计。
+    evidence_tool_names: list[str] = Field(
+        default_factory=list,
+        description="本轮评价依据的检索证据工具名列表（核心层组装，脱敏）",
+    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_be_bounded(cls, reason: str) -> str:
+        # 写入端宽容：reason 允许为空（模型可能只给结论不给理由），
+        # 但超长理由会在工具层截断（submit_evaluation 的 reason[:200]），
+        # 这里兜底再截一次，保证 checkpoint 中的审计字段永远有界。
+        return reason[:200]
+
+
 # ─────────────────────────────────────────────
 # Reducer 函数
 # ─────────────────────────────────────────────
@@ -502,6 +587,37 @@ class AgentState(TypedDict, total=False):
     # 供 Worker 读取。
     level: Annotated[str | None, _replace]
 
+    # --- 评价结论（S2-T3） ---
+    # 评价 Agent 对一轮最终回答的结构化评价结论（EvaluationResult 模型）；
+    # last-write-wins，由 submit_evaluation 工具结果经 _wrap 校验后写入，
+    # run() 在新用户轮次重置为 None（与 intent 同构：评价是「这一轮的
+    # 结论」，每轮重新评价；若跨轮保留，上一轮的评价徽章会误导后续轮次
+    # 的展示与审计）。
+    #
+    # 为什么放 state 而不是只发事件：
+    # 1) checkpoint 持久化——事件只存在于当次运行的 events 列表中，跨轮
+    #    不可查；state 字段随 checkpoint 保存，get_state()/恢复会话后
+    #    仍能读到上一轮的评价结论，是「后续审计读取」的事实来源；
+    # 2) 脱敏分工——state 存完整结论（含 reason 与证据工具名列表），
+    #    EVALUATION_COMPLETED 事件只记录 verdict 摘要（不记录 reason
+    #    等可能含敏感正文的字段，见 events.py 注释），审计者按需选择
+    #    轻量事件流或完整状态；
+    # 3) 权威值——ToolResult 只记录「模型声称的评价」，state["evaluation"]
+    #    是 _wrap 校验后的权威结论（枚举由工具 schema 严格约束），两者
+    #    对照可以发现模型谎报或乱填。
+    # 评价输入（最终回答 + 本轮检索证据）如何组装：最终回答天然在模型
+    # 可见的消息历史中；检索证据以 ToolResult 形式进入模型上下文（ReAct
+    # 循环的 ToolMessage 观察）供模型判断，_wrap 解析时再把本轮证据工具
+    # 名组装进 EvaluationResult.evidence_tool_names（不记正文，正文仍按
+    # tool_results 审计）——详见 graph_builder.py 的 submit_evaluation
+    # 与 _wrap 注释。
+    # 类型取舍：与 task_context / tool_results 通道一致，本通道直接存
+    # Pydantic 模型（EvaluationResult 含 StrEnum 枚举字段，序列化为
+    # 字符串）而不是像 intent/level 那样存裸字符串——嵌套模型由 Pydantic
+    # 统一处理序列化，checkpoint 往返后的反序列化形式（dict 或模型实例，
+    # 视序列化器而定）由读取方宽容处理（测试已兼容两种形式）。
+    evaluation: Annotated[EvaluationResult | None, _replace]
+
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
@@ -558,6 +674,9 @@ def create_initial_state(
         # S2-T2 学生水平画像：初始为 None（「尚未识别任何水平」），
         # 跨轮保留、不随新轮重置；读取侧按 StudentLevel.UNKNOWN 归一。
         level=None,
+        # S2-T3 评价结论：初始为 None（「本轮尚无评价」），
+        # 与 intent 同构、每轮重置（评价是单轮结论，见 AgentState.evaluation）。
+        evaluation=None,
         task_context=None,
         task_plan=None,
         task_results=[],

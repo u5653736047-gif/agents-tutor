@@ -18,6 +18,12 @@ class EventType(StrEnum):
     # 为准（checkpoint 持久化）；消费方（api/chat.py 的 EVENT_TYPE_MAP 白名单）
     # 对未映射的新事件类型安全跳过，因此新增类型不会破坏既有事件协议。
     INTENT_DETECTED = "intent_detected"
+    # S2-T3 评价：评价 Agent 完成一轮结构化评价后发出（agent=evaluator，
+    # evaluation_verdict=总结论枚举值字符串）。脱敏原则：事件只记录结论
+    # 摘要（verdict 枚举值，无敏感正文），理由等完整内容存 state["evaluation"]
+    # （随 checkpoint 持久化，供审计读取）——与「事件不记录敏感正文」的
+    # 仓库惯例一致（RunEvent 无 content/arguments 字段，见该类注释）。
+    EVALUATION_COMPLETED = "evaluation_completed"
     TASK_RESULT_ARCHIVED = "task_result_archived"
     TASK_RESULTS_AGGREGATED = "task_results_aggregated"
     RUN_COMPLETED = "run_completed"
@@ -60,6 +66,12 @@ class RunEvent(BaseModel):
     # 放在事件本体而不是塞进 agent/tool_name，是为了让消费方按字段读取，
     # 与 TOOL_COMPLETED 携带 tool_name 的既有约定保持一致。
     intent: str | None = None
+    # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论枚举值
+    # （如 "pass"/"questionable"/"fail"，见 EvaluationVerdict 注释）。
+    # 脱敏原则：事件只带结论摘要，不带 reason 理由正文（理由可能包含
+    # 被评价内容的细节，属敏感正文；完整结论存 state["evaluation"] 供
+    # 审计读取）。默认 None 向后兼容——旧事件与未评价轮次不携带该字段。
+    evaluation_verdict: str | None = None
 
 
 class RunError(BaseModel):

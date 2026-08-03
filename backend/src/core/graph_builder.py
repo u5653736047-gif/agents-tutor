@@ -28,6 +28,8 @@ from .nodes.react_agent import ChatModel
 from .state import (
     AgentRole,
     AgentState,
+    EvaluationResult,
+    EvaluationVerdict,
     HandoffApprovalAction,
     HandoffApprovalDecision,
     HandoffApprovalRequest,
@@ -140,6 +142,57 @@ def detect_level(level: StudentLevel, reason: str = "") -> str:
     )
 
 
+class _EvaluationInput(BaseModel):
+    """仅暴露给模型的评价输入，verdict 与两个维度取值由枚举严格约束。
+
+    与 _IntentInput 同一约定：extra="forbid" 防止模型夹带任意字段，
+    非法评价值会在工具执行层被 TOOL_INVALID_ARGUMENTS 拒绝，
+    不会进入 ToolResult 审计记录。
+    reason 不设长度硬约束：超长理由由工具函数截断（见 submit_evaluation），
+    避免 schema 校验失败导致整个评价丢失。
+
+    三个结论字段为何共用 EvaluationVerdict 枚举：总结论（verdict）与
+    单维度结论（fact_accuracy / citation_completeness）语义一致
+    （通过/存疑/不通过），复用同一枚举避免平行定义；verdict 与维度
+    之间的一致性（如总评 fail 时维度不应全 pass）不做硬校验——骨架期
+    最小可用，写入端只保证枚举合法，语义一致性留给 reason 与审计对照。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: EvaluationVerdict
+    fact_accuracy: EvaluationVerdict
+    citation_completeness: EvaluationVerdict
+    reason: str = ""
+
+
+@tool(args_schema=_EvaluationInput)
+def submit_evaluation(
+    verdict: EvaluationVerdict,
+    fact_accuracy: EvaluationVerdict,
+    citation_completeness: EvaluationVerdict,
+    reason: str = "",
+) -> str:
+    """提交对最终回答的结构化评价结论（评价 Agent 专用，决策后必调）。"""
+    # 与 detect_intent 同构：LangChain 工具执行时 args 里的枚举值是
+    # 字符串而非枚举实例，这里显式转换保证输出永远是规范值（schema
+    # 校验已保证值合法，转换不会失败）。
+    # reason 截断到 200 字符：审计字段有界（ToolResult.output 不膨胀），
+    # 且超长理由不会让评价丢失；理由可能含被评价内容细节，事件层只取
+    # verdict 摘要（脱敏见 events.py），完整 reason 存 state["evaluation"]。
+    # 返回 JSON 而非裸枚举值：ToolResult.output 是审计记录，JSON 里同时
+    # 保留总结论、两维度结论与理由，_evaluation_from_results 解析取用。
+    return json.dumps(
+        {
+            "verdict": EvaluationVerdict(verdict).value,
+            "fact_accuracy": EvaluationVerdict(fact_accuracy).value,
+            "citation_completeness": EvaluationVerdict(citation_completeness).value,
+            "reason": reason[:200],
+        },
+        ensure_ascii=False,
+    )
+
+
 class CollaborativeAgentGraph:
     """注册四个同构 ReAct Agent，并负责它们之间的路由。"""
 
@@ -204,6 +257,14 @@ class CollaborativeAgentGraph:
         registry.register(
             detect_level,
             allowed_roles={AgentRole.SUPERVISOR},
+        )
+        # S2-T3 基础评价规则：submit_evaluation 仅 evaluator 可用，
+        # 由评价 Agent 在 ReAct 循环中基于最终回答与检索证据调用
+        # （prompt 约定，见 ROLE_PROMPTS[EVALUATOR]），结果经 _wrap
+        # 解析写入 state["evaluation"] 并发 EVALUATION_COMPLETED 事件。
+        registry.register(
+            submit_evaluation,
+            allowed_roles={AgentRole.EVALUATOR},
         )
         for business_tool in tools:
             registry.register(
@@ -531,6 +592,7 @@ class CollaborativeAgentGraph:
                 plan_step_sequence: int | None = None,
                 degraded: bool | None = None,
                 event_intent: str | None = None,
+                event_verdict: str | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -545,6 +607,7 @@ class CollaborativeAgentGraph:
                         plan_step_sequence=plan_step_sequence,
                         degraded=degraded,
                         intent=event_intent,
+                        evaluation_verdict=event_verdict,
                     )
                 )
 
@@ -563,6 +626,82 @@ class CollaborativeAgentGraph:
                     EventType.INTENT_DETECTED,
                     agent.role.value,
                     event_intent=intent.value,
+                )
+
+            # ── S2-T3 评价结论：解析 submit_evaluation 结果并写入 state/事件 ──
+            # 触发时机设计：评价作为 evaluator 的 ReAct 轮内动作（prompt +
+            # 工具约定，与 detect_intent/detect_level 同构），在「最终回答
+            # 产出后」（evaluator 轮结束时）由 _wrap 统一解析——不新增图
+            # 节点/路由，不改聚合轮，事件协议向后兼容（EVENT_TYPE_MAP 对
+            # 未知事件安全跳过）。模型先观察检索证据（ToolMessage），再
+            # 调用 submit_evaluation，最后给出评价文本，_wrap 在轮末把
+            # 结论写入 state["evaluation"]。
+            #
+            # 评价输入如何组装（「不凭空评价」的确定性保障）：
+            # - 最终回答：在模型可见的消息历史中（ReAct 输入），无需额外注入；
+            # - 本轮检索证据：以 ToolResult 进入模型上下文（工具观察），
+            #   _wrap 解析时把「本轮 evaluator 成功执行、有输出、且不是
+            #   submit_evaluation 本身」的工具名组装进
+            #   EvaluationResult.evidence_tool_names——只记工具名不记正文
+            #   （正文仍在 state["tool_results"] 按工具结果审计），既给审计
+            #   留了「评价基于哪些证据」的核对线索，又不把证据正文复制进
+            #   评价模型造成双重存储。
+            # 未调用 submit_evaluation（旧行为/历史替身/模型违约）→
+            # evaluation 保持 None、不发事件，运行不受影响。
+            # 角色守卫（纯防御性）：只允许 evaluator 轮的 submit_evaluation
+            # 结果进入解析与写入。当前权限模型下（注册时 allowed_roles 仅
+            # evaluator）成功记录只可能来自 evaluator，其他角色的调用必然
+            # TOOL_UNAUTHORIZED 失败；守卫保证未来权限调整也不会让非评价
+            # 角色写入评价结论。
+            evaluation_input = (
+                _evaluation_from_results(tool_results)
+                if agent.role is AgentRole.EVALUATOR
+                else None
+            )
+            if evaluation_input is not None:
+                # 证据工具名：本轮成功且有输出的工具结果，排除评价工具本身；
+                # 保持出现顺序去重（dict.fromkeys），保证审计列表稳定可读。
+                # 骨架期取舍：范围偏宽——凡成功有输出的业务工具都算「证据」
+                # （可能含非检索类业务工具），不区分类型；S2-T4 引入 Citation
+                # 结构化引用后，此处应按证据类型（Citation/检索类工具）过滤，
+                # 只记录真正的检索证据来源。
+                evidence_tools = list(
+                    dict.fromkeys(
+                        result.tool_name
+                        for result in tool_results
+                        if result.success
+                        and result.output
+                        and result.tool_name != "submit_evaluation"
+                    )
+                )
+                # 边界语义（与 intent 写入模式一致）：若 evaluator 本轮先成功
+                # 提交了 submit_evaluation、随后模型迭代超限或调用失败，会
+                # 出现「state["evaluation"] 有结论 + RUN_FAILED 事件」共存——
+                # 评价结论本身完整（工具已成功执行），失败发生在评价产出之后，
+                # 两者是先后关系而非矛盾，审计者按事件序列读取即可。intent/
+                # level 同此语义（成功工具结果先写、轮末失败再补 RUN_FAILED）。
+                # 设计边界：「不凭空评价」目前无运行时硬校验——模型在零证据
+                # （无任何检索工具调用）下提交 pass 不会被拦截。骨架期以
+                # prompt 约定（禁止凭空评价）+ 审计闭环（evidence_tool_names
+                # 记录本轮实际证据，审计者可见「零证据却判通过」的可疑评价）
+                # 实现；S2-T5 做引用真实性校验时再考虑运行时加强。
+                updates["evaluation"] = EvaluationResult(
+                    verdict=EvaluationVerdict(evaluation_input["verdict"]),
+                    fact_accuracy=EvaluationVerdict(
+                        evaluation_input["fact_accuracy"]
+                    ),
+                    citation_completeness=EvaluationVerdict(
+                        evaluation_input["citation_completeness"]
+                    ),
+                    reason=evaluation_input["reason"],
+                    evidence_tool_names=evidence_tools,
+                )
+                # 事件脱敏：只发 verdict 摘要（无敏感正文），完整结论
+                # （含 reason）在 state["evaluation"] 随 checkpoint 持久化。
+                emit(
+                    EventType.EVALUATION_COMPLETED,
+                    agent.role.value,
+                    event_verdict=evaluation_input["verdict"],
                 )
 
             handoff_count = state.get("handoff_count", 0)
@@ -1077,6 +1216,10 @@ class CollaborativeAgentGraph:
                         # S2-T1：每轮重新识别意图，旧意图随新轮清除，
                         # 避免上一轮的意图误导本轮路由。
                         "intent": None,
+                        # S2-T3：评价结论是「本轮结论」（与 intent 同构），
+                        # 新轮重置为 None——若跨轮保留，上一轮的评价徽章
+                        # 会误导后续轮次的展示与审计。
+                        "evaluation": None,
                         # S2-T2：这里刻意不重置 level——学生水平是「跨轮
                         # 保留的画像」（与 intent 相反），只有模型再次调用
                         # detect_level 时才覆盖；若随新轮重置，已建立的
@@ -1266,6 +1409,41 @@ def _level_from_results(tool_results: Sequence[ToolResult]) -> StudentLevel | No
             try:
                 payload = json.loads(result.output)
                 return StudentLevel(str(payload["level"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+    return None
+
+
+def _evaluation_from_results(
+    tool_results: Sequence[ToolResult],
+) -> dict[str, str] | None:
+    """只读取本次 evaluator 成功调用的最后一个 submit_evaluation 结果。
+
+    与 _intent_from_results 同一哲学（写入端严格、读取端宽容）：
+    写入端由工具 schema 的枚举约束保证合法；读取端在此处再做一次
+    枚举校验——历史脏数据或未来枚举变更产生的非法值抛 ValueError
+    被捕获，返回 None 而非抛错，本轮退化为「无评价」，不击穿运行
+    （也兼容未调 submit_evaluation 的旧行为与历史替身，见 _wrap 注释）。
+
+    返回的 dict 只含四个模型填写的字段（verdict、fact_accuracy、
+    citation_completeness、reason，枚举均为规范值字符串），证据工具名
+    列表由调用方（_wrap）从本轮 tool_results 单独组装进
+    EvaluationResult——证据是核心侧确定的「评价输入」记录，不由模型自报。
+    """
+    for result in reversed(tool_results):
+        if result.tool_name == "submit_evaluation" and result.success:
+            try:
+                payload = json.loads(result.output)
+                return {
+                    "verdict": EvaluationVerdict(str(payload["verdict"])).value,
+                    "fact_accuracy": EvaluationVerdict(
+                        str(payload["fact_accuracy"])
+                    ).value,
+                    "citation_completeness": EvaluationVerdict(
+                        str(payload["citation_completeness"])
+                    ).value,
+                    "reason": str(payload.get("reason", "")),
+                }
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return None
     return None
@@ -1541,4 +1719,5 @@ __all__ = [
     "detect_intent",
     "detect_level",
     "handoff",
+    "submit_evaluation",
 ]

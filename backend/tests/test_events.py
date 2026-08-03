@@ -42,6 +42,9 @@ def test_run_event_serializes_only_safe_fields() -> None:
         "degraded",
         # S2-T1：INTENT_DETECTED 事件携带的意图值，默认 None 向后兼容
         "intent",
+        # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论摘要，
+        # 默认 None 向后兼容（旧事件与未评价轮次不携带）
+        "evaluation_verdict",
     }
 
 
