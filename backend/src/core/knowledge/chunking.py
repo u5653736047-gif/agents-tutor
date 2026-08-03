@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 from .models import KnowledgeChunk, KnowledgeDocument
 
@@ -21,14 +23,22 @@ def chunk_document(
     chunk_size: int = 1000,
     overlap: int = 100,
 ) -> list[KnowledgeChunk]:
-    """Split one document into stable character windows."""
+    """Split one document into stable character windows.
+
+    S3-T3 章节字段：每个 chunk 的 metadata 会追加「起点之前最近标题」
+    解析出的 chapter/section/tags（规则提取，见 _find_headings 注释）；
+    文档没有标题时不写这些字段（保持 S3-T1 行为不变）。
+    """
     _validate_window(chunk_size, overlap)
+    headings = _find_headings(document.content)
 
     chunks: list[KnowledgeChunk] = []
     start = 0
     while start < len(document.content):
         end = min(start + chunk_size, len(document.content))
         page = document.page if document.page is not None else 0
+        metadata = document.metadata.copy()
+        metadata.update(_section_metadata(start, headings))
         chunks.append(
             KnowledgeChunk(
                 chunk_id=f"{document.document_id}:{page}:{start}:{end}",
@@ -38,7 +48,7 @@ def chunk_document(
                 page=document.page,
                 start=start,
                 end=end,
-                metadata=document.metadata.copy(),
+                metadata=metadata,
             )
         )
         if end == len(document.content):
@@ -95,6 +105,127 @@ _HEADING_RE = re.compile(
     r")",
     re.MULTILINE,
 )
+
+# ── 章节层级字段（S3-T3 新增：从标题行规则提取，不做模型自动标注）──
+#
+# 领域字段约定（与 models.py 的 metadata 约定一致，详见该模块注释）：
+# - chapter: str，章节（如 "第1章"），取自标题行「第 X 章/节/篇/部分/卷」；
+# - section: str，小节编号（如 "3.2.1"），取自数字小节标题；
+# - tags: list[str]，概念标签（标题行核心词，最小可用启发式）。
+#
+# 提取规则：标题识别复用上面的 _HEADING_RE（三种形态完全一致）；
+# 「文档级标题传播」——先扫描整篇文档的所有标题行，再给每个 chunk
+# 标注「其起点之前最近的一个标题」的章节信息。这样两种分块策略
+# 行为一致：
+# - semantic 分块：标题行总是开启新 chunk，chunk 起点恰在标题上，
+#   标注结果就是该标题（精确到章/节）；
+# - character 分块：窗口不一定包含标题行，但按起点传播仍能知道
+#   每个 chunk 属于哪一章（章节过滤对两种策略都可用）。
+# 文档没有标题（如书前序言）时不给 chunk 写章节字段。
+# 已知取舍：标题行里的数字/标点/虚词不进 tags，只取中文词与英文词；
+# tags 可能含「简介」「导论」等泛词，这是最小可用方案（概念标签
+# 本身是可选增强，任务要求允许跳过）。
+_CHAPTER_HEADING_RE = re.compile(r"^第\s*([0-9一二三四五六七八九十百千]+)\s*([章节篇部分卷])(.*)$")
+_SECTION_HEADING_RE = re.compile(r"^(\d+(?:\.\d+)+)\s+(.*)$")
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+_TAG_WORD_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z][A-Za-z0-9]*")
+
+
+@dataclass(frozen=True)
+class _HeadingInfo:
+    """一个标题行的解析结果：原文偏移 + 章节层级字段。"""
+
+    offset: int
+    chapter: str | None
+    section: str | None
+    tags: list[str]
+
+
+def _title_tags(text: str) -> list[str]:
+    """从标题剩余文本提取概念标签：连续中文串与英文单词，去重，最多 8 个。"""
+    tags: list[str] = []
+    for word in _TAG_WORD_RE.findall(text):
+        if word not in tags:
+            tags.append(word)
+        if len(tags) >= 8:
+            break
+    return tags
+
+
+def _find_headings(content: str) -> list[_HeadingInfo]:
+    """扫描全文，返回所有命中 _HEADING_RE 的标题及其章节信息（按偏移升序）。
+
+    三种标题形态的解析：
+    1. 中文章节「第 X 章/节/篇/部分/卷 …」→ chapter="第X章"（去空白规范化），
+       其余文本进 tags；
+    2. 数字小节「3.2.1 支持向量机」→ section="3.2.1"，其余文本进 tags；
+    3. Markdown 标题「## 支持向量机」→ 整行内容进 tags。
+    """
+    headings: list[_HeadingInfo] = []
+    for match in _HEADING_RE.finditer(content):
+        start = match.start()
+        line_end = content.find("\n", start)
+        if line_end == -1:
+            line_end = len(content)
+        line = content[start:line_end].strip()
+
+        chapter: str | None = None
+        section: str | None = None
+        remainder = line
+        chapter_match = _CHAPTER_HEADING_RE.match(line)
+        if chapter_match:
+            chapter = f"第{chapter_match.group(1)}{chapter_match.group(2)}"
+            remainder = chapter_match.group(3).strip()
+        else:
+            section_match = _SECTION_HEADING_RE.match(line)
+            if section_match:
+                section = section_match.group(1)
+                remainder = section_match.group(2).strip()
+            else:
+                md_match = _MD_HEADING_RE.match(line)
+                if md_match:
+                    remainder = md_match.group(1).strip()
+        headings.append(
+            _HeadingInfo(
+                offset=start,
+                chapter=chapter,
+                section=section,
+                tags=_title_tags(remainder),
+            )
+        )
+    return headings
+
+
+def _nearest_heading(
+    headings: list[_HeadingInfo], offset: int
+) -> _HeadingInfo | None:
+    """二分查找 offset 之前（含等于）最近的标题；没有则返回 None。"""
+    lo, hi = 0, len(headings)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if headings[mid].offset <= offset:
+            lo = mid + 1
+        else:
+            hi = mid
+    return headings[lo - 1] if lo > 0 else None
+
+
+def _section_metadata(
+    offset: int, headings: list[_HeadingInfo]
+) -> dict[str, Any]:
+    """构造 chunk 起点 offset 的章节 metadata 追加字段（无标题则空字典）。"""
+    heading = _nearest_heading(headings, offset)
+    if heading is None:
+        return {}
+    metadata: dict[str, Any] = {}
+    if heading.chapter is not None:
+        metadata["chapter"] = heading.chapter
+    if heading.section is not None:
+        metadata["section"] = heading.section
+    if heading.tags:
+        metadata["tags"] = list(heading.tags)
+    return metadata
+
 
 # 公式与代码保护启发式（原理见 _protected_spans 注释）：
 # 以下「保护块」模式在整页文本上扫描，命中区间内的任何位置都不允许
@@ -320,9 +451,14 @@ def chunk_document_semantic(
     # 第二步：保护校正（切点不得落在公式/代码块中间）。
     bounds = _finalize_bounds(raw, protected)
 
+    # S3-T3：章节字段与字符分块同一套规则（起点之前最近标题）。
+    headings = _find_headings(content)
+
     page = document.page if document.page is not None else 0
     chunks: list[KnowledgeChunk] = []
     for start, end in bounds:
+        metadata = {**document.metadata, "chunking": "semantic"}
+        metadata.update(_section_metadata(start, headings))
         chunks.append(
             KnowledgeChunk(
                 chunk_id=f"{document.document_id}:{page}:{start}:{end}",
@@ -332,7 +468,7 @@ def chunk_document_semantic(
                 page=document.page,
                 start=start,
                 end=end,
-                metadata={**document.metadata, "chunking": "semantic"},
+                metadata=metadata,
             )
         )
     return chunks

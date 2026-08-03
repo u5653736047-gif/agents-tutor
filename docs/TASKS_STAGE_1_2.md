@@ -433,7 +433,7 @@
   干净；独立 review 无 Critical，I-1（策略与标记交互提示）与 2 个 Minor
   已处理并复审放行。
 
-### S3-T3 领域元数据与过滤检索
+### [x] S3-T3 领域元数据与过滤检索
 
 - 对应总清单：2.2.2（领域元数据部分）、2.2.3（元数据过滤部分）
 - 范围：`src/core/knowledge/models.py`、`service.py`、`index.py`、ingest 脚本。
@@ -443,6 +443,19 @@
   - 检索接口支持按 metadata 过滤（如限定某本书、某难度），过滤与排序组合正确。
   - 测试覆盖：字段写入、单条件与组合条件过滤、过滤后空结果语义。
 - 依赖：S3-T2。
+- 完成备注：2026-08-03；领域字段约定写入
+  `models.py` docstring：清单注入 `subject`/`difficulty`/`title`（ingest
+  已有）+ 规则提取 `chapter`/`section`/`tags`（chunking 复用 S3-T2 的
+  `_HEADING_RE`，按「起点之前最近标题」传播，character/semantic 两种分块
+  都可用，无标题不写字段）；`KnowledgeIndex` 协议与 InMemory/Sqlite 两实现
+  的 `search` 新增 keyword-only `metadata_filter`（多键 AND；`source` 映射
+  顶层；str 精确相等/list 任一元素；先过滤→打分→排序→top_k 截断；空结果
+  返回 []）；SQLite 用 `json_extract OR json_each` 双分支 WHERE（键白名单
+  正则防 JSON-path 注入、值全绑定参数，OR 写法在 json_each 标量两种语义
+  下都正确）；过滤校验异常分类（非 Mapping → TypeError、键/值格式 →
+  ValueError）。新增 19 个测试（32 项，memory/sqlite 参数化双跑锁定语义
+  一致），全量 496 通过，ruff、mypy strict（30 文件）干净；独立 review 无
+  Critical/Important，6 个 Minor 已处理并复审放行。
 
 ### S3-T4 Embedding 选型与向量索引
 

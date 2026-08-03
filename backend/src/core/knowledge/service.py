@@ -86,13 +86,31 @@ class KnowledgeService:
         """Remove all chunks for a document."""
         self._index.delete_document(document_id)
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchHit]:
-        """Validate public search inputs, then delegate ranking to the index."""
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        metadata_filter: dict[str, str] | None = None,
+    ) -> list[SearchHit]:
+        """Validate public search inputs, then delegate ranking to the index.
+
+        过滤语义（S3-T3，面向初学者）：metadata_filter 是「键 → 值」
+        字典，例如 {"source": "ml-zhouzhihua", "difficulty": "intermediate"}
+        表示「只在这本书、这个难度里检索」。规则：
+        - 多键之间是「并且」关系，全部满足才入选；
+        - 键 "source" 限定逻辑来源（某本书）；其余键匹配 chunk 的
+          领域字段 subject/difficulty/chapter/section/tags（字段约定
+          见 models.py 模块注释）；
+        - 过滤在打分排序之前生效（索引层实现），top_k 截断发生在
+          过滤之后——过滤后不足 top_k 个就返回全部匹配；
+        - 没有任何匹配时返回空列表（不报错）。
+        """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
-        return self._index.search(query, top_k)
+        return self._index.search(query, top_k, metadata_filter=metadata_filter)
 
 
 __all__ = ["KnowledgeService"]

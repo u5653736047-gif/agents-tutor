@@ -32,7 +32,11 @@
 4. 逻辑 source 约定
    source 就是清单里的逻辑标识（ml-zhouzhihua 等），与 S0-T1 脱敏语义
    一致：对外只暴露逻辑标识，绝不暴露文件系统路径；同时注入 metadata
-   （学科 subject、难度 difficulty、书名 title）供后续 S3-T3 元数据过滤。
+   （学科 subject、难度 difficulty、书名 title）供 S3-T3 元数据过滤。
+   S3-T3 起：章节字段 chapter/section 与概念标签 tags 由分块层
+   （chunking.py）从标题行规则提取并自动附加到每个 chunk 的 metadata，
+   本脚本无需额外逻辑——清单注入字段与规则提取字段合起来构成完整的
+   领域元数据（字段约定见 core/knowledge/models.py 模块注释）。
 5. 检索用例验证（--verify）
    遍历清单中每本书的 verify 用例：执行词法检索，若期望命中的逻辑
    source 出现在前 top_k 个结果中即 PASS，否则 FAIL；退出码 0 表示全部
