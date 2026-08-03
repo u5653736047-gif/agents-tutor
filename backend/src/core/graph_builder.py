@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Collection, Hashable, Mapping, Sequence
 from threading import RLock
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from langchain_core.messages import (
     AIMessage,
@@ -33,6 +33,7 @@ from .knowledge.models import Citation
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.react_agent import ChatModel
 from .state import (
+    REFERENCES_METADATA_KEY,
     AgentRole,
     AgentState,
     EvaluationResult,
@@ -42,6 +43,7 @@ from .state import (
     HandoffApprovalRequest,
     Intent,
     PendingHandoffApproval,
+    ReferenceVerification,
     StudentLevel,
     TaskContext,
     TaskPlan,
@@ -50,6 +52,7 @@ from .state import (
     TaskStepResult,
     ToolResult,
     create_initial_state,
+    message_references,
     with_agent_role,
     with_references,
 )
@@ -521,10 +524,15 @@ class CollaborativeAgentGraph:
             # 收集时机与来源见 _citations_from_tool_results 注释（与
             # S2-T3 evidence_tool_names 同源：只读本轮新增的工具结果，
             # 按 _CITATION_TOOL_NAMES 过滤检索类工具）。
-            updates["messages"] = _attach_references(
+            # S2-T5：_attach_references 在写入前完成真实性校验与文档级
+            # 合并规范化，并返回校验结论（reference_verification），
+            # 稍后写入 state["reference_verification"] 并在 evaluator 轮
+            # 并入 EvaluationResult（见下方评价组装与 state 写入处注释）。
+            updated_messages, reference_verification = _attach_references(
                 cast(list[BaseMessage], updates["messages"]),
                 tool_results,
             )
+            updates["messages"] = updated_messages
             target = _handoff_target(tool_results)
             new_plan = _task_plan_from_results(tool_results)
             existing_plan = _task_plan_from_state(state)
@@ -718,6 +726,48 @@ class CollaborativeAgentGraph:
                 # prompt 约定（禁止凭空评价）+ 审计闭环（evidence_tool_names
                 # 记录本轮实际证据，审计者可见「零证据却判通过」的可疑评价）
                 # 实现；S2-T5 做引用真实性校验时再考虑运行时加强。
+                # S2-T5 评价联动：把本轮引用校验结论并入评价结果——
+                # 验收要求校验结论「在评价结果中体现」，读取方拿到
+                # evaluation 即可同时看到引用校验结论（剔除/合并计数
+                # 与明细），与 evidence_tool_names 的「证据由核心层
+                # 组装」同一哲学；无校验内容（无引用无剔除）时为 None，
+                # 向后兼容旧数据。
+                #
+                # 取值口径（I-1 修复，真正实现「被评价轮」的联动）：
+                # 优先用 evaluator 轮自身结论（reference_verification——
+                # 本轮检索/剔除的校验结果）；evaluator 只评价不检索时
+                # 本轮结论为 None，则回退到 state 中已写入的「本用户轮」
+                # 结论——典型场景：计划流程中 worker 轮先检索作答（伪造
+                # 被剔除、结论写入 state["reference_verification"]），
+                # evaluator 轮随后评价，评价结果必须携带 worker 轮的
+                # 剔除明细（removed/chunk_id），「伪造剔除在评价结果中
+                # 体现」才算成立。
+                # state 读取路径核实：_wrap 的 state 参数是「本轮执行前
+                # 的 state」，包含同一用户轮内先前 agent 轮已写入
+                # checkpoint 的 updates（langgraph 节点链式传递）；run()
+                # 每轮重置 reference_verification 为 None，不存在跨轮
+                # 污染（旧轮结论不会误入本轮评价）。宽容读取：checkpoint
+                # 反序列化后通道值可能是 dict 或 ReferenceVerification
+                # 实例（视序列化器而定），统一归一为模型再赋值。
+                # 取舍（与 reviewer 方案 a 一致）：若 evaluator 轮自身
+                # 也检索（新结论非 None），以 evaluator 轮结论为准——
+                # 评价结果内嵌「评价所依据轮次」的校验结论，worker 轮
+                # 明细仍保留在 state["reference_verification"] 被覆盖
+                # 前的审计路径（本轮 state 最终值为 evaluator 轮结论），
+                # 简单一致、不做两轮并集。
+                evaluation_verification: Any = reference_verification or cast(
+                    Any, state.get("reference_verification")
+                )
+                # 宽容归一化：checkpoint 反序列化后通道值可能是 dict 或
+                # ReferenceVerification 实例（视序列化器而定），统一归一
+                # 为模型再赋值（cast(Any) 让本分支在静态类型下可达，同时
+                # 运行时防御 dict 形态——与仓库「读取端宽容」哲学一致）。
+                if evaluation_verification is not None and not isinstance(
+                    evaluation_verification, ReferenceVerification
+                ):
+                    evaluation_verification = ReferenceVerification.model_validate(
+                        evaluation_verification
+                    )
                 updates["evaluation"] = EvaluationResult(
                     verdict=EvaluationVerdict(evaluation_input["verdict"]),
                     fact_accuracy=EvaluationVerdict(
@@ -728,14 +778,31 @@ class CollaborativeAgentGraph:
                     ),
                     reason=evaluation_input["reason"],
                     evidence_tool_names=evidence_tools,
+                    reference_verification=evaluation_verification,
                 )
                 # 事件脱敏：只发 verdict 摘要（无敏感正文），完整结论
-                # （含 reason）在 state["evaluation"] 随 checkpoint 持久化。
+                # （含 reason 与引用校验结论）在 state["evaluation"]
+                # 随 checkpoint 持久化。
                 emit(
                     EventType.EVALUATION_COMPLETED,
                     agent.role.value,
                     event_verdict=evaluation_input["verdict"],
                 )
+
+            # ── S2-T5 引用真实性校验结论写入 state ──
+            # 权威来源（供审计与 API 层读取，随 checkpoint 持久化）。
+            # 与 evaluation.reference_verification 的关系：两者**并不
+            # 恒等**——本通道记录「本轮实际校验动作」（本轮挂载/剔除），
+            # evaluator 轮的评价结果在自身无校验内容时回退并入「本用户
+            # 轮先前轮次」的结论（见上方评价组装注释），因此 evaluation
+            # 内嵌的可能是先前 worker 轮的结论而 state 通道仍是本轮的。
+            # 只有本轮确实产生了校验内容（挂载了引用或剔除了伪造）才写入，
+            # 全零结论（无检索无引用）不写、保持 None——与 evaluation 的
+            # 「无评价 → None」同一语义，避免 checkpoint 出现噪音字段。
+            # 脱敏：结论只含计数与 chunk_id/document_id 结构化标识，
+            # 不复制引用正文（正文仍按 tool_results 审计）。
+            if reference_verification is not None:
+                updates["reference_verification"] = reference_verification
 
             handoff_count = state.get("handoff_count", 0)
             switch_count = state.get("agent_switch_count", 0)
@@ -1253,6 +1320,11 @@ class CollaborativeAgentGraph:
                         # 新轮重置为 None——若跨轮保留，上一轮的评价徽章
                         # 会误导后续轮次的展示与审计。
                         "evaluation": None,
+                        # S2-T5：引用校验结论是「本轮事实记录」（与
+                        # evaluation 同构），新轮重置为 None——若跨轮保留，
+                        # 上一轮的校验结论会误导本轮审计（引用真实性是
+                        # 按轮判定的，旧轮结论只属于旧轮）。
+                        "reference_verification": None,
                         # S2-T2：这里刻意不重置 level——学生水平是「跨轮
                         # 保留的画像」（与 intent 相反），只有模型再次调用
                         # detect_level 时才覆盖；若随新轮重置，已建立的
@@ -1464,8 +1536,8 @@ def _citations_from_tool_results(
 def _attach_references(
     messages: Sequence[BaseMessage],
     tool_results: Sequence[ToolResult],
-) -> list[BaseMessage]:
-    """把本轮检索命中的引用挂到本轮终端回答消息上（S2-T4）。
+) -> tuple[list[BaseMessage], ReferenceVerification | None]:
+    """把本轮检索命中的引用挂到本轮终端回答消息上，并做真实性校验（S2-T4+S2-T5）。
 
     注入目标：本轮（本次 Agent 轮）最后一个无 tool_calls 的 AIMessage
     ——即「使用检索证据作答」的那条最终回答；中间带 tool_calls 的助手
@@ -1479,20 +1551,197 @@ def _attach_references(
     model_copy 仅替换 content、原样保留 additional_kwargs，因此先注入
     的引用不会因聚合改写丢失（与角色元数据同一保障）。
 
-    边界：无检索命中 → 原样返回，消息不带 references 键（「零命中不
-    伪造」）；检索命中但本轮没有终端回答（如模型一直调用工具直到迭代
-    超限）→ 没有可挂的消息，同样原样返回——回答不存在时引用无意义。
+    ── S2-T5 校验时机与依据（为什么在写入前校验）──
+    校验层位于「收集之后、写入消息元数据之前」：本函数是引用进入
+    state["messages"]（进而 checkpoint 持久化）的唯一闸口，写入前校验
+    保证「落到消息上的每条引用都是本轮真实命中」这一不变式成立；若在
+    写入后校验，伪造引用已经持久化，只能事后修补，且无法保证前端
+    （D3-T5 按消息渲染引用）看到的列表纯净。
+    校验依据（ground truth）：_citations_from_tool_results 从本轮
+    tool_results 解析出的真实命中（chunk 级全集）——「本轮」由
+    updates["tool_results"] 天然界定（只含本 Agent 轮新增的工具结果），
+    不会把历史轮的检索混入。被校验对象：消息上**已存在**的引用
+    （message_references 宽容读取）——正常路径下模型不产出引用，消息
+    无引用；出现已有引用只可能是模型输出注入、历史脏数据或外部写入，
+    这正是伪造引用的唯一来源，校验层逐一识别。
+    处置取舍（剔除 vs 降级标记）：选「剔除」。理由：1) 引用列表的语义
+    是「本轮真实证据的权威列表」，保留伪造条目会让前端渲染出点不开的
+    坏链接（引用编号=列表下标，见下）；2) 剔除后列表紧凑、编号稳定，
+    与 S2-T4「编号=出现顺序」的契约一致，无需前端处理「未验证」态；
+    3) 剔除不是无痕的——校验结论（removed 计数与被剔除 chunk_id）写
+    入 state["reference_verification"] 并并入评价结果，审计者可查；
+    4) 不动既有 Citation 模型（不加 verified 字段），向后兼容风险最小。
+    「降级标记」方案留给未来需要保留可疑引用的场景（届时
+    ReferenceVerification.verified < total 即有语义）。
+
+    边界：无检索命中 → 消息不带 references 键（「零命中不伪造」）；
+    检索命中但本轮没有终端回答（如模型一直调用工具直到迭代超限）→
+    没有可挂的消息，同样不挂——回答不存在时引用无意义。
     """
-    citations = _citations_from_tool_results(tool_results)
-    if not citations:
-        return list(messages)
+    # 第一步：收集本轮真实命中（chunk 级全集，校验与挂载的共同依据）。
+    ground_truth = _citations_from_tool_results(tool_results)
     updated = list(messages)
     for index in range(len(updated) - 1, -1, -1):
         message = updated[index]
-        if isinstance(message, AIMessage) and not message.tool_calls:
-            updated[index] = with_references(message, citations)
-            return updated
-    return updated
+        if not (isinstance(message, AIMessage) and not message.tool_calls):
+            continue
+        # 第二步：读取消息上已有的引用（读取端宽容，见 message_references）
+        # 并与真实命中逐条比对，识别伪造/越界条目（判定逻辑见
+        # _verify_references 注释；剔除后其余合法引用保留——它们本就
+        # 是真实命中的子集，由下方最终列表覆盖）。
+        existing = message_references(message) or []
+        removed: list[Citation] = []
+        if existing:
+            _, removed = _verify_references(existing, ground_truth)
+        # 第三步：文档级合并规范化（同一 document_id 的多个 chunk 合并
+        # 为一条，规则与编号稳定性见 _merge_citations_by_document 注释）。
+        final = _merge_citations_by_document(ground_truth)
+        if final:
+            # 挂载规范化后的引用；with_references 整体替换 references 键，
+            # 因此消息上残留的伪造引用不会写入持久化历史。
+            updated[index] = with_references(message, final)
+        elif existing:
+            # 全部引用被剔除且无真实命中可挂：剥离消息上已有的 references
+            # 键（否则伪造引用仍会随消息写入 checkpoint），与「零命中不
+            # 注入」语义一致。
+            updated[index] = _strip_references(message)
+        # 第四步：组装校验结论（无挂载且无剔除 → None，调用方不写 state）。
+        verification = _reference_verification_from(ground_truth, final, removed)
+        return updated, verification
+    return updated, None
+
+
+def _citation_fields_match(left: Citation, right: Citation) -> bool:
+    """Citation 全字段比对（伪造判定用）。
+
+    判定规则：除 chunk_id 外，document_id / source / page 也必须与真实
+    命中一致——「引用指向的文档与页码」是引用真实性的组成部分，模型或
+    脏数据若在真实 chunk_id 上篡改文档/页码（字段不匹配），同样按伪造
+    处置（见任务验收「chunk_id 不在命中集、或字段不匹配」）。
+    """
+    return (left.document_id, left.source, left.page, left.chunk_id) == (
+        right.document_id,
+        right.source,
+        right.page,
+        right.chunk_id,
+    )
+
+
+def _verify_references(
+    existing: Sequence[Citation],
+    ground_truth: Sequence[Citation],
+) -> tuple[list[Citation], list[Citation]]:
+    """逐条校验消息中已有引用 vs 本轮真实命中，返回 (通过, 伪造)。
+
+    伪造/越界判定（对应任务验收定义）：
+    - chunk_id 不在本轮命中集（ground_truth 的 chunk_id 集合）→ 越界
+      （声称引用了本轮根本没检索到的片段）；
+    - chunk_id 在命中集但 Citation 其他字段不匹配 → 伪造（在真实
+      chunk_id 上篡改 document_id/source/page，见 _citation_fields_match）。
+    两者都进 removed 列表；通过校验的进 verified 列表（当前剔除策略下
+    调用方只需 removed，verified 保留供未来「降级未验证」模式使用）。
+    ground_truth 已由 _citations_from_tool_results 按 chunk_id 去重，
+    因此 chunk_id → Citation 映射是单值的，不会出现同 id 多候选。
+    """
+    truth_by_chunk_id = {citation.chunk_id: citation for citation in ground_truth}
+    verified: list[Citation] = []
+    removed: list[Citation] = []
+    for citation in existing:
+        truth = truth_by_chunk_id.get(citation.chunk_id)
+        if truth is not None and _citation_fields_match(citation, truth):
+            verified.append(citation)
+        else:
+            removed.append(citation)
+    return verified, removed
+
+
+def _merge_citations_by_document(
+    citations: Sequence[Citation],
+) -> list[Citation]:
+    """文档级合并规范化：同一 document_id 的多个 chunk 引用合并为一条。
+
+    规则：保留「首次出现」的 chunk 的 Citation（含其 page/chunk_id），
+    同文档后续 chunk 全部并入该条（不新增条目）。为什么保留第一条而非
+    聚合 page 列表：Citation 模型没有 pages 字段，聚合需要改既有模型
+    （向后兼容风险）；保留第一条则模型零改动，且输出稳定可解析——
+    列表顺序 = 文档首次出现顺序，编号（列表下标）与文档一一对应，前端
+    按编号渲染时同一文档永远只有一个编号，点击可定位到首个 chunk 的
+    原文位置（chunk_id 坐标仍在）。
+
+    为什么合并发生在写入端而不是收集端（_citations_from_tool_results
+    保持 chunk 级全集）：真实命中全集是校验依据，若收集端就合并，同
+    文档第二条 chunk 会被「地面真相」遗漏，消息里引用它时会被误判为
+    伪造——合并只影响「最终挂载形态」，不影响「校验依据」。
+    入参约定：citations 已按 chunk_id 去重（_citations_from_tool_results
+    的保证），这里只做文档维度的第二次归并。
+    """
+    merged: list[Citation] = []
+    seen_document_ids: set[str] = set()
+    for citation in citations:
+        if citation.document_id in seen_document_ids:
+            continue
+        seen_document_ids.add(citation.document_id)
+        merged.append(citation)
+    return merged
+
+
+def _reference_verification_from(
+    ground_truth: Sequence[Citation],
+    final: Sequence[Citation],
+    removed: Sequence[Citation],
+) -> ReferenceVerification | None:
+    """由校验/合并结果组装 ReferenceVerification；无内容时返回 None。
+
+    无内容判定：既没有挂载任何引用（final 为空）也没有剔除任何伪造
+    （removed 为空）→ 返回 None，调用方不写 state——与 evaluation 的
+    「无评价 → None」同一语义，避免 checkpoint 出现「全零结论」噪音。
+    字段口径（M-1 修正）：
+    - verified 记录 **chunk 级**通过校验的条数（= ground_truth 条数）：
+      最终挂载列表由 ground_truth 合并而来，chunk 级口径下每条都是真实
+      命中；文档级合并后展示为 total 条（<= verified），因此
+      merged = verified - total 自洽——审计者可同时看到「校验了多少个
+      chunk、合并展示为几条」；
+    - removed 仍是被剔除的伪造条数（来自消息已有引用，chunk 级）。
+    合并明细（merged_document_ids）：ground_truth 中「同一文档第二次
+    出现」的 chunk 所属 document_id——每个被合并文档只记录一次
+    （M-2 修正：直接用「第二次出现才记录」生成，无需事后去重）。
+    脱敏：明细只记 chunk_id / document_id 结构化标识，不复制引用正文。
+    """
+    if not final and not removed:
+        return None
+    merged_document_ids: list[str] = []
+    seen_document_ids: set[str] = set()
+    recorded_document_ids: set[str] = set()
+    for citation in ground_truth:
+        document_id = citation.document_id
+        if document_id in seen_document_ids:
+            # 同文档第二次出现：该文档被合并，记录一次后不再重复
+            if document_id not in recorded_document_ids:
+                recorded_document_ids.add(document_id)
+                merged_document_ids.append(document_id)
+        else:
+            seen_document_ids.add(document_id)
+    return ReferenceVerification(
+        total=len(final),
+        verified=len(ground_truth),
+        removed=len(removed),
+        merged=len(ground_truth) - len(final),
+        removed_chunk_ids=[citation.chunk_id for citation in removed],
+        merged_document_ids=merged_document_ids,
+    )
+
+
+def _strip_references(message: BaseMessage) -> BaseMessage:
+    """返回移除 references 元数据键的消息副本（校验剔除后的清理动作）。
+
+    仅当「消息上已有引用被全部剔除且无真实命中可挂」时调用：伪造引用
+    不能随消息写入持久化历史，否则校验形同虚设。与 with_references
+    同一副本语义（不修改原对象，避免污染模型返回对象被复用）；其他
+    additional_kwargs（角色元数据等）原样保留。
+    """
+    additional_kwargs = dict(message.additional_kwargs)
+    additional_kwargs.pop(REFERENCES_METADATA_KEY, None)
+    return message.model_copy(update={"additional_kwargs": additional_kwargs})
 
 
 def _handoff_target(tool_results: Sequence[ToolResult]) -> str | None:

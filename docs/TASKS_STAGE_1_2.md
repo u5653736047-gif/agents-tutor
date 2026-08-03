@@ -342,7 +342,7 @@
   2 个 Minor 已修复并复审放行。维护点：测试对照依赖词法索引确定性，
   Sprint 3 换向量索引后需复核。
 
-### S2-T5 引用真实性校验
+### [x] S2-T5 引用真实性校验
 
 - 对应总清单：2.3.3（真实性校验、引用格式规范化部分）
 - 范围：后处理校验模块（位置自选，建议贴近 graph 输出层）、评价规则联动。
@@ -352,6 +352,22 @@
   - 引用格式规范化：同一文档多次引用合并编号，输出格式稳定可解析。
   - 测试覆盖：注入伪造引用被识别、合法引用不受影响、格式合并正确。
 - 依赖：S2-T4。
+- 完成备注：2026-08-03；校验置于 `_attach_references`
+  收集之后、`with_references` 写入之前（消息进 checkpoint 的唯一闸口，
+  伪造不可能持久化）；伪造判定：chunk_id 不在本轮真实命中集 → 越界剔除，
+  字段不匹配 → 伪造剔除（选剔除：编号=列表下标契约稳定、removed 明细进
+  `ReferenceVerification` 可审计、Citation 零改动）；文档级合并保留首次
+  出现 chunk（真实命中保持 chunk 级全集避免误判），`verified` 为 chunk
+  级通过数；结论写 `state["reference_verification"]`（每轮重置）并并入
+  `EvaluationResult.reference_verification`——评价联动语义：evaluator
+  自身结论优先，否则回退读取本用户轮 state 已写结论（worker 轮剔除
+  明细可在评价结果中体现，有回归测试锁定）。新增 11 个测试（注入伪造
+  识别、字段篡改、合法不受影响、文档合并、worker→evaluator 联动、零
+  引用/无检索、checkpoint 持久化与序列化往返），全量 395 通过，ruff、
+  mypy strict（30 文件）干净；独立 review 发现 1 个 Important（评价联动
+  语义缺口）已修复并复审放行。维护点：测试对照依赖词法索引确定性
+  （short-doc 双词命中排序），Sprint 3 换向量索引后需复核（与 S2-T4
+  同一维护点）。
 
 ---
 

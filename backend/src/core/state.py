@@ -527,6 +527,64 @@ class ToolResult(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ReferenceVerification(BaseModel):
+    """引用真实性校验结论（S2-T5 核心校验层自动产出，非模型填写）。
+
+    这是「引用真实性校验层」的产物：核心层在引用写入消息元数据之前，
+    把「消息中已有的引用」与「本轮检索工具结果的真实命中」逐条比对，
+    剔除伪造/越界条目、做文档级合并规范化后，把结论记录在这里
+    （校验依据、判定逻辑与处置取舍的完整说明见 graph_builder.py 的
+    _attach_references / _verify_references / _merge_citations_by_document
+    注释）。
+
+    字段语义：
+    - total：最终挂载到消息上的引用条数（文档级合并之后）；
+    - verified：经校验确认为真实命中的 **chunk 级** 引用条数——最终
+      挂载列表由本轮真实命中（chunk 级全集）合并而来，chunk 级口径下
+      每条都是真实命中，故 verified = chunk 级命中条数；文档级合并后
+      展示为 total 条（total <= verified），merged = verified - total
+      自洽（审计者可同时看到「校验了多少个 chunk、合并展示为几条」）。
+      注意与「降级标记」模式的关系：若未来改为保留未验证条目，
+      verified < chunk 级命中条数 即有语义；
+    - removed：检测到并剔除的伪造/越界引用条数（来自消息中已有的
+      引用——注入/脏数据的唯一来源，见 _attach_references 注释）；
+    - merged：文档级合并减少的条数（chunk 级条数 - 文档级条数）；
+    - removed_chunk_ids：被剔除引用的 chunk_id 列表（脱敏原则：只记
+      结构化标识，不记任何正文/内容字段）；
+    - merged_document_ids：被合并（非文档首条）chunk 所属 document_id
+      列表——每个被合并文档只记录一次（M-2：第二次出现时记录、其后
+      不再重复，保序）。
+
+    为什么校验结论要独立成模型并写入 state（而不是只挂在消息上）：
+    1) 校验结论是「本轮运行的事实记录」，随 checkpoint 持久化后
+       get_state()/恢复会话仍可审计——与 evaluation 同机制；
+    2) 它会被核心层并入 EvaluationResult.reference_verification
+       （见该字段注释），评价 Agent 的结论与引用校验结论同处可读，
+       构成「引用真实性」的审计闭环；
+    3) 只记计数与结构化标识（chunk_id/document_id），不复制引用正文，
+       与仓库「事件/审计字段不记敏感正文」的惯例一致。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0, description="最终挂载引用条数（文档级合并后）")
+    verified: int = Field(
+        ge=0,
+        description="经校验为真实命中的 chunk 级条数（合并前口径，>= total）",
+    )
+    removed: int = Field(ge=0, description="检测到并剔除的伪造/越界引用条数")
+    merged: int = Field(ge=0, description="文档级合并减少的条数")
+    removed_chunk_ids: list[str] = Field(
+        default_factory=list,
+        description="被剔除引用的 chunk_id（脱敏：结构化标识，非正文）",
+    )
+    merged_document_ids: list[str] = Field(
+        default_factory=list,
+        description="被合并（非文档首条）chunk 所属 document_id（去重保序）",
+    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class EvaluationResult(BaseModel):
     """评价 Agent 对一轮最终回答的结构化评价结论（S2-T3）。
 
@@ -563,6 +621,17 @@ class EvaluationResult(BaseModel):
     evidence_tool_names: list[str] = Field(
         default_factory=list,
         description="本轮评价依据的检索证据工具名列表（核心层组装，脱敏）",
+    )
+    # S2-T5 引用真实性校验结论（核心层组装，模型不可填写——submit_evaluation
+    # 的 schema 没有该字段）。为什么并入评价结果：验收标准要求校验结论
+    # 「在评价结果中体现」，读取方（API/审计）拿到 evaluation 即可同时看到
+    # 引用校验结论（剔除/合并计数与明细），与 evidence_tool_names 的
+    # 「证据由核心层确定」同一哲学。默认 None 向后兼容：旧 checkpoint 或
+    # 未走校验层的评价没有该字段，读取端宽容（见测试
+    # test_legacy_evaluation_without_verification_field_validates）。
+    reference_verification: ReferenceVerification | None = Field(
+        default=None,
+        description="本轮引用真实性校验结论（核心层组装，默认 None 向后兼容）",
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -711,6 +780,31 @@ class AgentState(TypedDict, total=False):
     # 视序列化器而定）由读取方宽容处理（测试已兼容两种形式）。
     evaluation: Annotated[EvaluationResult | None, _replace]
 
+    # --- 引用真实性校验结论（S2-T5） ---
+    # 引用校验层对本轮引用的自动校验结论（ReferenceVerification 模型）；
+    # last-write-wins，由 _wrap 在引用写入消息元数据时同步产出，
+    # run() 在新用户轮次重置为 None（与 evaluation 同构：校验结论是
+    # 「本轮引用的事实记录」，每轮重新校验；跨轮保留会让审计者误以为
+    # 旧轮结论属于新轮）。
+    #
+    # 为什么放 state 而不是只发事件：
+    # 1) checkpoint 持久化——校验结论随 checkpoint 保存，get_state()/
+    #    恢复会话后仍能读到上一轮的引用校验结论，是「引用真实性审计」
+    #    的事实来源（与 evaluation 同一机制）；
+    # 2) 评价联动——核心层在 evaluator 轮组装 EvaluationResult 时并入
+    #    引用校验结论：优先用 evaluator 轮自身结论，否则回退并入本通道
+    #    中「本用户轮先前轮次」的结论（如计划流程中 worker 轮的剔除
+    #    明细，见 graph_builder.py _wrap 注释），评价结果与引用校验
+    #    结论同处可读；
+    # 3) 脱敏——本通道只记计数与结构化标识（chunk_id/document_id），
+    #    不复制引用正文，符合「审计字段不记敏感正文」的仓库惯例。
+    # 写入语义（见 graph_builder.py _attach_references 注释）：本轮
+    # 挂载了引用或剔除了伪造才写入（非 None）；无检索无引用的全零
+    # 场景不写（保持 None），与 evaluation 的「无评价→None」一致。
+    # 类型取舍：与 evaluation 一致直接存 Pydantic 模型（嵌套模型由
+    # Pydantic 统一处理序列化，读取方宽容处理 dict/模型实例两种形式）。
+    reference_verification: Annotated[ReferenceVerification | None, _replace]
+
     # --- 任务上下文 ---
     # 跨轮持久的结构化任务信息（由 Supervisor 填充）
     task_context: Annotated[TaskContext | None, _replace]
@@ -770,6 +864,9 @@ def create_initial_state(
         # S2-T3 评价结论：初始为 None（「本轮尚无评价」），
         # 与 intent 同构、每轮重置（评价是单轮结论，见 AgentState.evaluation）。
         evaluation=None,
+        # S2-T5 引用真实性校验结论：初始为 None（「本轮尚无校验内容」），
+        # 与 evaluation 同构、每轮重置（校验结论是单轮事实记录）。
+        reference_verification=None,
         task_context=None,
         task_plan=None,
         task_results=[],
