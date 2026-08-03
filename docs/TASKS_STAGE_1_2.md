@@ -404,7 +404,7 @@
   干净；独立 review 无 Critical，2 个前置（.gitignore 加 `data/`、全量
   verify 收官）已落实。
 
-### S3-T2 语义分块
+### [x] S3-T2 语义分块
 
 - 对应总清单：2.2.2（语义分块部分）
 - 范围：`src/core/knowledge/chunking.py`、`loaders.py`。
@@ -415,6 +415,23 @@
   - 分块策略可通过 ingest 参数选择，字符分块保持默认兼容。
   - 测试覆盖：章节边界切分、长公式段完整保留、坐标一致性。
 - 依赖：S3-T1。
+- 完成备注：2026-08-03；`chunking.py` 新增
+  `chunk_document_semantic`（原字符分块逐字节未动）：三种标题形态
+  （Markdown `#`、中文「第 X 章/节」含中文数字、数字小节 x.y.z，正则需
+  MULTILINE 才能命中非首段标题）+ 段落边界（空行切分，标题行完整保留
+  在 chunk 开头）；公式/代码保护：`$$...$$`、`\[...\]`、
+  `\begin..\end`、``` 围栏 + 连续 ≥2 行缩进块，切点落入保护块整体推至
+  块结束并入前 chunk，`_finalize_bounds` 防重叠不丢内容（已推演「标题段
+  起点落入跨段保护块」的几何场景）；坐标语义与字符分块完全一致
+  （content[start:end] 恒等、chunk_id 派生）；`KnowledgeService(chunking=
+  "character"|"semantic")` 与 ingest `--chunking` 参数（默认 character
+  兼容 S3-T1）；已知取舍：版本号行（如 2024.5.1）会被数字小节模式误判
+  为标题（粒度变细、坐标无影响，行为有测试锁定）；「更换分块策略需
+  --force 重入库」（完成标记不记录策略，help/docstring 已注明）。新增
+  26 个测试（含跨段公式、围栏/缩进代码、版本号锁定、坐标一致性、
+  service/ingest 策略选择），全量 464 通过，ruff、mypy strict（30 文件）
+  干净；独立 review 无 Critical，I-1（策略与标记交互提示）与 2 个 Minor
+  已处理并复审放行。
 
 ### S3-T3 领域元数据与过滤检索
 

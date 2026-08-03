@@ -5,6 +5,7 @@
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --books ml-lihang,dl-d2l
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --force
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --verify
+    $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --chunking semantic
 
 设计说明（按功能模块）：
 1. 入库流程
@@ -25,6 +26,9 @@
    --force 重入库前先清除标记：若中途失败，旧标记不存在，下次默认运行
    会自动重新入库这本书；而其它已完成的书仍被跳过，互不影响。
    单本书解析失败只影响它自己（逐书 try/except 继续处理后续书）。
+   注意：完成标记不记录分块策略——更换 --chunking 后旧标记仍存在，
+   默认运行会直接跳过（新策略不生效）；更换分块策略必须加 --force
+   强制重新入库。
 4. 逻辑 source 约定
    source 就是清单里的逻辑标识（ml-zhouzhihua 等），与 S0-T1 脱敏语义
    一致：对外只暴露逻辑标识，绝不暴露文件系统路径；同时注入 metadata
@@ -40,6 +44,12 @@
    --force 也不会尝试入库——数据源不可用时强制入库只会报错）。
    恢复方式：拿到可用的数据源（如文本版 PDF）后移除/清空 blocked
    字段即可自动恢复入库与验证。
+7. 分块策略选择（S3-T2）
+   --chunking 参数二选一：character（默认）保持 S3-T1 的字符窗口
+   分块，行为完全不变；semantic 按章节标题/段落边界分块，并对公式段
+   与代码块做最小保护（不被从中间截断）。策略透传给
+   KnowledgeService 的 chunking 参数；两种策略产出的 chunk 坐标
+   （document_id/page/start/end）语义一致，均可回溯到原文。
 """
 
 from __future__ import annotations
@@ -279,6 +289,7 @@ def ingest_book(
     force: bool = False,
     page_loader: PageLoader | None = None,
     progress: Callable[[int, int], None] | None = None,
+    chunking: str = "character",
 ) -> IngestResult:
     """入库一本书，返回入库结果。
 
@@ -291,6 +302,10 @@ def ingest_book(
     4. 解析全部页 → 注入学科/难度/书名 metadata → 一次性 add_documents
        （S0-T2 整文档替换：旧 chunk 先删后插，无残留）；
     5. 全部成功后才写完成标记。
+
+    分块策略（S3-T2）：chunking 参数（"character" 默认 | "semantic"）
+    透传给 KnowledgeService 构造，与 CLI --chunking 一一对应；
+    默认 character 与 S3-T1 行为完全一致。
     """
     if book.blocked:
         return IngestResult(book_source=book.source, status="blocked")
@@ -314,7 +329,7 @@ def ingest_book(
         page.metadata["difficulty"] = book.difficulty
         page.metadata["title"] = book.title
 
-    service = KnowledgeService(index)
+    service = KnowledgeService(index, chunking=chunking)
     chunks = service.add_documents(pages)
     index.mark_document_complete(
         book.source, chunk_count=len(chunks), page_count=len(pages)
@@ -426,6 +441,14 @@ def main(argv: list[str] | None = None) -> int:
         default=5,
         help="验证时每个用例取前 N 个检索结果（1-10）",
     )
+    parser.add_argument(
+        "--chunking",
+        choices=["character", "semantic"],
+        default="character",
+        help="分块策略（默认 character，与 S3-T1 一致）：character=字符窗口；"
+        "semantic=按章节标题/段落边界，并保护公式与代码块不被截断。"
+        "注意：完成标记不记录策略，更换策略后需加 --force 重新入库",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.top_k <= 10:
@@ -488,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
                     pdf_path,
                     force=args.force,
                     progress=_print_progress,
+                    chunking=args.chunking,
                 )
             except ValueError as exc:
                 # 单本书失败只影响它自己：无完成标记，下次默认运行会自动重试；

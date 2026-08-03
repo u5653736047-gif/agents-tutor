@@ -688,3 +688,72 @@ def test_main_rejects_unknown_book_id(tmp_path: Path) -> None:
     )
 
     assert code == 2
+
+
+# ── S3-T2 分块策略选择（--chunking semantic | character）──────────
+
+
+def test_ingest_book_semantic_chunking_selected(
+    index: SqliteKnowledgeIndex,
+) -> None:
+    """ingest_book 支持 chunking="semantic"：按章节标题分块并打策略标记。"""
+    book = _manifest_book("ml-a")
+
+    def headed_loader(
+        path: Path, document_id: str, source_label: str
+    ) -> Iterator[KnowledgeDocument]:
+        yield KnowledgeDocument(
+            document_id=document_id,
+            content=(
+                "第 1 章 支持向量机\n\n支持向量机 间隔 核函数\n\n"
+                "第 2 章 条件随机场\n\n概率 标注"
+            ),
+            source=source_label,
+            page=1,
+        )
+
+    result = ingest_book(
+        index,
+        book,
+        Path("book.pdf"),
+        page_loader=headed_loader,
+        chunking="semantic",
+    )
+
+    assert result.status == "ingested"
+    assert result.chunks == 2  # 两章 → 两个 chunk（标题开启新 chunk）
+    hit = KnowledgeService(index).search("支持向量机", top_k=5)[0]
+    assert hit.chunk.metadata["chunking"] == "semantic"
+
+
+def test_ingest_default_character_has_no_strategy_marker(
+    index: SqliteKnowledgeIndex,
+) -> None:
+    """默认 character 分块不带策略标记（与 S3-T1 行为一致）。"""
+    ingest_book(index, _manifest_book("ml-a"), Path("book.pdf"), page_loader=_fake_pages)
+
+    hit = KnowledgeService(index).search("支持向量机", top_k=5)[0]
+    assert "chunking" not in hit.chunk.metadata
+
+
+def test_main_semantic_chunking_flag(tmp_path: Path) -> None:
+    """CLI --chunking semantic：入库成功且 chunk 带策略标记。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+    ]
+
+    assert main([*common, "--chunking", "semantic"]) == 0
+
+    reopened = SqliteKnowledgeIndex(db_path)
+    try:
+        assert reopened.is_document_complete("ml-a")
+        hit = KnowledgeService(reopened).search("support vector", top_k=5)[0]
+        assert hit.chunk.metadata["chunking"] == "semantic"
+    finally:
+        reopened.close()
