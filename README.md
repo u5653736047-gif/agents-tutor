@@ -28,6 +28,43 @@ uv sync --extra dev
 复制 `.env.example` 为 `.env`，然后填入自己的 DeepSeek 配置。`.env`
 已被 Git 忽略，请勿提交真实 API Key。
 
+## 阶段三骨架联调
+
+先准备两个运行时：
+
+```powershell
+cd backend
+uv sync --extra dev
+cd ..\frontend
+npm install
+```
+
+根目录 `.env` 需要以下变量。启动脚本只将这些变量传给子进程，绝不会打印
+`DEEPSEEK_API_KEY`。
+
+| 变量 | 说明 |
+| --- | --- |
+| `DEEPSEEK_MODEL` | 必填，DeepSeek 模型名。 |
+| `DEEPSEEK_BASE_URL` | 必填，OpenAI 兼容 API 根地址。 |
+| `DEEPSEEK_API_KEY` | 必填，真实 DeepSeek 凭证。 |
+| `NEXT_PUBLIC_API_BASE_URL` | 可选，前端 API 地址；默认 `http://127.0.0.1:8000`。 |
+| `API_SESSION_STORE_PATH` | 可选，会话 SQLite 文件；默认根目录 `data/api_sessions.sqlite3`。 |
+| `API_CHECKPOINT_PATH` | 可选，图 checkpoint SQLite 文件；默认根目录 `data/api_checkpoints.sqlite3`。 |
+
+然后在 Windows PowerShell 的仓库根目录运行一条命令：
+
+```powershell
+.\scripts\start-stage3.ps1
+```
+
+脚本会加载根目录 `.env`、等待 API `healthz` 与前端就绪，并在 Ctrl+C 时停止两端。
+浏览器打开 `http://127.0.0.1:3000`；前端固定使用演示用户 `demo-user`（请求头
+`X-User-Id`），API 文档位于 `http://127.0.0.1:8000/docs`。
+
+骨架期的手动验收路径是：在前端创建会话并提问，确认带角色徽章的回答；在 API
+文档中用同一 `demo-user` 和会话 ID 查询 / 提交 handoff 的 `confirm` 或 `reject`，
+再刷新前端验证历史，最后归档会话。审批卡片的完整前端交互属于后续细节清单。
+
 ## 验证
 
 ```powershell

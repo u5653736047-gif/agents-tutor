@@ -243,7 +243,7 @@
   - 自适应高度、取消发送、快捷指令 → 细节清单。
 - 依赖：W1-T4。
 
-### W1-T7 启动脚本与骨架联调验收
+### [x] W1-T7 启动脚本与骨架联调验收
 
 - 验收标准：
   - 根目录一条命令（脚本）同时启动后端与前端；README 写明环境变量、
@@ -253,6 +253,30 @@
     归档会话。
   - 需要真实 DeepSeek 凭证；无凭证时本任务按阻塞记录并汇报。
 - 依赖：Sprint W1 全部完成（W1-T8 除外）。
+
+> 阻塞记录（2026-08-03，已解除）：根目录 `scripts/start-stage3.ps1` 已能以一条
+> 命令启动双端，临时数据库中的 `/healthz` 与前端首页均返回 200；真实 DeepSeek
+> 联调已验证创建会话、触发 pending handoff、`confirm` 后继续、`reject` 后清除
+> pending，以及归档会话从活动列表消失（凭证未输出）。但确认后的
+> `GET /sessions/{id}/messages` 返回的助手消息缺少 `agent`。前端发送后和刷新后
+> 都以该历史为准，因而只能显示“助手”降级徽章，不能满足本任务“看到带角色
+> 徽章的回答”的验收。根因是 core 持久化历史未提供可恢复的助手角色；不得在
+> 本清单中修改 `backend/src/core/`。已复核仅在 API 层按 `events` 顺序或数量回填的
+> 方案：事件没有消息 ID / 索引，且正常的结构化模型内容会被历史投影过滤、聚合
+> 降级会保留可见消息但将对应 completion 标为失败；两类路径均可能令推断错配。
+> 因此不能用不可靠的映射伪造角色。待 core 负责人提供稳定历史角色后，重新运行
+> W1-T7 联调；在此之前不要勾选 W1-T7 或启动 W1-T8。
+
+> 解除记录（2026-08-03）：core 侧已由清单 `docs/TASKS_STAGE_1_2.md` 的
+> S1-T7（提交 a6b31a3）提供稳定历史角色（`additional_kwargs["agent"]` +
+> `core.state.message_agent_role`），API 层衔接适配（提交 afd81a7，
+> `_safe_agent` 元数据优先 + name 回退 + None 降级）后重跑真实 DeepSeek 联调，
+> 验收清单逐项通过：创建会话 → 提问回答带 `agent=supervisor` → 待审批触发并
+> `confirm` 继续完成 → 再触发 `reject` 后 pending 清除 → 刷新后历史回溯 4 条
+> 助手消息角色 `['supervisor','learning_assistant','supervisor','supervisor']`
+> 可区分（多 Agent 徽章）→ 归档会话从活动列表消失。全程经
+> `scripts/start-stage3.ps1` 一条命令启动双端。前端 lint / typecheck / build
+> 与后端 pytest / ruff / mypy 门禁全绿。
 
 ### W1-T8 产出细节任务清单
 
