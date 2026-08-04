@@ -180,7 +180,9 @@ export function ConversationPanel() {
                 : null
             }
             isDeciding={isDecidingHandoff}
-            onDecide={(action) => void decideHandoff(action)}
+            onDecide={(action, modifications) =>
+              void decideHandoff(action, modifications)
+            }
             pending={pendingHandoff}
           />
           <div data-slot="conversation-end" ref={endRef} />

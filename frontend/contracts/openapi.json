@@ -278,17 +278,18 @@
         "type": "object"
       },
       "HandoffDecisionAction": {
-        "description": "Approval actions supported by the skeleton API.",
+        "description": "Approval actions for one pending handoff interrupt.",
         "enum": [
           "confirm",
-          "reject"
+          "reject",
+          "modify"
         ],
         "title": "HandoffDecisionAction",
         "type": "string"
       },
       "HandoffDecisionRequest": {
         "additionalProperties": false,
-        "description": "A confirmation or rejection for one pending handoff interrupt.",
+        "description": "A confirmation, rejection, or modification for one pending handoff interrupt.",
         "properties": {
           "action": {
             "$ref": "#/components/schemas/HandoffDecisionAction"
@@ -308,7 +309,7 @@
               }
             ],
             "default": null,
-            "description": "Reserved for a future modification workflow."
+            "description": "The modified target worker; only valid when action is modify."
           },
           "task_content": {
             "anyOf": [
@@ -320,7 +321,7 @@
               }
             ],
             "default": null,
-            "description": "Reserved for a future modification workflow.",
+            "description": "The modified task content; only valid when action is modify.",
             "title": "Task Content"
           }
         },

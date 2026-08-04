@@ -277,7 +277,7 @@
 - 依赖：无（依赖骨架 W0-T5 端点与 store 结构）。
 - 完成备注：
 
-### [ ] D2-T4 审批修改工作流（修改目标 Agent / 任务内容）
+### [x] D2-T4 审批修改工作流（修改目标 Agent / 任务内容）
 
 - 对应总清单：1.1.4（用户可修改目标 Agent / 任务内容后继续）、3.1.1
 - 背景：core 已完整支持修改——`core/state.py` 的 `HandoffApprovalAction` 含
@@ -314,6 +314,23 @@
     typecheck 通过。
 - 依赖：D2-T3。
 - 完成备注：
+  - 后端：`HandoffDecisionAction` 增加 `MODIFY`；`HandoffDecisionRequest` 删除
+    `reject_modification_fields`，改为复刻 core 双分支的 `action_matches_changes`
+    （MODIFY 必须携带修改字段 / 非 MODIFY 不得携带）；`decide_handoff` 透传
+    target_agent（WorkerAgentRole → AgentRole 按值转换）与 task_content，决策构造
+    包入独立 try/except ValueError → 422（invalid_request，防 core 校验穿透成 500，
+    位于 resume 的 409 分支之前，不影响既有 409 逻辑）。
+  - 测试：`test_approval_api.py` 追加 5 个替身测试（modify 目标 / modify 内容 /
+    modify 双字段 → 200 且断言 core HandoffApprovalDecision 字段；modify 无字段 →
+    422；confirm 携带修改字段 → 422）。
+  - 前端：`HandoffDecision` 放开为全字段契约；`chat-store.decideHandoff` 签名扩展
+    `(action: "confirm" | "reject" | "modify", modifications?: HandoffModifications)`
+    （向后兼容，既有调用不变），modify 时把修改字段转 snake_case 透传；
+    `handoff-card.tsx` 增加「修改并继续」入口与编辑区（目标 Agent 下拉 + 任务内容
+    文本域 + 本地校验），编辑状态为组件内 useState。
+  - 替身测试已覆盖；真实 DeepSeek 联调（modify 后 resume 按新目标执行）并入 M3
+    出口检查的真实冒烟——本任务环境无法启动双端 + 真实模型调用（需后端服务 +
+    Next.js + 真实 DeepSeek key 的完整链路），故不在此处单独联调。
 
 ### [ ] D2-T5 错误降级 UX 打磨
 

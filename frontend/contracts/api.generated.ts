@@ -279,26 +279,26 @@ export interface components {
         };
         /**
          * HandoffDecisionAction
-         * @description Approval actions supported by the skeleton API.
+         * @description Approval actions for one pending handoff interrupt.
          * @enum {string}
          */
-        HandoffDecisionAction: "confirm" | "reject";
+        HandoffDecisionAction: "confirm" | "reject" | "modify";
         /**
          * HandoffDecisionRequest
-         * @description A confirmation or rejection for one pending handoff interrupt.
+         * @description A confirmation, rejection, or modification for one pending handoff interrupt.
          */
         HandoffDecisionRequest: {
             action: components["schemas"]["HandoffDecisionAction"];
             /** Interrupt Id */
             interrupt_id: string;
             /**
-             * @description Reserved for a future modification workflow.
+             * @description The modified target worker; only valid when action is modify.
              * @default null
              */
             target_agent?: components["schemas"]["WorkerAgentRole"] | null;
             /**
              * Task Content
-             * @description Reserved for a future modification workflow.
+             * @description The modified task content; only valid when action is modify.
              * @default null
              */
             task_content?: string | null;

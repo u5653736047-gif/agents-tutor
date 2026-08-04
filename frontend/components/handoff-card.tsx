@@ -5,6 +5,13 @@
 // 提供确认/拒绝两个操作。所有数据与回调由父组件(ConversationPanel)从
 // store 订阅后以 props 传入,自身不订阅 store,便于 SSR 渲染与组件测试。
 // 对 null(pending 为空)直接不渲染;对决策中(isDeciding)与错误文案健壮。
+// D2-T4:新增「修改并继续」入口——展开编辑区修改目标 Agent(下拉)与任务
+// 内容(文本域)后提交 modify 决策。编辑区展开/下拉值/文本域值均为组件
+// 内部 useState(纯展示组件不写 store);SSR 初始不展开,编辑区交互逻辑由
+// store 层透传测试与代码审查保障。本地校验:提交的修改至少一项与原始值
+// 不同(任务内容需非空白),与后端「modify 至少携带一个非空修改字段」的
+// 422 语义对齐。
+import { useState } from "react";
 import { LoaderCircle } from "lucide-react";
 
 import { AgentBadge } from "@/components/agent-badge";
@@ -12,16 +19,34 @@ import { Button } from "@/components/ui/button";
 import type { components } from "@/contracts/api.generated";
 
 type PendingHandoff = components["schemas"]["PendingHandoff"];
+type WorkerAgentRole = components["schemas"]["WorkerAgentRole"];
 
-export type HandoffDecisionAction = "confirm" | "reject";
+export type HandoffDecisionAction = "confirm" | "reject" | "modify";
+
+// D2-T4:modify 的修改字段(组件层 camelCase,store 转契约 snake_case 发送)
+export type HandoffModifications = {
+  targetAgent?: WorkerAgentRole;
+  taskContent?: string;
+};
 
 export type HandoffCardProps = {
   // 决策相关错误文案(store requestError 映射后传入,仅审批相关错误码)
   errorMessage?: string | null;
   isDeciding: boolean;
-  onDecide: (action: HandoffDecisionAction) => void;
+  // D2-T4:action 扩展 modify;modifications 仅在 modify 时由组件组装传入
+  onDecide: (
+    action: HandoffDecisionAction,
+    modifications?: HandoffModifications,
+  ) => void;
   pending: PendingHandoff | null;
 };
+
+// D2-T4:可修改的目标 Agent 选项(WorkerAgentRole 值子集,与后端契约一致;
+// 不含 evaluator——审批场景的目标只可能是授课/学习助理)
+const MODIFIABLE_AGENTS: WorkerAgentRole[] = [
+  "learning_assistant",
+  "teaching_assistant",
+];
 
 export function HandoffCard({
   errorMessage,
@@ -29,11 +54,48 @@ export function HandoffCard({
   onDecide,
   pending,
 }: HandoffCardProps) {
+  // D2-T4:编辑区状态(展开/目标下拉值/文本域值/本地校验错误)
+  const [isEditing, setIsEditing] = useState(false);
+  const [targetAgent, setTargetAgent] = useState<WorkerAgentRole | null>(null);
+  const [taskContent, setTaskContent] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+
   if (!pending) {
     return null;
   }
 
   const { request } = pending;
+
+  // D2-T4:打开编辑区——以原始提案值为下拉/文本域初始值
+  const startEditing = () => {
+    setTargetAgent(request.target_agent);
+    setTaskContent(request.task_content);
+    setLocalError(null);
+    setIsEditing(true);
+  };
+
+  const cancelEditing = () => {
+    setIsEditing(false);
+    setLocalError(null);
+  };
+
+  // D2-T4:提交修改——本地校验「至少一项与原始值不同」(任务内容需非空白),
+  // 与后端「modify 至少携带一个非空修改字段」的 422 语义对齐。
+  const submitModification = () => {
+    const changes: HandoffModifications = {};
+    if (targetAgent !== null && targetAgent !== request.target_agent) {
+      changes.targetAgent = targetAgent;
+    }
+    const trimmedTaskContent = taskContent.trim();
+    if (trimmedTaskContent && trimmedTaskContent !== request.task_content) {
+      changes.taskContent = trimmedTaskContent;
+    }
+    if (Object.keys(changes).length === 0) {
+      setLocalError("请至少修改目标 Agent 或任务内容。");
+      return;
+    }
+    onDecide("modify", changes);
+  };
 
   return (
     <section
@@ -64,6 +126,90 @@ export function HandoffCard({
         </p>
       ) : null}
 
+      {/* D2-T4:修改编辑区——初始收起,点击「修改并继续」后展开 */}
+      {isEditing ? (
+        <div
+          className="space-y-3 border-t border-border px-4 py-3"
+          data-slot="handoff-modify-editor"
+        >
+          <div className="flex items-center gap-2">
+            <label
+              className="text-caption text-muted-foreground"
+              htmlFor="handoff-modify-target"
+            >
+              目标 Agent
+            </label>
+            <select
+              className="rounded-md border border-border bg-background px-2 py-1 text-body text-foreground"
+              data-slot="handoff-modify-target"
+              disabled={isDeciding}
+              id="handoff-modify-target"
+              onChange={(event) =>
+                setTargetAgent(event.target.value as WorkerAgentRole)
+              }
+              value={targetAgent ?? ""}
+            >
+              {MODIFIABLE_AGENTS.map((agent) => (
+                <option key={agent} value={agent}>
+                  {agent}
+                </option>
+              ))}
+            </select>
+            {/* 复用 AgentBadge 展示当前选中的目标 Agent */}
+            {targetAgent ? <AgentBadge agent={targetAgent} /> : null}
+          </div>
+
+          <div className="space-y-1">
+            <label
+              className="text-caption text-muted-foreground"
+              htmlFor="handoff-modify-task"
+            >
+              任务内容
+            </label>
+            <textarea
+              className="w-full rounded-md border border-border bg-background px-2 py-1 text-body text-foreground"
+              data-slot="handoff-modify-task"
+              disabled={isDeciding}
+              id="handoff-modify-task"
+              onChange={(event) => setTaskContent(event.target.value)}
+              rows={4}
+              value={taskContent}
+            />
+          </div>
+
+          {/* 本地校验错误(至少修改一项) */}
+          {localError ? (
+            <p
+              className="text-caption text-destructive"
+              data-slot="handoff-modify-error"
+              role="alert"
+            >
+              {localError}
+            </p>
+          ) : null}
+
+          <div className="flex items-center gap-2">
+            <Button
+              data-slot="handoff-modify-cancel"
+              disabled={isDeciding}
+              type="button"
+              variant="outline"
+              onClick={cancelEditing}
+            >
+              取消
+            </Button>
+            <Button
+              data-slot="handoff-modify-submit"
+              disabled={isDeciding}
+              type="button"
+              onClick={submitModification}
+            >
+              提交修改
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
       <footer className="flex items-center gap-2 border-t border-border px-4 py-3">
         <Button
           data-slot="handoff-reject"
@@ -81,6 +227,16 @@ export function HandoffCard({
           onClick={() => onDecide("confirm")}
         >
           确认
+        </Button>
+        {/* D2-T4:修改入口——点击展开编辑区 */}
+        <Button
+          data-slot="handoff-modify"
+          disabled={isDeciding}
+          type="button"
+          variant="outline"
+          onClick={startEditing}
+        >
+          修改并继续
         </Button>
         {isDeciding ? (
           <span

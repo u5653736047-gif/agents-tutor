@@ -427,3 +427,58 @@ test("decideHandoff surfaces a session_busy run_error embedded in a 200 response
   // 忙态转友好文案(卡片显示「会话正忙,请稍后重试。」)
   assert.equal(state.requestError?.message, "会话正忙,请稍后重试。");
 });
+
+test("decideHandoff with modify forwards the modification fields", async () => {
+  // D2-T4:modify 的 camelCase 修改字段(targetAgent/taskContent)应转为
+  // 契约 snake_case(target_agent/task_content)组装进请求体透传给 client,
+  // 与后端双分支校验(仅 modify 携带修改字段)对齐。
+  const { createChatStore } = await loadChatStore();
+  const decided: Array<{
+    action: string;
+    interrupt_id: string;
+    target_agent?: string | null;
+    task_content?: string | null;
+  }> = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async (_sessionId, decision) => {
+      decided.push(decision);
+      return {
+        events: [],
+        message: assistantMessage,
+        pending_handoff: null,
+        session_id: session.session_id,
+      };
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: null,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      message: assistantMessage,
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({ pendingHandoff });
+  await store.getState().decideHandoff("modify", {
+    targetAgent: "learning_assistant",
+    taskContent: "修改后的任务内容。",
+  });
+
+  assert.deepEqual(decided, [
+    {
+      action: "modify",
+      interrupt_id: "interrupt-1",
+      target_agent: "learning_assistant",
+      task_content: "修改后的任务内容。",
+    },
+  ]);
+  assert.equal(store.getState().isDecidingHandoff, false);
+  assert.equal(store.getState().requestError, null);
+});

@@ -25,7 +25,7 @@ from api.schemas import (
 from api.sessions import current_user_id
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionStore
-from core.state import HandoffApprovalAction, HandoffApprovalDecision
+from core.state import AgentRole, HandoffApprovalAction, HandoffApprovalDecision
 
 router = APIRouter(prefix="/sessions", tags=["handoffs"])
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -125,10 +125,29 @@ async def decide_handoff(
             _raise_handoff_not_pending()
 
         previous_state = await run_in_threadpool(graph.get_state, session_id, user_id)
-        decision = HandoffApprovalDecision(
-            interrupt_id=payload.interrupt_id,
-            action=HandoffApprovalAction(payload.action.value),
-        )
+        # D2-T4:构造 core 决策时透传修改字段。API 层双分支校验(见
+        # HandoffDecisionRequest.action_matches_changes)已挡非法组合;此处再
+        # 兜底一次——core 侧还有独立校验(如空白 task_content 会被拒),抛出的
+        # ValueError 统一转 422,防止校验异常穿透成 500。
+        try:
+            decision = HandoffApprovalDecision(
+                interrupt_id=payload.interrupt_id,
+                action=HandoffApprovalAction(payload.action.value),
+                # api WorkerAgentRole 与 core AgentRole 值字符串一致,按值显式
+                # 转换(WorkerAgentRole 不含 supervisor,天然满足 core 校验)。
+                target_agent=(
+                    AgentRole(payload.target_agent.value)
+                    if payload.target_agent is not None
+                    else None
+                ),
+                task_content=payload.task_content,
+            )
+        except ValueError:
+            _raise_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                ApiErrorCode.INVALID_REQUEST,
+                "Request is invalid.",
+            )
         try:
             state = await run_in_threadpool(
                 graph.resume_handoff,

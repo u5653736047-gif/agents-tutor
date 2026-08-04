@@ -10,10 +10,9 @@ export type ApiErrorCode = components["schemas"]["ApiErrorCode"];
 export type ChatRequest = components["schemas"]["ChatRequest"];
 export type ChatResponse = paths["/chat"]["post"]["responses"][200]["content"]["application/json"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
-export type HandoffDecision = Pick<
-  components["schemas"]["HandoffDecisionRequest"],
-  "action" | "interrupt_id"
->;
+// D2-T4:审批决策放开为全字段契约(action/interrupt_id + modify 的
+// target_agent/task_content),由 store 按 action 构造合法组合。
+export type HandoffDecision = components["schemas"]["HandoffDecisionRequest"];
 export type Message = components["schemas"]["Message"];
 export type PendingHandoffResponse = components["schemas"]["PendingHandoffResponse"];
 export type Session = components["schemas"]["Session"];

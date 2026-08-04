@@ -7,6 +7,7 @@ import {
   apiClient,
   type ApiClient,
   type ChatResponse,
+  type HandoffDecision,
   type Message,
   type PendingHandoffResponse,
   type Session,
@@ -35,6 +36,12 @@ type RunError = ChatResponse["run_error"];
 type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
 type AgentRole = components["schemas"]["AgentRole"];
+type WorkerAgentRole = components["schemas"]["WorkerAgentRole"];
+// D2-T4:审批修改字段——组件层 camelCase 语义,发送前由 store 转契约 snake_case
+export type HandoffModifications = {
+  targetAgent?: WorkerAgentRole;
+  taskContent?: string;
+};
 // D2-T2:任务计划与执行结果(ChatResponse.task_plan / task_results)
 type TaskPlan = components["schemas"]["TaskPlan"];
 type TaskResult = components["schemas"]["TaskResult"];
@@ -50,8 +57,12 @@ export type ChatStore = {
   createSession(): Promise<Session | null>;
   currentAgent: AgentRole | null;
   currentSessionId: string | null;
-  // D2-T3:审批决策——决定(确认/拒绝)与状态字段
-  decideHandoff(action: "confirm" | "reject"): Promise<void>;
+  // D2-T3:审批决策——决定(确认/拒绝/修改)与状态字段
+  // D2-T4:modify 时携带 modifications(目标 Agent / 任务内容),store 组装请求体
+  decideHandoff(
+    action: "confirm" | "reject" | "modify",
+    modifications?: HandoffModifications,
+  ): Promise<void>;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
   isDecidingHandoff: boolean;
@@ -200,7 +211,13 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     // 公共 applyChatResponse;后端把 session_busy 放进成功响应的 run_error
     // (200,非 HTTP 错误),这里转成审批卡片的友好文案;409
     // handoff_not_pending 表示已被他人处理,清本地 pending 后 GET 兜底刷新。
-    decideHandoff: async (action: "confirm" | "reject") => {
+    // D2-T4:支持修改决策。modify 的修改字段由组件以 camelCase 传入,
+    // 这里转成契约 snake_case 组装进请求体;非 modify 一律不带修改字段
+    // (与后端双分支校验对齐),守卫逻辑与 D2-T3 一致。
+    decideHandoff: async (
+      action: "confirm" | "reject" | "modify",
+      modifications?: HandoffModifications,
+    ) => {
       const sessionId = get().currentSessionId;
       const pending = get().pendingHandoff;
       const decide = client.decideHandoff;
@@ -209,12 +226,36 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
+      const decision: HandoffDecision = {
+        action,
+        interrupt_id: pending.interrupt_id,
+        ...(action === "modify" && modifications?.targetAgent
+          ? { target_agent: modifications.targetAgent }
+          : {}),
+        ...(action === "modify" && modifications?.taskContent
+          ? { task_content: modifications.taskContent }
+          : {}),
+      };
+      // 本地校验:modify 至少携带一项修改(后端 422 语义前置;组件层也有
+      // 校验,这里是防御性兜底,避免空白请求打到后端)
+      if (
+        action === "modify" &&
+        decision.target_agent == null &&
+        decision.task_content == null
+      ) {
+        set({
+          isDecidingHandoff: false,
+          requestError: new ApiClientError("请至少修改目标 Agent 或任务内容。", {
+            code: "invalid_request",
+            status: 422,
+          }),
+        });
+        return;
+      }
+
       set({ isDecidingHandoff: true, requestError: null });
       try {
-        const response = await decide(sessionId, {
-          action,
-          interrupt_id: pending.interrupt_id,
-        });
+        const response = await decide(sessionId, decision);
         if (get().currentSessionId === sessionId) {
           const messages = await client.getSessionMessages(sessionId);
           if (get().currentSessionId === sessionId) {

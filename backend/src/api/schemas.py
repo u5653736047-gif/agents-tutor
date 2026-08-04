@@ -217,24 +217,25 @@ class PendingHandoffResponse(ContractModel):
 
 
 class HandoffDecisionAction(str, Enum):
-    """Approval actions supported by the skeleton API."""
+    """Approval actions for one pending handoff interrupt."""
 
     CONFIRM = "confirm"
     REJECT = "reject"
+    MODIFY = "modify"
 
 
 class HandoffDecisionRequest(ContractModel):
-    """A confirmation or rejection for one pending handoff interrupt."""
+    """A confirmation, rejection, or modification for one pending handoff interrupt."""
 
     interrupt_id: str = Field(min_length=1)
     action: HandoffDecisionAction
     target_agent: WorkerAgentRole | None = Field(
         default=None,
-        description="Reserved for a future modification workflow.",
+        description="The modified target worker; only valid when action is modify.",
     )
     task_content: str | None = Field(
         default=None,
-        description="Reserved for a future modification workflow.",
+        description="The modified task content; only valid when action is modify.",
     )
 
     @field_validator("interrupt_id")
@@ -245,10 +246,19 @@ class HandoffDecisionRequest(ContractModel):
         return value
 
     @model_validator(mode="after")
-    def reject_modification_fields(self) -> HandoffDecisionRequest:
-        """Reserve modification fields without implementing that workflow yet."""
-        if self.target_agent is not None or self.task_content is not None:
-            raise ValueError("handoff modifications are not supported")
+    def action_matches_changes(self) -> HandoffDecisionRequest:
+        """Replicate the core HandoffApprovalDecision change rule (both branches).
+
+        - MODIFY must carry at least one of target_agent / task_content;
+        - confirm / reject must not carry either modification field.
+        Missing either branch would let invalid input reach the core
+        HandoffApprovalDecision constructor and surface as a 500.
+        """
+        has_changes = self.target_agent is not None or self.task_content is not None
+        if self.action is HandoffDecisionAction.MODIFY and not has_changes:
+            raise ValueError("modify requires target_agent or task_content")
+        if self.action is not HandoffDecisionAction.MODIFY and has_changes:
+            raise ValueError("only modify accepts target_agent or task_content")
         return self
 
 class Citation(ContractModel):
