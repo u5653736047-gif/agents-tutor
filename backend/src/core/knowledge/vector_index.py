@@ -44,6 +44,9 @@
    直接复用 index.py 的校验与匹配函数（_validate_metadata_filter /
    _matches_metadata_filter），保证与词法索引的过滤语义完全一致
    （先过滤、后打分排序、最后 top_k 截断），不另写一份过滤逻辑。
+   H-T2：复用意味着自动获得 metadata_filter 的「!」排除语义（值以
+   ! 开头表示排除，如 {"chunk_class": "!frontmatter"} 抑制前言/
+   目录类噪音 chunk）——向量路与词法/混合路行为一致，无需改逻辑。
 """
 
 from __future__ import annotations
@@ -59,6 +62,9 @@ from pathlib import Path
 from .embedding import EmbeddingProvider
 from .index import _matches_metadata_filter, _validate_metadata_filter
 from .models import Citation, KnowledgeChunk, SearchHit
+
+# H-T2：直接复用 index.py 的校验与匹配函数（含「!」排除语义，见
+# index.py 模块顶部契约注释的否定/排除语义段），不另写一份过滤逻辑。
 
 
 def _normalize(vector: list[float]) -> list[float]:
@@ -126,8 +132,10 @@ def _rank_hits(
     """共享的检索打分流程：过滤 → 点积打分 → 排序 → top_k 截断。
 
     语义与词法索引完全对齐（模块注释第 4 节）：metadata_filter 非空时
-    先剔除不匹配分块，剩下的按相似度降序排序（同分按 chunk_id 升序，
-    与词法索引的平局规则一致），最后截断 top_k。
+    先剔除不匹配分块（复用 index.py 的 _matches_metadata_filter，H-T2
+    起支持「!」前缀的排除语义，如 {"chunk_class": "!frontmatter"}），
+    剩下的按相似度降序排序（同分按 chunk_id 升序，与词法索引的平局
+    规则一致），最后截断 top_k。
     """
     scored: list[tuple[float, str, KnowledgeChunk]] = []
     for chunk_id, chunk in chunks.items():

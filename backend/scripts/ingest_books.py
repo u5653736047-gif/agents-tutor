@@ -7,6 +7,7 @@
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --verify
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --chunking semantic
     $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --vector --provider fastembed
+    $env:PYTHONPATH="src"; .venv/Scripts/python.exe scripts/ingest_books.py --relabel-frontmatter
 
 设计说明（按功能模块）：
 1. 入库流程
@@ -100,6 +101,7 @@ from core.knowledge.embedding import (
     FastEmbedProvider,
     HashEmbeddingProvider,
 )
+from core.knowledge.frontmatter import classify_frontmatter
 from core.knowledge.hybrid import HybridKnowledgeIndex, open_vector_index_if_available
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import iter_pdf_pages
@@ -454,6 +456,103 @@ def verify_cases(
     return results
 
 
+# ── H-T2 前言/目录增量重标注 ────────────────────────────────────
+
+
+def _update_metadata_json(
+    db_path: Path, table: str, updates: list[tuple[str, str]]
+) -> None:
+    """直接 UPDATE 某个库表的 metadata_json 列（单事务提交，幂等）。
+
+    table 只取内部常量（"chunks" / "chunk_vectors"），不是用户输入，
+    无 SQL 注入面；值一律绑定参数。
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany(
+            f"UPDATE {table} SET metadata_json = ? WHERE chunk_id = ?",
+            [(metadata_json, chunk_id) for chunk_id, metadata_json in updates],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def relabel_frontmatter(
+    lexical_db: Path, vector_db: Path, books: list[ManifestBook]
+) -> int:
+    """H-T2：对已入库 chunk 重新执行前言/目录分类，更新两库 metadata_json。
+
+    背景（面向初学者）：H-T2 起分块层默认写 metadata["chunk_class"] =
+    "frontmatter"（frontmatter.classify_frontmatter 启发式），检索侧
+    默认抑制该类 chunk；但已经入库的旧数据没有该键。本函数把旧库里的
+    chunk 逐个重新分类并直接 UPDATE 两库的 metadata_json 列：
+
+    1. 对每本非阻塞书，用 SqliteKnowledgeIndex.chunks_of_document 读出
+       全部 chunk（不重新解析 PDF）；
+    2. 每个 chunk 计算 classify_frontmatter(content, page)，与现有
+       metadata 中的 chunk_class 比对，收集需要更新的 (chunk_id,
+       新 metadata_json)——分类结果与标记双向一致（新标 frontmatter
+       或移除旧标），一致的不更新，因此幂等：第二次运行时全部一致，
+       更新数为 0；
+    3. 词法库（chunks 表）与向量库（chunk_vectors 表）分别直接
+       UPDATE metadata_json 列，单事务提交；向量库文件不存在则跳过
+       （只有词法库时同样可用）。不重算向量 BLOB——metadata 变更不
+       影响向量，直接 UPDATE 即可，也无需 embedding provider（不联网、
+       无维度依赖）；
+    4. 打印每本书统计 `{source}: 标记 N / 更新 M 个 chunk`（N = 本次
+       分类为 frontmatter 的 chunk 数，M = 实际更新的行数）。
+
+    返回 0 表示成功；阻塞书跳过不报错（与入库/verify 的 blocked 语义
+    一致）。
+    """
+    index = SqliteKnowledgeIndex(lexical_db)
+    changed_total = 0
+    try:
+        for book in books:
+            if book.blocked:
+                print(f"    跳过（阻塞：{book.blocked}）")
+                continue
+            chunks = index.chunks_of_document(book.source)
+            if not chunks:
+                print(f"{book.source}: 无已入库 chunk（跳过）")
+                continue
+            updates: list[tuple[str, str]] = []
+            marked = 0
+            for chunk in chunks:
+                is_fm = classify_frontmatter(chunk.content, chunk.page)
+                new_metadata = dict(chunk.metadata)
+                if is_fm:
+                    marked += 1
+                    if new_metadata.get("chunk_class") == "frontmatter":
+                        continue  # 已一致，无需更新
+                    new_metadata["chunk_class"] = "frontmatter"
+                elif new_metadata.get("chunk_class") == "frontmatter":
+                    # 旧标记被新分类推翻：移除（与分类结果双向一致）。
+                    new_metadata.pop("chunk_class", None)
+                else:
+                    continue
+                updates.append(
+                    (
+                        chunk.chunk_id,
+                        json.dumps(new_metadata, ensure_ascii=False),
+                    )
+                )
+            if updates:
+                _update_metadata_json(lexical_db, "chunks", updates)
+                if vector_db.exists():
+                    _update_metadata_json(vector_db, "chunk_vectors", updates)
+                changed_total += len(updates)
+            print(f"{book.source}: 标记 {marked} / 更新 {len(updates)} 个 chunk")
+        if changed_total:
+            print(f"重标注完成: 共更新 {changed_total} 个 chunk（幂等，可重复运行）")
+        else:
+            print("重标注完成: 无变化（所有 chunk 已一致）")
+        return 0
+    finally:
+        index.close()
+
+
 # ── 命令行入口 ───────────────────────────────────────────────────
 
 
@@ -551,6 +650,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_VECTOR_DB_PATH,
         help="向量索引数据库路径（默认 data/vector_knowledge.db，随 data/ 不进 git）",
     )
+    parser.add_argument(
+        "--relabel-frontmatter",
+        action="store_true",
+        help="H-T2：只对已入库 chunk 重新执行前言/目录分类并更新两库 "
+        "metadata_json 列，不重解析 PDF、不重算向量、幂等；--books 子集 "
+        "与 --db/--vector-db 生效",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.top_k <= 10:
@@ -635,6 +741,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"（另有 {len(blocked_books)} 本阻塞书未验证）"
             )
             return 0 if failed == 0 else 1
+
+        if args.relabel_frontmatter:
+            # H-T2 增量重标注分支：只更新两库 metadata_json 列（不重解析
+            # PDF、不重算向量、不需要 embedding provider，幂等），处理完
+            # 直接返回，不进入入库流程（见 relabel_frontmatter）。
+            return relabel_frontmatter(args.db, args.vector_db, books)
 
         # --vector：走到这里说明不是 --verify 分支（verify 已在上方
         # return），此时才打开向量库，避免空库文件被创建。provider

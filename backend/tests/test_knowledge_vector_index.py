@@ -587,3 +587,41 @@ def test_sqlite_vector_index_thread_safe_concurrent_access(tmp_path: Path) -> No
             assert [hit.chunk.chunk_id for hit in hits] == [f"{prefix}-final"]
     finally:
         index.close()
+
+
+# ── 6. H-T2「!」排除语义（复用 index.py 的匹配函数）──────────────
+
+
+def test_vector_index_excludes_frontmatter_chunks() -> None:
+    """H-T2：向量路自动获得「!」排除语义（复用 index.py 的匹配函数）。
+
+    带 chunk_class=frontmatter 的 chunk 在排除过滤下不进入结果，
+    不带过滤时正常参与排序（与词法路语义一致，见 index.py 契约注释）。
+    """
+    provider = _FixedVectorProvider(
+        {
+            "frontmatter content": [1.0, 0.0, 0.0],
+            "support vector machine": [0.9, 0.1, 0.0],
+        }
+    )
+    index = InMemoryVectorKnowledgeIndex(provider)
+    index.upsert(
+        [
+            _chunk(
+                "fm", "frontmatter content", metadata={"chunk_class": "frontmatter"}
+            ),
+            _chunk("body", "support vector machine"),
+        ]
+    )
+
+    # 不过滤：两个 chunk 都命中（查询与 body 同文本，余弦 1.0 排最前）。
+    unfiltered = index.search("support vector machine", top_k=5)
+    assert [hit.chunk.chunk_id for hit in unfiltered] == ["body", "fm"]
+
+    # 排除 frontmatter：fm 被剔除，只剩 body。
+    filtered = index.search(
+        "support vector machine",
+        top_k=5,
+        metadata_filter={"chunk_class": "!frontmatter"},
+    )
+    assert [hit.chunk.chunk_id for hit in filtered] == ["body"]

@@ -41,6 +41,7 @@ class KnowledgeService:
         refiner: QueryRefiner | None = None,
         relevance_threshold: float | None = None,
         max_refine_rounds: int = 2,
+        suppress_frontmatter: bool = True,
     ) -> None:
         """初始化服务。
 
@@ -86,6 +87,12 @@ class KnowledgeService:
           须 ≥ 0 且 ≤ 10），仅 refiner 非 None 时生效。上限 10 是
           成本软上限：每轮重检 = 一次完整检索（未来 LLM 精化器还有
           模型调用），上限过高会让单次查询成本失控。
+        - suppress_frontmatter（H-T2）：默认 True 时，search /
+          adaptive_search 自动附加 {"chunk_class": "!frontmatter"}
+          排除过滤，抑制前言/目录类噪音 chunk（分类规则见
+          frontmatter.py；排除语义见 index.py 模块顶部契约注释）；
+          False 关闭。调用方显式传 metadata_filter 且含 chunk_class
+          键时尊重调用方，不合并（见 _apply_suppression）。
         """
         if chunking not in _CHUNKING_STRATEGIES:
             raise ValueError("chunking must be 'character' or 'semantic'")
@@ -109,6 +116,28 @@ class KnowledgeService:
         self._refiner = refiner
         self._relevance_threshold = relevance_threshold
         self._max_refine_rounds = max_refine_rounds
+        self._suppress_frontmatter = suppress_frontmatter
+
+    def _apply_suppression(
+        self, metadata_filter: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        """H-T2：把默认的 frontmatter 抑制合并进调用方的过滤条件。
+
+        规则（search 与 adaptive_search 共用本方法，词法/向量/混合
+        索引都经 service 收到同一份过滤条件，三路行为一致）：
+        - suppress_frontmatter=False → 原样返回，不附加任何条件；
+        - 未传过滤条件 → 返回 {"chunk_class": "!frontmatter"}；
+        - 调用方已传含 chunk_class 键的条件 → 原样返回（尊重调用方
+          的显式意图，如 {"chunk_class": "frontmatter"} 精确限定）；
+        - 否则在调用方条件上追加 chunk_class 排除（多键 AND 语义）。
+        """
+        if not self._suppress_frontmatter:
+            return metadata_filter
+        if metadata_filter is None:
+            return {"chunk_class": "!frontmatter"}
+        if "chunk_class" in metadata_filter:
+            return metadata_filter
+        return {**metadata_filter, "chunk_class": "!frontmatter"}
 
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
@@ -184,11 +213,22 @@ class KnowledgeService:
         - 没有任何匹配时返回空列表（不报错）；
         - 多路检索下过滤条件透传给每一个变体，被过滤的 chunk 不会
           进入任何变体、自然也不进合并结果（与单路语义一致）。
+
+        H-T2 前言/目录抑制（面向初学者）：构造时 suppress_frontmatter=
+        True（默认）时，本方法会自动附加 {"chunk_class": "!frontmatter"}
+        排除条件——前言/目录类噪音 chunk（分类见 frontmatter.py）
+        不会进入任何变体的候选，自然也不进合并结果；调用方显式传
+        含 chunk_class 键的过滤条件时尊重调用方，不合并。该抑制对
+        词法/向量/混合三路一致生效（search_knowledge 工具路径调用
+        本方法，自动获得该行为）。
         """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
+        # H-T2：入口校验后合并默认抑制——词法/向量/混合三路都经
+        # service 收到同一份过滤条件，行为一致（见 _apply_suppression）。
+        metadata_filter = self._apply_suppression(metadata_filter)
         return multi_query_search(
             self._index,
             query,
@@ -250,11 +290,19 @@ class KnowledgeService:
         的形态与 search 一致（分数、排序、citation 语义不变）。所有
         失败路径（policy / refiner 异常）都不抛错（降级语义详见
         retrieval.py 的 _safe_policy / _safe_refine）。
+
+        H-T2 前言/目录抑制：与 search 一致——suppress_frontmatter=
+        True（默认）时自动附加 {"chunk_class": "!frontmatter"} 排除
+        条件，每轮检索（含精化重检）都带同一份过滤条件；调用方显式
+        传含 chunk_class 键的条件时尊重调用方，不合并（见
+        _apply_suppression）。
         """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
+        # H-T2：与 search 同一套默认抑制（三路一致，见 _apply_suppression）。
+        metadata_filter = self._apply_suppression(metadata_filter)
         return adaptive_search(
             self._index,
             query,

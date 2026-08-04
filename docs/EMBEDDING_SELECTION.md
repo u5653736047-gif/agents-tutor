@@ -160,6 +160,58 @@ S3-T3 的 metadata 过滤（页码/章节）或目录页剔除规则缓解，属
 为最强证据）；「词法 0 命中」不可构造的发现已如实记录，替身测试继续
 作为无网络 CI 下的链路证明。
 
+### 5.2 实测记录（H-T2 向量噪音治理，2026-08-04）
+
+**目标**：治理观察 3 的目录页/讨论链接噪音（根因：目录行被切成独立
+chunk）。实现与验收见 `docs/TASKS_M3_CLOSE.md` H-T2；规则见
+`backend/src/core/knowledge/frontmatter.py`（启发式
+`classify_frontmatter`），检索侧默认抑制走 `metadata_filter` 的
+`!` 排除语义 + `KnowledgeService(suppress_frontmatter=True)`（H-T2）。
+
+**relabel 执行结果**（`ingest_books.py --relabel-frontmatter`，不重解析
+PDF、不重算向量，直接更新两库 metadata_json，幂等）：
+
+| 书 | frontmatter chunk / 总 chunk |
+| --- | --- |
+| ml-zhouzhihua | 22 / 610 |
+| dl-goodfellow | 17 / 1037 |
+| dl-d2l | 76 / 1219 |
+| ai-russell | 46 / 2158 |
+| 合计 | 161 / 5024 |
+
+幂等验证：第二遍运行「更新 0 个 chunk / 无变化」。
+
+**更新前后对照**（fastembed 512 维向量库；「更新后」= 向量单路 +
+`metadata_filter={"chunk_class": "!frontmatter"}`，与 service 默认抑制
+同一过滤语义）：
+
+| 查询词 | 更新前向量 top15 噪音 | 更新后 top15 噪音 | 更新后正例命中（部分） |
+| --- | --- | --- | --- |
+| 「卷积网络」 | 1/15（dl-d2l:306 讨论链接碎片页 rank1，0.73） | 0/15 | dl-d2l:235「6 卷积神经网络」rank1、dl-d2l:265「7 现代卷积神经网络」、dl-goodfellow:49/333/338 |
+| 「注意力机制」 | 1/15（dl-d2l:10:2700:3700 目录页 rank8，0.69） | 0/15 | dl-d2l:399「10 注意力机制」rank1、dl-d2l:400/401/402/404、ai-russell:772/773 |
+
+目录/讨论链接类条目在抑制后不再进入 top15，正例（d2l 卷积神经网络
+章节、goodfellow 注意力内容）全部保留——「明显减少且不误伤正例」
+验收达成。
+
+**真实复测中发现并修正的规则问题**（测试已锁定，见
+`test_knowledge_frontmatter.py`）：
+1. 初版 URL 规则是「任一非空行含 discuss.d2l.ai → 整页 frontmatter」。
+   但 d2l **每节正文末尾**都有 "NNN https://discuss.d2l.ai/t/XXXX" 行，
+   导致正文练习页（dl-d2l:404）、小结页（dl-d2l:411）被误标——默认
+   抑制会误伤正例。修正：URL 命中须同时满足「非空行数 ≤ 4」
+   （`_URL_LINES_MAX`，只有行数极少的链接/页码碎片页才是噪音）；
+2. 目录行形态二（短行 + 行尾页码 + 标题前缀）用 `search` 匹配标题
+   前缀，代码行 "return 2 * torch.sin(x) + x**0.8"（行内任意位置
+   「2 」+行尾 "8"）被误当目录行。修正：标题前缀一律**行首 match**；
+3. 目录点线正则只认连续点（"......"），真实 d2l 目录是「点 + 空格」
+   排版（". . . ."），目录页识别率低。修正：`(?:[.…·]\s*){3,}`，
+   并新增目录行形态「标题前缀 + 点线」（行尾是点不是数字、行长可
+   超 80，不再设行长上限）。
+
+修正后全库复跑 relabel 与全部 674 项测试通过，规则三态（误判/
+漏判/正例）由新增用例锁定。
+
 ---
 
 ## 6. 依赖变更记录

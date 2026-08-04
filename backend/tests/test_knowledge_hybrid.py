@@ -420,3 +420,41 @@ def test_open_vector_index_if_available_falls_back_on_corrupt_file(
     db_path = tmp_path / "corrupt.db"
     db_path.write_bytes(b"this is not a sqlite database")
     assert open_vector_index_if_available(db_path) is None
+
+
+# ── 7. H-T2「!」排除语义：词法/向量/混合三路一致 ─────────────────
+
+
+def test_hybrid_exclusion_filter_consistent_across_three_paths() -> None:
+    """H-T2 三路一致：词法/向量/混合带 !frontmatter 排除都不含 frontmatter。
+
+    同一份数据分别挂 InMemory 词法、内存向量、混合索引，断言排除
+    过滤在三路的行为一致：不带过滤都含 fm（chunk_class=frontmatter），
+    带 {"chunk_class": "!frontmatter"} 过滤都不含 fm。
+    """
+    chunks = [
+        _chunk("fm", "alpha frontmatter", metadata={"chunk_class": "frontmatter"}),
+        _chunk("body", "alpha beta"),
+    ]
+    lexical = InMemoryKnowledgeIndex()
+    vector = InMemoryVectorKnowledgeIndex(
+        _FixedVectorProvider(
+            {
+                "alpha": [1.0, 0.0, 0.0],
+                "alpha beta": [0.9, 0.1, 0.0],
+                "alpha frontmatter": [0.8, 0.2, 0.0],
+            }
+        )
+    )
+    lexical.upsert(chunks)
+    vector.upsert(chunks)
+    hybrid = HybridKnowledgeIndex(lexical, vector)
+
+    for retriever in (lexical, vector, hybrid):
+        unfiltered = retriever.search("alpha", top_k=5)
+        filtered = retriever.search(
+            "alpha", top_k=5, metadata_filter={"chunk_class": "!frontmatter"}
+        )
+        assert "fm" in [hit.chunk.chunk_id for hit in unfiltered]
+        assert "fm" not in [hit.chunk.chunk_id for hit in filtered]
+        assert [hit.chunk.chunk_id for hit in filtered] == ["body"]

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from .frontmatter import classify_frontmatter
 from .models import KnowledgeChunk, KnowledgeDocument
 
 
@@ -22,12 +23,19 @@ def chunk_document(
     *,
     chunk_size: int = 1000,
     overlap: int = 100,
+    mark_frontmatter: bool = True,
 ) -> list[KnowledgeChunk]:
     """Split one document into stable character windows.
 
     S3-T3 章节字段：每个 chunk 的 metadata 会追加「起点之前最近标题」
     解析出的 chapter/section/tags（规则提取，见 _find_headings 注释）；
     文档没有标题时不写这些字段（保持 S3-T1 行为不变）。
+
+    H-T2 前言/目录标记：mark_frontmatter=True（默认）时，命中前言/
+    目录启发式（frontmatter.classify_frontmatter）的 chunk 额外写入
+    metadata["chunk_class"] = "frontmatter"，检索侧默认排除该类
+    chunk（见 service.py 的 suppress_frontmatter）；mark_frontmatter=
+    False 关闭该行为（恢复 S3-T3 的纯章节字段语义）。
     """
     _validate_window(chunk_size, overlap)
     headings = _find_headings(document.content)
@@ -39,6 +47,13 @@ def chunk_document(
         page = document.page if document.page is not None else 0
         metadata = document.metadata.copy()
         metadata.update(_section_metadata(start, headings))
+        # H-T2：前言/目录启发式（目录行/讨论链接页等噪音 chunk 的治理，
+        # 规则见 frontmatter.py；用与 content 相同的切片与 document.page，
+        # 与 chunk 的 content/page 字段保持一致）。
+        if mark_frontmatter and classify_frontmatter(
+            document.content[start:end], document.page
+        ):
+            metadata["chunk_class"] = "frontmatter"
         chunks.append(
             KnowledgeChunk(
                 chunk_id=f"{document.document_id}:{page}:{start}:{end}",
@@ -62,13 +77,24 @@ def chunk_documents(
     *,
     chunk_size: int = 1000,
     overlap: int = 100,
+    mark_frontmatter: bool = True,
 ) -> list[KnowledgeChunk]:
-    """Chunk documents in input order."""
+    """Chunk documents in input order.
+
+    H-T2：mark_frontmatter 透传给 chunk_document（默认 True，命中前言/
+    目录启发式时写 metadata["chunk_class"]="frontmatter"，见
+    frontmatter.classify_frontmatter；False 关闭）。
+    """
     _validate_window(chunk_size, overlap)
     return [
         chunk
         for document in documents
-        for chunk in chunk_document(document, chunk_size=chunk_size, overlap=overlap)
+        for chunk in chunk_document(
+            document,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            mark_frontmatter=mark_frontmatter,
+        )
     ]
 
 
@@ -400,6 +426,7 @@ def chunk_document_semantic(
     *,
     max_chunk_size: int = 2000,
     min_chunk_size: int = 200,
+    mark_frontmatter: bool = True,
 ) -> list[KnowledgeChunk]:
     """按章节标题 / 段落边界分块（strategy="semantic"）。
 
@@ -415,6 +442,11 @@ def chunk_document_semantic(
     （左闭右开），chunk.content == document.content[start:end] 恒成立，
     chunk_id 由 document_id + page + start + end 派生，可按坐标定位回
     原文。metadata 复制自文档并追加 "chunking": "semantic" 便于区分策略。
+
+    H-T2 前言/目录标记：与字符分块同一套启发式——mark_frontmatter=
+    True（默认）时，命中前言/目录启发式（frontmatter.classify_
+    frontmatter）的 chunk 额外写入 metadata["chunk_class"] =
+    "frontmatter"；False 关闭。
     """
     _validate_semantic_window(max_chunk_size, min_chunk_size)
     content = document.content
@@ -459,6 +491,11 @@ def chunk_document_semantic(
     for start, end in bounds:
         metadata = {**document.metadata, "chunking": "semantic"}
         metadata.update(_section_metadata(start, headings))
+        # H-T2：与字符分块同一套前言/目录启发式（切片与 chunk 内容一致）。
+        if mark_frontmatter and classify_frontmatter(
+            content[start:end], document.page
+        ):
+            metadata["chunk_class"] = "frontmatter"
         chunks.append(
             KnowledgeChunk(
                 chunk_id=f"{document.document_id}:{page}:{start}:{end}",

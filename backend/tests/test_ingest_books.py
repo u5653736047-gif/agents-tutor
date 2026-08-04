@@ -25,12 +25,14 @@ from ingest_books import (
     ingest_book,
     load_manifest,
     main,
+    relabel_frontmatter,
     select_books,
     verify_cases,
 )
 
+from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
-from core.knowledge.models import KnowledgeDocument
+from core.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from core.knowledge.service import KnowledgeService
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
 
@@ -997,3 +999,207 @@ def test_main_vector_with_fastembed_against_hash_vector_db_returns_2(
     captured = capsys.readouterr()
     assert "删除向量库文件" in captured.err
     assert "--force" in captured.err
+
+
+# ── H-T2 前言/目录增量重标注（--relabel-frontmatter）──────────────
+
+
+def test_relabel_frontmatter_idempotent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """relabel 幂等：第一遍更新、第二遍无变化；两库 metadata_json 同步更新。
+
+    构造：手工写入一个「目录特征」chunk（metadata 无 chunk_class 键，
+    模拟 H-T2 之前入库的旧数据）与一个正文 chunk。relabel 后词法与
+    向量两库的 metadata_json 都被补上/保持正确，且不重算向量（直接
+    UPDATE，不依赖 embedding provider）。
+    """
+    lexical_path = tmp_path / "kb.db"
+    vector_path = tmp_path / "vector.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    vector = SqliteVectorKnowledgeIndex(vector_path, provider=HashEmbeddingProvider())
+    try:
+        toc_chunk = KnowledgeChunk(
+            chunk_id="book-a:5:0:20",
+            document_id="book-a",
+            content="1 Introduction 1\n2 Fundamentals 15",
+            source="book-a",
+            page=5,
+            start=0,
+            end=20,
+            metadata={},
+        )
+        body_chunk = KnowledgeChunk(
+            chunk_id="book-a:5:20:45",
+            document_id="book-a",
+            content="卷积神经网络是一种专门处理网格结构数据的深度学习模型。",
+            source="book-a",
+            page=5,
+            start=20,
+            end=45,
+            metadata={},
+        )
+        lexical.upsert([toc_chunk, body_chunk])
+        vector.upsert([toc_chunk, body_chunk])
+    finally:
+        lexical.close()
+        vector.close()
+
+    book = _manifest_book("book-a")
+
+    first_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    first_out = capsys.readouterr().out
+    second_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    second_out = capsys.readouterr().out
+
+    assert first_code == 0
+    assert second_code == 0
+    # 第一遍：目录 chunk 被标记并更新（更新 1 个）；第二遍：已一致（更新 0 个）。
+    assert "标记 1 / 更新 1 个 chunk" in first_out
+    assert "标记 1 / 更新 0 个 chunk" in second_out
+
+    # 词法库读回：metadata_json 已更新（chunk_class 正确，正文不误标）。
+    reopened_lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened_lexical.chunks_of_document("book-a")
+        by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        assert by_id["book-a:5:0:20"].metadata["chunk_class"] == "frontmatter"
+        assert "chunk_class" not in by_id["book-a:5:20:45"].metadata
+    finally:
+        reopened_lexical.close()
+
+    # 向量库读回：同一 chunk_id 的 metadata_json 已更新（向量 BLOB 未动）。
+    reopened_vector = SqliteVectorKnowledgeIndex(
+        vector_path, provider=HashEmbeddingProvider()
+    )
+    try:
+        hits = reopened_vector.search("Introduction", top_k=5)
+        toc_hit = next(
+            hit for hit in hits if hit.chunk.chunk_id == "book-a:5:0:20"
+        )
+        assert toc_hit.chunk.metadata["chunk_class"] == "frontmatter"
+    finally:
+        reopened_vector.close()
+
+
+def test_relabel_frontmatter_skips_blocked_books(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """阻塞书跳过不报错（与入库/verify 的 blocked 语义一致）。"""
+    lexical_path = tmp_path / "kb.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        lexical.upsert(
+            [
+                KnowledgeChunk(
+                    chunk_id="book-a:1:0:10",
+                    document_id="book-a",
+                    content="1 Introduction 1",
+                    source="book-a",
+                    page=1,
+                    start=0,
+                    end=10,
+                    metadata={},
+                )
+            ]
+        )
+    finally:
+        lexical.close()
+
+    blocked_book = _manifest_book("book-a", blocked="scanned-pdf-no-text-layer")
+    code = relabel_frontmatter(lexical_path, tmp_path / "missing.db", [blocked_book])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "阻塞" in out
+    # 被跳过的书不被触碰：metadata_json 未更新（chunk_class 仍未写入）。
+    reopened = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened.chunks_of_document("book-a")
+        assert "chunk_class" not in chunks[0].metadata
+    finally:
+        reopened.close()
+
+
+def test_relabel_frontmatter_removes_stale_mark(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """relabel 移除旧标分支：内容不再是目录但 metadata 残留旧标 → 键被移除。
+
+    review 补充：relabel 是「双向一致」比对——既补新标也清旧标；
+    旧标清理是幂等的（第二遍更新数为 0）。
+    """
+    lexical_path = tmp_path / "kb.db"
+    vector_path = tmp_path / "vector.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    vector = SqliteVectorKnowledgeIndex(vector_path, provider=HashEmbeddingProvider())
+    try:
+        stale_chunk = KnowledgeChunk(
+            chunk_id="book-b:8:0:30",
+            document_id="book-b",
+            content="卷积神经网络是一种专门处理网格结构数据的深度学习模型。",
+            source="book-b",
+            page=8,
+            start=0,
+            end=30,
+            metadata={"chunk_class": "frontmatter"},  # 旧标：内容实为正文
+        )
+        lexical.upsert([stale_chunk])
+        vector.upsert([stale_chunk])
+    finally:
+        lexical.close()
+        vector.close()
+
+    book = _manifest_book("book-b")
+
+    first_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    first_out = capsys.readouterr().out
+    second_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    second_out = capsys.readouterr().out
+
+    assert first_code == 0
+    assert second_code == 0
+    # 第一遍：旧标被移除（标记 0、更新 1）；第二遍：已一致（更新 0）。
+    assert "标记 0 / 更新 1 个 chunk" in first_out
+    assert "标记 0 / 更新 0 个 chunk" in second_out
+
+    # 词法库读回：旧标已清除。
+    reopened_lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened_lexical.chunks_of_document("book-b")
+        assert "chunk_class" not in chunks[0].metadata
+    finally:
+        reopened_lexical.close()
+
+    # 向量库读回：同一 chunk 的 metadata 也已清除（BLOB 未动）。
+    reopened_vector = SqliteVectorKnowledgeIndex(
+        vector_path, provider=HashEmbeddingProvider()
+    )
+    try:
+        hits = reopened_vector.search("卷积神经网络", top_k=5)
+        assert "chunk_class" not in hits[0].chunk.metadata
+    finally:
+        reopened_vector.close()
+
+
+def test_main_relabel_frontmatter_flag(tmp_path: Path) -> None:
+    """CLI --relabel-frontmatter：独立分支，处理完即返回，不进入入库流程。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则会探测到开发者本地的向量库。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    # 空库上运行：不报错，正常退出（无已入库 chunk，全部跳过）。
+    assert main([*common, "--relabel-frontmatter"]) == 0
+    # 入库后运行：已入库 chunk 被重标注（CLI 分支不解析 PDF），同样正常退出。
+    assert main(common) == 0
+    assert main([*common, "--relabel-frontmatter"]) == 0

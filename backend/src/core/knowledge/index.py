@@ -32,6 +32,16 @@ _METADATA_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #   tags）任一元素相等即匹配；键不存在视为不匹配；
 # - 过滤发生在打分之前，top_k 截断发生在过滤与排序之后（先过滤，
 #   后排序，最后截断）。
+#
+# 否定/排除语义（H-T2，向量噪音治理）：
+# - 值以 "!" 开头表示「排除」：该键值（字符串精确相等，或列表任一
+#   元素相等）等于 "!" 后内容时，该 chunk 被排除；键不存在视为
+#   「不匹配该排除条件」，因此通过。普通值（不以 ! 开头）语义不变。
+# - 约定："!" 前缀是保留字，领域值不应以 ! 开头（如 subject 等
+#   领域字段的值不会真的以 ! 开头）。
+# - 典型用法：检索侧默认抑制前言/目录类噪音 chunk——service 层自动
+#   合并 {"chunk_class": "!frontmatter"}（见 service.py 的
+#   suppress_frontmatter），词法/向量/混合三路语义一致。
 
 
 def _validate_metadata_filter(
@@ -75,17 +85,28 @@ def _matches_metadata_filter(
     这里只是防御性对齐）。注意：在该形态下两实现一致；bool 等非常规
     值行为可能不同——InMemory 的 str(True) == 'True'，而 SQLite 的
     1 = 'True' 不成立（bool 是 int 子类，SQLite 按数字比较）。
+
+    H-T2 否定语义：值以 "!" 开头表示排除（见模块顶部契约注释）——
+    命中排除值（字符串相等或列表任一元素相等）时该 chunk 不匹配；
+    键不存在视为「不匹配该排除条件」，因此通过。
     """
     for key, value in metadata_filter.items():
+        exclude = value.startswith("!")
+        wanted = value[1:] if exclude else value
         if key == "source":
-            if chunk.source != value:
-                return False
-            continue
-        meta_value = chunk.metadata.get(key)
-        if isinstance(meta_value, list):
-            if not any(str(item) == value for item in meta_value):
-                return False
-        elif meta_value is None or str(meta_value) != value:
+            matched = chunk.source == wanted
+        else:
+            meta_value = chunk.metadata.get(key)
+            if isinstance(meta_value, list):
+                matched = any(str(item) == wanted for item in meta_value)
+            elif meta_value is None:
+                matched = False
+            else:
+                matched = str(meta_value) == wanted
+        if exclude:
+            if matched:
+                return False  # 命中排除值 → 不匹配（被过滤掉）
+        elif not matched:
             return False
     return True
 
@@ -112,17 +133,42 @@ def _metadata_where_clause(
        标量时返回 0 行还是 1 行（不同 SQLite 版本行为可能不同），
        OR 双分支的结果都正确——字符串值由 json_extract 分支命中，
        列表值由 json_each 分支命中，两者互不依赖。
-    3. 不用独立列：metadata 键集会随领域字段扩展（S3-T3 已 7 个键），
+    3. 排除语义（H-T2，值以 "!" 开头，见模块顶部契约注释）：
+       - source 排除：顶层列直接 source != ?；
+       - 普通键排除：JSON1 三条件——键不存在（json_extract 为
+         NULL）通过；值存在但既不等于排除值、列表也不含排除值时
+         通过；值等于排除值或列表含排除值时排除（三条件合起来
+         与 InMemory 版语义一致，键不存在不被误排除）。
+    4. 不用独立列：metadata 键集会随领域字段扩展（S3-T3 已 7 个键），
        独立列需要 ALTER TABLE 迁移旧库且键集固定；向量不进 metadata——
        S3-T4 起向量由向量索引的独立 BLOB 列存储（见 vector_index.py）。
        JSON1 是 Python 内置 sqlite3 自带能力，无需迁移。数万级 chunk
        的过滤开销可控（全表扫描打分本就要读每一行）。
-    4. 防注入：键名已通过 _METADATA_KEY_PATTERN 白名单校验，拼进
+    5. 防注入：键名已通过 _METADATA_KEY_PATTERN 白名单校验，拼进
        JSON path 安全；值一律用绑定参数。
     """
     clauses: list[str] = []
     params: list[object] = []
     for key, value in metadata_filter.items():
+        if value.startswith("!"):
+            # H-T2 排除语义：wanted 是排除值，命中它即被剔除。
+            wanted = value[1:]
+            if key == "source":
+                # source 是顶层列（非 JSON）：直接 != 比较。
+                clauses.append("source != ?")
+                params.append(wanted)
+                continue
+            # JSON1 三条件（语义见 docstring 第 3 点）：键不存在通过，
+            # 值/列表不含排除值通过，等于/含排除值则被排除。
+            clauses.append(
+                f"(json_extract(metadata_json, '$.{key}') IS NULL OR "
+                f"(json_extract(metadata_json, '$.{key}') != ? AND "
+                f"NOT EXISTS (SELECT 1 FROM json_each(metadata_json, '$.{key}') "
+                "WHERE json_each.value = ?)))"
+            )
+            params.append(wanted)
+            params.append(wanted)
+            continue
         if key == "source":
             # source 是顶层列（非 JSON）：直接比较，可走普通索引。
             clauses.append("source = ?")
