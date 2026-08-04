@@ -55,6 +55,9 @@ const _STREAM_RETRY_LIMIT = 3;
 
 export type ChatStore = {
   archiveSession(sessionId: string): Promise<void>;
+  // D4-T3:停止生成——abort 当前流式请求(仅对流式通道生效,同步
+  // 通道无取消能力);无活跃流时为 no-op。
+  cancelStreaming(): void;
   clearConversationState(): void;
   clearRequestError(): void;
   createSession(): Promise<Session | null>;
@@ -146,6 +149,11 @@ function applyChatResponse(
 }
 
 export function createChatStore(client: ChatStoreClient = apiClient) {
+  // D4-T3:当前流式请求的 AbortController,存于工厂闭包内(create
+  // 调用外)——非响应式字段,不触发渲染;多个 store 实例各自持有
+  // 自己的 controller,不会串(cancelStreaming 只 abort 本实例的流)。
+  let activeStreamController: AbortController | null = null;
+
   return create<ChatStore>()((set, get) => ({
     ...emptyConversationState(),
     currentSessionId: null,
@@ -153,6 +161,11 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     requestError: null,
     sessions: [],
     archiveSession: async (sessionId) => {
+      // D4-T3 review 修正:切会话时 abort 活跃流——旧流继续在后台
+      // 跑完浪费算力,且「切走再切回」时旧流剩余事件会重新通过会话
+      // 守卫写回污染新状态;abort 后 finally 的引用比对与会话守卫
+      // 保证无副作用、不误清新流引用。
+      activeStreamController?.abort();
       set({ requestError: null });
       try {
         await client.archiveSession(sessionId);
@@ -168,7 +181,16 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     },
     clearConversationState: () => set(emptyConversationState()),
     clearRequestError: () => set({ requestError: null }),
+    // D4-T3:停止生成——abort 当前流(streamChatWithRetry 对调用方
+    // abort 静默返回,streamSendMessage 的 catch 因 signal.aborted 走
+    // 正常收尾路径:已收到的流式内容保留)。同步通道无取消能力,
+    // 按钮仅对流式通道生效(D4-T3 定义)。
+    cancelStreaming: () => {
+      activeStreamController?.abort();
+    },
     createSession: async () => {
+      // D4-T3 review 修正:新建会话同样中止旧流(见 archiveSession 注释)。
+      activeStreamController?.abort();
       set({ requestError: null });
       try {
         const session = await client.createSession();
@@ -214,12 +236,15 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         set({ isLoadingSessions: false, requestError: asApiClientError(error) });
       }
     },
-    selectSession: (sessionId) =>
+    selectSession: (sessionId) => {
+      // D4-T3 review 修正:切换会话中止旧流(见 archiveSession 注释)。
+      activeStreamController?.abort();
       set({
         ...emptyConversationState(),
         currentSessionId: sessionId,
         requestError: null,
-      }),
+      });
+    },
     // D2-T3:确认/拒绝待审批手递交接。
     // 成功时与 sendMessage 一样「POST + 拉全量」两段式,response 字段走
     // 公共 applyChatResponse;后端把 session_busy 放进成功响应的 run_error
@@ -425,6 +450,12 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
+      // D4-T3:守卫通过后创建本轮 controller 并挂到实例闭包,供
+      // cancelStreaming abort;signal 透传给流式通道(StreamChatOptions
+      // 已支持,abort 时静默返回)。
+      const controller = new AbortController();
+      activeStreamController = controller;
+
       set({
         isStreaming: true,
         requestError: null,
@@ -496,10 +527,16 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             message,
             maxRetries: _STREAM_RETRY_LIMIT,
             onEvent: dispatch,
+            signal: controller.signal,
           });
         } else if (plainStream) {
           // 旧 stub 兼容路径:无重试,失败行为与 D1-T1 一致(不降级)
-          await plainStream({ sessionId, message, onEvent: dispatch });
+          await plainStream({
+            sessionId,
+            message,
+            onEvent: dispatch,
+            signal: controller.signal,
+          });
         }
 
         // 正常结束:把流式气泡并入消息列表,再拉一次权威历史覆盖
@@ -524,7 +561,18 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           }
         }
       } catch (error) {
-        // 此处只处理流式通道(streamChatWithRetry / streamChat)抛出的错误
+        // 此处只处理流式通道(streamChatWithRetry / streamChat)抛出的错误。
+        // D4-T3 review 修正:用户点击「停止生成」(abort)恰逢后端错误
+        // 响应时,stream-client 的 catch 先判 ApiClientError 再判
+        // signal.aborted,错误可能透传到这里——若此时误走降级分支会
+        // sendMessage 重发同一条已送达消息。abort 短路:取消路径直接
+        // 走正常收尾(内容保留、不降级、不重发)。
+        if (controller.signal.aborted) {
+          if (get().currentSessionId === sessionId) {
+            set({ isStreaming: false });
+          }
+          return;
+        }
         if (get().currentSessionId === sessionId) {
           if (retryStream) {
             // D1-T3 降级:重试通道耗尽(重试 + 续传均失败)后走同步通道
@@ -553,6 +601,12 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           }
         }
       } finally {
+        // D4-T3:清理 controller 引用(按引用比对,只清自己的;流结束后
+        // cancelStreaming 不再影响后续新流)。放在会话守卫外:切会话的
+        // 旧流收尾也要释放引用,否则泄漏。
+        if (activeStreamController === controller) {
+          activeStreamController = null;
+        }
         // 兜底:任何路径都不让 isStreaming 悬挂;但只在会话未切换时
         // 复位——否则流 A 收尾会误清「切会话后开始的流 B」的
         // isStreaming(review 修正,后果是新流提前解锁输入)。

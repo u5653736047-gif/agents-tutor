@@ -269,6 +269,8 @@ type StreamChatWithRetryStub = (options: {
   message: string;
   onEvent(event: unknown): void;
   sessionId: string;
+  // D4-T3:调用方取消信号(store 透传 StreamChatOptions.signal)
+  signal?: AbortSignal;
 }) => Promise<void>;
 
 // 注入 streamChatWithRetry 的 store 构造(重试语义由 stub 自持,
@@ -444,4 +446,180 @@ test("streamSendMessage stores references from the message_end event", async () 
     },
   ]);
   assert.equal(state.isStreaming, false);
+});
+
+// ── D4-T3 停止生成:取消当前流 ──────────────────────────────────
+
+test("cancelStreaming aborts the active stream and finishes cleanly", async () => {
+  // D4-T3:abort 后 streamChatWithRetry 对调用方取消静默返回(D1-T3
+  // 语义),streamSendMessage 走正常收尾路径:不抛错、isStreaming
+  // 复位、已收到的流式内容保留。
+  let receivedSignal: AbortSignal | undefined;
+  let markStreamStarted: (() => void) | undefined;
+  const streamStarted = new Promise<void>((resolve) => {
+    markStreamStarted = resolve;
+  });
+
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent, signal }) => {
+      receivedSignal = signal;
+      onEvent({
+        content: "部分内容",
+        event_type: "message_end",
+        sequence: 1,
+        session_id: session.session_id,
+      });
+      markStreamStarted?.();
+      // 挂起直到调用方 abort(真实通道里由 fetch 读取循环响应)
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const streaming = store.getState().streamSendMessage("可取消的请求");
+  await streamStarted;
+
+  store.getState().cancelStreaming();
+  assert.equal(receivedSignal?.aborted, true);
+
+  // abort 后 streamSendMessage 正常收尾:不抛、状态复位
+  await streaming;
+  const state = store.getState();
+  assert.equal(state.isStreaming, false);
+  assert.equal(state.requestError, null);
+  assert.equal(state.degradedNotice, null);
+  assert.equal(state.streamingMessage, null);
+});
+
+test("cancelStreaming without an active stream is a no-op", async () => {
+  const store = await createRetryStreamStore({});
+
+  store.getState().selectSession(session.session_id);
+  assert.doesNotThrow(() => store.getState().cancelStreaming());
+  assert.equal(store.getState().isStreaming, false);
+});
+
+test("cancelStreaming aborts only the active stream; a later stream is unaffected", async () => {
+  // D4-T3:controller 存于 store 实例且流结束后清理(按引用比对),
+  // 取消旧流不会影响之后的新流。
+  const signals: AbortSignal[] = [];
+  let markStreamStarted: (() => void) | undefined;
+  const streamStarted = new Promise<void>((resolve) => {
+    markStreamStarted = resolve;
+  });
+
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent, signal }) => {
+      signals.push(signal as AbortSignal);
+      if (signals.length === 1) {
+        markStreamStarted?.();
+        // 第一个流挂起,等待调用方 abort
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return;
+      }
+      onEvent({ event_type: "done", sequence: 2, session_id: session.session_id });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const first = store.getState().streamSendMessage("第一个流");
+  await streamStarted;
+
+  store.getState().cancelStreaming();
+  assert.equal(signals[0]?.aborted, true);
+  await first;
+  assert.equal(store.getState().isStreaming, false);
+
+  // 新流使用全新 controller,不受旧流取消影响
+  await store.getState().streamSendMessage("第二个流");
+  assert.equal(signals.length, 2);
+  assert.equal(signals[1]?.aborted, false);
+});
+
+test("switching sessions aborts the active stream and stale events do not leak back", async () => {
+  // review 修正回归:selectSession 切会话时 abort 活跃流——旧流继续
+  // 后台跑完浪费算力,且「切走再切回」时旧流剩余事件会重新通过会话
+  // 守卫写回污染新状态。abort 后旧流的收尾被会话守卫拦截。
+  let receivedSignal: AbortSignal | undefined;
+  let markStreamStarted: (() => void) | undefined;
+  const streamStarted = new Promise<void>((resolve) => {
+    markStreamStarted = resolve;
+  });
+
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent, signal }) => {
+      receivedSignal = signal;
+      onEvent({
+        content: "旧流的部分内容",
+        event_type: "message_end",
+        sequence: 1,
+        session_id: session.session_id,
+      });
+      markStreamStarted?.();
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const streaming = store.getState().streamSendMessage("旧会话请求");
+  await streamStarted;
+
+  // 流进行中切会话:活跃 controller 被 abort,旧流剩余事件被会话
+  // 守卫拦截,不写回(已切换到新会话的状态)。
+  store.getState().selectSession("session-b");
+  assert.equal(receivedSignal?.aborted, true);
+  await streaming;
+
+  const state = store.getState();
+  assert.equal(state.currentSessionId, "session-b");
+  assert.equal(state.messages.length, 0); // 旧流内容未污染新会话
+  assert.equal(state.streamingMessage, null);
+  assert.equal(state.isStreaming, false);
+});
+
+test("an abort racing an ApiClientError does not trigger the sync fallback", async () => {
+  // review 修正回归:用户点「停止生成」(abort)恰逢后端错误响应时,
+  // stream-client 的 catch 先判 ApiClientError 再判 signal.aborted,
+  // 错误可能透传进 store——catch 的 abort 短路必须拦截,否则误走
+  // 降级分支会 sendMessage 重发同一条已送达消息。
+  const { ApiClientError } = await loadApiClient();
+  let sendChatCalls = 0;
+  let markStreamStarted: (() => void) | undefined;
+  const streamStarted = new Promise<void>((resolve) => {
+    markStreamStarted = resolve;
+  });
+
+  const store = await createRetryStreamStore({
+    sendChat: async () => {
+      sendChatCalls += 1;
+      return { events: [], message: assistantMessage, session_id: session.session_id };
+    },
+    streamChatWithRetry: async ({ signal }) => {
+      markStreamStarted?.();
+      // 模拟「abort 与错误竞争」:先等待 abort,再抛 ApiClientError
+      // (stream-client 实际行为:catch 先命中 ApiClientError 分支)。
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw new ApiClientError("服务错误。", { code: "internal_error", status: 500 });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const streaming = store.getState().streamSendMessage("会竞争的消息");
+  await streamStarted;
+
+  store.getState().cancelStreaming();
+  await streaming;
+
+  const state = store.getState();
+  assert.equal(state.isStreaming, false);
+  assert.equal(state.degradedNotice, null); // abort 短路:不降级
+  assert.equal(sendChatCalls, 0); // 不重发
 });
