@@ -95,3 +95,46 @@ test("assistant Markdown tolerates invalid TeX without crashing", async () => {
   assert.match(markup, /class="katex"/);
   assert.doesNotMatch(markup, /data-slot="markdown-fallback"/);
 });
+
+test("assistant Markdown highlights Python fences with hljs classes", async () => {
+  const { AssistantMarkdown } = await loadAssistantMarkdown();
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMarkdown, {
+      content: "```python\ndef add(a, b):\n    return a + b\n```",
+    }),
+  );
+
+  // rehype-highlight 注入 hljs + language-python 类;def/return 是
+  // Python 关键字,渲染为 hljs-keyword(D3-T2 验收:围栏语言高亮)。
+  assert.match(markup, /language-python/);
+  assert.match(markup, /hljs-keyword/);
+});
+
+test("assistant Markdown highlights TypeScript fences", async () => {
+  const { AssistantMarkdown } = await loadAssistantMarkdown();
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMarkdown, {
+      content: "```ts\nconst x: number = 1;\n```",
+    }),
+  );
+
+  // highlight.js 把 ts 解析为 typescript;类名可能为 language-ts 或
+  // language-typescript,宽松断言(rehype-highlight 保留原语言名,
+  // 实测确认后注释)。
+  assert.match(markup, /language-ts|language-typescript/);
+  assert.match(markup, /hljs-keyword/); // const
+});
+
+test("assistant Markdown keeps plain fences without language classes", async () => {
+  const { AssistantMarkdown } = await loadAssistantMarkdown();
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMarkdown, {
+      content: "```\n<div>plain</div>\n```",
+    }),
+  );
+
+  // 无语言围栏:不注入 language- 类(降级为现样式),代码文本完整
+  // 保留、不炸页(宽松断言,以实测行为为准)。
+  assert.doesNotMatch(markup, /language-/);
+  assert.match(markup, /&lt;div&gt;plain&lt;\/div&gt;/);
+});

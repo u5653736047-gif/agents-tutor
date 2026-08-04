@@ -2,6 +2,7 @@
 
 import { Component, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 
@@ -62,10 +63,24 @@ export function AssistantMarkdown({ content }: AssistantMarkdownProps) {
     <MarkdownErrorBoundary content={content}>
       <ReactMarkdown
         remarkPlugins={[remarkMath]}
-        rehypePlugins={[rehypeKatex]}
+        // 顺序:先 KaTeX 后代码高亮,互不干扰。rehype-highlight 跟随
+        // ```lang 围栏注入 hljs + language-xxx 类(D3-T2);无语言围栏
+        // 的代码块不注入语言类,保持原样式。
+        rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
-          code({ children }) {
-            return <code className="font-mono text-caption">{children}</code>;
+          code({ children, className }) {
+            // rehype-highlight 注入的 hljs + language-xxx 类必须保留
+            // (整体覆盖会导致高亮样式丢失——D3-T2 关键点);无语言
+            // 围栏时 className 为空,保持等宽/字号基础样式。
+            return (
+              <code
+                className={[className, "font-mono text-caption"]
+                  .filter(Boolean)
+                  .join(" ")}
+              >
+                {children}
+              </code>
+            );
           },
           pre({ children }) {
             return (

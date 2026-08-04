@@ -5,6 +5,11 @@
    全局引入;rehype-katex 生成的 .katex / .katex-display / .katex-error
    类依赖这份样式。 */
 @import "katex/dist/katex.min.css";
+/* D3-T2:highlight.js github-dark 主题。rehype-highlight 注入的 hljs
+   + language-xxx 类依赖这份样式;.hljs 背景覆盖为透明,与 pre 的
+   bg-neutral-900 底色统一(github-dark 自带 #282c34 背景会与 pre
+   背景冲突成双层色块)。 */
+@import "highlight.js/styles/github-dark.css";
 
 :root {
   --brand: oklch(0.546 0.245 262.88);
@@ -101,4 +106,20 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--app-font-sans);
+}
+
+/* D3-T2:highlight.js github-dark 主题自带 #282c34 背景,与代码块
+   pre 的 bg-neutral-900 冲突成双层色块——覆盖为透明,让 pre 底色
+   统一(注释与上方 @import 对应)。 */
+.hljs {
+  background: transparent;
+}
+
+/* github-dark 主题的 pre code.hljs 自带 padding:1em + 自己的横向
+   滚动容器,与 pre 的 p-3/overflow-x-auto 叠加成双层内边距与双滚动
+   (review 修正)——重置为 0,内边距与滚动统一由 pre 承担。 */
+pre code.hljs {
+  padding: 0;
+  display: block;
+  overflow-x: visible;
 }
