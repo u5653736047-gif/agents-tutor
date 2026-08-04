@@ -7,6 +7,7 @@ import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CollaborationPanel } from "@/components/collaboration-panel";
+import { HandoffCard } from "@/components/handoff-card";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ChatResponse, Message } from "@/lib/api-client";
 import { useChatStore } from "@/stores/chat-store";
@@ -115,10 +116,15 @@ export function ConversationContent({
 export function ConversationPanel() {
   // D2-T2:协作过程面板所需数据(计划、结果、事件、活跃 Agent)由这里订阅后传入
   const currentAgent = useChatStore((state) => state.currentAgent);
+  // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
+  const decideHandoff = useChatStore((state) => state.decideHandoff);
   const events = useChatStore((state) => state.events);
+  const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const messages = useChatStore((state) => state.messages);
+  const pendingHandoff = useChatStore((state) => state.pendingHandoff);
+  const requestError = useChatStore((state) => state.requestError);
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
@@ -131,9 +137,11 @@ export function ConversationPanel() {
   }, [
     currentAgent,
     events,
+    isDecidingHandoff,
     isSending,
     isStreaming,
     messages,
+    pendingHandoff,
     runError,
     streamingAgent,
     streamingMessage,
@@ -159,6 +167,21 @@ export function ConversationPanel() {
             events={events}
             taskPlan={taskPlan}
             taskResults={taskResults}
+          />
+          {/* D2-T3:审批卡片——协作面板之后、输入区之前;错误文案只映射
+              审批相关错误码,其它 requestError 仍由侧栏等现有路径处理。
+              handoff_not_pending 不在此映射:store 收到该码会清除并刷新
+              pending,卡片随之消失,错误行永远不会显示(死分支已删,
+              review nit)。 */}
+          <HandoffCard
+            errorMessage={
+              requestError?.code === "session_busy"
+                ? requestError.message
+                : null
+            }
+            isDeciding={isDecidingHandoff}
+            onDecide={(action) => void decideHandoff(action)}
+            pending={pendingHandoff}
           />
           <div data-slot="conversation-end" ref={endRef} />
         </div>

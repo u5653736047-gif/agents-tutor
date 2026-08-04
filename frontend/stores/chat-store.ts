@@ -17,6 +17,10 @@ type ChatStoreClient = Pick<
   ApiClient,
   "archiveSession" | "createSession" | "getSessionMessages" | "listSessions" | "sendChat"
 > & {
+  // D2-T3:审批接口——可选:既有测试注入的 stub 未实现,正式 apiClient
+  // 一定实现;decideHandoff action 在未注入时直接跳过(与 streamChat 同模式)
+  decideHandoff?: ApiClient["decideHandoff"];
+  getPendingHandoff?: ApiClient["getPendingHandoff"];
   // 可选:既有测试注入的 stub 未实现流式通道,正式 apiClient 一定实现
   streamChat?: ApiClient["streamChat"];
   // D1-T3:断线重连通道(指数退避重试 + fromSequence 续传)。store 优先
@@ -24,7 +28,9 @@ type ChatStoreClient = Pick<
   // (保持 D1-T1 行为)。
   streamChatWithRetry?: ApiClient["streamChatWithRetry"];
 };
-type PendingHandoff = PendingHandoffResponse["pending_handoff"];
+// NonNullable:响应字段可选(含 undefined),store 语义统一为 null
+// (所有写入点都用 ?? null 归一化)——否则组件 props 会收到 undefined。
+type PendingHandoff = NonNullable<PendingHandoffResponse["pending_handoff"]>;
 type RunError = ChatResponse["run_error"];
 type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
@@ -44,8 +50,11 @@ export type ChatStore = {
   createSession(): Promise<Session | null>;
   currentAgent: AgentRole | null;
   currentSessionId: string | null;
+  // D2-T3:审批决策——决定(确认/拒绝)与状态字段
+  decideHandoff(action: "confirm" | "reject"): Promise<void>;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
+  isDecidingHandoff: boolean;
   isLoadingMessages: boolean;
   isLoadingSessions: boolean;
   isSending: boolean;
@@ -71,6 +80,7 @@ function emptyConversationState() {
     currentAgent: null,
     degradedNotice: null as string | null,
     events: [] as (RunEvent | StreamEvent)[],
+    isDecidingHandoff: false,
     isLoadingMessages: false,
     isSending: false,
     isStreaming: false,
@@ -90,6 +100,24 @@ function asApiClientError(error: unknown): ApiClientError {
   }
 
   return new ApiClientError("请求失败，请稍后重试。", { code: null, status: null });
+}
+
+// D2-T3:sendMessage 与 decideHandoff 共用的 ChatResponse 字段合并。
+// events 重置为本轮增量(D2-T2 语义:ChatResponse.events 按 previous_sequence
+// 过滤,累积会让时间线跨 run 交错);sendMessage 调用前已清空 events,
+// 因此与原先的追加写法等价(行为不变)。
+function applyChatResponse(
+  state: ChatStore,
+  response: ChatResponse,
+): Partial<ChatStore> {
+  return {
+    currentAgent: response.current_agent ?? null,
+    events: [...(response.events ?? [])],
+    pendingHandoff: response.pending_handoff ?? null,
+    runError: response.run_error ?? null,
+    taskPlan: response.task_plan ?? null,
+    taskResults: response.task_results ?? null,
+  };
 }
 
 export function createChatStore(client: ChatStoreClient = apiClient) {
@@ -167,6 +195,75 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         currentSessionId: sessionId,
         requestError: null,
       }),
+    // D2-T3:确认/拒绝待审批手递交接。
+    // 成功时与 sendMessage 一样「POST + 拉全量」两段式,response 字段走
+    // 公共 applyChatResponse;后端把 session_busy 放进成功响应的 run_error
+    // (200,非 HTTP 错误),这里转成审批卡片的友好文案;409
+    // handoff_not_pending 表示已被他人处理,清本地 pending 后 GET 兜底刷新。
+    decideHandoff: async (action: "confirm" | "reject") => {
+      const sessionId = get().currentSessionId;
+      const pending = get().pendingHandoff;
+      const decide = client.decideHandoff;
+      // 无会话 / 无待审批 / stub 未注入审批接口时直接跳过(不降级)
+      if (!sessionId || !pending || !decide) {
+        return;
+      }
+
+      set({ isDecidingHandoff: true, requestError: null });
+      try {
+        const response = await decide(sessionId, {
+          action,
+          interrupt_id: pending.interrupt_id,
+        });
+        if (get().currentSessionId === sessionId) {
+          const messages = await client.getSessionMessages(sessionId);
+          if (get().currentSessionId === sessionId) {
+            const busyMessage =
+              response.run_error?.error_code === "session_busy"
+                ? new ApiClientError("会话正忙,请稍后重试。", {
+                    code: "session_busy",
+                    status: null,
+                  })
+                : null;
+            set({
+              ...applyChatResponse(get(), response),
+              messages,
+              isDecidingHandoff: false,
+              ...(busyMessage ? { requestError: busyMessage } : {}),
+            });
+          }
+        }
+      } catch (error) {
+        if (get().currentSessionId === sessionId) {
+          const apiError = asApiClientError(error);
+          if (apiError.code === "handoff_not_pending") {
+            // 已被他人处理:清除本地 pending 并刷新(getPendingHandoff 兜底)
+            set({ isDecidingHandoff: false, pendingHandoff: null });
+            const refreshPending = client.getPendingHandoff;
+            if (refreshPending) {
+              try {
+                const fresh = await refreshPending(sessionId);
+                if (get().currentSessionId === sessionId) {
+                  set({ pendingHandoff: fresh.pending_handoff ?? null });
+                }
+              } catch {
+                // 刷新失败保持已清除状态
+              }
+            }
+          } else if (apiError.code === "session_busy") {
+            set({
+              isDecidingHandoff: false,
+              requestError: new ApiClientError("会话正忙,请稍后重试。", {
+                code: apiError.code,
+                status: apiError.status,
+              }),
+            });
+          } else {
+            set({ isDecidingHandoff: false, requestError: apiError });
+          }
+        }
+      }
+    },
     sendMessage: async (message) => {
       const sessionId = get().currentSessionId;
       if (!sessionId) {
@@ -181,20 +278,12 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         const response = await client.sendChat({ message, session_id: sessionId });
         const messages = await client.getSessionMessages(sessionId);
         if (get().currentSessionId === sessionId) {
-          // D2-T2:同步路径保存任务计划、执行结果与当前活跃 Agent;
-          // 契约字段缺省为 null(与后端归一化一致),组件对 null 健壮。
-          // events 在 run 开始时重置:契约中 ChatResponse.events 是
-          // 本轮增量(按 previous_sequence 过滤),累积会让时间线跨
-          // run 交错(review 修正);单轮内仍按 sequence 追加。
+          // D2-T3:response 字段合并抽到公共 applyChatResponse(与
+          // decideHandoff 复用);isSending/messages 保持本处原有结构。
           set((state) => ({
-            currentAgent: response.current_agent ?? null,
-            events: [...state.events, ...(response.events ?? [])],
+            ...applyChatResponse(state, response),
             isSending: false,
             messages,
-            pendingHandoff: response.pending_handoff ?? null,
-            runError: response.run_error ?? null,
-            taskPlan: response.task_plan ?? null,
-            taskResults: response.task_results ?? null,
           }));
         }
       } catch (error) {

@@ -191,3 +191,239 @@ test("a new run resets events so timelines do not interleave across runs", async
     { event_type: "tool_call", sequence: 2, tool_name: "search" },
   ]);
 });
+
+// D2-T3:审批决策(确认/拒绝)——————————————————————————
+const pendingHandoff = {
+  interrupt_id: "interrupt-1",
+  request: {
+    plan_step_sequence: 2,
+    target_agent: "teaching_assistant" as const,
+    task_content: "请整理学习笔记。",
+  },
+};
+
+test("decideHandoff confirms and merges the response", async () => {
+  const { createChatStore } = await loadChatStore();
+  const decided: string[] = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async (_sessionId, decision) => {
+      decided.push(decision.action);
+      return {
+        current_agent: "learning_assistant" as const,
+        events: [
+          { event_type: "tool_call" as const, sequence: 1, tool_name: "search" },
+        ],
+        message: assistantMessage,
+        pending_handoff: null,
+        session_id: session.session_id,
+      };
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: null,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      message: assistantMessage,
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({ pendingHandoff });
+  await store.getState().decideHandoff("confirm");
+
+  const state = store.getState();
+  // 动作透传 + 全量历史覆盖 + events 重置为本轮增量 + pending 清除
+  assert.deepEqual(decided, ["confirm"]);
+  assert.deepEqual(state.messages, [userMessage, assistantMessage]);
+  assert.deepEqual(state.events, [
+    { event_type: "tool_call", sequence: 1, tool_name: "search" },
+  ]);
+  assert.equal(state.pendingHandoff, null);
+  assert.equal(state.currentAgent, "learning_assistant");
+  assert.equal(state.isDecidingHandoff, false);
+  assert.equal(state.requestError, null);
+});
+
+test("decideHandoff rejects and clears the pending handoff", async () => {
+  const { createChatStore } = await loadChatStore();
+  const decided: string[] = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async (_sessionId, decision) => {
+      decided.push(decision.action);
+      return {
+        events: [],
+        message: assistantMessage,
+        pending_handoff: null,
+        session_id: session.session_id,
+      };
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: null,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      message: assistantMessage,
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({ pendingHandoff });
+  await store.getState().decideHandoff("reject");
+
+  assert.deepEqual(decided, ["reject"]);
+  assert.equal(store.getState().pendingHandoff, null);
+  assert.equal(store.getState().isDecidingHandoff, false);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("decideHandoff refreshes pending when another client handled it", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const freshPending = {
+    interrupt_id: "interrupt-2",
+    request: {
+      plan_step_sequence: 4,
+      target_agent: "evaluator" as const,
+      task_content: "评估新任务。",
+    },
+  };
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async () => {
+      throw new ApiClientError("No handoff is pending for this session.", {
+        code: "handoff_not_pending",
+        status: 409,
+      });
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: freshPending,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({ pendingHandoff });
+  await store.getState().decideHandoff("confirm");
+
+  // 409 handoff_not_pending:清除旧 pending 后 GET 兜底刷新为新值
+  assert.equal(store.getState().isDecidingHandoff, false);
+  assert.equal(store.getState().pendingHandoff?.interrupt_id, "interrupt-2");
+  assert.equal(store.getState().requestError, null);
+});
+
+test("decideHandoff surfaces session_busy with a friendly message", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async () => {
+      throw new ApiClientError(
+        "Another request is already running for this session.",
+        { code: "session_busy", status: null },
+      );
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: null,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({ pendingHandoff });
+  await store.getState().decideHandoff("confirm");
+
+  assert.equal(store.getState().isDecidingHandoff, false);
+  assert.match(store.getState().requestError?.message ?? "", /稍后重试/);
+});
+
+test("decideHandoff without a pending handoff skips the client", async () => {
+  const { createChatStore } = await loadChatStore();
+  let decided = false;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    decideHandoff: async () => {
+      decided = true;
+      return { events: [], session_id: session.session_id };
+    },
+    getPendingHandoff: async () => ({
+      pending_handoff: null,
+      session_id: session.session_id,
+    }),
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => ({
+      events: [],
+      session_id: session.session_id,
+    }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().decideHandoff("confirm");
+
+  assert.equal(decided, false);
+  assert.equal(store.getState().isDecidingHandoff, false);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("decideHandoff surfaces a session_busy run_error embedded in a 200 response", async () => {
+  // 后端真实路径:会话忙时 decide_handoff 返回 200 + ChatResponse,
+  // 忙态表达在 run_error(error_code=session_busy),不是 HTTP 错误
+  // (review 补充测试)。
+  const { createChatStore } = await loadChatStore();
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    getPendingHandoff: async () => ({ pending_handoff: null, session_id: session.session_id }),
+    listSessions: async () => [session],
+    decideHandoff: async () => ({
+      events: [],
+      message: null,
+      pending_handoff: null,
+      run_error: {
+        agent: null,
+        error_code: "session_busy",
+        message: "A request is already running for this session.",
+      },
+      session_id: session.session_id,
+    }),
+  });
+
+  await store.getState().refreshSessions();
+  store.getState().selectSession(session.session_id);
+  // 先放入一个 pending(decideHandoff 依赖)
+  store.setState({ pendingHandoff: { interrupt_id: "interrupt-1", request: { target_agent: "teaching_assistant", task_content: "检查" } } });
+  await store.getState().decideHandoff("confirm");
+
+  const state = store.getState();
+  assert.equal(state.isDecidingHandoff, false);
+  // 忙态转友好文案(卡片显示「会话正忙,请稍后重试。」)
+  assert.equal(state.requestError?.message, "会话正忙,请稍后重试。");
+});
