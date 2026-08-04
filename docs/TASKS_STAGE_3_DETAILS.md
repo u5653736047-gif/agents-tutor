@@ -360,7 +360,7 @@
 > 目标：把骨架的「能看」升级为「好看好读」：公式、代码高亮、复制、表格、
 > 引用溯源。全部落在 `components/assistant-markdown.tsx` 一个组件内扩展。
 
-### [ ] D3-T1 KaTeX 数学公式渲染
+### [x] D3-T1 KaTeX 数学公式渲染
 
 - 对应总清单：3.2.1（Markdown + LaTeX（KaTeX））
 - 背景：`assistant-markdown.tsx`（48-69 行）只有 react-markdown + code/pre 样式，

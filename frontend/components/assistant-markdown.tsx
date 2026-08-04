@@ -2,6 +2,18 @@
 
 import { Component, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkMath from "remark-math";
+
+// 数学公式渲染说明(KaTeX):
+// - remark-math 把行内 $...$ 与块级 $$...$$ 解析成 math 节点;
+// - rehype-katex 把这些节点渲染成 KaTeX 的 HTML(class="katex" / katex-display);
+// - KaTeX 样式表(katex.min.css)在 app/globals.css 里通过 @import 全局引入,
+//   负责公式字体与布局;组件内 import 会让 tsx 测试加载本模块时因 .css 扩展名报错,
+//   因此不在这里引入;
+// - 非法公式(如 KaTeX 无法解析的 TeX)由 rehype-katex 内部容错:记录告警后输出
+//   带 katex-error 标记的错误样式,不会抛异常,页面不会因公式错误崩溃
+//   (MarkdownErrorBoundary 仍负责其它渲染错误的兜底)。
 
 type MarkdownErrorBoundaryProps = {
   children: ReactNode;
@@ -49,6 +61,8 @@ export function AssistantMarkdown({ content }: AssistantMarkdownProps) {
   return (
     <MarkdownErrorBoundary content={content}>
       <ReactMarkdown
+        remarkPlugins={[remarkMath]}
+        rehypePlugins={[rehypeKatex]}
         components={{
           code({ children }) {
             return <code className="font-mono text-caption">{children}</code>;

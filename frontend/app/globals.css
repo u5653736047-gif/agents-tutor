@@ -1,5 +1,10 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+/* D3-T1:KaTeX 公式样式。@import 必须在 tailwind 指令前(全局层)——
+   组件内 import CSS 会被 tsx(测试运行器)拒绝(无 CSS 处理),故在此
+   全局引入;rehype-katex 生成的 .katex / .katex-display / .katex-error
+   类依赖这份样式。 */
+@import "katex/dist/katex.min.css";
 
 :root {
   --brand: oklch(0.546 0.245 262.88);
