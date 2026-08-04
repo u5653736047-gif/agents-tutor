@@ -54,6 +54,30 @@ npm install
 | `API_VECTOR_DB_PATH` | 可选，知识库向量 SQLite 文件；默认根目录 `data/vector_knowledge.db`；不可用（文件不存在 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断启动。 |
 | `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
 
+### 启用真实语义检索（可选）
+
+默认 `uv sync --extra dev` 不安装 fastembed，`auto` 模式会自动回退到
+零依赖的哈希向量（256 维字符特征替身，语义能力有限）。需要真实语义
+检索（fastembed + bge-small-zh-v1.5，512 维）时，在 `backend/` 下安装
+可选依赖并重建向量库：
+
+```powershell
+uv sync --extra embedding   # 或对已存在的环境：uv pip install fastembed
+uv run python scripts/ingest_books.py --force --vector --provider fastembed
+```
+
+注意：fastembed 的向量是 512 维，与哈希库的 256 维不同——重建前请先
+删除旧 `data/vector_knowledge.db`（或用新的 `--vector-db` 路径），
+`--force` 无法绕过维度守卫。
+
+语义检索是否真的在线，看启动日志（`知识检索模式=hybrid
+embedding_provider=FastEmbedProvider vector_dimension=512`）或
+`GET /healthz` 返回的 `retrieval` 字段：`mode` 为 `hybrid` /
+`lexical_only`，`embedding_provider` 为实际打开向量库的 provider 类名，
+`vector_dimension` 为其维度。`mode=hybrid` 且
+`embedding_provider=FastEmbedProvider` 即真实语义检索在线；否则是哈希
+替身或纯词法降级。诊断字段不含任何文件路径。
+
 然后在 Windows PowerShell 的仓库根目录运行一条命令：
 
 ```powershell

@@ -19,6 +19,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient, Response
 from pytest import MonkeyPatch
 
 import api.app as api_app
@@ -321,3 +323,108 @@ def test_knowledge_default_paths_resolve_to_repo_root() -> None:
     assert knowledge_db.parent.name == "data"
     assert knowledge_db.name == "knowledge.db"
     assert vector_db.name == "vector_knowledge.db"
+
+
+# ── H-T1 检索模式诊断（/healthz retrieval 字段）────────────────────
+
+async def _get(app: FastAPI, path: str) -> Response:
+    """用 ASGITransport 发请求（与 test_api.py 的 _get 同一写法）。"""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.get(path)
+
+
+def test_knowledge_stack_exposes_retrieval_diagnostics(tmp_path: Path) -> None:
+    """向量路打开后 stack 暴露 H-T1 诊断字段：provider 类名与维度。
+
+    诊断字段是给启动日志与 /healthz 的观测数据：mode 之外，
+    embedding_provider / vector_dimension 说明「向量路被谁打开、多少
+    维」，据此判断语义检索是否真的在线（哈希 = 零依赖替身，fastembed
+    = 真实语义模型）。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    vector_db = tmp_path / "vector_knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _make_vector_db(vector_db)  # 默认 256 维哈希库
+
+    stack = create_knowledge_search_stack(knowledge_db, vector_db, embedding="hash")
+
+    assert stack.vector_enabled is True
+    assert stack.vector_provider == "HashEmbeddingProvider"
+    assert stack.vector_dimension == 256
+    stack.close()
+
+
+def test_healthz_reports_hybrid_mode(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """lifespan 装配 hybrid 后，/healthz 的 retrieval 诊断报告真实状态。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    vector_db = tmp_path / "vector_knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _make_vector_db(vector_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, vector_db)
+    # 显式 hash：与文件头约定一致（测试不碰 fastembed 模型），
+    # 断言结果确定（HashEmbeddingProvider + 256 维）。
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+        assert response.status_code == 200
+        assert response.json()["retrieval"] == {
+            "mode": "hybrid",
+            "embedding_provider": "HashEmbeddingProvider",
+            "vector_dimension": 256,
+        }
+
+    asyncio.run(verify_runtime())
+
+
+def test_healthz_reports_lexical_only_when_vector_missing(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """向量库不存在 → lifespan 降级词法，/healthz 诊断如实报告。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+        assert response.status_code == 200
+        assert response.json()["retrieval"] == {
+            "mode": "lexical_only",
+            "embedding_provider": None,
+            "vector_dimension": None,
+        }
+
+    asyncio.run(verify_runtime())
+
+
+def test_healthz_reports_lexical_only_on_dimension_mismatch(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """128 维向量库 vs 默认 256 维哈希 → 维度不匹配降级，诊断如实报告。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    vector_db = tmp_path / "vector_knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _make_vector_db(vector_db, dimension=128)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, vector_db)
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+        assert response.status_code == 200
+        assert response.json()["retrieval"] == {
+            "mode": "lexical_only",
+            "embedding_provider": None,
+            "vector_dimension": None,
+        }
+
+    asyncio.run(verify_runtime())

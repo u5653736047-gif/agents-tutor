@@ -67,6 +67,8 @@ DEFAULT_CHECKPOINT_PATH = str(_REPO_ROOT / "data" / "api_checkpoints.sqlite3")
 # - API_VECTOR_DB_PATH：向量库（可选增强，不可用自动降级词法）；
 # - API_KNOWLEDGE_EMBEDDING：向量 embedding 提供方模式，auto（默认）
 #   优先真实语义模型、不可用时回退哈希；hash 强制零依赖哈希。
+#   部署未启用 embedding extra（未安装 fastembed）时 auto 会回退哈希，
+#   实际启用了哪条路以启动日志与 /healthz 的 retrieval 诊断为准。
 DEFAULT_KNOWLEDGE_DB_PATH = str(_REPO_ROOT / "data" / "knowledge.db")
 DEFAULT_VECTOR_DB_PATH = str(_REPO_ROOT / "data" / "vector_knowledge.db")
 DEFAULT_EMBEDDING_MODE = "auto"
@@ -89,12 +91,18 @@ class KnowledgeSearchStack:
     - close：关闭底层索引（词法/向量 SQLite 连接）的回调，lifespan
       退出时调用，避免连接泄漏；
     - vector_enabled：向量路是否真的打开（False = 降级为纯词法），
-      供日志与测试观测，不在图里暴露。
+      供日志与测试观测，不在图里暴露；
+    - vector_provider / vector_dimension（H-T1 诊断字段）：向量路成功
+      打开时使用的 provider 类名与其向量维度（如 "HashEmbeddingProvider"
+      / 256、"FastEmbedProvider" / 512），向量路未打开时为 None。
+      供启动日志与 /healthz 诊断「语义检索是否在线」，不参与检索。
     """
 
     tool: BaseTool
     close: Callable[[], None]
     vector_enabled: bool
+    vector_provider: str | None = None
+    vector_dimension: int | None = None
 
 
 def _embedding_provider_candidates(mode: str) -> list[EmbeddingProvider]:
@@ -112,8 +120,9 @@ def _embedding_provider_candidates(mode: str) -> list[EmbeddingProvider]:
     模式说明：
     - "auto"（默认）：优先 FastEmbedProvider（真实语义，匹配 T1 的
       512 维库）。fastembed 未安装 / 模型不可用（构造抛 ImportError /
-      RuntimeError / OSError）时回退哈希——注意 pyproject 未锁定
-      fastembed（既定决策），装配必须容忍它不存在；
+      RuntimeError / OSError）时回退哈希——fastembed 是可选依赖组
+      embedding（uv lock 已锁定），默认 uv sync --extra dev 不安装，
+      装配必须容忍它不存在；
     - "hash"：强制 HashEmbeddingProvider，零依赖、零模型下载、行为
       完全确定——测试与完全离线部署用它，避免启动时碰模型。
     """
@@ -177,6 +186,11 @@ def create_knowledge_search_stack(
     # 不阻断服务启动。
     lexical = SqliteKnowledgeIndex(knowledge_db)
     vector: SqliteVectorKnowledgeIndex | None = None
+    # H-T1 诊断字段：记录「向量路被哪个 provider 打开、维度多少」，
+    # 供启动日志与 /healthz 观测「语义检索是否在线」；向量路未打开
+    # （文件不存在 / 维度不匹配 / 损坏）时保持 None。
+    vector_provider: str | None = None
+    vector_dimension: int | None = None
     if Path(vector_db).exists():
         # 文件存在才尝试打开（hybrid 层自己也会检查；这里提前检查
         # 是为了在「没有向量库」的环境里不构造 provider——避免
@@ -184,6 +198,10 @@ def create_knowledge_search_stack(
         for provider in _embedding_provider_candidates(embedding):
             vector = open_vector_index_if_available(vector_db, provider=provider)
             if vector is not None:
+                # 记录真正打开向量库的 provider（类名 + 维度），
+                # 供日志与 /healthz 诊断，不参与检索本身。
+                vector_provider = type(provider).__name__
+                vector_dimension = provider.dimension
                 break
     hybrid = HybridKnowledgeIndex(lexical, vector)
     service = KnowledgeService(hybrid)
@@ -191,6 +209,8 @@ def create_knowledge_search_stack(
         tool=create_search_knowledge_tool(service),
         close=hybrid.close,
         vector_enabled=hybrid.vector_enabled,
+        vector_provider=vector_provider,
+        vector_dimension=vector_dimension,
     )
 
 
@@ -220,10 +240,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             vector_db,
             embedding=os.getenv("API_KNOWLEDGE_EMBEDDING", DEFAULT_EMBEDDING_MODE),
         )
-        if not knowledge_stack.vector_enabled:
-            _LOGGER.info(
-                "知识检索降级为纯词法：向量库不可用或维度不匹配（%s）", vector_db
-            )
+        # H-T1 统一结构化启动日志：hybrid / lexical_only 都打，让运维
+        # 一眼看出语义检索是否在线。只打模式 / provider / 维度，不打印
+        # 任何文件路径（旧日志打印 vector_db 绝对路径，属部署细节）。
+        mode = "hybrid" if knowledge_stack.vector_enabled else "lexical_only"
+        _LOGGER.info(
+            "知识检索模式=%s embedding_provider=%s vector_dimension=%s",
+            mode,
+            knowledge_stack.vector_provider,
+            knowledge_stack.vector_dimension,
+        )
+        # 诊断快照挂到 app.state，供 /healthz 输出（字段只含 mode /
+        # provider / 维度，绝不含路径；lifespan 未跑或已退出时该属性
+        # 不存在/为 None，/healthz 用 getattr 兜底保持现状）。挂在 try
+        # 内：图装配失败时不留「与实际不符」的快照。
         try:
             app.state.graph = CollaborativeAgentGraph(
                 model=cast(ChatModel, create_deepseek_model(model_settings)),
@@ -237,14 +267,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tool_permissions=_KNOWLEDGE_TOOL_PERMISSIONS,
             )
             app.state.session_store = session_store
+            app.state.retrieval_diagnostics = {
+                "mode": mode,
+                "embedding_provider": knowledge_stack.vector_provider,
+                "vector_dimension": knowledge_stack.vector_dimension,
+            }
             yield
         finally:
             # 释放顺序：先关知识索引（图已不再执行，工具闭包不再被
-            # 调用），再关会话库，最后清空状态引用。
+            # 调用），再关会话库，最后清空状态引用。诊断快照一并清除，
+            # 与「lifespan 未跑时 /healthz 不带 retrieval」语义一致。
             knowledge_stack.close()
             session_store.close()
             app.state.graph = None
             app.state.session_store = None
+            app.state.retrieval_diagnostics = None
 
 
 def create_app() -> FastAPI:
@@ -292,8 +329,19 @@ def create_app() -> FastAPI:
         return response
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    def healthz(request: Request) -> dict[str, object]:
+        """存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+
+        - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
+          {"status": "ok"} 现状，不破坏既有探针语义与测试；
+        - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
+          vector_dimension），运维据此判断语义检索是否在线。诊断只含
+          这三个字段，绝不含任何文件路径。
+        """
+        diagnostics = getattr(request.app.state, "retrieval_diagnostics", None)
+        if diagnostics is None:
+            return {"status": "ok"}
+        return {"status": "ok", "retrieval": diagnostics}
 
     return app
 

@@ -164,21 +164,29 @@ S3-T3 的 metadata 过滤（页码/章节）或目录页剔除规则缓解，属
 
 ## 6. 依赖变更记录
 
-- **运行依赖新增：0 个**（`pyproject.toml` 未改动，锁文件无需更新）。
-  向量检索用 math / struct / sqlite3 / zlib（crc32 特征哈希）全部是
-  Python 标准库；
+- **运行依赖新增：0 个**（`pyproject.toml` 的 `[project.dependencies]`
+  未改动；可选依赖变化见下方「fastembed 转正」条目）。向量检索用
+  math / struct / sqlite3 / zlib（crc32 特征哈希）全部是 Python 标准库；
 - **更换 provider 的约束**：不同 provider 的向量维度可能不同（哈希替身
   256 维、bge-small-zh-v1.5 为 512 维），切换后需删除旧向量库文件（或
   改用新的 `--vector-db` 路径）再重新入库——`--force` 无法绕过维度
   守卫：维度校验发生在加载旧库的构造期（`_load_all`），早于 `--force`
   清完成标记；向量索引加载旧库时会给出明确报错，`_dot` 也有长度断言，
   不会静默截断计算（详见 vector_index.py 注释）。
-- **可选依赖**：fastembed 未写入锁文件（避免重依赖与 Windows 安装风险），
-  需要时 `uv pip install fastembed` 即可（`FastEmbedProvider` 惰性导入，
-  未安装时给出明确安装指引，不影响项目其它功能）。
-- 若后续决定把 fastembed 转正，建议加入 `pyproject.toml` 的
-  optional-dependencies（如 `[project.optional-dependencies].embedding`）并
-  `uv lock`，届时在 Windows 上实际安装验证一次。
+- **fastembed 转正（H-T1 决策）**：fastembed 已加入 `pyproject.toml` 的
+  `[project.optional-dependencies].embedding` 可选依赖组
+  （`fastembed>=0.8.0`）并 `uv lock` 锁定；启用命令
+  `uv sync --extra embedding`（或对已存在的环境 `uv pip install fastembed`）。
+  默认 `uv sync --extra dev` 不安装 fastembed，`auto` 模式自动回退哈希
+  （`FastEmbedProvider` 惰性导入，未安装时给出明确安装指引，不影响项目
+  其它功能）。转正前已在 Windows 上实际安装验证过 fastembed 0.8.0
+  （2026-08-03 T1 工作单：onnxruntime 官方 Windows wheel 可用，模型
+  首次下载后完全离线），「Windows 安装风险」不再成立。
+- **在线状态诊断（H-T1）**：API 启动时统一打印结构化日志
+  （`知识检索模式=hybrid|lexical_only embedding_provider=... vector_dimension=...`），
+  并可在 `GET /healthz` 的 `retrieval` 字段确认检索模式（`mode` /
+  `embedding_provider` / `vector_dimension`，不含任何文件路径）——
+  据此判断语义检索是否真的在线。
 
 ---
 

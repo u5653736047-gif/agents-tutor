@@ -20,6 +20,9 @@ dev = [
     "ruff>=0.5.0",
     "mypy>=1.10",
 ]
+embedding = [
+    "fastembed>=0.8.0",
+]
 
 [build-system]
 requires = ["hatchling"]
