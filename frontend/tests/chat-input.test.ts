@@ -117,3 +117,24 @@ test("ChatInput renders without a stop button in the initial SSR state", async (
 // 不可行。组合逻辑由 chat-store-stream.test.ts 的 isStreaming 状态
 // 生命周期用例 + chat-input.test.ts 的 ChatInputContent disabled 用例
 // 间接覆盖(两者合并即该一行表达式的两端)。
+
+// ── D4-T4 快捷指令候选列表 ─────────────────────────────
+
+test("the chat input does not render the slash command list in the initial SSR state", async () => {
+  // D4-T4:候选列表由键盘/鼠标交互触发(showList 初始为 false),与
+  // D4-T3 停止按钮同理,renderToStaticMarkup 下无法触发交互,SSR
+  // 初始态恒不渲染;键盘导航/选中/Escape 关闭由手动验收覆盖。
+  const { ChatInputContent } = await loadChatInput();
+
+  const markup = renderToStaticMarkup(
+    createElement(ChatInputContent, {
+      isSending: false,
+      onChange: () => {},
+      onSubmit: () => {},
+      value: "/",
+    }),
+  );
+
+  assert.doesNotMatch(markup, /data-slot="slash-commands"/);
+  assert.doesNotMatch(markup, /data-slot="slash-command-item"/);
+});
