@@ -856,15 +856,14 @@
     },
     "/healthz": {
       "get": {
+        "description": "存活探针；lifespan 装配后附带检索模式诊断（H-T1）。\n\n- lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持\n  {\"status\": \"ok\"} 现状，不破坏既有探针语义与测试；\n- lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /\n  vector_dimension），运维据此判断语义检索是否在线。诊断只含\n  这三个字段，绝不含任何文件路径。",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
+                  "additionalProperties": true,
                   "title": "Response Healthz Healthz Get",
                   "type": "object"
                 }

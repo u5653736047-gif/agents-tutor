@@ -31,7 +31,16 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Healthz */
+        /**
+         * Healthz
+         * @description 存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+         *
+         *     - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
+         *       {"status": "ok"} 现状，不破坏既有探针语义与测试；
+         *     - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
+         *       vector_dimension），运维据此判断语义检索是否在线。诊断只含
+         *       这三个字段，绝不含任何文件路径。
+         */
         get: operations["healthz_healthz_get"];
         put?: never;
         post?: never;
@@ -515,7 +524,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        [key: string]: string;
+                        [key: string]: unknown;
                     };
                 };
             };
