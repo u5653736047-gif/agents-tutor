@@ -25,6 +25,10 @@ from api.schemas import (
     RunError,
     RunEvent,
     StreamEventType,
+    TaskPlan,
+    TaskPlanStatus,
+    TaskPlanStep,
+    TaskResult,
     WorkerAgentRole,
 )
 from api.schemas import (
@@ -37,6 +41,8 @@ from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionStore
 from core.state import AgentState, PendingHandoffApproval
+from core.state import TaskPlan as CoreTaskPlan
+from core.state import TaskStepResult as CoreTaskStepResult
 from core.state import message_references as core_message_references
 
 router = APIRouter(tags=["chat"])
@@ -85,6 +91,63 @@ def _public_agent(value: object) -> AgentRole | None:
         return AgentRole(value)
     except ValueError:
         return None
+
+
+def _public_task_plan(plan: object) -> TaskPlan | None:
+    """core TaskPlan → 公开契约 TaskPlan（字段一一对应；整体类型不符 → None）。
+
+    core 与 API 的 TaskPlan / TaskPlanStep 字段同名同义，这里按字段
+    逐项映射；core 的 WorkerAgentRole 是 AgentRole 的 Literal 别名、
+    API 侧是独立枚举（值字符串一致），target_agent 显式按值转换，
+    status 同理（core StrEnum 与 api Enum 值一致）。注意：字段级非法
+    值（如未知枚举）会抛 ValueError——core 模型 extra="forbid" + 类型
+    校验保证 CoreTaskPlan 实例字段必然合法，isinstance 入口已挡掉
+    脏 dict，故不做字段级降级（与 _public_event 的策略一致）。
+    """
+    if not isinstance(plan, CoreTaskPlan):
+        return None
+    return TaskPlan(
+        steps=[
+            TaskPlanStep(
+                sequence=step.sequence,
+                description=step.description,
+                target_agent=WorkerAgentRole(step.target_agent.value),
+            )
+            for step in plan.steps
+        ],
+        current_step_index=plan.current_step_index,
+        status=TaskPlanStatus(plan.status.value),  # core StrEnum 与 api Enum 值一致
+    )
+
+
+def _public_task_results(results: object) -> list[TaskResult] | None:
+    """core TaskStepResult 列表 → 公开契约 TaskResult 列表（缺失/类型不符 → None）。
+
+    逐项 isinstance 防御：列表中出现非 core TaskStepResult 的脏项时
+    跳过而不是整体失败；全部跳过（或空列表）时归一化为 None，与
+    「无结果就不携带」的契约一致。error_code 与 target_agent 按值
+    转换到 API 侧枚举（core/API 枚举值字符串一致，见 _public_event）。
+    """
+    if not isinstance(results, list):
+        return None
+    public: list[TaskResult] = []
+    for item in results:
+        if not isinstance(item, CoreTaskStepResult):
+            continue
+        public.append(
+            TaskResult(
+                step_sequence=item.step_sequence,
+                target_agent=WorkerAgentRole(item.target_agent.value),
+                success=item.success,
+                output=item.output,
+                error_code=(
+                    ApiRunErrorCode(item.error_code.value)
+                    if item.error_code is not None
+                    else None
+                ),
+            )
+        )
+    return public or None
 
 
 def _safe_created_at(message: BaseMessage) -> datetime | None:
@@ -305,6 +368,8 @@ async def chat_response_for_state(
         session_id=session_id,
         message=_final_assistant_message(state, previous_count),
         references=_response_references(state, previous_count),
+        task_plan=_public_task_plan(state.get("task_plan")),
+        task_results=_public_task_results(state.get("task_results")),
         events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
         run_error=_public_run_error(state.get("run_error")),
         pending_handoff=await pending_handoff_for_session(graph, session_id, user_id),

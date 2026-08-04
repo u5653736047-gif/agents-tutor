@@ -21,6 +21,10 @@ from core.state import (
     AgentRole,
     HandoffApprovalRequest,
     PendingHandoffApproval,
+    TaskPlan,
+    TaskPlanStatus,
+    TaskPlanStep,
+    TaskStepResult,
 )
 
 
@@ -607,3 +611,149 @@ def test_chat_run_error_responses_carry_no_references(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()["message"] is None
     assert response.json()["references"] is None
+
+
+# ── ChatResponse.task_plan / task_results（D2-T1：任务计划契约生效） ──────
+
+
+def test_chat_response_includes_task_plan_and_results(tmp_path: Path) -> None:
+    """final_state 带 core TaskPlan/TaskStepResult → 响应透传契约字段。
+
+    core 校验约束：COMPLETED 计划必须 current_step_index == len(steps)，
+    失败结果只带 error_code（本地可恢复错误码之一）。
+    """
+    plan = TaskPlan(
+        steps=[
+            TaskPlanStep(
+                sequence=1,
+                description="检查课程设计",
+                target_agent=AgentRole.TEACHING_ASSISTANT,
+            ),
+            TaskPlanStep(
+                sequence=2,
+                description="制定学习规划",
+                target_agent=AgentRole.LEARNING_ASSISTANT,
+            ),
+        ],
+        current_step_index=2,
+        status=TaskPlanStatus.COMPLETED,
+    )
+    results = [
+        TaskStepResult(
+            step_sequence=1,
+            target_agent=AgentRole.TEACHING_ASSISTANT,
+            success=True,
+            output="课程设计检查完成",
+        ),
+        TaskStepResult(
+            step_sequence=2,
+            target_agent=AgentRole.LEARNING_ASSISTANT,
+            success=False,
+            error_code=ErrorCode.MODEL_CALL_FAILED,
+        ),
+    ]
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="分解任务"), AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+            "task_plan": plan,
+            "task_results": results,
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "分解任务"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["task_plan"] == {
+        "steps": [
+            {
+                "sequence": 1,
+                "description": "检查课程设计",
+                "target_agent": "teaching_assistant",
+            },
+            {
+                "sequence": 2,
+                "description": "制定学习规划",
+                "target_agent": "learning_assistant",
+            },
+        ],
+        "current_step_index": 2,
+        "status": "completed",
+    }
+    assert response.json()["task_results"] == [
+        {
+            "step_sequence": 1,
+            "target_agent": "teaching_assistant",
+            "success": True,
+            "output": "课程设计检查完成",
+            "error_code": None,
+        },
+        {
+            "step_sequence": 2,
+            "target_agent": "learning_assistant",
+            "success": False,
+            "output": None,
+            "error_code": "model_call_failed",
+        },
+    ]
+
+
+def test_chat_response_task_plan_and_results_none_when_missing(tmp_path: Path) -> None:
+    """final_state 不带 task_plan、task_results 为空列表 → 响应两者为 None。
+
+    空列表按契约归一化为 None（_public_task_results 无有效项时返回
+    None），与「无结果就不携带」的语义一致。
+    """
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="普通问题"), AIMessage(content="普通回答")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+            "task_results": [],
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "普通问题"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["task_plan"] is None
+    assert response.json()["task_results"] is None
+
+
+def test_chat_response_task_plan_degrades_to_none_on_wrong_types(tmp_path: Path) -> None:
+    """task_plan 类型不符、task_results 含非 core 项 → 防御性降级为 None。
+
+    脏数据防御：task_plan 传字符串整体降级为 None；task_results 列表里
+    的 dict 项逐项跳过，无有效项时整体为 None。
+    """
+    graph = ChatGraph(
+        {
+            "messages": [HumanMessage(content="请分解"), AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+            "task_plan": "not-a-plan",
+            "task_results": [{"step_sequence": 1, "success": True}],
+        },
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        response = asyncio.run(_post_chat(app, {"session_id": "session-1", "message": "请分解"}))
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["task_plan"] is None
+    assert response.json()["task_results"] is None
