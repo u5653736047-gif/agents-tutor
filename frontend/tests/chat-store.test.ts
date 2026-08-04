@@ -121,6 +121,134 @@ test("switching sessions clears a pending send from the previous session", async
   assert.equal(store.getState().requestError, null);
 });
 
+// D4-T2:乐观更新与失败回滚 ——————————————————————————————
+test("sendMessage optimistically shows the user message then replaces with the authoritative history", async () => {
+  const { createChatStore } = await loadChatStore();
+  let resolveChat: ((value: { events: []; session_id: string }) => void) | undefined;
+  let markChatStarted: (() => void) | undefined;
+  const chatStarted = new Promise<void>((resolve) => {
+    markChatStarted = resolve;
+  });
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      markChatStarted?.();
+      return new Promise((resolve) => {
+        resolveChat = resolve;
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const sending = store.getState().sendMessage("请解释概念");
+  await chatStarted;
+
+  // 响应未返回:用户消息已乐观显示(created_at 为本地占位 undefined,
+  // 与后端历史消息的形状差异仅在此占位键)
+  assert.equal(store.getState().isSending, true);
+  assert.deepEqual(store.getState().messages, [
+    { agent: null, content: "请解释概念", created_at: undefined, role: "user" },
+  ]);
+
+  resolveChat?.({ events: [], session_id: session.session_id });
+  await sending;
+
+  // 成功:权威历史整体替换乐观消息(用户消息在后端历史中天然存在)
+  assert.deepEqual(store.getState().messages, [userMessage, assistantMessage]);
+  assert.equal(store.getState().isSending, false);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("sendMessage rolls back the optimistic message on failure", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const failure = new ApiClientError("服务不可用。", { code: null, status: null });
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      throw failure;
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().sendMessage("会失败的请求");
+
+  // 失败后乐观消息被回滚:列表恢复为空,错误与状态复位
+  const state = store.getState();
+  assert.deepEqual(state.messages, []);
+  assert.deepEqual(state.events, []);
+  assert.equal(state.isSending, false);
+  assert.equal(state.requestError, failure);
+});
+
+test("sendMessage rollback removes only the optimistic message", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const failure = new ApiClientError("网络失败。", { code: null, status: null });
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      throw failure;
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  // 历史中已存在一条同内容同 role 的用户消息(权威历史,非本次追加)
+  store.setState({ messages: [userMessage] });
+  await store.getState().sendMessage("请解释概念");
+
+  // 按对象引用回滚:只移除本次追加的乐观消息,历史同内容消息保留
+  assert.deepEqual(store.getState().messages, [userMessage]);
+  assert.equal(store.getState().isSending, false);
+  assert.equal(store.getState().requestError, failure);
+});
+
+test("sendMessage keeps optimistic messages in order for two consecutive sends", async () => {
+  const { createChatStore } = await loadChatStore();
+  const resolvers: Array<(value: { events: []; session_id: string }) => void> = [];
+  let started = 0;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      started += 1;
+      return new Promise((resolve) => {
+        resolvers.push(resolve);
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  // 两次发送均未完成:乐观消息按调用顺序追加(函数式 set 各自基于
+  // 最新 state,不互相覆盖)
+  const first = store.getState().sendMessage("第一条");
+  const second = store.getState().sendMessage("第二条");
+
+  assert.equal(started, 2);
+  assert.deepEqual(
+    store.getState().messages.map((item) => item.content),
+    ["第一条", "第二条"],
+  );
+
+  // 依次放行:权威历史(空)整体替换两条乐观消息
+  resolvers[0]?.({ events: [], session_id: session.session_id });
+  resolvers[1]?.({ events: [], session_id: session.session_id });
+  await Promise.all([first, second]);
+  assert.deepEqual(store.getState().messages, []);
+  assert.equal(store.getState().isSending, false);
+});
+
 test("a previous session failure does not overwrite the current session error", async () => {
   const { ApiClientError } = await loadApiClient();
   const { createChatStore } = await loadChatStore();

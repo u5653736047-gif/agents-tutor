@@ -328,15 +328,35 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
+      // D4-T2:乐观更新——守卫通过后、调 sendChat 前,先把用户消息
+      // 追加进 messages(UI 即时回显,不等网络往返)。created_at 用
+      // undefined 占位,权威历史会整体替换;构造风格与流式
+      // message_end 的兜底 Message 一致。
+      const optimistic: Message = {
+        agent: null,
+        content: message,
+        created_at: undefined,
+        role: "user",
+      };
       // D2-T5:发起前记录上一条消息,供失败后的「重新发送」入口使用
-      // (守卫通过才记录;无会话时不覆盖旧值,与既有行为一致)
-      set({ isSending: true, requestError: null, events: [], lastSentMessage: message });
+      // (守卫通过才记录;无会话时不覆盖旧值,与既有行为一致)。
+      // 函数式 set 与乐观追加合并为一次更新:并发连续发送时各自基于
+      // 最新 state 追加,乐观消息按调用顺序排列。
+      set((state) => ({
+        isSending: true,
+        requestError: null,
+        events: [],
+        lastSentMessage: message,
+        messages: [...state.messages, optimistic],
+      }));
       try {
         const response = await client.sendChat({ message, session_id: sessionId });
         const messages = await client.getSessionMessages(sessionId);
         if (get().currentSessionId === sessionId) {
           // D2-T3:response 字段合并抽到公共 applyChatResponse(与
           // decideHandoff 复用);isSending/messages 保持本处原有结构。
+          // 乐观消息被权威历史整体替换(用户消息在后端历史中天然
+          // 存在,一致即可,无需去重)。
           set((state) => ({
             ...applyChatResponse(state, response),
             isSending: false,
@@ -345,7 +365,24 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       } catch (error) {
         if (get().currentSessionId === sessionId) {
-          set({ isSending: false, requestError: asApiClientError(error) });
+          // D4-T2:失败回滚——只移除本次追加的乐观消息。按对象引用
+          // 从末尾向前找(只移除一条),避免误删历史中同内容同 role
+          // 的用户消息;tsconfig lib 为 es2022,无 Array.findLastIndex
+          // (ES2023),用循环等价实现。
+          set((state) => {
+            const messages = [...state.messages];
+            let index = -1;
+            for (let i = messages.length - 1; i >= 0; i -= 1) {
+              if (messages[i] === optimistic) {
+                index = i;
+                break;
+              }
+            }
+            if (index !== -1) {
+              messages.splice(index, 1);
+            }
+            return { isSending: false, requestError: asApiClientError(error), messages };
+          });
         }
       }
     },
