@@ -98,7 +98,7 @@
 > 技术选型定案为 SSE（FastAPI `StreamingResponse` + 前端 fetch ReadableStream），
 > 不用 WebSocket；总清单 3.1.2 / 3.3.2 的「WebSocket」条目按此定案以 SSE 达成。
 
-### [ ] D1-T1 后端 SSE 流式聊天端点
+### [x] D1-T1 后端 SSE 流式聊天端点
 
 - 对应总清单：3.1.2（Agent 思考过程实时推送、多 Agent 协作进度可视化事件）、3.3.2（后端侧）
 - 背景：`POST /chat`（`api/chat.py`）是同步请求-响应；流式推送留给细节清单。

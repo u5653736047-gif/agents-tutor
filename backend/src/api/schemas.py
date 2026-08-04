@@ -156,6 +156,36 @@ class RunEvent(ContractModel):
     degraded: bool | None = None
 
 
+class StreamEvent(ContractModel):
+    """SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
+
+    事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
+    的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
+    - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
+      成功与否、耗时等摘要,绝不含工具参数与结果正文;
+    - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
+      模型中间输出;
+    - message_end 事件的 content 是最终消息全文(与 POST /chat 的
+      ChatResponse.message.content 同源)。
+    error_code 复用 RunError 的联合类型:流式 error 事件需要携带
+    ApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。
+    """
+
+    event_type: StreamEventType
+    sequence: int = Field(ge=0)
+    session_id: str
+    agent: AgentRole | None = None
+    tool_name: str | None = None
+    success: bool | None = None
+    duration_ms: float | None = Field(default=None, ge=0)
+    error_code: ErrorCode | ApiErrorCode | None = None
+    plan_step_sequence: int | None = Field(default=None, ge=1)
+    content: str | None = None  # thinking 占位 / message_end 全文
+    message: Message | None = None  # message_end 的完整消息(可选)
+    citations: list[Citation] | None = None
+    current_agent: AgentRole | None = None
+
+
 class RunError(ContractModel):
     """A stable, sanitized error response for a completed run."""
 
@@ -278,6 +308,7 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ChatRequest,
     Message,
     RunEvent,
+    StreamEvent,
     RunError,
     HandoffRequest,
     PendingHandoff,

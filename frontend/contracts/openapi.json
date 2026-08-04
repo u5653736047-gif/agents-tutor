@@ -264,6 +264,19 @@
         "title": "ErrorResponse",
         "type": "object"
       },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
       "HandoffDecisionAction": {
         "description": "Approval actions supported by the skeleton API.",
         "enum": [
@@ -639,6 +652,156 @@
         "title": "Session",
         "type": "object"
       },
+      "StreamEvent": {
+        "additionalProperties": false,
+        "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」\n的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):\n- tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、\n  成功与否、耗时等摘要,绝不含工具参数与结果正文;\n- thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造\n  模型中间输出;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "citations": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Citation"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Citations"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content"
+          },
+          "current_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Duration Ms"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              {
+                "$ref": "#/components/schemas/ApiErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Code"
+          },
+          "event_type": {
+            "$ref": "#/components/schemas/StreamEventType"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Message"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "plan_step_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Step Sequence"
+          },
+          "sequence": {
+            "minimum": 0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "success": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Success"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Name"
+          }
+        },
+        "required": [
+          "event_type",
+          "sequence",
+          "session_id"
+        ],
+        "title": "StreamEvent",
+        "type": "object"
+      },
       "StreamEventType": {
         "description": "Public event protocol reserved for future streaming support.",
         "enum": [
@@ -766,6 +929,46 @@
         "title": "TaskResult",
         "type": "object"
       },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
       "WorkerAgentRole": {
         "description": "Roles that can receive a handoff or task-plan step.",
         "enum": [
@@ -849,6 +1052,64 @@
           }
         },
         "summary": "Chat",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/stream": {
+      "post": {
+        "description": "SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。",
+        "operationId": "chat_stream_chat_stream_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat Stream",
         "tags": [
           "chat"
         ]

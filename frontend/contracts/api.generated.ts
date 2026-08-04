@@ -24,6 +24,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/chat/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Chat Stream
+         * @description SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。
+         *
+         *     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
+         *     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
+         */
+        post: operations["chat_stream_chat_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -244,6 +267,11 @@ export interface components {
         ErrorResponse: {
             detail: components["schemas"]["ErrorDetail"];
         };
+        /** HTTPValidationError */
+        HTTPValidationError: {
+            /** Detail */
+            detail?: components["schemas"]["ValidationError"][];
+        };
         /**
          * HandoffDecisionAction
          * @description Approval actions supported by the skeleton API.
@@ -398,6 +426,69 @@ export interface components {
             user_id: string | null;
         };
         /**
+         * StreamEvent
+         * @description SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
+         *
+         *     事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
+         *     的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
+         *     - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
+         *       成功与否、耗时等摘要,绝不含工具参数与结果正文;
+         *     - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
+         *       模型中间输出;
+         *     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
+         *       ChatResponse.message.content 同源)。
+         *     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
+         *     ApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。
+         */
+        StreamEvent: {
+            /** @default null */
+            agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Citations
+             * @default null
+             */
+            citations?: components["schemas"]["Citation"][] | null;
+            /**
+             * Content
+             * @default null
+             */
+            content?: string | null;
+            /** @default null */
+            current_agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Duration Ms
+             * @default null
+             */
+            duration_ms?: number | null;
+            /**
+             * Error Code
+             * @default null
+             */
+            error_code?: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"] | null;
+            event_type: components["schemas"]["StreamEventType"];
+            /** @default null */
+            message?: components["schemas"]["Message"] | null;
+            /**
+             * Plan Step Sequence
+             * @default null
+             */
+            plan_step_sequence?: number | null;
+            /** Sequence */
+            sequence: number;
+            /** Session Id */
+            session_id: string;
+            /**
+             * Success
+             * @default null
+             */
+            success?: boolean | null;
+            /**
+             * Tool Name
+             * @default null
+             */
+            tool_name?: string | null;
+        };
+        /**
          * StreamEventType
          * @description Public event protocol reserved for future streaming support.
          * @enum {string}
@@ -448,6 +539,19 @@ export interface components {
             /** Success */
             success: boolean;
             target_agent: components["schemas"]["WorkerAgentRole"];
+        };
+        /** ValidationError */
+        ValidationError: {
+            /** Context */
+            ctx?: Record<string, never>;
+            /** Input */
+            input?: unknown;
+            /** Location */
+            loc: (string | number)[];
+            /** Message */
+            msg: string;
+            /** Error Type */
+            type: string;
         };
         /**
          * WorkerAgentRole
@@ -504,6 +608,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    chat_stream_chat_stream_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
