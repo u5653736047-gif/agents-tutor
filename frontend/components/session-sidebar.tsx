@@ -1,32 +1,104 @@
 "use client";
 
 import { Archive, Plus } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { errorMessageFor } from "@/lib/error-messages";
+import type { ApiClientError, Session } from "@/lib/api-client";
 import { useChatStore } from "@/stores/chat-store";
 
-export function SessionSidebar() {
-  const archiveSession = useChatStore((state) => state.archiveSession);
-  const createSession = useChatStore((state) => state.createSession);
-  const currentSessionId = useChatStore((state) => state.currentSessionId);
-  const isLoadingSessions = useChatStore((state) => state.isLoadingSessions);
-  const loadCurrentSessionMessages = useChatStore(
-    (state) => state.loadCurrentSessionMessages,
+// D4-T1:会话搜索——过滤与高亮抽为纯函数,组件与测试共用。
+// 过滤只匹配 session_id,不区分大小写;空查询(含纯空白)返回全部。
+export function filterSessions(sessions: Session[], query: string): Session[] {
+  const keyword = query.trim().toLowerCase();
+  if (!keyword) {
+    return sessions;
+  }
+
+  return sessions.filter((session) =>
+    session.session_id.toLowerCase().includes(keyword),
   );
-  const requestError = useChatStore((state) => state.requestError);
-  const refreshSessions = useChatStore((state) => state.refreshSessions);
-  const selectSession = useChatStore((state) => state.selectSession);
-  const sessions = useChatStore((state) => state.sessions);
+}
+
+// D4-T1:命中高亮切分。返回三段(前缀 / 命中 / 后缀);query 为空或未
+// 命中时返回单段 non-highlighted。定位用全小写,切分用原始 session_id,
+// 因此高亮保留原始大小写。
+export type HighlightSegment = {
+  highlighted: boolean;
+  text: string;
+};
+
+export function highlightMatch(
+  sessionId: string,
+  query: string,
+): HighlightSegment[] {
+  if (!query) {
+    return [{ highlighted: false, text: sessionId }];
+  }
+
+  const start = sessionId.toLowerCase().indexOf(query.toLowerCase());
+  if (start === -1) {
+    return [{ highlighted: false, text: sessionId }];
+  }
+
+  const end = start + query.length;
+  return [
+    { highlighted: false, text: sessionId.slice(0, start) },
+    { highlighted: true, text: sessionId.slice(start, end) },
+    { highlighted: false, text: sessionId.slice(end) },
+  ];
+}
+
+// D4-T1:展示组件接收 props(纯函数 + SSR 可测);顶部容器 SessionSidebar
+// 从 store 订阅后原样转发。交互(选中/归档/新建)只依赖 props 回调,
+// 测试用 stub 注入即可,无需触碰 zustand store。
+type SessionSidebarContentProps = {
+  archiveSession: (sessionId: string) => void;
+  createSession: () => void;
+  currentSessionId: string | null;
+  isLoadingSessions: boolean;
+  loadCurrentSessionMessages: () => void;
+  requestError: ApiClientError | null;
+  selectSession: (sessionId: string) => void;
+  sessions: Session[];
+};
+
+export function SessionSidebarContent({
+  archiveSession,
+  createSession,
+  currentSessionId,
+  isLoadingSessions,
+  loadCurrentSessionMessages,
+  requestError,
+  selectSession,
+  sessions,
+}: SessionSidebarContentProps) {
+  // D4-T1:搜索防抖——query 即时更新(输入框受控值),debounced 延迟
+  // 200ms 生效用于过滤;清空输入时立即恢复全列表(不等防抖)。
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+
+  useEffect(() => {
+    // 防抖 200ms。注意不在 effect 内同步 setState(eslint react-hooks
+    // 禁止「effect 内同步 setState 引发级联渲染」);query 清空的即时
+    // 生效由下方 effectiveQuery 处理(清空时直接回落空串,不等防抖)。
+    if (query === "") {
+      return;
+    }
+    const timer = setTimeout(() => setDebounced(query), 200);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // query 清空(或纯空白)时立即回落空串恢复全列表;否则用防抖后的词。
+  const effectiveQuery = query.trim() === "" ? "" : debounced;
+  const visibleSessions = filterSessions(sessions, effectiveQuery);
+  // 仅在有实际查询词(trim 后非空)时展示「未找到」占位
+  const hasQuery = effectiveQuery.trim() !== "";
   // D2-T5:请求错误统一映射为标题 + 说明(覆盖 ApiErrorCode 与网络失败)
   const requestErrorPreset = requestError
     ? errorMessageFor(requestError.code)
     : null;
-
-  useEffect(() => {
-    void refreshSessions();
-  }, [refreshSessions]);
 
   return (
     <aside
@@ -50,6 +122,19 @@ export function SessionSidebar() {
         </Button>
       </div>
 
+      {/* D4-T1:会话搜索框。输入防抖 200ms 后过滤;清空输入立即恢复全列表。 */}
+      <div className="border-b border-border px-4 py-3">
+        <input
+          aria-label="搜索会话"
+          className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-caption text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+          data-slot="session-search"
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索会话 ID…"
+          type="search"
+          value={query}
+        />
+      </div>
+
       <div className="flex-1 overflow-y-auto p-2">
         {isLoadingSessions ? (
           <p className="px-2 py-3 text-caption text-muted-foreground">正在加载会话…</p>
@@ -59,7 +144,17 @@ export function SessionSidebar() {
           <p className="px-2 py-3 text-caption text-muted-foreground">暂无会话</p>
         ) : null}
 
-        {sessions.map((session) => {
+        {/* D4-T1:搜索无结果占位——仅在有查询词时出现 */}
+        {hasQuery && visibleSessions.length === 0 ? (
+          <p
+            className="px-2 py-3 text-caption text-muted-foreground"
+            data-slot="session-search-empty"
+          >
+            未找到匹配的会话
+          </p>
+        ) : null}
+
+        {visibleSessions.map((session) => {
           const selected = session.session_id === currentSessionId;
 
           return (
@@ -79,7 +174,20 @@ export function SessionSidebar() {
                 }}
                 type="button"
               >
-                {session.session_id}
+                {/* D4-T1:命中片段用 <mark> 高亮(定位不区分大小写,展示保留
+                    原始大小写);未命中时整段以普通 span 渲染。用
+                    effectiveQuery 而非 debounced(review 修正):清空查询后
+                    高亮随列表一起立即消失,防抖等待期高亮与列表一致。 */}
+                {highlightMatch(session.session_id, effectiveQuery).map(
+                  (segment, index) =>
+                    segment.highlighted ? (
+                      <mark className="bg-amber-200/70 text-inherit" key={index}>
+                        {segment.text}
+                      </mark>
+                    ) : (
+                      <span key={index}>{segment.text}</span>
+                    ),
+                )}
               </button>
               <button
                 aria-label={`归档会话 ${session.session_id}`}
@@ -109,5 +217,40 @@ export function SessionSidebar() {
         </div>
       ) : null}
     </aside>
+  );
+}
+
+// D4-T1:容器——从 store 订阅全部所需状态并转发给展示组件
+// (保持 SessionSidebar 无 props 签名,AppShell 与既有测试不受影响)。
+export function SessionSidebar() {
+  const archiveSession = useChatStore((state) => state.archiveSession);
+  const createSession = useChatStore((state) => state.createSession);
+  const currentSessionId = useChatStore((state) => state.currentSessionId);
+  const isLoadingSessions = useChatStore((state) => state.isLoadingSessions);
+  const loadCurrentSessionMessages = useChatStore(
+    (state) => state.loadCurrentSessionMessages,
+  );
+  const refreshSessions = useChatStore((state) => state.refreshSessions);
+  const requestError = useChatStore((state) => state.requestError);
+  const selectSession = useChatStore((state) => state.selectSession);
+  const sessions = useChatStore((state) => state.sessions);
+
+  useEffect(() => {
+    // 挂载时拉取会话列表(review blocking 修复:重构时勿删——store
+    // 初始 sessions 为空,不拉取则侧栏永远「暂无会话」)。
+    void refreshSessions();
+  }, [refreshSessions]);
+
+  return (
+    <SessionSidebarContent
+      archiveSession={archiveSession}
+      createSession={createSession}
+      currentSessionId={currentSessionId}
+      isLoadingSessions={isLoadingSessions}
+      loadCurrentSessionMessages={loadCurrentSessionMessages}
+      requestError={requestError}
+      selectSession={selectSession}
+      sessions={sessions}
+    />
   );
 }
