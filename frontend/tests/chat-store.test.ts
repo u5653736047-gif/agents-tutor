@@ -62,8 +62,7 @@ test("the chat store keeps response messages and events in separate fields", asy
   assert.deepEqual(state.messages, [userMessage, assistantMessage]);
   assert.deepEqual(state.events, [event]);
   assert.equal(state.isSending, false);
-  assert.equal(state.requestError, null);
-});
+  assert.equal(state.requestError, null);});
 
 test("the chat store records a client failure without optimistic messages", async () => {
   const { ApiClientError } = await loadApiClient();
@@ -154,4 +153,41 @@ test("a previous session failure does not overwrite the current session error", 
   assert.equal(store.getState().currentSessionId, "session-b");
   assert.equal(store.getState().isSending, false);
   assert.equal(store.getState().requestError, null);
+});
+
+test("a new run resets events so timelines do not interleave across runs", async () => {
+  // review 修正回归:events 是「本轮事件」(ChatResponse.events 按
+  // previous_sequence 过滤的增量语义),每轮 sequence 从 1 起——若跨
+  // run 累积,协作面板时间线会交错、key 与展开状态会撞号。
+  const { createChatStore } = await loadChatStore();
+  let run = 0;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      run += 1;
+      return {
+        events: [
+          { event_type: "tool_call" as const, sequence: run, tool_name: "search" },
+        ],
+        message: assistantMessage,
+        session_id: session.session_id,
+      };
+    },
+  });
+
+  await store.getState().refreshSessions();
+  store.getState().selectSession(session.session_id);
+  await store.getState().sendMessage("第一轮");
+  assert.deepEqual(store.getState().events, [
+    { event_type: "tool_call", sequence: 1, tool_name: "search" },
+  ]);
+
+  await store.getState().sendMessage("第二轮");
+  // 第二轮开始时 events 已重置:只含本轮事件,不残留第一轮的 sequence=1
+  assert.deepEqual(store.getState().events, [
+    { event_type: "tool_call", sequence: 2, tool_name: "search" },
+  ]);
 });

@@ -125,6 +125,8 @@ test("streaming lifecycle merges the final message and tracks the active agent",
   // thinking 与 agent_switch 都更新流式徽章,agent_switch 后为新 agent
   assert.equal(observations[0]?.streamingAgent, "supervisor");
   assert.equal(observations[2]?.streamingAgent, "teaching_assistant");
+  // D2-T2:agent_switch 同时更新 currentAgent(活跃 Agent 高亮数据源)
+  assert.equal(state.currentAgent, "teaching_assistant");
   // message_end 后 streamingMessage 持有最终内容
   assert.equal(
     (observations[3]?.streamingMessage as { content?: string } | null)?.content,
@@ -232,6 +234,8 @@ test("switching sessions during a stream discards stale events", async () => {
   });
   assert.equal(store.getState().streamingAgent, null);
   assert.equal(store.getState().streamingMessage, null);
+  // D2-T2:旧流的事件不污染新会话的 currentAgent(切会话已清空)
+  assert.equal(store.getState().currentAgent, null);
   assert.deepEqual(store.getState().messages, []);
 
   resolveStream?.();

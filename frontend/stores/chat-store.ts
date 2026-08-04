@@ -29,6 +29,9 @@ type RunError = ChatResponse["run_error"];
 type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
 type AgentRole = components["schemas"]["AgentRole"];
+// D2-T2:任务计划与执行结果(ChatResponse.task_plan / task_results)
+type TaskPlan = components["schemas"]["TaskPlan"];
+type TaskResult = components["schemas"]["TaskResult"];
 
 // D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
 // streamChatWithRetry 的 maxRetries;耗尽后降级到同步通道。
@@ -39,6 +42,7 @@ export type ChatStore = {
   clearConversationState(): void;
   clearRequestError(): void;
   createSession(): Promise<Session | null>;
+  currentAgent: AgentRole | null;
   currentSessionId: string | null;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
@@ -58,10 +62,13 @@ export type ChatStore = {
   streamSendMessage(message: string): Promise<void>;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
+  taskPlan: TaskPlan | null;
+  taskResults: TaskResult[] | null;
 };
 
 function emptyConversationState() {
   return {
+    currentAgent: null,
     degradedNotice: null as string | null,
     events: [] as (RunEvent | StreamEvent)[],
     isLoadingMessages: false,
@@ -72,6 +79,8 @@ function emptyConversationState() {
     runError: null,
     streamingAgent: null,
     streamingMessage: null,
+    taskPlan: null,
+    taskResults: null,
   };
 }
 
@@ -167,17 +176,25 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
-      set({ isSending: true, requestError: null });
+      set({ isSending: true, requestError: null, events: [] });
       try {
         const response = await client.sendChat({ message, session_id: sessionId });
         const messages = await client.getSessionMessages(sessionId);
         if (get().currentSessionId === sessionId) {
+          // D2-T2:同步路径保存任务计划、执行结果与当前活跃 Agent;
+          // 契约字段缺省为 null(与后端归一化一致),组件对 null 健壮。
+          // events 在 run 开始时重置:契约中 ChatResponse.events 是
+          // 本轮增量(按 previous_sequence 过滤),累积会让时间线跨
+          // run 交错(review 修正);单轮内仍按 sequence 追加。
           set((state) => ({
+            currentAgent: response.current_agent ?? null,
             events: [...state.events, ...(response.events ?? [])],
             isSending: false,
             messages,
             pendingHandoff: response.pending_handoff ?? null,
             runError: response.run_error ?? null,
+            taskPlan: response.task_plan ?? null,
+            taskResults: response.task_results ?? null,
           }));
         }
       } catch (error) {
@@ -217,6 +234,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         runError: null,
         streamingAgent: null,
         streamingMessage: null,
+        // events 在 run 开始时重置(与 sendMessage 一致):契约中事件是
+        // 本轮增量,累积会让时间线跨 run 交错(review 修正)。
+        events: [],
       });
 
       // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
@@ -236,7 +256,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             set((state) => ({ events: [...state.events, event] }));
             break;
           case "agent_switch":
-            set({ streamingAgent: event.agent ?? null });
+            // D2-T2:流式路径没有 ChatResponse,用最后一条 agent_switch
+            // 的目标 Agent 作为当前活跃 Agent(与面板内的兜底逻辑一致)。
+            set({ currentAgent: event.agent ?? null, streamingAgent: event.agent ?? null });
             break;
           case "message_end": {
             const streamed: Message = event.message ?? {

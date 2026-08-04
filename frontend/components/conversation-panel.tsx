@@ -6,6 +6,7 @@ import { useEffect, useRef } from "react";
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
+import { CollaborationPanel } from "@/components/collaboration-panel";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ChatResponse, Message } from "@/lib/api-client";
 import { useChatStore } from "@/stores/chat-store";
@@ -112,17 +113,33 @@ export function ConversationContent({
 }
 
 export function ConversationPanel() {
+  // D2-T2:协作过程面板所需数据(计划、结果、事件、活跃 Agent)由这里订阅后传入
+  const currentAgent = useChatStore((state) => state.currentAgent);
+  const events = useChatStore((state) => state.events);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const messages = useChatStore((state) => state.messages);
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
+  const taskPlan = useChatStore((state) => state.taskPlan);
+  const taskResults = useChatStore((state) => state.taskResults);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [isSending, isStreaming, messages, runError, streamingAgent, streamingMessage]);
+  }, [
+    currentAgent,
+    events,
+    isSending,
+    isStreaming,
+    messages,
+    runError,
+    streamingAgent,
+    streamingMessage,
+    taskPlan,
+    taskResults,
+  ]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -135,6 +152,13 @@ export function ConversationPanel() {
             runError={runError ?? null}
             streamingAgent={streamingAgent}
             streamingMessage={streamingMessage}
+          />
+          {/* D2-T2:协作过程面板——消息流与输入区之间,展示计划与事件 */}
+          <CollaborationPanel
+            currentAgent={currentAgent}
+            events={events}
+            taskPlan={taskPlan}
+            taskResults={taskResults}
           />
           <div data-slot="conversation-end" ref={endRef} />
         </div>
