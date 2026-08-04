@@ -48,6 +48,7 @@ from api.chat import (
     _previous_sequence,
     _public_agent,
     _public_events,
+    _response_references,
     session_busy_response,
     session_lock,
 )
@@ -330,6 +331,12 @@ async def _stream_events(
                                 agent=_public_agent(state.get("current_agent")),
                                 content=final_message.content,
                                 message=final_message,
+                                # D3-T5:message_end 携带本轮引用(与
+                                # POST /chat 的 references 同源,复用
+                                # _response_references 两级口径)——流式
+                                # 主通道的引用渲染依赖它(前端在 message_end
+                                # 事件读取 citations 存入 store)。
+                                citations=_response_references(state, previous_count),
                             )
                         )
                     last_sequence += 1

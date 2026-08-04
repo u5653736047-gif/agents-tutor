@@ -45,6 +45,9 @@ export type HandoffModifications = {
 // D2-T2:任务计划与执行结果(ChatResponse.task_plan / task_results)
 type TaskPlan = components["schemas"]["TaskPlan"];
 type TaskResult = components["schemas"]["TaskResult"];
+// D3-T4:回答引用(ChatResponse.references)——与既有字段同一取型方式,
+// 直接取生成契约,保持单一数据源
+type Citation = components["schemas"]["Citation"];
 
 // D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
 // streamChatWithRetry 的 maxRetries;耗尽后降级到同步通道。
@@ -74,6 +77,9 @@ export type ChatStore = {
   loadCurrentSessionMessages(): Promise<void>;
   messages: Message[];
   pendingHandoff: PendingHandoff | null;
+  // D3-T4:本轮回答的引用列表(null = 无引用,与后端「无引用不携带」
+  // 契约一致;组件层零渲染降级)
+  references: Citation[] | null;
   refreshSessions(): Promise<void>;
   requestError: ApiClientError | null;
   retryLastMessage(): Promise<void>;
@@ -100,6 +106,8 @@ function emptyConversationState() {
     lastSentMessage: null,
     messages: [] as Message[],
     pendingHandoff: null,
+    // D3-T4:引用随轮次清空(引用对应最后一轮回答,切会话/新建会话不残留)
+    references: null,
     runError: null,
     streamingAgent: null,
     streamingMessage: null,
@@ -128,6 +136,9 @@ function applyChatResponse(
     currentAgent: response.current_agent ?? null,
     events: [...(response.events ?? [])],
     pendingHandoff: response.pending_handoff ?? null,
+    // D3-T4:响应缺失(undefined/null)统一归一为 null,store 语义与
+    // 其它可选字段一致,组件层收到 null 时零渲染
+    references: response.references ?? null,
     runError: response.run_error ?? null,
     taskPlan: response.task_plan ?? null,
     taskResults: response.task_results ?? null,
@@ -418,7 +429,12 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
               created_at: undefined,
               role: "assistant",
             };
-            set({ streamingMessage: streamed });
+            set({
+              streamingMessage: streamed,
+              // D3-T5:流式主通道的引用由 message_end 事件携带(与
+              // POST /chat 的 references 同源);未携带时为 null。
+              references: event.citations ?? null,
+            });
             break;
           }
           case "error":

@@ -403,7 +403,7 @@
   的形态为准。
 - 完成备注：
 
-### [ ] D3-T4 回答引用渲染（前端，缺失降级）
+### [x] D3-T4 回答引用渲染（前端，缺失降级）
 
 - 对应总清单：2.3.3（点击查看原文）、3.2.1
 - 背景：`ChatResponse.references: list[Citation] | None` 可选字段（
@@ -425,7 +425,7 @@
 - 依赖：D3-T5（挂载位置约定）；组件实现可与 D3-T5 并行。
 - 完成备注：
 
-### [ ] D3-T5 后端 references 填充（依赖 core 引用数据，可阻塞）
+### [x] D3-T5 后端 references 填充（依赖 core 引用数据，可阻塞）
 
 - 对应总清单：2.3.3（最终回答中的引用插入与真实性校验，core 侧尚未完成）
 - 背景：`api/chat.py` 的 `chat_response_for_state` 未填充 `references`；core 侧

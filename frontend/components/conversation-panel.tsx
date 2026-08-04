@@ -6,6 +6,7 @@ import { useEffect, useRef } from "react";
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
+import { CitationList } from "@/components/citation-list";
 import { CollaborationPanel } from "@/components/collaboration-panel";
 import { HandoffCard } from "@/components/handoff-card";
 import { Button } from "@/components/ui/button";
@@ -209,6 +210,9 @@ export function ConversationPanel() {
   const lastSentMessage = useChatStore((state) => state.lastSentMessage);
   const messages = useChatStore((state) => state.messages);
   const pendingHandoff = useChatStore((state) => state.pendingHandoff);
+  // D3-T4:本轮回答的引用列表(store 从 ChatResponse.references 归一),
+  // null 时 CitationList 零渲染,无引用轮次不显示任何东西
+  const references = useChatStore((state) => state.references);
   const requestError = useChatStore((state) => state.requestError);
   const retryLastMessage = useChatStore((state) => state.retryLastMessage);
   const runError = useChatStore((state) => state.runError);
@@ -228,6 +232,7 @@ export function ConversationPanel() {
     isStreaming,
     messages,
     pendingHandoff,
+    references,
     runError,
     streamingAgent,
     streamingMessage,
@@ -275,6 +280,10 @@ export function ConversationPanel() {
             }
             pending={pendingHandoff}
           />
+          {/* D3-T4:引用卡片——消息列表尾部(审批卡片之后),引用对应
+              最后一轮回答,跟随该轮的回答与协作过程一起展示;store
+              的 references 为 null 时组件零渲染,不占位 */}
+          <CitationList citations={references} />
           <div data-slot="conversation-end" ref={endRef} />
         </div>
       </div>

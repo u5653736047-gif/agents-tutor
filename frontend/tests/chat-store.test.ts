@@ -556,3 +556,43 @@ test("streamSendMessage also records lastSentMessage", async () => {
   assert.equal(store.getState().lastSentMessage, "流式消息");
   assert.equal(store.getState().isStreaming, false);
 });
+
+// D3-T4:回答引用(references)的保存与轮次清空 ————————————————————
+test("sendMessage saves response references and resets them when absent", async () => {
+  const { createChatStore } = await loadChatStore();
+  // 与后端契约字段一致(document_id / source / page / chunk_id)
+  const citedAnswer = {
+    chunk_id: "ml-zhouzhihua:88:0:500",
+    document_id: "ml-zhouzhihua",
+    page: 88,
+    source: "ml-zhouzhihua",
+  };
+  let sendCount = 0;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      sendCount += 1;
+      return {
+        events: [],
+        message: assistantMessage,
+        // 第一轮带引用,第二轮不带(undefined 等价于契约缺失)
+        references: sendCount === 1 ? [citedAnswer] : undefined,
+        session_id: session.session_id,
+      };
+    },
+  });
+
+  // 初始无引用(与 emptyConversationState 一致)
+  assert.equal(store.getState().references, null);
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().sendMessage("带引用的提问");
+  assert.deepEqual(store.getState().references, [citedAnswer]);
+
+  // 第二轮响应无 references → 归一为 null,不残留上一轮引用
+  await store.getState().sendMessage("无引用的提问");
+  assert.equal(store.getState().references, null);
+});

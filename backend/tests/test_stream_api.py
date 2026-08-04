@@ -806,3 +806,74 @@ def test_stream_replay_done_sequence_exceeds_real_terminal_with_public_gap(
     # 保证「把 done.sequence 传回」时回放条件必然不成立。
     assert [frame["event_type"] for frame in frames] == ["tool_call", "done"]
     assert [frame["sequence"] for frame in frames] == [4, 7]
+
+def test_stream_message_end_carries_citations_when_final_message_has_them(
+    tmp_path: Path,
+) -> None:
+    """D3-T5:流式主通道的引用由 message_end 事件携带(review blocking 修复)。
+
+    后端在合成 message_end 时复用 _response_references(与 POST /chat
+    的 references 同源,两级口径:优先最终消息自身引用,聚合回答无
+    引用时回退本轮最近带引用的 worker 作答);前端在 message_end 事件
+    读取 citations 存入 store。
+    """
+    final_message = AIMessage(
+        content="评估完成",
+        # 键必须用 core 的 REFERENCES_METADATA_KEY("references"),
+        # 与 _attach_references / _api_citations 的读写一致
+        # (test_chat_api 同款口径)。
+        additional_kwargs={
+            "references": [
+                {
+                    "document_id": "ml-zhouzhihua",
+                    "source": "ml-zhouzhihua",
+                    "page": 88,
+                    "chunk_id": "ml-zhouzhihua:88:0:500",
+                }
+            ]
+        },
+    )
+    final_events = [
+        RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=0,
+            session_id="session-1",
+            agent="supervisor",
+        ),
+        RunEvent(
+            event_type=EventType.RUN_COMPLETED,
+            sequence=1,
+            session_id="session-1",
+            success=True,
+        ),
+    ]
+    graph = StreamingChatGraph(
+        {
+            "messages": [HumanMessage(content="请评估"), final_message],
+            "events": final_events,
+            "current_agent": "supervisor",
+        },
+        intermediate_state={"events": [], "messages": []},
+        run_delay=0.0,
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream(app, {"session_id": "session-1", "message": "请评估"})
+        )
+    finally:
+        store.close()
+
+    message_end_frames = [
+        frame for frame in frames if frame["event_type"] == "message_end"
+    ]
+    assert message_end_frames
+    assert message_end_frames[-1]["citations"] == [
+        {
+            "document_id": "ml-zhouzhihua",
+            "source": "ml-zhouzhihua",
+            "page": 88,
+            "chunk_id": "ml-zhouzhihua:88:0:500",
+        }
+    ]
+    assert frames[-1]["event_type"] == "done"

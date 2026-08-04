@@ -405,3 +405,43 @@ test("a history fetch failure after a successful stream does not trigger the syn
   assert.ok(state.requestError instanceof ApiClientError);
   assert.equal(state.isStreaming, false);
 });
+
+test("streamSendMessage stores references from the message_end event", async () => {
+  // D3-T5:流式主通道的引用由 message_end 事件的 citations 携带
+  // (review blocking 修复:此前流式路径从不设置 references,引用在
+  // 真实使用中不可达)。未携带时保持 null。
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent }) => {
+      onEvent({
+        agent: "learning_assistant",
+        citations: [
+          {
+            chunk_id: "ml-zhouzhihua:88:0:500",
+            document_id: "ml-zhouzhihua",
+            page: 88,
+            source: "ml-zhouzhihua",
+          },
+        ],
+        content: "带引用的回答",
+        event_type: "message_end",
+        sequence: 1,
+        session_id: "session-1",
+      });
+      onEvent({ event_type: "done", sequence: 2, session_id: "session-1" });
+    },
+  });
+
+  store.getState().selectSession("session-1");
+  await store.getState().streamSendMessage("请检索");
+
+  const state = store.getState();
+  assert.deepEqual(state.references, [
+    {
+      chunk_id: "ml-zhouzhihua:88:0:500",
+      document_id: "ml-zhouzhihua",
+      page: 88,
+      source: "ml-zhouzhihua",
+    },
+  ]);
+  assert.equal(state.isStreaming, false);
+});
