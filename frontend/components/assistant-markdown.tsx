@@ -4,7 +4,9 @@ import { Component, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { CodeBlock, textFromChildren } from "./code-block";
 
 // 数学公式渲染说明(KaTeX):
 // - remark-math 把行内 $...$ 与块级 $$...$$ 解析成 math 节点;
@@ -62,7 +64,9 @@ export function AssistantMarkdown({ content }: AssistantMarkdownProps) {
   return (
     <MarkdownErrorBoundary content={content}>
       <ReactMarkdown
-        remarkPlugins={[remarkMath]}
+        // remark-gfm:GFM 表格(| a | b |)在 CommonMark 下不解析,
+        // D3-T3 表格样式依赖它(D3-T3 补装依赖,测试锁定)。
+        remarkPlugins={[remarkGfm, remarkMath]}
         // 顺序:先 KaTeX 后代码高亮,互不干扰。rehype-highlight 跟随
         // ```lang 围栏注入 hljs + language-xxx 类(D3-T2);无语言围栏
         // 的代码块不注入语言类,保持原样式。
@@ -83,11 +87,36 @@ export function AssistantMarkdown({ content }: AssistantMarkdownProps) {
             );
           },
           pre({ children }) {
+            // D3-T3:代码块右上角复制按钮。textFromChildren 提取高亮后
+            // code 的纯文本作为复制内容;pre 的 pt-8 给绝对定位的按钮
+            // 让位(按钮定位在 pre 右上角)。
             return (
-              <pre className="overflow-x-auto rounded-md bg-neutral-900 p-3 text-neutral-50">
-                {children}
-              </pre>
+              <CodeBlock text={textFromChildren(children)}>
+                <pre className="overflow-x-auto rounded-md bg-neutral-900 p-3 pt-8 text-neutral-50">
+                  {children}
+                </pre>
+              </CodeBlock>
             );
+          },
+          table({ children }) {
+            // D3-T3:表格边框/横向滚动。data-slot 供测试与样式锚定。
+            // GFM 表格语法由 remark-gfm 解析(remarkPlugins 已接入,
+            // D3-T3 补装依赖);表头行 bg-muted 作行级区分,表格本身
+            // 用 border 边框分隔单元格。
+            return (
+              <div className="my-3 overflow-x-auto" data-slot="markdown-table">
+                <table className="w-full border-collapse text-body">{children}</table>
+              </div>
+            );
+          },
+          thead({ children }) {
+            return <thead className="bg-muted text-left">{children}</thead>;
+          },
+          th({ children }) {
+            return <th className="border border-border px-3 py-1.5 font-medium">{children}</th>;
+          },
+          td({ children }) {
+            return <td className="border border-border px-3 py-1.5 align-top">{children}</td>;
           },
         }}
         skipHtml

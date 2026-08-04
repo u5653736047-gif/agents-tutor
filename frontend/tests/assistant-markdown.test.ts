@@ -138,3 +138,37 @@ test("assistant Markdown keeps plain fences without language classes", async () 
   assert.doesNotMatch(markup, /language-/);
   assert.match(markup, /&lt;div&gt;plain&lt;\/div&gt;/);
 });
+
+test("assistant Markdown wraps code blocks with a copy button", async () => {
+  const { AssistantMarkdown } = await loadAssistantMarkdown();
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMarkdown, {
+      // 无语言围栏:hljs 不注入 span,代码纯文本在标记中连续出现,
+      // 便于断言“代码文本在按钮文本之外保留”。
+      content: "```\nconst value = 1;\n```",
+    }),
+  );
+
+  assert.match(markup, /data-slot="code-block"/);
+  assert.match(markup, /data-slot="code-copy"/);
+  assert.match(markup, />复制</);
+  assert.match(markup, /const value = 1;/);
+});
+
+test("assistant Markdown renders GFM tables with bordered cells", async () => {
+  // D3-T3:表格组件(table/thead/th/td + data-slot="markdown-table")已
+  // 接入;GFM 表格语法由 remark-gfm 解析(依赖已安装并接入
+  // remarkPlugins,D3-T3 定案——表格验收依赖它)。
+  const { AssistantMarkdown } = await loadAssistantMarkdown();
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMarkdown, {
+      content: "| 名称 | 值 |\n| --- | --- |\n| a | 1 |",
+    }),
+  );
+
+  assert.match(markup, /data-slot="markdown-table"/);
+  assert.match(markup, /<thead/);
+  assert.match(markup, /<th/);
+  assert.match(markup, /<td/);
+  assert.match(markup, /border-border/);
+});
