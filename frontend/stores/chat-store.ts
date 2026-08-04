@@ -70,11 +70,13 @@ export type ChatStore = {
   isLoadingSessions: boolean;
   isSending: boolean;
   isStreaming: boolean;
+  lastSentMessage: string | null;
   loadCurrentSessionMessages(): Promise<void>;
   messages: Message[];
   pendingHandoff: PendingHandoff | null;
   refreshSessions(): Promise<void>;
   requestError: ApiClientError | null;
+  retryLastMessage(): Promise<void>;
   runError: RunError | null;
   selectSession(sessionId: string | null): void;
   sendMessage(message: string): Promise<void>;
@@ -95,6 +97,7 @@ function emptyConversationState() {
     isLoadingMessages: false,
     isSending: false,
     isStreaming: false,
+    lastSentMessage: null,
     messages: [] as Message[],
     pendingHandoff: null,
     runError: null,
@@ -314,7 +317,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
-      set({ isSending: true, requestError: null, events: [] });
+      // D2-T5:发起前记录上一条消息,供失败后的「重新发送」入口使用
+      // (守卫通过才记录;无会话时不覆盖旧值,与既有行为一致)
+      set({ isSending: true, requestError: null, events: [], lastSentMessage: message });
       try {
         const response = await client.sendChat({ message, session_id: sessionId });
         const messages = await client.getSessionMessages(sessionId);
@@ -331,6 +336,20 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         if (get().currentSessionId === sessionId) {
           set({ isSending: false, requestError: asApiClientError(error) });
         }
+      }
+    },
+    // D2-T5:重新发送上一条消息。通道选择与首次发送一致:client 有
+    // 流式能力(streamChatWithRetry / streamChat)时走 streamSendMessage
+    // (当前 UI 主通道),否则走 sendMessage(同步通道,既有降级语义)。
+    retryLastMessage: async () => {
+      const message = get().lastSentMessage;
+      if (!message) {
+        return;
+      }
+      if (client.streamChatWithRetry || client.streamChat) {
+        await get().streamSendMessage(message);
+      } else {
+        await get().sendMessage(message);
       }
     },
     streamSendMessage: async (message) => {
@@ -364,6 +383,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         runError: null,
         streamingAgent: null,
         streamingMessage: null,
+        // D2-T5:流式通道也记录上一条消息(与 sendMessage 同一语义)
+        lastSentMessage: message,
         // events 在 run 开始时重置(与 sendMessage 一致):契约中事件是
         // 本轮增量,累积会让时间线跨 run 交错(review 修正)。
         events: [],

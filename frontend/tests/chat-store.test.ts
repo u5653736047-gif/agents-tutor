@@ -482,3 +482,77 @@ test("decideHandoff with modify forwards the modification fields", async () => {
   assert.equal(store.getState().isDecidingHandoff, false);
   assert.equal(store.getState().requestError, null);
 });
+
+// D2-T5:错误降级 UX——lastSentMessage 记录与 retryLastMessage 重发 ——————
+test("sendMessage records lastSentMessage and retryLastMessage resends it", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const sent: string[] = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async ({ message }) => {
+      sent.push(message);
+      // 第一次失败(网络错误),第二次成功——模拟「失败后重试」
+      if (sent.length === 1) {
+        throw new ApiClientError("网络失败。", { code: null, status: null });
+      }
+      return { events: [], message: assistantMessage, session_id: session.session_id };
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().sendMessage("请重发这条");
+
+  // 发起前已记录,失败后仍保留,便于重试入口使用
+  assert.deepEqual(sent, ["请重发这条"]);
+  assert.equal(store.getState().lastSentMessage, "请重发这条");
+  assert.ok(store.getState().requestError);
+
+  // 未注入流式通道 → retryLastMessage 走 sendMessage(同步通道)重发同一条
+  await store.getState().retryLastMessage();
+  assert.deepEqual(sent, ["请重发这条", "请重发这条"]);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("retryLastMessage without a recorded message does nothing", async () => {
+  const { createChatStore } = await loadChatStore();
+  let sendCount = 0;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => {
+      sendCount += 1;
+      return { events: [], session_id: session.session_id };
+    },
+  });
+
+  // 未发送过任何消息(也无会话):lastSentMessage 为 null,重试为空操作
+  await store.getState().retryLastMessage();
+  assert.equal(sendCount, 0);
+  assert.equal(store.getState().lastSentMessage, null);
+});
+
+test("streamSendMessage also records lastSentMessage", async () => {
+  const { createChatStore } = await loadChatStore();
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+    streamChat: async ({ onEvent }) => {
+      onEvent({ event_type: "message_end", message: assistantMessage, sequence: 1 });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("流式消息");
+
+  assert.equal(store.getState().lastSentMessage, "流式消息");
+  assert.equal(store.getState().isStreaming, false);
+});

@@ -1,6 +1,6 @@
 "use client";
 
-import { LoaderCircle } from "lucide-react";
+import { CircleAlert, LoaderCircle, WifiOff } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
@@ -8,8 +8,10 @@ import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CollaborationPanel } from "@/components/collaboration-panel";
 import { HandoffCard } from "@/components/handoff-card";
+import { Button } from "@/components/ui/button";
 import type { AgentRole } from "@/lib/agent-roles";
-import type { ChatResponse, Message } from "@/lib/api-client";
+import type { ApiClientError, ChatResponse, Message } from "@/lib/api-client";
+import { errorMessageFor } from "@/lib/error-messages";
 import { useChatStore } from "@/stores/chat-store";
 
 function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
@@ -31,6 +33,11 @@ type ConversationContentProps = {
   isSending: boolean;
   isStreaming: boolean;
   messages: Message[];
+  // D2-T5:可选重试回调(重发上一条消息);未提供时不渲染重试按钮
+  onRetry?: () => void;
+  // D2-T5:请求层错误——仅 code===null(网络失败/超时)在消息流内
+  // 显示错误块 + 重试入口;其余码由侧栏统一映射展示
+  requestError?: ApiClientError | null;
   runError: NonNullable<ChatResponse["run_error"]> | null;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
@@ -40,10 +47,16 @@ export function ConversationContent({
   isSending,
   isStreaming,
   messages,
+  onRetry,
+  requestError,
   runError,
   streamingAgent,
   streamingMessage,
 }: ConversationContentProps) {
+  // D2-T5:网络失败/超时(code===null)预设,供消息流下方的网络错误块使用
+  const networkPreset = errorMessageFor(null);
+  const runErrorPreset = runError ? errorMessageFor(runError.error_code) : null;
+
   return (
     <>
       {messages.map((message, index) => {
@@ -97,10 +110,81 @@ export function ConversationContent({
         </article>
       ) : null}
 
-      {runError ? (
-        <p className="text-caption text-destructive" role="alert">
-          本轮执行提示：{runError.message}
-        </p>
+      {runError && runErrorPreset ? (
+        <div
+          className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3"
+          data-slot="run-error"
+          role="alert"
+        >
+          <CircleAlert
+            aria-hidden
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+          />
+          <div className="min-w-0 flex-1">
+            <p className="text-caption font-medium text-destructive">
+              {runErrorPreset.title}
+            </p>
+            <p className="mt-0.5 text-caption text-muted-foreground">
+              {runErrorPreset.detail}
+            </p>
+            {runError.message && runError.message !== runErrorPreset.detail ? (
+              <p className="mt-0.5 text-caption text-muted-foreground/80">
+                {runError.message}
+              </p>
+            ) : null}
+            {onRetry ? (
+              <Button
+                className="mt-2"
+                data-slot="run-error-retry"
+                onClick={onRetry}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {runErrorPreset.action ?? "重试"}
+              </Button>
+            ) : runErrorPreset.action ? (
+              <p className="mt-0.5 text-caption text-muted-foreground/80">
+                {runErrorPreset.action}
+              </p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {/* D2-T5:网络失败/超时(code===null)——消息流下方给出重试入口;
+          其它 requestError 由侧栏映射展示,面板不重复提示 */}
+      {requestError?.code === null ? (
+        <div
+          className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3"
+          data-slot="request-error-network"
+          role="alert"
+        >
+          <WifiOff
+            aria-hidden
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+          />
+          <div className="min-w-0 flex-1">
+            <p className="text-caption font-medium text-destructive">
+              {networkPreset.title}
+            </p>
+            <p className="mt-0.5 text-caption text-muted-foreground">
+              {networkPreset.detail}
+            </p>
+            {onRetry ? (
+              <Button
+                className="mt-2"
+                data-slot="request-error-retry"
+                onClick={onRetry}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {networkPreset.action ?? "重试"}
+              </Button>
+            ) : null}
+          </div>
+        </div>
       ) : null}
 
       {isSending ? (
@@ -122,9 +206,11 @@ export function ConversationPanel() {
   const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
+  const lastSentMessage = useChatStore((state) => state.lastSentMessage);
   const messages = useChatStore((state) => state.messages);
   const pendingHandoff = useChatStore((state) => state.pendingHandoff);
   const requestError = useChatStore((state) => state.requestError);
+  const retryLastMessage = useChatStore((state) => state.retryLastMessage);
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
@@ -157,6 +243,10 @@ export function ConversationPanel() {
             isSending={isSending}
             isStreaming={isStreaming}
             messages={messages}
+            onRetry={
+              lastSentMessage ? () => void retryLastMessage() : undefined
+            }
+            requestError={requestError}
             runError={runError ?? null}
             streamingAgent={streamingAgent}
             streamingMessage={streamingMessage}

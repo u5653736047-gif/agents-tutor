@@ -332,7 +332,7 @@
     出口检查的真实冒烟——本任务环境无法启动双端 + 真实模型调用（需后端服务 +
     Next.js + 真实 DeepSeek key 的完整链路），故不在此处单独联调。
 
-### [ ] D2-T5 错误降级 UX 打磨
+### [x] D2-T5 错误降级 UX 打磨
 
 - 对应总清单：3.3.1（错误处理）、3.2.1
 - 背景：骨架把 run_error 渲染为一行文案（`components/conversation-panel.tsx`

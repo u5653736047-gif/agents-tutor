@@ -4,6 +4,7 @@ import { Archive, Plus } from "lucide-react";
 import { useEffect } from "react";
 
 import { Button } from "@/components/ui/button";
+import { errorMessageFor } from "@/lib/error-messages";
 import { useChatStore } from "@/stores/chat-store";
 
 export function SessionSidebar() {
@@ -18,6 +19,10 @@ export function SessionSidebar() {
   const refreshSessions = useChatStore((state) => state.refreshSessions);
   const selectSession = useChatStore((state) => state.selectSession);
   const sessions = useChatStore((state) => state.sessions);
+  // D2-T5:请求错误统一映射为标题 + 说明(覆盖 ApiErrorCode 与网络失败)
+  const requestErrorPreset = requestError
+    ? errorMessageFor(requestError.code)
+    : null;
 
   useEffect(() => {
     void refreshSessions();
@@ -89,10 +94,19 @@ export function SessionSidebar() {
         })}
       </div>
 
-      {requestError ? (
-        <p className="border-t border-border px-4 py-3 text-caption text-destructive" role="alert">
-          {requestError.message}
-        </p>
+      {requestError && requestErrorPreset ? (
+        <div
+          className="border-t border-border px-4 py-3"
+          data-slot="sidebar-request-error"
+          role="alert"
+        >
+          <p className="text-caption font-medium text-destructive">
+            {requestErrorPreset.title}
+          </p>
+          <p className="mt-0.5 text-caption text-muted-foreground">
+            {requestErrorPreset.detail}
+          </p>
+        </div>
       ) : null}
     </aside>
   );
