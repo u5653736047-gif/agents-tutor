@@ -76,22 +76,26 @@ export function ChatInputContent({
 
 export function ChatInput() {
   const isSending = useChatStore((state) => state.isSending);
-  const sendMessage = useChatStore((state) => state.sendMessage);
+  const isStreaming = useChatStore((state) => state.isStreaming);
+  const streamSendMessage = useChatStore((state) => state.streamSendMessage);
   const [value, setValue] = useState("");
 
   const handleSubmit = () => {
     const message = normalizeMessage(value);
-    if (!message || isSending) {
+    // 流式期间同样锁定输入(与发送中一致):并发重复提交会互相覆盖
+    // 流状态(review 修正——sendMessage 时期只有 isSending,切换流式后
+    // 必须同时看 isStreaming)。
+    if (!message || isSending || isStreaming) {
       return;
     }
 
     setValue("");
-    void sendMessage(message);
+    void streamSendMessage(message);
   };
 
   return (
     <ChatInputContent
-      isSending={isSending}
+      isSending={isSending || isStreaming}
       onChange={setValue}
       onSubmit={handleSubmit}
       value={value}

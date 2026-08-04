@@ -27,14 +27,20 @@ function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
 
 type ConversationContentProps = {
   isSending: boolean;
+  isStreaming: boolean;
   messages: Message[];
   runError: NonNullable<ChatResponse["run_error"]> | null;
+  streamingAgent: AgentRole | null;
+  streamingMessage: Message | null;
 };
 
 export function ConversationContent({
   isSending,
+  isStreaming,
   messages,
   runError,
+  streamingAgent,
+  streamingMessage,
 }: ConversationContentProps) {
   return (
     <>
@@ -67,6 +73,28 @@ export function ConversationContent({
         );
       })}
 
+      {/* 流式气泡:isStreaming 期间渲染,或异常中断后保留已收到内容时继续展示 */}
+      {isStreaming || streamingMessage ? (
+        <article
+          className="flex justify-start"
+          data-message-role="assistant"
+          data-slot="streaming-message"
+        >
+          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground">
+            <AssistantBadge agent={streamingAgent} />
+            <div className="mt-2">
+              <AssistantMarkdown content={streamingMessage?.content ?? ""} />
+            </div>
+            {isStreaming ? (
+              <div className="mt-2 flex items-center gap-2 text-caption text-muted-foreground">
+                <LoaderCircle aria-hidden className="size-4 animate-spin" />
+                正在生成…
+              </div>
+            ) : null}
+          </div>
+        </article>
+      ) : null}
+
       {runError ? (
         <p className="text-caption text-destructive" role="alert">
           本轮执行提示：{runError.message}
@@ -85,13 +113,16 @@ export function ConversationContent({
 
 export function ConversationPanel() {
   const isSending = useChatStore((state) => state.isSending);
+  const isStreaming = useChatStore((state) => state.isStreaming);
   const messages = useChatStore((state) => state.messages);
   const runError = useChatStore((state) => state.runError);
+  const streamingAgent = useChatStore((state) => state.streamingAgent);
+  const streamingMessage = useChatStore((state) => state.streamingMessage);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [isSending, messages, runError]);
+  }, [isSending, isStreaming, messages, runError, streamingAgent, streamingMessage]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -99,8 +130,11 @@ export function ConversationPanel() {
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
           <ConversationContent
             isSending={isSending}
+            isStreaming={isStreaming}
             messages={messages}
             runError={runError ?? null}
+            streamingAgent={streamingAgent}
+            streamingMessage={streamingMessage}
           />
           <div data-slot="conversation-end" ref={endRef} />
         </div>

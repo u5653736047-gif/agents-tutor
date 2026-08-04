@@ -1,4 +1,8 @@
 import type { components, paths } from "@/contracts/api.generated";
+import {
+  streamChat as streamChatImpl,
+  type StreamChatOptions,
+} from "./stream-client";
 
 export type ApiErrorCode = components["schemas"]["ApiErrorCode"];
 export type ChatRequest = components["schemas"]["ChatRequest"];
@@ -45,6 +49,9 @@ export type ApiClient = {
   getSessionMessages(sessionId: string): Promise<Message[]>;
   listSessions(includeArchived?: boolean): Promise<Session[]>;
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
+  streamChat(
+    options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
+  ): Promise<void>;
 };
 
 export type ApiClientOptions = {
@@ -172,6 +179,16 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       request<ChatResponse>(config, "/chat", {
         body: JSON.stringify(payload),
         method: "POST",
+      }),
+    // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
+    // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
+    streamChat: (options) =>
+      streamChatImpl({
+        baseUrl: config.baseUrl,
+        fetchImpl: config.fetchImpl,
+        timeoutMs: config.timeoutMs,
+        userId: config.userId,
+        ...options,
       }),
   };
 }

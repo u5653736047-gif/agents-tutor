@@ -51,3 +51,9 @@ test("the chat input reserves plain Enter for send and leaves Shift+Enter as a n
   assert.equal(normalizeMessage("  \n  "), null);
   assert.equal(normalizeMessage("  保留输入内容  "), "保留输入内容");
 });
+// 注:ChatInput 的 isSending={isSending || isStreaming} 组合逻辑没有
+// 渲染级测试——zustand v5 的 useStore 在 renderToStaticMarkup(SSR)下
+// 用初始 state 快照,setState 不会反映到服务端渲染输出,该断言方式
+// 不可行。组合逻辑由 chat-store-stream.test.ts 的 isStreaming 状态
+// 生命周期用例 + chat-input.test.ts 的 ChatInputContent disabled 用例
+// 间接覆盖(两者合并即该一行表达式的两端)。
