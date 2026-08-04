@@ -257,3 +257,147 @@ test("streamSendMessage without a session records a request error and skips the 
   assert.equal(store.getState().isStreaming, false);
   assert.equal(streamCalled, false);
 });
+
+// ── D1-T3 断线重连与消息补发:重试通道与同步降级 ────────────────────
+
+type StreamChatWithRetryStub = (options: {
+  maxRetries?: number;
+  message: string;
+  onEvent(event: unknown): void;
+  sessionId: string;
+}) => Promise<void>;
+
+// 注入 streamChatWithRetry 的 store 构造(重试语义由 stub 自持,
+// store 只负责委托与收尾,见 streamSendMessage 的 D1-T3 分支)。
+async function createRetryStreamStore(overrides: {
+  getSessionMessages?: () => Promise<unknown[]>;
+  sendChat?: () => Promise<unknown>;
+  streamChatWithRetry?: StreamChatWithRetryStub;
+}) {
+  const { createChatStore } = await loadChatStore();
+  return createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: (overrides.getSessionMessages ??
+      (async () => [])) as ApiClient["getSessionMessages"],
+    listSessions: async () => [session],
+    sendChat: (overrides.sendChat ??
+      (async () => ({ events: [], session_id: session.session_id }))) as ApiClient["sendChat"],
+    streamChatWithRetry: overrides.streamChatWithRetry,
+  });
+}
+
+test("streamSendMessage falls back to the sync channel after retries are exhausted", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const failure = new ApiClientError("流式通道重试耗尽。", { code: null, status: null });
+  let sendChatCalls = 0;
+  const store = await createRetryStreamStore({
+    getSessionMessages: async () => [assistantMessage],
+    sendChat: async () => {
+      sendChatCalls += 1;
+      return { events: [], message: assistantMessage, session_id: session.session_id };
+    },
+    streamChatWithRetry: async () => {
+      throw failure;
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("会降级的请求");
+
+  const state = store.getState();
+  assert.equal(state.isStreaming, false);
+  // 降级提示被设置,且同步通道确实被调用(sendMessage 拉全量后消息一致)。
+  assert.equal(
+    state.degradedNotice,
+    "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
+  );
+  assert.equal(sendChatCalls, 1);
+  assert.deepEqual(state.messages, [assistantMessage]);
+});
+
+test("streamSendMessage finishes normally via the retry channel after internal recovery", async () => {
+  // 语义:重试循环在 streamChatWithRetry(stream-client)内部,store
+  // 只调用一次委托方法——stub 模拟「内部已恢复」:首次尝试收到
+  // seq=5 后中断,重试成功 message_end + done 收尾(单次委托调用
+  // 内自持)。store 侧断言:正常收尾(不降级、不报错、消息并入)。
+  let messagesAtHistoryFetch: unknown = null;
+  const store = await createRetryStreamStore({
+    // 拉权威历史的一刻读取 messages:验证流式消息已并入
+    getSessionMessages: async () => {
+      messagesAtHistoryFetch = store.getState().messages;
+      return [assistantMessage];
+    },
+    streamChatWithRetry: async ({ fromSequence, onEvent }) => {
+      // 首次尝试:收到 seq=5 的事件后流中断,内部重试续传
+      // (fromSequence 由 stream-client 维护,stub 只需演示语义)。
+      assert.equal(fromSequence, undefined); // store 不传 fromSequence(默认 0)
+      onEvent({
+        agent: "supervisor",
+        event_type: "thinking",
+        sequence: 5,
+        session_id: session.session_id,
+      });
+      onEvent({
+        content: "重连后的回答",
+        event_type: "message_end",
+        sequence: 6,
+        session_id: session.session_id,
+      });
+      onEvent({ event_type: "done", sequence: 7, session_id: session.session_id });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("会中断的请求");
+
+  const state = store.getState();
+  assert.equal(state.isStreaming, false);
+  assert.equal(state.requestError, null);
+  assert.equal(state.degradedNotice, null);
+  // 流式消息并入消息列表后再拉权威历史,消息一致。
+  assert.deepEqual(
+    (messagesAtHistoryFetch as Array<{ content: string }>).map((item) => item.content),
+    ["重连后的回答"],
+  );
+  assert.deepEqual(state.messages, [assistantMessage]);
+});
+
+test("a history fetch failure after a successful stream does not trigger the sync fallback", async () => {
+  // review 修正回归:流式成功后的拉权威历史失败 ≠ 流式通道失败——
+  // 若落入降级分支会 sendMessage 重发同一条已送达消息,造成历史重复。
+  // 正确行为:只设 requestError,不降级、不重发(sendChat 不被调用)。
+  const { ApiClientError } = await loadApiClient();
+  const historyFailure = new ApiClientError("拉取历史失败。", {
+    code: null,
+    status: null,
+  });
+  let sendChatCalls = 0;
+  const store = await createRetryStreamStore({
+    getSessionMessages: async () => {
+      throw historyFailure;
+    },
+    sendChat: async () => {
+      sendChatCalls += 1;
+      return { events: [], message: assistantMessage, session_id: session.session_id };
+    },
+    streamChatWithRetry: async ({ onEvent }) => {
+      onEvent({
+        content: "已送达的回答",
+        event_type: "message_end",
+        sequence: 1,
+        session_id: session.session_id,
+      });
+      onEvent({ event_type: "done", sequence: 2, session_id: session.session_id });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("已送达的请求");
+
+  const state = store.getState();
+  assert.equal(sendChatCalls, 0, "history failure must not re-send the message");
+  assert.equal(state.degradedNotice, null);
+  assert.ok(state.requestError instanceof ApiClientError);
+  assert.equal(state.isStreaming, false);
+});

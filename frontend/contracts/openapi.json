@@ -1059,9 +1059,20 @@
     },
     "/chat/stream": {
       "post": {
-        "description": "SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。",
+        "description": "SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端\n回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新\n消息,启动新 run。",
         "operationId": "chat_stream_chat_stream_post",
         "parameters": [
+          {
+            "in": "query",
+            "name": "from_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "From Sequence",
+              "type": "integer"
+            }
+          },
           {
             "in": "header",
             "name": "x-user-id",

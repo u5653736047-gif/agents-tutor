@@ -39,6 +39,11 @@ export interface paths {
          *
          *     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
          *     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
+         *
+         *     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
+         *     sequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端
+         *     回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新
+         *     消息,启动新 run。
          */
         post: operations["chat_stream_chat_stream_post"];
         delete?: never;
@@ -614,7 +619,9 @@ export interface operations {
     };
     chat_stream_chat_stream_post: {
         parameters: {
-            query?: never;
+            query?: {
+                from_sequence?: number;
+            };
             header?: {
                 "x-user-id"?: string | null;
             };

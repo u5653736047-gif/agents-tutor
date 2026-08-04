@@ -1,7 +1,9 @@
 import type { components, paths } from "@/contracts/api.generated";
 import {
   streamChat as streamChatImpl,
+  streamChatWithRetry as streamChatWithRetryImpl,
   type StreamChatOptions,
+  type StreamRetryOptions,
 } from "./stream-client";
 
 export type ApiErrorCode = components["schemas"]["ApiErrorCode"];
@@ -51,6 +53,15 @@ export type ApiClient = {
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
+  ): Promise<void>;
+  // D1-T3:断线重连与消息补发——指数退避重试 + fromSequence 续传。
+  // 重试参数(maxRetries 等)由调用方传入;baseUrl/userId/fetchImpl/
+  // timeoutMs 等基础设施配置与 streamChat 一样由注入配置填充。
+  streamChatWithRetry(
+    options: Omit<
+      StreamChatOptions & StreamRetryOptions,
+      "baseUrl" | "fetchImpl" | "userId"
+    >,
   ): Promise<void>;
 };
 
@@ -184,6 +195,16 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>
       streamChatImpl({
+        baseUrl: config.baseUrl,
+        fetchImpl: config.fetchImpl,
+        timeoutMs: config.timeoutMs,
+        userId: config.userId,
+        ...options,
+      }),
+    // D1-T3 重试版流式对话:同样由注入配置填充基础设施参数,额外支持
+    // 断线重连(指数退避 + fromSequence 续传,实现见 stream-client)。
+    streamChatWithRetry: (options) =>
+      streamChatWithRetryImpl({
         baseUrl: config.baseUrl,
         fetchImpl: config.fetchImpl,
         timeoutMs: config.timeoutMs,

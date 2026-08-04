@@ -280,3 +280,208 @@ test("a caller abort wins over an imminent timeout", async () => {
 
   await done;
 });
+
+test("streamChatWithRetry retries when the stream closes without a done frame", async () => {
+  const { streamChatWithRetry } = await loadStreamClient();
+  const received: Array<{ event_type: string }> = [];
+  let fetchCalls = 0;
+  const fetchImpl: typeof fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      // 第一次:推送一帧(无 done)后流正常关闭——服务端截断,
+      // 消息可能未送达,必须重试续传(review 修正)。
+      return sseResponse([
+        frame(
+          JSON.stringify({
+            agent: "supervisor",
+            event_type: "thinking",
+            sequence: 1,
+            session_id: "session-1",
+          }),
+        ),
+      ]);
+    }
+    // 第二次:补发剩余事件并以 done 收尾。
+    return sseResponse([
+      frame(
+        JSON.stringify({
+          content: "完整回答",
+          event_type: "message_end",
+          sequence: 2,
+          session_id: "session-1",
+        }),
+      ),
+      frame(
+        JSON.stringify({
+          event_type: "done",
+          sequence: 3,
+          session_id: "session-1",
+        }),
+      ),
+    ]);
+  };
+
+  await streamChatWithRetry({
+    ...streamOptions(fetchImpl),
+    baseDelayMs: 5,
+    maxRetries: 2,
+    onEvent: (event) => received.push(event),
+  });
+
+  assert.equal(fetchCalls, 2);
+  assert.deepEqual(
+    received.map((event) => event.event_type),
+    ["thinking", "message_end", "done"],
+  );
+});
+
+// ── D1-T3 断线重连与消息补发:streamChatWithRetry ───────────────────
+
+test("streamChatWithRetry retries with an increasing fromSequence after a mid-stream failure", async () => {
+  const { streamChatWithRetry } = await loadStreamClient();
+  const received: Array<{ event_type: string; sequence: number }> = [];
+  const urls: string[] = [];
+  let fetchCalls = 0;
+  const fetchImpl: typeof fetch = async (input) => {
+    fetchCalls += 1;
+    urls.push(String(input));
+    if (fetchCalls === 1) {
+      // 第一次:推送一帧后流中断(controller.error 模拟网络中断),
+      // 客户端已收到 seq=1,重试应携带 from_sequence=1 续传。
+      // 注意 error 必须异步触发:同步 enqueue + error 会让第一个
+      // read() 直接抛错,seq=1 交付不到(重试的 from_sequence 会退
+      // 回 0);setTimeout 保证「帧先交付、中断随后」。
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              frame(
+                JSON.stringify({
+                  agent: "supervisor",
+                  event_type: "thinking",
+                  sequence: 1,
+                  session_id: "session-1",
+                }),
+              ),
+            ),
+          );
+          setTimeout(() => controller.error(new Error("network interrupted")), 0);
+        },
+      });
+      return new Response(body, {
+        headers: { "Content-Type": "text/event-stream" },
+        status: 200,
+      });
+    }
+    // 第二次:正常返回剩余事件(sequence 更大)并收尾。
+    return sseResponse([
+      frame(
+        JSON.stringify({
+          agent: "supervisor",
+          event_type: "tool_call",
+          sequence: 2,
+          session_id: "session-1",
+          tool_name: "web_search",
+        }),
+      ),
+      frame(
+        JSON.stringify({
+          event_type: "done",
+          sequence: 3,
+          session_id: "session-1",
+        }),
+      ),
+    ]);
+  };
+
+  await streamChatWithRetry({
+    ...streamOptions(fetchImpl),
+    baseDelayMs: 5,
+    maxRetries: 2,
+    onEvent: (event) => received.push(event),
+  });
+
+  // 重试请求携带递增的 from_sequence(首次 0,续传 1)。
+  assert.equal(fetchCalls, 2);
+  assert.ok(urls[0]?.includes("from_sequence=0"), `unexpected first url: ${urls[0]}`);
+  assert.ok(urls[1]?.includes("from_sequence=1"), `unexpected retry url: ${urls[1]}`);
+  // 首次收到的 seq=1 与重试后的 seq=2/3 全部交付,不丢事件。
+  assert.deepEqual(
+    received.map((event) => event.sequence),
+    [1, 2, 3],
+  );
+});
+
+test("streamChatWithRetry gives up after maxRetries and rethrows", async () => {
+  const { streamChatWithRetry } = await loadStreamClient();
+  const { ApiClientError } = await loadApiClient();
+  let fetchCalls = 0;
+  const fetchImpl: typeof fetch = async () => {
+    fetchCalls += 1;
+    // 每次都在读取阶段中断(流 error),模拟持续的网络故障。
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("network down"));
+      },
+    });
+    return new Response(body, {
+      headers: { "Content-Type": "text/event-stream" },
+      status: 200,
+    });
+  };
+
+  await assert.rejects(
+    streamChatWithRetry({
+      ...streamOptions(fetchImpl),
+      baseDelayMs: 5,
+      maxRetries: 2,
+      onEvent: () => {
+        assert.fail("no event should be delivered for a failing stream");
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiClientError);
+      assert.match(error.message, /读取流式响应失败/);
+      return true;
+    },
+  );
+  // 初次尝试 + 2 次重试 = 3 次调用。
+  assert.equal(fetchCalls, 3);
+});
+
+test("streamChatWithRetry does not retry after a caller abort", async () => {
+  const { streamChatWithRetry } = await loadStreamClient();
+  const caller = new AbortController();
+  let fetchCalls = 0;
+  const fetchImpl: typeof fetch = (_url, init) => {
+    fetchCalls += 1;
+    return new Promise<Response>((resolve) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("aborted", "AbortError"));
+          });
+        },
+      });
+      resolve(
+        new Response(body, {
+          headers: { "Content-Type": "text/event-stream" },
+          status: 200,
+        }),
+      );
+    });
+  };
+
+  const done = streamChatWithRetry({
+    ...streamOptions(fetchImpl),
+    baseDelayMs: 5,
+    maxRetries: 2,
+    onEvent: () => {},
+    signal: caller.signal,
+  });
+  setTimeout(() => caller.abort(), 10);
+
+  await done; // 取消是正常路径:resolve 且不重试
+  assert.equal(fetchCalls, 1);
+});

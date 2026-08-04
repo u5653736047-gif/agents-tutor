@@ -1,4 +1,4 @@
-"""SSE 事件级流式聊天端点(D1-T1)。
+"""SSE 事件级流式聊天端点(D1-T1,D1-T3 断线重连与消息补发)。
 
 与 POST /chat 的差异:POST /chat 在一个请求内等待完整 run 结束并返回
 最终契约;本端点把 run 放到后台线程,事件按 sequence 增量通过 SSE
@@ -8,6 +8,14 @@
 (CollaborativeAgentGraph.run 一次性跑完一轮),没有 token 流可暴露;
 可流式化的粒度是运行事件(RunEvent),由 checkpoint 的 get_state 轮询
 增量读取。thinking 事件只带固定占位文本,message_end 一次性携带全文。
+
+D1-T3 断线重连与消息补发:客户端可在查询参数传 from_sequence
+(上次收到的最新 sequence)。若 checkpoint 中已存在比 from_sequence
+更新的运行事件且最近一轮已结束(最后事件是终态),本端点直接回放
+剩余事件 + done,不启动新 run(避免断线重试导致整轮重复执行);
+否则按正常路径启动新 run。sequence 跨轮次全局递增(core 侧 events
+通道跨轮累积),回放只对 from_sequence > 0 生效——正常发新消息时
+默认 from_sequence=0 必须启动新 run,否则会把上一轮误判为重连回放。
 
 事件安全红线(与 api/chat.py 同口径):
 - tool_call / tool_result 事件只含工具名、成功与否、耗时等摘要,
@@ -28,7 +36,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -51,6 +59,8 @@ from api.schemas import (
     StreamEventType,
 )
 from api.sessions import current_user_id
+from core.events import EventType
+from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionStore
 from core.state import AgentState
@@ -177,19 +187,70 @@ async def _stream_events(
     request: Request,
     user_id: str | None,
     active_session_lock: asyncio.Lock,
+    from_sequence: int = 0,
 ) -> AsyncIterator[str]:
     """SSE 生成器:锁内启动后台 run,轮询增量事件,收尾推送 message_end + done。
 
     会话锁在生成器内持有(而不是路由函数内):锁必须覆盖整个流式
     推送期间,才能让并发的第二次请求在 locked() 检查时命中 session_busy。
+
+    from_sequence(D1-T3):客户端断线重连时传「上次收到的最新 sequence」。
+    若 checkpoint 已存在比 from_sequence 更新的终态轮次,直接回放剩余
+    事件 + done,不启动新 run;否则正常启动新 run(默认 0 表示发新消息,
+    必须启动新 run——回放仅对 from_sequence > 0 生效,见模块 docstring)。
     """
     async with active_session_lock:
         await run_in_threadpool(
             _ensure_session, session_store, payload.session_id, user_id
         )
-        previous_state = await run_in_threadpool(
+        # 只读一次 checkpoint:回放检查与正常路径的 previous_state 共用
+        # 同一份状态,避免重复取(两者本就要求同一时刻的快照)。
+        current_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id
         )
+        events: list[CoreRunEvent] = (
+            [] if current_state is None else current_state.get("events", [])
+        )
+        last_event = events[-1] if events else None
+        if (
+            from_sequence > 0
+            and last_event is not None
+            and last_event.event_type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED)
+            and last_event.sequence > from_sequence
+        ):
+            # D1-T3 回放:上次连接中断后重连——最近一轮已结束(最后事件
+            # 是终态)且存在比 from_sequence 更新的运行事件,直接回放
+            # 剩余事件 + done,不启动新 run(避免重复执行)。回放路径
+            # 不合成 message_end 全文:前端在 done 后调用历史接口拉
+            # 权威消息(D1-T3 验收「重连后回放剩余事件并以 done 收尾」)。
+            for event in _public_events(events, from_sequence):
+                if event.event_type in (
+                    StreamEventType.MESSAGE_END,
+                    StreamEventType.DONE,
+                ):
+                    # 与正常流一致:终态不推映射版(message_end 的全文
+                    # 与 done 由收尾统一合成,回放路径只合成 done)。
+                    continue
+                yield _sse_frame(
+                    _stream_event_from_run_event(event, payload.session_id)
+                )
+            # done 的 sequence 必须大于「真实终态序列」:公开事件序列
+            # 可能有间隙(TASK_RESULTS_AGGREGATED 等被 EVENT_TYPE_MAP
+            # 过滤),用 events[-1].sequence + 1 而非 last_sequence + 1
+            # (review 修正)——保证调用方把 done.sequence 传回时,回放
+            # 条件「终态 > from_sequence」必然不成立,下一条消息正常
+            # 启动新 run,不会被误判为回放而静默吞掉。
+            done_sequence = last_event.sequence + 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.DONE,
+                    sequence=done_sequence,
+                    session_id=payload.session_id,
+                )
+            )
+            return
+
+        previous_state = current_state
         last_sequence = _previous_sequence(previous_state)
         previous_count = _previous_message_count(previous_state)
         background_task = asyncio.create_task(
@@ -294,11 +355,17 @@ async def chat_stream(
     payload: ChatRequest,
     request: Request,
     user_id: Annotated[str | None, Depends(current_user_id)],
+    from_sequence: int = Query(default=0, ge=0),
 ) -> Response:
     """SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。
 
     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
+
+    from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
+    sequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端
+    回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新
+    消息,启动新 run。
     """
     graph = _graph(request)
     session_store = _session_store(request)
@@ -320,6 +387,7 @@ async def chat_stream(
             request,
             user_id,
             active_session_lock,
+            from_sequence,
         ),
         media_type="text/event-stream",
         headers={

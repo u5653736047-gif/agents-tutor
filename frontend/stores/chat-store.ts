@@ -19,6 +19,10 @@ type ChatStoreClient = Pick<
 > & {
   // 可选:既有测试注入的 stub 未实现流式通道,正式 apiClient 一定实现
   streamChat?: ApiClient["streamChat"];
+  // D1-T3:断线重连通道(指数退避重试 + fromSequence 续传)。store 优先
+  // 使用它;未注入(旧测试 stub)时退回底层 streamChat,失败不降级
+  // (保持 D1-T1 行为)。
+  streamChatWithRetry?: ApiClient["streamChatWithRetry"];
 };
 type PendingHandoff = PendingHandoffResponse["pending_handoff"];
 type RunError = ChatResponse["run_error"];
@@ -26,12 +30,17 @@ type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
 type AgentRole = components["schemas"]["AgentRole"];
 
+// D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
+// streamChatWithRetry 的 maxRetries;耗尽后降级到同步通道。
+const _STREAM_RETRY_LIMIT = 3;
+
 export type ChatStore = {
   archiveSession(sessionId: string): Promise<void>;
   clearConversationState(): void;
   clearRequestError(): void;
   createSession(): Promise<Session | null>;
   currentSessionId: string | null;
+  degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
   isLoadingMessages: boolean;
   isLoadingSessions: boolean;
@@ -53,6 +62,7 @@ export type ChatStore = {
 
 function emptyConversationState() {
   return {
+    degradedNotice: null as string | null,
     events: [] as (RunEvent | StreamEvent)[],
     isLoadingMessages: false,
     isSending: false,
@@ -185,7 +195,11 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
-      if (!client.streamChat) {
+      // D1-T3:优先走带断线重连的通道(指数退避 + fromSequence 续传);
+      // 未注入重试通道的旧 stub 退回底层 streamChat(D1-T1 行为不变)。
+      const retryStream = client.streamChatWithRetry;
+      const plainStream = client.streamChat;
+      if (!retryStream && !plainStream) {
         // 注入的 client 未实现流式通道(仅测试 stub 场景),明确报错,不静默降级
         set({
           isStreaming: false,
@@ -205,53 +219,62 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         streamingMessage: null,
       });
 
+      // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
+      const dispatch = (event: StreamEvent) => {
+        // 旧会话的流事件不回写新会话状态(与 sendMessage 的会话守卫一致)
+        if (get().currentSessionId !== sessionId) {
+          return;
+        }
+        switch (event.event_type) {
+          case "thinking":
+            // thinking 的 content 只是占位文本,不进消息体,仅更新当前 agent
+            set({ streamingAgent: event.agent ?? null });
+            break;
+          case "tool_call":
+          case "tool_result":
+            // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)
+            set((state) => ({ events: [...state.events, event] }));
+            break;
+          case "agent_switch":
+            set({ streamingAgent: event.agent ?? null });
+            break;
+          case "message_end": {
+            const streamed: Message = event.message ?? {
+              agent: event.agent ?? undefined,
+              content: event.content ?? "",
+              created_at: undefined,
+              role: "assistant",
+            };
+            set({ streamingMessage: streamed });
+            break;
+          }
+          case "error":
+            set({
+              runError: {
+                agent: event.agent ?? undefined,
+                error_code: event.error_code ?? "internal_error",
+                message: "The request could not be completed.",
+              },
+            });
+            break;
+          case "done":
+            // done 无需处理,await 返回后统一收尾
+            break;
+        }
+      };
+
       try {
-        await client.streamChat({
-          sessionId,
-          message,
-          onEvent: (event) => {
-            // 旧会话的流事件不回写新会话状态(与 sendMessage 的会话守卫一致)
-            if (get().currentSessionId !== sessionId) {
-              return;
-            }
-            switch (event.event_type) {
-              case "thinking":
-                // thinking 的 content 只是占位文本,不进消息体,仅更新当前 agent
-                set({ streamingAgent: event.agent ?? null });
-                break;
-              case "tool_call":
-              case "tool_result":
-                // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)
-                set((state) => ({ events: [...state.events, event] }));
-                break;
-              case "agent_switch":
-                set({ streamingAgent: event.agent ?? null });
-                break;
-              case "message_end": {
-                const streamed: Message = event.message ?? {
-                  agent: event.agent ?? undefined,
-                  content: event.content ?? "",
-                  created_at: undefined,
-                  role: "assistant",
-                };
-                set({ streamingMessage: streamed });
-                break;
-              }
-              case "error":
-                set({
-                  runError: {
-                    agent: event.agent ?? undefined,
-                    error_code: event.error_code ?? "internal_error",
-                    message: "The request could not be completed.",
-                  },
-                });
-                break;
-              case "done":
-                // done 无需处理,await streamChat 返回后统一收尾
-                break;
-            }
-          },
-        });
+        if (retryStream) {
+          await retryStream({
+            sessionId,
+            message,
+            maxRetries: _STREAM_RETRY_LIMIT,
+            onEvent: dispatch,
+          });
+        } else if (plainStream) {
+          // 旧 stub 兼容路径:无重试,失败行为与 D1-T1 一致(不降级)
+          await plainStream({ sessionId, message, onEvent: dispatch });
+        }
 
         // 正常结束:把流式气泡并入消息列表,再拉一次权威历史覆盖
         // (与 sendMessage 的「POST 后拉全量」两段式保持一致)
@@ -265,11 +288,43 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             streamingMessage: null,
           }));
         }
-        await get().loadCurrentSessionMessages();
+        // 拉权威历史失败 ≠ 流式通道失败:只报错,绝不触发降级重发——
+        // 消息已经送达,重发同一条消息会造成历史重复(review 修正)。
+        try {
+          await get().loadCurrentSessionMessages();
+        } catch (historyError) {
+          if (get().currentSessionId === sessionId) {
+            set({ requestError: asApiClientError(historyError) });
+          }
+        }
       } catch (error) {
+        // 此处只处理流式通道(streamChatWithRetry / streamChat)抛出的错误
         if (get().currentSessionId === sessionId) {
-          // 保留已流式收到的内容(streamingMessage 不清空),仅标记失败
-          set({ isStreaming: false, requestError: asApiClientError(error) });
+          if (retryStream) {
+            // D1-T3 降级:重试通道耗尽(重试 + 续传均失败)后走同步通道
+            // 保证消息一致。sendMessage 内部「POST + 拉全量」以历史为
+            // 权威,流式残留先并入消息列表再拉全量,不闪失。
+            set({ isStreaming: false, requestError: asApiClientError(error) });
+            set({
+              degradedNotice: "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
+            });
+            const streamed = get().streamingMessage;
+            if (streamed) {
+              set((state) => ({
+                messages: [...state.messages, streamed],
+                streamingMessage: null,
+              }));
+            }
+            try {
+              await get().sendMessage(message);
+            } catch {
+              // sendMessage 内部已处理错误(requestError / 会话守卫),无需再处理
+            }
+          } else {
+            // 旧通道失败:保留已流式收到的内容(streamingMessage 不清空),
+            // 仅标记失败(D1-T1 行为)
+            set({ isStreaming: false, requestError: asApiClientError(error) });
+          }
         }
       } finally {
         // 兜底:任何路径都不让 isStreaming 悬挂;但只在会话未切换时

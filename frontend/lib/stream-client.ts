@@ -18,6 +18,19 @@ export interface StreamChatOptions {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  // D1-T3:断线重连续传起点——上次成功收到的最新事件 sequence。
+  // 服务端据此回放剩余事件 + done,不重复执行整轮;默认 0 表示新消息。
+  fromSequence?: number;
+}
+
+// D1-T3 重连参数:指数退避 + 重试上限。重试期间携带递增的
+// fromSequence(见 streamChatWithRetry),配合服务端回放语义
+// (轮次已结束时重连不重复执行,只补发剩余事件)。
+export interface StreamRetryOptions {
+  maxRetries: number;
+  baseDelayMs?: number; // 首次重试等待,默认 1000ms,之后按 2 的幂翻倍
+  maxDelayMs?: number; // 退避上限,默认 30000ms
+  onRetry?: (attempt: number, error: unknown) => void; // 可选,供 UI 提示
 }
 
 // 为什么手写 SSE 解析而不引入依赖:
@@ -66,6 +79,7 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
   const {
     baseUrl,
     fetchImpl = fetch,
+    fromSequence = 0,
     message,
     onEvent,
     sessionId,
@@ -92,15 +106,18 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     // ── fetch 阶段:响应头返回前,网络错误 / 超时 / 调用方取消在此分流 ──
     let response: Response;
     try {
-      response = await fetchImpl(`${baseUrl}/chat/stream`, {
-        body: JSON.stringify({ message, session_id: sessionId }),
-        headers: {
-          "Content-Type": "application/json",
-          "X-User-Id": userId,
+      response = await fetchImpl(
+        `${baseUrl}/chat/stream?from_sequence=${fromSequence}`,
+        {
+          body: JSON.stringify({ message, session_id: sessionId }),
+          headers: {
+            "Content-Type": "application/json",
+            "X-User-Id": userId,
+          },
+          method: "POST",
+          signal: controller.signal,
         },
-        method: "POST",
-        signal: controller.signal,
-      });
+      );
     } catch {
       if (signal?.aborted) {
         // 调用方取消:正常路径,不抛
@@ -205,5 +222,88 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     // 计时器与监听在此统一清理:覆盖 fetch + 读取全程(review 修正)。
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+// D1-T3:可中断的退避等待。signal abort 时立即返回(不抛错)——调用方
+// 取消后,重试循环继续,下一次 streamChat 会因 signal.aborted 静默返回,
+// 与「取消不重试」的语义衔接(取消优先于任何待执行的重试)。
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    // onAbort 先定义、timeout 后定义:abort 事件最早在同步代码之后
+    // 触发,闭包引用 timeout 时它已初始化(无 TDZ 风险)。
+    const onAbort = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// D1-T3:断线重连与消息补发——指数退避重试 + fromSequence 续传。
+//
+// 语义:
+// - 每次尝试都携带「已收到的最新 sequence」(maxSeen,初始为
+//   options.fromSequence ?? 0),断线重连时服务端回放剩余事件 + done,
+//   不会重复执行整轮;
+// - session_busy(会话忙)/ 超时 / 网络错误都重试:原流未结束时后端
+//   返回 session_busy,退避等待锁释放后重连,自然进入回放补发;
+// - 调用方取消(signal.aborted)不重试,静默返回;
+// - 重试耗尽(maxRetries 次重试后仍失败)原样抛出最后一次错误。
+export async function streamChatWithRetry(
+  options: StreamChatOptions & StreamRetryOptions,
+): Promise<void> {
+  let maxSeen = options.fromSequence ?? 0;
+  let sawDone = false;
+  const wrappedOnEvent: StreamEventCallback = (event) => {
+    maxSeen = Math.max(maxSeen, event.sequence);
+    if (event.event_type === "done") {
+      sawDone = true;
+    }
+    options.onEvent(event);
+  };
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await streamChat({ ...options, fromSequence: maxSeen, onEvent: wrappedOnEvent });
+      // 流关闭但从未收到 done(服务端截断/代理掐断):视为失败,重试
+      // 续传——否则消息可能静默丢失(无 message_end 且不重试、不降级,
+      // review 修正)。调用方取消(abort)时 streamChat 静默返回,不算失败。
+      if (!sawDone && !options.signal?.aborted) {
+        throw new ApiClientError("连接中断:未收到完成事件。", {
+          code: null,
+          status: null,
+        });
+      }
+      return; // 正常收到 done / 流正常结束
+    } catch (error) {
+      if (options.signal?.aborted) {
+        return; // 调用方取消:不重试
+      }
+      if (sawDone) {
+        // 已收到 done 后连接才断:本轮结果已完整交付,重试只会让
+        // 服务端重复执行一轮(review nit 修正)。
+        return;
+      }
+      if (attempt >= options.maxRetries) {
+        throw error; // 重试耗尽:原样抛出,由调用方决定降级策略
+      }
+      options.onRetry?.(attempt + 1, error);
+      await delay(
+        Math.min(
+          (options.baseDelayMs ?? 1000) * 2 ** attempt,
+          options.maxDelayMs ?? 30000,
+        ),
+        options.signal,
+      );
+    }
   }
 }
