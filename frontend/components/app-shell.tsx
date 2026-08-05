@@ -2,11 +2,21 @@
 
 import { CircleCheck, CircleX, Menu, Moon, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore, useState } from "react";
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
+import { isOnboardingSeen, markOnboardingSeen, subscribeOnboarding } from "@/lib/onboarding";
 import { useChatStore } from "@/stores/chat-store";
+
+// D5-T4:空态示例问题——点击后按「建会话 → 流式提问」时序快速开始,
+// 不依赖引导标记,新老用户始终可见。
+const EXAMPLE_QUESTIONS = [
+  "用通俗方式讲解反向传播",
+  "如何规划一条机器学习学习路径",
+  "对比卷积神经网络与全连接网络",
+  "什么是注意力机制",
+];
 
 type AppShellProps = {
   apiConnected: boolean;
@@ -14,6 +24,32 @@ type AppShellProps = {
 
 export function AppShell({ apiConnected }: AppShellProps) {
   const currentSessionId = useChatStore((state) => state.currentSessionId);
+  const createSession = useChatStore((state) => state.createSession);
+  const streamSendMessage = useChatStore((state) => state.streamSendMessage);
+
+  // D5-T4:首次引导「已看过」标记——useSyncExternalStore 读 localStorage 外部
+  // 存储(react-hooks lint 拦截 effect 内 setState,mounted 模式不可用,先例
+  // 见 D4-T6)。getServerSnapshot 恒 false:SSR 首帧与客户端首帧都渲染引导,
+  // 无 hydration mismatch;hydration 后若本地已有标记,订阅者收到变更重渲染
+  // 隐藏引导(React 官方「服务端默认值 + 客户端真实值」模式)。
+  const onboardingSeen = useSyncExternalStore(
+    subscribeOnboarding,
+    isOnboardingSeen,
+    () => false,
+  );
+
+  // D5-T4:示例问题点击时序——先 await createSession()(成功时 currentSessionId
+  // 已就位:chat-store 的 createSession 在 await 返回前同步 set),再流式发送
+  // 问题。失败时 createSession 返回 null 并已写入 requestError(不抛错),此时
+  // 跳过发送,避免无会话的守卫文案覆盖真实失败原因。
+  const startExample = (question: string) => {
+    void (async () => {
+      const session = await createSession();
+      if (session) {
+        void streamSendMessage(question);
+      }
+    })();
+  };
 
   // D4-T5:移动端抽屉状态。初始 false,SSR 首屏不渲染抽屉/遮罩,
   // 开合全部发生在客户端交互之后(SSR 安全)。
@@ -126,13 +162,60 @@ export function AppShell({ apiConnected }: AppShellProps) {
         {currentSessionId ? (
           <ConversationPanel />
         ) : (
-          <div className="flex flex-1 items-center justify-center p-8">
+          <div className="flex flex-1 flex-col items-center justify-center gap-8 overflow-y-auto p-8">
             <div className="max-w-md text-center">
               <p className="text-title font-semibold text-foreground">请选择或新建会话</p>
               <p className="mt-3 text-body text-muted-foreground">
                 从左侧创建一个会话，或选择已有会话后开始对话。
               </p>
             </div>
+
+            {/* D5-T4:示例问题卡——始终展示(不依赖 seen),点击即建会话并提问 */}
+            <section
+              className="w-full max-w-md rounded-lg border border-border bg-card p-5"
+              data-slot="example-questions"
+            >
+              <p className="text-caption font-medium text-foreground">
+                选择一个示例问题快速开始，或手动创建会话
+              </p>
+              <div className="mt-4 grid gap-2">
+                {EXAMPLE_QUESTIONS.map((question) => (
+                  <button
+                    className="rounded-md border border-border px-4 py-2 text-left text-body text-foreground hover:bg-muted"
+                    data-slot="example-question"
+                    key={question}
+                    onClick={() => startExample(question)}
+                    type="button"
+                  >
+                    {question}
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            {/* D5-T4:首次使用三步引导——仅「未看过」时展示;跳过即写入本地标记,
+                事件驱动 useSyncExternalStore 订阅者重渲染隐藏本卡 */}
+            {onboardingSeen ? null : (
+              <section
+                className="w-full max-w-md rounded-lg border border-border bg-card p-5"
+                data-slot="onboarding"
+              >
+                <p className="text-caption font-medium text-foreground">首次使用？三步开始</p>
+                <ol className="mt-3 list-decimal space-y-2 pl-5 text-body text-muted-foreground">
+                  <li>创建会话：点击左侧「新建会话」，或直接选一个示例问题</li>
+                  <li>提问：在输入框描述你的问题，等待多智能体协作回答</li>
+                  <li>查看审批与协作过程：审批卡片确认任务，协作面板看事件时间线</li>
+                </ol>
+                <button
+                  className="mt-4 rounded-md border border-border px-3 py-1.5 text-caption text-muted-foreground hover:bg-muted hover:text-foreground"
+                  data-slot="onboarding-skip"
+                  onClick={markOnboardingSeen}
+                  type="button"
+                >
+                  跳过引导
+                </button>
+              </section>
+            )}
           </div>
         )}
       </section>

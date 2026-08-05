@@ -109,3 +109,34 @@ test("the mobile drawer and overlay carry enter animations", () => {
   // 抽屉:淡入 + 左侧滑入(tw-animate-css slide-in-from-left-2)
   assert.match(source, /animate-in fade-in-0 slide-in-from-left-2/);
 });
+
+// D5-T4:空态引导与示例问题卡的 SSR 断言。useSyncExternalStore 服务端
+// 快照恒 false(getServerSnapshot = () => false),SSR 首帧必渲染示例卡与
+// 引导;「已看过」标记只在客户端 hydration 后生效(React 官方「服务端
+// 默认值 + 客户端真实值」模式)。
+test("the empty state renders example questions and first-use onboarding", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  // 示例问题卡 + 4 个示例问题按钮
+  assert.match(markup, /data-slot="example-questions"/);
+  assert.equal((markup.match(/data-slot="example-question"/g) ?? []).length, 4);
+  // 首次使用引导 + 跳过按钮
+  assert.match(markup, /data-slot="onboarding"/);
+  assert.match(markup, /data-slot="onboarding-skip"/);
+  assert.match(markup, /跳过引导/);
+  // 既有空态标题保留(零回归)
+  assert.match(markup, /请选择或新建会话/);
+});
+
+// D5-T4:示例问题点击时序的源码正则守卫——建会话成功后流式发送问题,
+// 失败(createSession 返回 null)不发送;跳过按钮直接调用 markOnboardingSeen。
+test("example question clicks create a session then stream the question", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  assert.match(source, /const session = await createSession\(\)/);
+  assert.match(source, /if \(session\)/);
+  assert.match(source, /streamSendMessage\(question\)/);
+  // 跳过引导:写入本地标记(事件驱动订阅者重渲染隐藏引导)
+  assert.match(source, /data-slot="onboarding-skip"[^>]*onClick=\{markOnboardingSeen\}/);
+});
