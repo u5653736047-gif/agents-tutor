@@ -10,9 +10,11 @@
     "export:openapi": "cd .. && .\\backend\\.venv\\Scripts\\python.exe .\\scripts\\export_openapi.py",
     "generate:api-types": "openapi-typescript contracts/openapi.json --default-non-nullable=false -o contracts/api.generated.ts",
     "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
     "test:scaffold": "node --test tests/scaffold.test.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/katex": "^0.16.8",
     "@types/node": "^26.1.2",
