@@ -155,6 +155,9 @@ export async function installMocks(
   }
   mockPendingHandoff = options.pendingHandoff ?? null;
   failStreaming = options.failStreaming ?? false;
+  // review nit:会话计数一并重置,避免跨用例 id 递增(不影响正确性,
+  // 仅让「mock-session-1」在用例间稳定可预期)。
+  sessionCounter = 0;
 
   // 注册顺序:先注册最泛的兜底 404,再注册具体路径——Playwright 的
   // route 按「后注册先匹配」(LIFO)处理,具体 handler 后注册才优先
