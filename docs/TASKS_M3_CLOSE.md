@@ -161,8 +161,8 @@ Supervisor 路由/分解 → 助教/助学 Worker 检索教材作答 → 评价 
 ## 出口检查
 
 - [x] H-T1 / H-T2 完成：新部署语义检索可启用、可诊断（/healthz 三态 +
-  启动日志 mode/provider/dimension）；向量噪音实测见 H-T2 完成备注
-  （frontmatter 归类 + 排除语义回归基线）。
+  启动日志 mode/provider/dimension）；向量噪音实测见
+  EMBEDDING_SELECTION.md 5.2 节（frontmatter 归类 + 排除语义回归基线）。
 - [x] 细节清单 D1–D7 全部勾选（38 项，D4-T6/T7 勾选丢失已补），M3 出口
   检查（其第十节）通过（3.1.3 单独立项备注、3.2.4/3.3.3 待 core 口径
   标注、DeepSeek 联调与环境阻塞如实记录）。
