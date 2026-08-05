@@ -75,6 +75,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload File
+         * @description 上传聊天附件(按用户隔离存储),返回受控下载回执。
+         *
+         *     - 扩展名白名单 / 大小上限 / 空文件都在 API 层拦截为 422(大小在
+         *       逐块读取时累计,不能信 Content-Length);
+         *     - 存储目录按 user_key 隔离(消毒后的 X-User-Id,None → anonymous);
+         *       落盘名是 uuid4().hex + 白名单后缀,原始文件名只作展示字段返回;
+         *     - 同步写盘走 run_in_threadpool,不阻塞事件循环;写盘失败(OSError
+         *       等)统一映射 500 internal_error,不泄底层细节。
+         */
+        post: operations["upload_file_files_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/files/{file_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Uploaded File
+         * @description 按受控下载路径提供已上传文件(用户隔离校验)。
+         *
+         *     - file_id 必须是安全段(见 _is_safe_segment),不匹配一律 404;
+         *     - 存储路径 {root}/{user_key}/{file_id}:user_key 由当前 X-User-Id
+         *       消毒得出(与上传同源)——他人目录下的 uuid 文件名不可枚举,
+         *       等价于文件不存在,统一 404(不返回 403,避免泄露目录存在性);
+         *     - media_type 按扩展名映射,与上传响应的 content_type 同源
+         *       (_UPLOAD_CONTENT_TYPES);底层读盘异常映射 500。
+         */
+        get: operations["get_uploaded_file_files__file_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -317,8 +371,34 @@ export interface components {
          * @enum {string}
          */
         ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
+        /**
+         * Attachment
+         * @description 聊天消息附件引用(D7-T1 契约扩展预留)。
+         *
+         *     - file_id / name / content_type / size 由上传回执(FILE-UPLOAD)填充;
+         *     - 骨架期 chat 路由忽略该字段不影响现有行为(见 ChatRequest 注释),由
+         *       D7-T3 或后续 core 能力决定如何进入模型上下文。
+         */
+        Attachment: {
+            /**
+             * Content Type
+             * @default null
+             */
+            content_type?: string | null;
+            /** File Id */
+            file_id: string;
+            /** Name */
+            name: string;
+            /** Size */
+            size: number;
+        };
         /** Body_upload_document_knowledge_documents_post */
         Body_upload_document_knowledge_documents_post: {
+            /** File */
+            file: string;
+        };
+        /** Body_upload_file_files_post */
+        Body_upload_file_files_post: {
             /** File */
             file: string;
         };
@@ -327,6 +407,11 @@ export interface components {
          * @description One synchronous user message for a session.
          */
         ChatRequest: {
+            /**
+             * Attachments
+             * @default null
+             */
+            attachments?: components["schemas"]["Attachment"][] | null;
             /** Message */
             message: string;
             /** Session Id */
@@ -452,6 +537,29 @@ export interface components {
              * @default true
              */
             received?: boolean;
+        };
+        /**
+         * FileUploadResponse
+         * @description 文件上传回执(D7-T1):url 为受控下载的相对路径。
+         *
+         *     - file_id 是服务端生成的 uuid4().hex + 白名单后缀(落盘名),url 形如
+         *       /files/{file_id}——客户端凭 url 即可 GET 下载,url 不含原始文件名
+         *       (后者只作展示字段 name);
+         *     - content_type 由服务端按扩展名映射,不信任客户端伪造的类型;
+         *     - name 是原始文件名(仅展示用;落盘名是 uuid,见 api/files.py 的
+         *       防穿越设计)。
+         */
+        FileUploadResponse: {
+            /** Content Type */
+            content_type: string | null;
+            /** File Id */
+            file_id: string;
+            /** Name */
+            name: string;
+            /** Size */
+            size: number;
+            /** Url */
+            url: string;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -968,6 +1076,110 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FeedbackResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    upload_file_files_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_file_files_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileUploadResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_uploaded_file_files__file_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Unprocessable Entity */
