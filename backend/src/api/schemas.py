@@ -306,6 +306,34 @@ class KnowledgeSearchResponse(ContractModel):
     hits: list[SearchHitDto]
 
 
+class KnowledgeDocumentListEntry(ContractModel):
+    """知识库文档列表条目(只读元数据,不含内容)。
+
+    page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
+    能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+    """
+
+    document_id: str
+    source: str
+    page_count: int | None = None
+    chunk_count: int | None = None
+
+
+class KnowledgeDocumentUploadResponse(ContractModel):
+    """上传解析结果:文档已入库(幂等替换)后的元数据回执。"""
+
+    document_id: str
+    source: str
+    page_count: int | None = None
+    chunk_count: int | None = None
+
+
+class KnowledgeDocumentListResponse(ContractModel):
+    """文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。"""
+
+    documents: list[KnowledgeDocumentListEntry]
+
+
 class TaskPlanStep(ContractModel):
     """One planned worker task."""
 
@@ -393,6 +421,9 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     KnowledgeSearchRequest,
     SearchHitDto,
     KnowledgeSearchResponse,
+    KnowledgeDocumentListEntry,
+    KnowledgeDocumentUploadResponse,
+    KnowledgeDocumentListResponse,
 )
 
 
