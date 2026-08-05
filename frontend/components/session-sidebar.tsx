@@ -4,6 +4,7 @@ import { Archive, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { errorMessageFor } from "@/lib/error-messages";
 import type { ApiClientError, Session } from "@/lib/api-client";
 // D4-T7:会话时间分组(今天 / 近 7 天 / 更早)——纯函数,与组件解耦可测
@@ -150,11 +151,30 @@ export function SessionSidebarContent({
       </div>
 
       <div className="flex-1 overflow-y-auto p-2">
+        {/* D5-T3:加载态骨架——3 条会话行占位(左侧方形占位 + 两行灰条,
+            行高与真实会话行 rounded-md px-3 py-2 对齐,减少切换跳动);
+            isLoadingSessions 结束后三态互斥:有会话渲染列表,无会话走
+            下方「暂无会话」空态。review nit:空态加 !hasQuery 守卫——
+            「暂无会话」与「未找到匹配的会话」两个空态互斥不同屏。 */}
         {isLoadingSessions ? (
-          <p className="px-2 py-3 text-caption text-muted-foreground">正在加载会话…</p>
+          <div className="space-y-1 px-2 py-1">
+            {[0, 1, 2].map((index) => (
+              <div
+                className="flex items-center gap-3 rounded-md px-3 py-2"
+                data-slot="session-skeleton"
+                key={index}
+              >
+                <Skeleton className="size-8 rounded-md" />
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <Skeleton className="h-3 w-3/4" />
+                  <Skeleton className="h-2.5 w-1/2" />
+                </div>
+              </div>
+            ))}
+          </div>
         ) : null}
 
-        {!isLoadingSessions && sessions.length === 0 ? (
+        {!isLoadingSessions && sessions.length === 0 && !hasQuery ? (
           <p
             className="px-2 py-3 text-caption text-muted-foreground"
             data-slot={showArchived ? "archive-empty" : undefined}

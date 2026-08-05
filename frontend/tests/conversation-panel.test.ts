@@ -35,7 +35,9 @@ test("the conversation panel distinguishes messages and shows Agent, error, and 
   assert.match(markup, /用户的问题/);
   assert.match(markup, /助手的回答/);
   assert.match(markup, /Supervisor/);
-  assert.match(markup, /正在生成回答/);
+  // D5-T3:同步路径发送态为骨架气泡(不再渲染「正在生成回答」文案)
+  assert.match(markup, /data-slot="message-skeleton"/);
+  assert.doesNotMatch(markup, /正在生成回答/);
   assert.match(markup, /模型暂时不可用。/);
 });
 
@@ -185,11 +187,11 @@ test("ConversationContent skips message rows when virtualItems is provided", asy
     }),
   );
 
-  // 消息行被跳过(虚拟窗口负责),但尾部块仍在
+  // 消息行被跳过(虚拟窗口负责),但尾部块仍在(发送态骨架气泡)
   assert.doesNotMatch(markup, /不应渲染的全量消息/);
   assert.doesNotMatch(markup, /全量路径才有的回答/);
   assert.doesNotMatch(markup, /data-message-role=/);
-  assert.match(markup, /正在生成回答/);
+  assert.match(markup, /data-slot="message-skeleton"/);
 });
 
 test("the conversation panel virtualizes long message lists behind a threshold", () => {
@@ -300,4 +302,64 @@ test("the enter animation is limited to the newest message in source", () => {
   assert.match(panel, /animate=\{index === messages\.length - 1\}/);
   // 虚拟化分支不带动画类(无 animate= 传参),仅全量分支出现
   assert.equal((panel.match(/animate=\{/g) ?? []).length, 1);
+});
+
+// D5-T3:骨架屏与渐进式内容加载 ————————————————————————
+test("the streaming bubble shows a skeleton before the first stream event", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  // isStreaming=true 且 streamingMessage=null(首事件前):气泡存在,
+  // 内容区为骨架行,不渲染「正在生成…」LoaderCircle 文案
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: true,
+      messages: [],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: null,
+    }),
+  );
+
+  assert.match(markup, /data-slot="streaming-message"/);
+  assert.match(markup, /data-slot="streaming-skeleton"/);
+  assert.doesNotMatch(markup, /data-slot="message-skeleton"/);
+  assert.doesNotMatch(markup, /正在生成/);
+});
+
+test("the streaming bubble switches to real content once the first event arrives", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  // 首事件后 streamingMessage 有内容:真实气泡渲染内容,骨架行消失
+  // (渐进式衔接,无额外切换逻辑)
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: true,
+      messages: [],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: {
+        agent: "supervisor",
+        content: "首段流式内容",
+        role: "assistant",
+      },
+    }),
+  );
+
+  assert.match(markup, /data-slot="streaming-message"/);
+  assert.match(markup, /首段流式内容/);
+  assert.doesNotMatch(markup, /data-slot="streaming-skeleton"/);
+  assert.doesNotMatch(markup, /data-slot="message-skeleton"/);
+});
+
+test("sending and streaming placeholders go through the Skeleton component in source", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  // review 防回归:同步发送态与流式首事件前占位必须走 Skeleton 骨架
+  // (不得回归为「正在生成回答…」等文案),两个 data-slot 可区分测试
+  assert.match(panel, /data-slot="message-skeleton"/);
+  assert.match(panel, /data-slot="streaming-skeleton"/);
+  assert.match(panel, /<Skeleton /);
+  assert.doesNotMatch(panel, /正在生成回答/);
 });

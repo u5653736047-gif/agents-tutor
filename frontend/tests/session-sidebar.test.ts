@@ -242,3 +242,43 @@ test("the sidebar omits section titles for empty groups", async () => {
   assert.doesNotMatch(markup, /data-slot="session-group-today"/);
   assert.doesNotMatch(markup, /data-slot="session-group-recent"/);
 });
+
+// D5-T3:加载态骨架屏 ————————————————————————————————
+test("the sidebar shows session skeletons while loading and keeps the empty state", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  const baseProps = {
+    archiveSession: () => undefined,
+    createSession: () => undefined,
+    currentSessionId: null,
+    isLoadingSessions: true,
+    loadCurrentSessionMessages: () => undefined,
+    onToggleArchived: () => undefined,
+    requestError: null,
+    selectSession: () => undefined,
+    showArchived: false,
+  };
+
+  // 加载态渲染 3 条会话行骨架
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, { ...baseProps, sessions: [] }),
+  );
+  assert.equal(
+    (markup.match(/data-slot="session-skeleton"/g) ?? []).length,
+    3,
+  );
+  // 三态互斥:加载态不出现「暂无会话」空态文案
+  assert.doesNotMatch(markup, /暂无会话/);
+  assert.doesNotMatch(markup, /正在加载会话/);
+});
+
+test("the sidebar loading branch goes through the Skeleton component in source", () => {
+  // review 防回归:isLoadingSessions 分支必须渲染 Skeleton 骨架,
+  // 不得回归为「正在加载会话…」文案
+  const source = readFileSync(
+    new URL("../components/session-sidebar.tsx", import.meta.url),
+    "utf-8",
+  );
+  assert.match(source, /isLoadingSessions \?[\s\S]*?<Skeleton /);
+  assert.doesNotMatch(source, /正在加载会话/);
+});

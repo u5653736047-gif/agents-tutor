@@ -11,6 +11,7 @@ import { CitationList } from "@/components/citation-list";
 import { CollaborationPanel } from "@/components/collaboration-panel";
 import { HandoffCard } from "@/components/handoff-card";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ApiClientError, ChatResponse, Message } from "@/lib/api-client";
 import { errorMessageFor } from "@/lib/error-messages";
@@ -161,10 +162,25 @@ export function ConversationContent({
               <AssistantMarkdown content={streamingMessage?.content ?? ""} />
             </div>
             {isStreaming ? (
-              <div className="mt-2 flex items-center gap-2 text-caption text-muted-foreground">
-                <LoaderCircle aria-hidden className="size-4 animate-spin" />
-                正在生成…
-              </div>
+              // D5-T3:渐进式衔接——首事件前(streamingMessage 为 null)气泡
+              // 内显示两行灰条骨架(data-slot="streaming-skeleton",区别于
+              // 同步路径的 message-skeleton);store 的 streamingMessage
+              // 收到首个增量后组件重渲染,骨架行自然消失切换真实内容
+              // (依赖 D1-T2 流式内容衔接,无额外切换逻辑)。骨架自身
+              // animate-pulse 呼吸,不叠加进入动画。有内容后保留既有
+              // LoaderCircle「正在生成…」指示。review nit:以 null 判定
+              // 「首事件前」,空内容回答不误判为骨架。
+              streamingMessage === null ? (
+                <div className="mt-2 space-y-2" data-slot="streaming-skeleton">
+                  <Skeleton className="h-3 w-full" />
+                  <Skeleton className="h-3 w-4/5" />
+                </div>
+              ) : (
+                <div className="mt-2 flex items-center gap-2 text-caption text-muted-foreground">
+                  <LoaderCircle aria-hidden className="size-4 animate-spin" />
+                  正在生成…
+                </div>
+              )
             ) : null}
           </div>
         </article>
@@ -247,11 +263,23 @@ export function ConversationContent({
         </div>
       ) : null}
 
+      {/* D5-T3:同步路径发送骨架——结构与助手气泡对齐(徽章占位 + 两行
+          文本占位),渐进式:发送中显示骨架,流式首事件到达后切换真实
+          气泡(下方 streaming-message 块);骨架自身 animate-pulse 呼吸,
+          不再叠加 D5-T2 进入动画(两种动画叠加无意义且费电)。 */}
       {isSending ? (
-        <div className="flex items-center gap-2 text-caption text-muted-foreground">
-          <LoaderCircle aria-hidden className="size-4 animate-spin" />
-          正在生成回答…
-        </div>
+        <article className="flex justify-start" data-slot="message-skeleton">
+          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+            <div className="flex items-center gap-2">
+              <Skeleton className="size-5 rounded-full" />
+              <Skeleton className="h-4 w-16" />
+            </div>
+            <div className="mt-3 space-y-2">
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-4/5" />
+            </div>
+          </div>
+        </article>
       ) : null}
     </>
   );
