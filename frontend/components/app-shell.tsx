@@ -1,6 +1,7 @@
 "use client";
 
 import { CircleCheck, CircleX, Menu, Moon, Sun } from "lucide-react";
+import Link from "next/link";
 import { useTheme } from "next-themes";
 import { useCallback, useEffect, useRef, useSyncExternalStore, useState } from "react";
 
@@ -172,6 +173,15 @@ export function AppShell({ apiConnected }: AppShellProps) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {/* D6-T4:知识库检索测试入口(教师端)——独立页面 /knowledge,
+                不经过主会话 store;小链接样式与顶栏辅助文案一致 */}
+            <Link
+              className="text-caption text-muted-foreground hover:text-foreground"
+              data-slot="knowledge-link"
+              href="/knowledge"
+            >
+              知识库
+            </Link>
             <div className="flex items-center gap-2 text-caption text-muted-foreground">
               {apiConnected ? (
                 <CircleCheck aria-hidden className="size-4 text-emerald-600" />

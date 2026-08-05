@@ -182,3 +182,76 @@ test("submitFeedback omits optional fields and normalizes the response", async (
   // 契约 received 默认 true 但可能缺省,归一为严格布尔语义
   assert.equal(result.received, false);
 });
+
+// D6-T4:知识库检索 ———————————————————————————————————————————————
+test("searchKnowledge posts snake_case top_k with the user header and passes hits through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{
+    body: string | null;
+    init: RequestInit | undefined;
+    url: string;
+  }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ body: String(init?.body ?? null), init, url: String(input) });
+      return Response.json({
+        hits: [
+          {
+            summary: "反向传播通过链式法则计算梯度。",
+            citation: {
+              chunk_id: "chunk-1",
+              document_id: "doc-1",
+              page: 3,
+              source: "ml-notes.pdf",
+            },
+            score: 0.87654,
+          },
+        ],
+      });
+    },
+  });
+
+  const result = await client.searchKnowledge({ query: "反向传播", topK: 3 });
+
+  assert.equal(requests[0]?.url, "https://api.example/knowledge/search");
+  assert.equal(requests[0]?.init?.method, "POST");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  // 调用侧 camelCase topK → 契约 snake_case top_k
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    query: "反向传播",
+    top_k: 3,
+  });
+  // 响应 { hits } 直接透传,契约 snake_case 字段原样(与 Session 等先例一致)
+  assert.equal(result.hits[0]?.summary, "反向传播通过链式法则计算梯度。");
+  assert.equal(result.hits[0]?.citation.document_id, "doc-1");
+  assert.equal(result.hits[0]?.citation.page, 3);
+  assert.equal(result.hits[0]?.score, 0.87654);
+});
+
+test("searchKnowledge defaults top_k to 5 and normalizes knowledge_unavailable errors", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (_input, init) => {
+      requests.push({ body: String(init?.body ?? null) });
+      return new Response(
+        JSON.stringify({
+          detail: { error_code: "knowledge_unavailable", message: "知识库未就绪。" },
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 503 },
+      );
+    },
+  });
+
+  await assert.rejects(client.searchKnowledge({ query: "测试" }), (error: unknown) => {
+    assert.ok(error instanceof ApiClientError);
+    assert.equal(error.status, 503);
+    assert.equal(error.code, "knowledge_unavailable");
+    assert.equal(error.message, "知识库未就绪。");
+    return true;
+  });
+  // topK 未传 → 落契约默认 top_k: 5
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { query: "测试", top_k: 5 });
+});

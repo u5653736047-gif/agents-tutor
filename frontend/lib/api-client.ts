@@ -29,6 +29,12 @@ export type FeedbackInput = {
   errorCode?: string;
 };
 export type FeedbackResult = { received: boolean };
+// D6-T4:知识库检索结果——直接取契约 KnowledgeSearchResponse(单一数据源):
+// hits 元素为 SearchHitDto { summary, score, citation },citation 为
+// Citation { document_id, source, page, chunk_id }。响应字段是契约
+// snake_case,request() 不做转换(Session/Message 等先例一致),页面按
+// snake_case 字段直接读取。
+export type KnowledgeSearchResult = components["schemas"]["KnowledgeSearchResponse"];
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -67,6 +73,10 @@ export type ApiClient = {
   // 其它接口一样归一为 ApiClientError,由调用方(FeedbackButtons)
   // 决定呈现方式,不进入主流程错误状态。
   submitFeedback(input: FeedbackInput): Promise<FeedbackResult>;
+  // D6-T4:知识库检索测试(教师端)——独立接口,不进入主会话 store。
+  // 入参 camelCase(query/topK),发送前转契约 snake_case top_k;
+  // 响应 { hits } 直接透传,错误归一为 ApiClientError。
+  searchKnowledge(input: { query: string; topK?: number }): Promise<KnowledgeSearchResult>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
   ): Promise<void>;
@@ -221,6 +231,17 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         }),
         method: "POST",
       }).then((response) => ({ received: response.received ?? false })),
+    // D6-T4:知识库检索——body 按契约 snake_case 发送(topK 未传默认
+    // 5);响应 { hits } 直接透传(不做字段转换);非 200 抛
+    // ApiClientError(含 errorDetail 解析),与其它接口一致。
+    searchKnowledge: (input) =>
+      request<KnowledgeSearchResult>(config, "/knowledge/search", {
+        body: JSON.stringify({
+          query: input.query,
+          top_k: input.topK ?? 5,
+        }),
+        method: "POST",
+      }),
     // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>

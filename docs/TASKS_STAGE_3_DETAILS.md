@@ -766,7 +766,7 @@
   API_KNOWLEDGE_DB_PATH / API_VECTOR_DB_PATH / API_KNOWLEDGE_EMBEDDING
   （auto/hash）。本任务（POST /knowledge/search 端点）仍待实现。
 
-### [ ] D6-T4 前端检索测试面板（教师端）
+### [x] D6-T4 前端检索测试面板（教师端）
 
 - 对应总清单：3.2.3（检索效果测试工具）
 - 背景：无教师端页面；App Router 目前只有首页（`app/page.tsx`）。

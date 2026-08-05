@@ -168,3 +168,25 @@ test("example question clicks create a session then stream the question", () => 
   // 跳过引导:写入本地标记(事件驱动订阅者重渲染隐藏引导)
   assert.match(source, /data-slot="onboarding-skip"[^>]*onClick=\{markOnboardingSeen\}/);
 });
+
+// D6-T4:顶栏知识库入口(教师端)——SSR 渲染 + 源码守卫。链接本身是
+// 纯静态导航(next/link),SSR 直渲可断言;零回归检查顶栏既有元素。
+test("the app shell header links to the knowledge search page", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /data-slot="knowledge-link"/);
+  assert.match(markup, /href="\/knowledge"/);
+  assert.match(markup, />知识库</);
+  // 零回归:既有顶栏元素(连接徽章/主题按钮)仍在
+  assert.match(markup, /后端已连接/);
+  assert.match(markup, /data-slot="theme-toggle"/);
+});
+
+test("the app shell knowledge link uses next/link with muted caption styling", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  assert.match(source, /import Link from "next\/link"/);
+  assert.match(source, /data-slot="knowledge-link"[\s\S]*?href="\/knowledge"/);
+  assert.match(source, /text-caption text-muted-foreground hover:text-foreground/);
+});
