@@ -52,6 +52,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/feedback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Feedback
+         * @description 记录一条用户反馈,返回受理确认。
+         *
+         *     只存脱敏引用字段:record 固定 7 个键,不含消息全文;user_id 为
+         *     None 时落 null(匿名反馈),与会话 API 的匿名语义一致。
+         */
+        post: operations["submit_feedback_feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -271,6 +294,47 @@ export interface components {
          */
         ErrorResponse: {
             detail: components["schemas"]["ErrorDetail"];
+        };
+        /**
+         * FeedbackRating
+         * @description 用户反馈评分方向。
+         * @enum {string}
+         */
+        FeedbackRating: "up" | "down";
+        /**
+         * FeedbackRequest
+         * @description 用户反馈请求体(只收脱敏引用字段,不收消息全文)。
+         */
+        FeedbackRequest: {
+            /**
+             * Comment
+             * @default null
+             */
+            comment?: string | null;
+            /**
+             * Error Code
+             * @default null
+             */
+            error_code?: string | null;
+            /**
+             * Message Id
+             * @default null
+             */
+            message_id?: string | null;
+            rating: components["schemas"]["FeedbackRating"];
+            /** Session Id */
+            session_id: string;
+        };
+        /**
+         * FeedbackResponse
+         * @description 反馈受理确认。
+         */
+        FeedbackResponse: {
+            /**
+             * Received
+             * @default true
+             */
+            received?: boolean;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -650,6 +714,50 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_feedback_feedback_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FeedbackRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FeedbackResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };
