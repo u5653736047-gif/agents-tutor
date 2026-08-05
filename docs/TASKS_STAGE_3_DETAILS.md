@@ -568,7 +568,7 @@
 - 依赖：无。
 - 完成备注：
 
-### [ ] D4-T8 虚拟化与性能（长会话渲染）
+### [x] D4-T8 虚拟化与性能（长会话渲染）
 
 - 对应总清单：3.2.1（虚拟化）
 - 背景：`conversation-panel.tsx` 的 `ConversationContent`（34-84 行）整表
@@ -583,7 +583,13 @@
     （手动记录对比数据到完成备注）。
   - 组件测试：虚拟列表渲染窗口正确、自动滚动开关行为正确。
 - 依赖：无（与 D1/D2 渲染层兼容即可）。
-- 完成备注：
+- 完成备注：选型 `@tanstack/react-virtual`；阈值开关 enabled=messages.length>50
+  （短会话保持全量渲染、长会话虚拟化）；gap:16 与 flex gap-4 对齐（无累积
+  偏差）；estimateSize 96 + measureElement 动态测量；followBottom ref +
+  isNearBottom 纯函数实现「上翻暂停跟随、回底恢复」。性能基准（主线程实测，
+  SSR 语义 500 条消息）：全量渲染 1117.7ms / 165390 字节 vs 虚拟窗口(28 行)
+  53.7ms / 9230 字节 ≈ **20.8×**。组件测试 10 个（scroll-follow 5 + panel 5：
+  短列表全量、阈值正则、MessageRow 窗口与 data-index、虚拟化分支行为级跳过）。
 
 ---
 
