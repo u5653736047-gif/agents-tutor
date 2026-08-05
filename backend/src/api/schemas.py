@@ -78,6 +78,7 @@ class ApiErrorCode(str, Enum):
     SESSION_ALREADY_EXISTS = "session_already_exists"
     SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
+    KNOWLEDGE_UNAVAILABLE = "knowledge_unavailable"
 
 
 class TaskPlanStatus(str, Enum):
@@ -270,6 +271,41 @@ class Citation(ContractModel):
     chunk_id: str
 
 
+class KnowledgeSearchRequest(ContractModel):
+    """知识库检索请求。
+
+    top_k 必须由 API 层校验(Field ge/le)拦截在 422,不得依赖 core
+    的 ValueError 运行时兜底(会变 500);query 的空白拦截与
+    ChatRequest.reject_blank_text 同构(core 对空白 query 抛
+    ValueError,同样要拦在 API 层)。
+    """
+
+    query: str = Field(min_length=1, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def reject_blank_query(cls, value: str) -> str:
+        """Reject whitespace-only queries before they reach the core service."""
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class SearchHitDto(ContractModel):
+    """检索命中的脱敏表示:chunk 摘要(截断)+ 逻辑 source 引用 + 分数。"""
+
+    summary: str
+    citation: Citation
+    score: float
+
+
+class KnowledgeSearchResponse(ContractModel):
+    """检索结果(空库返回空 hits,不报错)。"""
+
+    hits: list[SearchHitDto]
+
+
 class TaskPlanStep(ContractModel):
     """One planned worker task."""
 
@@ -354,6 +390,9 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ChatResponse,
     FeedbackRequest,
     FeedbackResponse,
+    KnowledgeSearchRequest,
+    SearchHitDto,
+    KnowledgeSearchResponse,
 )
 
 

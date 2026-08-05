@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 from api.approvals import router as approval_router
 from api.chat import router as chat_router
 from api.feedback import router as feedback_router
+from api.knowledge import router as knowledge_router
 from api.openapi import install_openapi_contract
 from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
 from api.sessions import router as session_router
@@ -105,6 +106,10 @@ class KnowledgeSearchStack:
     vector_enabled: bool
     vector_provider: str | None = None
     vector_dimension: int | None = None
+    # D6-T3:检索服务实例,随装配结果一起暴露——lifespan 把它挂到
+    # app.state.knowledge_service 供 REST 路由注入(见 api/knowledge.py),
+    # 与 search_knowledge 工具共用同一实例,检索行为一致。
+    service: KnowledgeService | None = None
 
 
 def _embedding_provider_candidates(mode: str) -> list[EmbeddingProvider]:
@@ -213,6 +218,9 @@ def create_knowledge_search_stack(
         vector_enabled=hybrid.vector_enabled,
         vector_provider=vector_provider,
         vector_dimension=vector_dimension,
+        # D6-T3:service 随 stack 暴露,让 lifespan 挂到 app.state 供
+        # REST 检索路由使用(与工具共用同一实例,见 dataclass 注释)。
+        service=service,
     )
 
 
@@ -269,6 +277,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tool_permissions=_KNOWLEDGE_TOOL_PERMISSIONS,
             )
             app.state.session_store = session_store
+            # D6-T3:检索服务挂到 app.state,供 /knowledge/search 路由
+            # 经 get_knowledge_service 依赖注入(见 api/knowledge.py)。
+            # 挂在 try 内:图装配失败时不留下指向已关闭索引的服务。
+            app.state.knowledge_service = knowledge_stack.service
             app.state.retrieval_diagnostics = {
                 "mode": mode,
                 "embedding_provider": knowledge_stack.vector_provider,
@@ -284,6 +296,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.graph = None
             app.state.session_store = None
             app.state.retrieval_diagnostics = None
+            # D6-T3:检索服务一并清空,与「lifespan 未跑时不带知识
+            # 服务」语义一致(路由经 getattr 兜底返回 503)。
+            app.state.knowledge_service = None
 
 
 def create_app() -> FastAPI:
@@ -296,6 +311,7 @@ def create_app() -> FastAPI:
     app.include_router(approval_router)
     app.include_router(session_router)
     app.include_router(feedback_router)
+    app.include_router(knowledge_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
