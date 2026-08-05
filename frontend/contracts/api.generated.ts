@@ -101,6 +101,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/knowledge/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search Knowledge
+         * @description 检索知识库,返回命中的脱敏摘要与逻辑引用。
+         *
+         *     - 空库返回空 hits,不报错(与 core 语义一致);
+         *     - top_k 已被 Pydantic 拦截在 1-10,core 的 ValueError 兜底不会
+         *       触发(见 KnowledgeSearchRequest 注释);
+         *     - service.search 内部异常统一映射 500 internal_error,不泄底层
+         *       细节(与 api/feedback 的存储异常处理同构)。
+         */
+        post: operations["search_knowledge_knowledge_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions": {
         parameters: {
             query?: never;
@@ -204,7 +230,7 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found";
+        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
         /**
          * ChatRequest
          * @description One synchronous user message for a session.
@@ -382,6 +408,32 @@ export interface components {
             task_content: string;
         };
         /**
+         * KnowledgeSearchRequest
+         * @description 知识库检索请求。
+         *
+         *     top_k 必须由 API 层校验(Field ge/le)拦截在 422,不得依赖 core
+         *     的 ValueError 运行时兜底(会变 500);query 的空白拦截与
+         *     ChatRequest.reject_blank_text 同构(core 对空白 query 抛
+         *     ValueError,同样要拦在 API 层)。
+         */
+        KnowledgeSearchRequest: {
+            /** Query */
+            query: string;
+            /**
+             * Top K
+             * @default 5
+             */
+            top_k?: number;
+        };
+        /**
+         * KnowledgeSearchResponse
+         * @description 检索结果(空库返回空 hits,不报错)。
+         */
+        KnowledgeSearchResponse: {
+            /** Hits */
+            hits: components["schemas"]["SearchHitDto"][];
+        };
+        /**
          * Message
          * @description A safe user or assistant message.
          */
@@ -476,6 +528,17 @@ export interface components {
              * @default null
              */
             tool_name?: string | null;
+        };
+        /**
+         * SearchHitDto
+         * @description 检索命中的脱敏表示:chunk 摘要(截断)+ 逻辑 source 引用 + 分数。
+         */
+        SearchHitDto: {
+            citation: components["schemas"]["Citation"];
+            /** Score */
+            score: number;
+            /** Summary */
+            summary: string;
         };
         /**
          * Session
@@ -780,6 +843,57 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    search_knowledge_knowledge_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KnowledgeSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeSearchResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };

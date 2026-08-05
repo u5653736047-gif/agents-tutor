@@ -20,7 +20,8 @@
           "handoff_not_pending",
           "session_already_exists",
           "session_busy",
-          "session_not_found"
+          "session_not_found",
+          "knowledge_unavailable"
         ],
         "title": "ApiErrorCode",
         "type": "string"
@@ -445,6 +446,48 @@
         "title": "HandoffRequest",
         "type": "object"
       },
+      "KnowledgeSearchRequest": {
+        "additionalProperties": false,
+        "description": "知识库检索请求。\n\ntop_k 必须由 API 层校验(Field ge/le)拦截在 422,不得依赖 core\n的 ValueError 运行时兜底(会变 500);query 的空白拦截与\nChatRequest.reject_blank_text 同构(core 对空白 query 抛\nValueError,同样要拦在 API 层)。",
+        "properties": {
+          "query": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "default": 5,
+            "maximum": 10,
+            "minimum": 1,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "KnowledgeSearchRequest",
+        "type": "object"
+      },
+      "KnowledgeSearchResponse": {
+        "additionalProperties": false,
+        "description": "检索结果(空库返回空 hits,不报错)。",
+        "properties": {
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDto"
+            },
+            "title": "Hits",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hits"
+        ],
+        "title": "KnowledgeSearchResponse",
+        "type": "object"
+      },
       "Message": {
         "additionalProperties": false,
         "description": "A safe user or assistant message.",
@@ -694,6 +737,30 @@
           "sequence"
         ],
         "title": "RunEvent",
+        "type": "object"
+      },
+      "SearchHitDto": {
+        "additionalProperties": false,
+        "description": "检索命中的脱敏表示:chunk 摘要(截断)+ 逻辑 source 引用 + 分数。",
+        "properties": {
+          "citation": {
+            "$ref": "#/components/schemas/Citation"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "citation",
+          "score"
+        ],
+        "title": "SearchHitDto",
         "type": "object"
       },
       "Session": {
@@ -1297,6 +1364,68 @@
           }
         },
         "summary": "Healthz"
+      }
+    },
+    "/knowledge/search": {
+      "post": {
+        "description": "检索知识库,返回命中的脱敏摘要与逻辑引用。\n\n- 空库返回空 hits,不报错(与 core 语义一致);\n- top_k 已被 Pydantic 拦截在 1-10,core 的 ValueError 兜底不会\n  触发(见 KnowledgeSearchRequest 注释);\n- service.search 内部异常统一映射 500 internal_error,不泄底层\n  细节(与 api/feedback 的存储异常处理同构)。",
+        "operationId": "search_knowledge_knowledge_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Search Knowledge",
+        "tags": [
+          "knowledge"
+        ]
       }
     },
     "/sessions": {
