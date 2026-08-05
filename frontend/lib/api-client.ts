@@ -35,6 +35,15 @@ export type FeedbackResult = { received: boolean };
 // snake_case,request() 不做转换(Session/Message 等先例一致),页面按
 // snake_case 字段直接读取。
 export type KnowledgeSearchResult = components["schemas"]["KnowledgeSearchResponse"];
+// D6-T6:知识库文档管理——上传回执与列表条目直接取契约(单一数据源):
+// KnowledgeDocumentUploadResponse 与 KnowledgeDocumentListEntry 同构
+// (document_id/source/page_count?/chunk_count?),page_count/chunk_count
+// 可空(txt 无页概念、core 未接清单能力时留空),页面用 "—" 兜底。
+export type KnowledgeDocumentUploadResponse =
+  components["schemas"]["KnowledgeDocumentUploadResponse"];
+export type KnowledgeDocumentListResponse =
+  components["schemas"]["KnowledgeDocumentListResponse"];
+export type KnowledgeDocumentEntry = components["schemas"]["KnowledgeDocumentListEntry"];
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -77,6 +86,16 @@ export type ApiClient = {
   // 入参 camelCase(query/topK),发送前转契约 snake_case top_k;
   // 响应 { hits } 直接透传,错误归一为 ApiClientError。
   searchKnowledge(input: { query: string; topK?: number }): Promise<KnowledgeSearchResult>;
+  // D6-T6:知识库文档管理(上传/列表/删除)——教师端管理页使用。
+  // uploadDocument 走 multipart/form-data(field 名 "file",见 request()
+  // 对 FormData 的处理注释);onProgress 仅回调 0/1 里程碑(fetch 无原生
+  // 上传进度事件,真实百分比需 XMLHttpRequest,本期不做)。
+  deleteDocument(documentId: string): Promise<void>;
+  listDocuments(): Promise<KnowledgeDocumentListResponse>;
+  uploadDocument(
+    file: File,
+    onProgress?: (fraction: number) => void,
+  ): Promise<KnowledgeDocumentUploadResponse>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
   ): Promise<void>;
@@ -142,7 +161,10 @@ async function request<T>(
     Accept: "application/json",
     "X-User-Id": config.userId,
   });
-  if (init.body) {
+  // D6-T6:FormData(文档上传)不设 Content-Type——浏览器会自动带
+  // multipart/form-data; boundary,强设 application/json 会破坏分界
+  // 导致 422。其余 JSON body 保持原行为。
+  if (init.body && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
 
@@ -171,6 +193,13 @@ async function request<T>(
     );
   }
   if (payload === undefined) {
+    // D6-T6:204 No Content(如 DELETE 文档)允许空响应体,不算格式错误。
+    // 注意:该放行是 request() 的全局语义——契约上仅 DELETE 文档返回
+    // 204;若后端对其它接口错误返回 204,原「服务响应格式无效」会被
+    // 静默吞掉(调用方会拿到 undefined),各接口契约约束在服务端。
+    if (response.status === 204) {
+      return undefined as T;
+    }
     throw new ApiClientError("服务响应格式无效。", { code: null, status: response.status });
   }
 
@@ -242,6 +271,37 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         }),
         method: "POST",
       }),
+    // D6-T6:文档上传——body 为 FormData(field 名 "file"),request() 对
+    // FormData 不设 Content-Type(见 request 注释),由浏览器自动带
+    // multipart boundary。onProgress 仅 0/1 里程碑(成功 1、失败回 0),
+    // 页面以「上传中…」禁用态表达进度,不依赖进度回调。
+    uploadDocument: async (file, onProgress) => {
+      onProgress?.(0);
+      try {
+        const body = new FormData();
+        body.append("file", file);
+        const response = await request<KnowledgeDocumentUploadResponse>(
+          config,
+          "/knowledge/documents",
+          { body, method: "POST" },
+        );
+        onProgress?.(1);
+        return response;
+      } catch (error) {
+        onProgress?.(0);
+        throw error;
+      }
+    },
+    // D6-T6:文档清单——GET 直接透传契约响应(documents 数组)。
+    listDocuments: () =>
+      request<KnowledgeDocumentListResponse>(config, "/knowledge/documents"),
+    // D6-T6:删除文档——204 空响应体由 request() 放行(见 request 注释)。
+    deleteDocument: (documentId) =>
+      request<void>(
+        config,
+        `/knowledge/documents/${encodeURIComponent(documentId)}`,
+        { method: "DELETE" },
+      ),
     // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>

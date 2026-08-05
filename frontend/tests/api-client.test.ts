@@ -255,3 +255,120 @@ test("searchKnowledge defaults top_k to 5 and normalizes knowledge_unavailable e
   // topK 未传 → 落契约默认 top_k: 5
   assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { query: "测试", top_k: 5 });
 });
+
+// D6-T6:知识库文档管理 ———————————————————————————————————————————
+test("uploadDocument posts FormData under the file field and passes the parse receipt through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json(
+        {
+          chunk_count: 42,
+          document_id: "doc-1",
+          page_count: 8,
+          source: "ml-notes.pdf",
+        },
+        { status: 201 },
+      );
+    },
+  });
+
+  const file = new File(["hello"], "ml-notes.pdf", { type: "application/pdf" });
+  const progress: number[] = [];
+  const uploaded = await client.uploadDocument(file, (fraction) => progress.push(fraction));
+
+  assert.equal(requests[0]?.url, "https://api.example/knowledge/documents");
+  assert.equal(requests[0]?.init?.method, "POST");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  // body 为 FormData、字段名 "file";Content-Type 不客户端强设(浏览器
+  // 自动带 multipart boundary;强设 application/json 会破坏分界)
+  assert.ok(requests[0]?.init?.body instanceof FormData);
+  assert.equal((requests[0]?.init?.body as FormData).get("file"), file);
+  assert.equal(new Headers(requests[0]?.init?.headers).has("Content-Type"), false);
+  // 响应透传契约字段;进度回调 0 → 1(fetch 无上传进度,仅里程碑)
+  assert.equal(uploaded.document_id, "doc-1");
+  assert.equal(uploaded.source, "ml-notes.pdf");
+  assert.equal(uploaded.page_count, 8);
+  assert.equal(uploaded.chunk_count, 42);
+  assert.deepEqual(progress, [0, 1]);
+});
+
+test("uploadDocument resets the progress milestone when the request fails", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          detail: { error_code: "invalid_request", message: "文件类型或大小不符。" },
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 422 },
+      ),
+  });
+
+  const progress: number[] = [];
+  await assert.rejects(
+    client.uploadDocument(new File(["x"], "bad.exe"), (fraction) => progress.push(fraction)),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiClientError);
+      assert.equal(error.status, 422);
+      assert.equal(error.code, "invalid_request");
+      return true;
+    },
+  );
+  // 失败复位为 0,调用方以「上传中」状态自行收尾
+  assert.deepEqual(progress, [0, 0]);
+});
+
+test("listDocuments GETs /knowledge/documents and passes documents through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        documents: [
+          {
+            chunk_count: 42,
+            document_id: "doc-1",
+            page_count: 8,
+            source: "ml-notes.pdf",
+          },
+        ],
+      });
+    },
+  });
+
+  const response = await client.listDocuments();
+
+  assert.equal(requests[0]?.url, "https://api.example/knowledge/documents");
+  // GET 不显式设 method(浏览器默认),仍带用户头
+  assert.equal(requests[0]?.init?.method, undefined);
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.equal(response.documents[0]?.document_id, "doc-1");
+  assert.equal(response.documents[0]?.source, "ml-notes.pdf");
+  assert.equal(response.documents[0]?.page_count, 8);
+  assert.equal(response.documents[0]?.chunk_count, 42);
+});
+
+test("deleteDocument DELETEs /knowledge/documents/{id} and tolerates a 204 empty body", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return new Response(null, { status: 204 });
+    },
+  });
+
+  await client.deleteDocument("doc/1");
+
+  assert.equal(requests[0]?.url, "https://api.example/knowledge/documents/doc%2F1");
+  assert.equal(requests[0]?.init?.method, "DELETE");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+});

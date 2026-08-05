@@ -76,3 +76,64 @@ test("the knowledge page calls searchKnowledge with default top_k 5 and normaliz
   assert.match(source, /hit\.citation\.page \?\? "—"/);
   assert.match(source, /hit\.citation\.chunk_id/);
 });
+
+// D6-T6:知识库管理区 ————————————————————————————————————————————
+test("the knowledge page SSR-renders the upload area and the document list loading state", async () => {
+  const { default: KnowledgePage } = await loadKnowledgePage();
+
+  const markup = renderToStaticMarkup(createElement(KnowledgePage));
+
+  // 管理区标题 + 上传区:file input(accept .pdf/.txt)+ 上传按钮
+  assert.match(markup, /知识库管理/);
+  assert.match(markup, /data-slot="document-manager"/);
+  assert.match(markup, /data-slot="upload-area"/);
+  assert.match(markup, /data-slot="upload-input"/);
+  assert.match(markup, /accept="\.pdf,\.txt"/);
+  assert.match(markup, /data-slot="upload-btn"/);
+  assert.match(markup, />上传</);
+  // 文档列表区:初始为加载态(列表在挂载后拉取,SSR 首帧不出空态),
+  // 加载/错误/空态三者的 data-slot 只在各自分支渲染
+  assert.match(markup, /data-slot="document-list"/);
+  assert.match(markup, /data-slot="document-loading"/);
+  assert.doesNotMatch(markup, /data-slot="document-empty"/);
+  assert.doesNotMatch(markup, /data-slot="document-item"/);
+});
+
+test("the knowledge page confirms deletes, refreshes the list and loads documents on mount", () => {
+  const source = readFileSync(knowledgePagePath, "utf8");
+
+  // 管理区 data-slot 齐全(上传区/结果/错误 + 列表/条目/删除/空态)
+  assert.match(source, /data-slot="upload-area"/);
+  assert.match(source, /data-slot="upload-input"/);
+  assert.match(source, /data-slot="upload-btn"/);
+  assert.match(source, /data-slot="upload-result"/);
+  assert.match(source, /data-slot="upload-error"/);
+  assert.match(source, /data-slot="document-list"/);
+  assert.match(source, /data-slot="document-item"/);
+  assert.match(source, /data-slot="document-delete"/);
+  assert.match(source, /data-slot="document-empty"/);
+  // 删除确认:window.confirm 只在点击事件回调(客户端)里执行,SSR 安全
+  assert.match(source, /window\.confirm\("确认删除该文档\?删除后不可恢复。"\)/);
+  // 上传成功后刷新列表(与删除成功共用 refreshDocuments)
+  assert.match(source, /await apiClient\.uploadDocument\(selectedFile\)/);
+  assert.match(source, /await refreshDocuments\(\)/);
+  // 挂载拉取:useEffect 内局部 async 函数 + void load()(setState 全部
+  // 在 await 之后,符合 react-hooks「effect 内同步 setState」规则)
+  assert.match(source, /useEffect\(\(\) => \{\s*\n\s*let ignore = false;/);
+  assert.match(source, /void load\(\);/);
+  assert.match(source, /await apiClient\.listDocuments\(\)/);
+  // 上传中禁用 + 「上传中…」文案;422 → 「文件类型或大小不符」
+  assert.match(source, /disabled=\{uploading \|\| selectedFile === null\}/);
+  assert.match(source, /上传中…/);
+  assert.match(source, /文件类型或大小不符/);
+  assert.match(source, /caught\.status === 422/);
+  // 空列表文案;条目展示 document_id/source/page_count/chunk_count(可空 "—")
+  assert.match(source, /暂无上传文档/);
+  assert.match(source, /uploadResult\.document_id/);
+  assert.match(source, /uploadResult\.source/);
+  assert.match(source, /uploadResult\.page_count \?\? "—"/);
+  assert.match(source, /uploadResult\.chunk_count \?\? "—"/);
+  assert.match(source, /doc\.document_id/);
+  assert.match(source, /doc\.page_count \?\? "—"/);
+  assert.match(source, /doc\.chunk_count \?\? "—"/);
+});
