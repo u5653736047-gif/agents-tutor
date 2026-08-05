@@ -310,6 +310,29 @@ class ChatResponse(ContractModel):
     current_agent: AgentRole | None = None
 
 
+class FeedbackRating(str, Enum):
+    """用户反馈评分方向。"""
+
+    UP = "up"
+    DOWN = "down"
+
+
+class FeedbackRequest(ContractModel):
+    """用户反馈请求体(只收脱敏引用字段,不收消息全文)。"""
+
+    session_id: str = Field(max_length=200)
+    message_id: str | None = Field(default=None, max_length=200)
+    rating: FeedbackRating
+    comment: str | None = Field(default=None, max_length=500)
+    error_code: str | None = Field(default=None, max_length=100)
+
+
+class FeedbackResponse(ContractModel):
+    """反馈受理确认。"""
+
+    received: bool = True
+
+
 CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     Session,
     CreateSessionRequest,
@@ -329,6 +352,8 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     TaskPlan,
     TaskResult,
     ChatResponse,
+    FeedbackRequest,
+    FeedbackResponse,
 )
 
 

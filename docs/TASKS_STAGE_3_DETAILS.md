@@ -693,7 +693,7 @@
 > 目标：补齐 `POST /feedback`、教师端知识库检索测试面板与上传管理、E2E 自动化
 > 与容器化部署。E2E 与 docker-compose 是骨架「明确不做」的收尾项。
 
-### [ ] D6-T1 后端 `POST /feedback`
+### [x] D6-T1 后端 `POST /feedback`
 
 - 对应总清单：3.1.1（`POST /feedback`：用户反馈收集）、5.2.2（回答反馈）
 - 背景：总清单 3.1.1 列出的五个端点中，`POST /feedback` 是骨架唯一未实现的；
