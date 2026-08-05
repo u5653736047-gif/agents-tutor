@@ -218,7 +218,7 @@ export function SessionSidebarContent({
                       {highlightMatch(session.session_id, effectiveQuery).map(
                         (segment, index) =>
                           segment.highlighted ? (
-                            <mark className="bg-amber-200/70 text-inherit" key={index}>
+                            <mark className="bg-amber-200/70 text-inherit dark:bg-amber-400/30" key={index}>
                               {segment.text}
                             </mark>
                           ) : (

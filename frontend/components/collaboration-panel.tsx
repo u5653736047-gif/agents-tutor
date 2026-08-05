@@ -35,7 +35,7 @@ const planStatusPresentation: Record<
   active: { label: "进行中", className: "border-primary/30 bg-primary/10 text-primary" },
   completed: {
     label: "已完成",
-    className: "border-emerald-600/30 bg-emerald-600/10 text-emerald-700",
+    className: "border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400",
   },
   cancelled: { label: "已取消", className: "border-border bg-muted text-muted-foreground" },
   failed: { label: "失败", className: "border-destructive/30 bg-destructive/10 text-destructive" },
