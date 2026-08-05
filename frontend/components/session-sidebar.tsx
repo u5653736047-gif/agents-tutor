@@ -6,6 +6,8 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { errorMessageFor } from "@/lib/error-messages";
 import type { ApiClientError, Session } from "@/lib/api-client";
+// D4-T7:会话时间分组(今天 / 近 7 天 / 更早)——纯函数,与组件解耦可测
+import { groupSessions, sessionGroupLabel, type SessionGroup } from "@/lib/session-groups";
 import { useChatStore } from "@/stores/chat-store";
 
 // D4-T1:会话搜索——过滤与高亮抽为纯函数,组件与测试共用。
@@ -50,6 +52,9 @@ export function highlightMatch(
   ];
 }
 
+// D4-T7:分组渲染顺序(今天 → 近 7 天 → 更早),空组不渲染标题。
+const GROUP_ORDER: SessionGroup[] = ["today", "recent", "older"];
+
 // D4-T1:展示组件接收 props(纯函数 + SSR 可测);顶部容器 SessionSidebar
 // 从 store 订阅后原样转发。交互(选中/归档/新建)只依赖 props 回调,
 // 测试用 stub 注入即可,无需触碰 zustand store。
@@ -59,9 +64,13 @@ type SessionSidebarContentProps = {
   currentSessionId: string | null;
   isLoadingSessions: boolean;
   loadCurrentSessionMessages: () => void;
+  // D4-T7:归档视图开关——true 时列表为归档会话(store 按此拉取),
+  // 按钮文案与空态随之切换。
+  onToggleArchived: () => void;
   requestError: ApiClientError | null;
   selectSession: (sessionId: string) => void;
   sessions: Session[];
+  showArchived: boolean;
 };
 
 export function SessionSidebarContent({
@@ -70,9 +79,11 @@ export function SessionSidebarContent({
   currentSessionId,
   isLoadingSessions,
   loadCurrentSessionMessages,
+  onToggleArchived,
   requestError,
   selectSession,
   sessions,
+  showArchived,
 }: SessionSidebarContentProps) {
   // D4-T1:搜索防抖——query 即时更新(输入框受控值),debounced 延迟
   // 200ms 生效用于过滤;清空输入时立即恢复全列表(不等防抖)。
@@ -93,6 +104,9 @@ export function SessionSidebarContent({
   // query 清空(或纯空白)时立即回落空串恢复全列表;否则用防抖后的词。
   const effectiveQuery = query.trim() === "" ? "" : debounced;
   const visibleSessions = filterSessions(sessions, effectiveQuery);
+  // D4-T7:过滤后再按 created_at 分组(今天 / 近 7 天 / 更早);组内保持
+  // 输入顺序,空组不渲染标题。
+  const groups = groupSessions(visibleSessions);
   // 仅在有实际查询词(trim 后非空)时展示「未找到」占位
   const hasQuery = effectiveQuery.trim() !== "";
   // D2-T5:请求错误统一映射为标题 + 说明(覆盖 ApiErrorCode 与网络失败)
@@ -141,7 +155,13 @@ export function SessionSidebarContent({
         ) : null}
 
         {!isLoadingSessions && sessions.length === 0 ? (
-          <p className="px-2 py-3 text-caption text-muted-foreground">暂无会话</p>
+          <p
+            className="px-2 py-3 text-caption text-muted-foreground"
+            data-slot={showArchived ? "archive-empty" : undefined}
+          >
+            {/* D4-T7:归档视图下的空态文案与未归档视图区分 */}
+            {showArchived ? "暂无归档会话" : "暂无会话"}
+          </p>
         ) : null}
 
         {/* D4-T1:搜索无结果占位——仅在有查询词时出现 */}
@@ -154,53 +174,89 @@ export function SessionSidebarContent({
           </p>
         ) : null}
 
-        {visibleSessions.map((session) => {
-          const selected = session.session_id === currentSessionId;
+        {/* D4-T7:会话按 created_at 分组展示——组标题置顶,组内保持输入
+            顺序;空组不渲染标题(含标题)。搜索态同样按组展示
+            (visibleSessions 已过滤)。 */}
+        {GROUP_ORDER.map((group) => {
+          const groupItems = groups[group];
+          if (groupItems.length === 0) {
+            return null;
+          }
 
           return (
-            <div
-              className={
-                selected
-                  ? "group mb-1 flex items-center rounded-md bg-muted px-3 py-2"
-                  : "group mb-1 flex items-center rounded-md px-3 py-2 hover:bg-muted/60"
-              }
-              key={session.session_id}
-            >
-              <button
-                className="min-w-0 flex-1 truncate text-left text-caption font-medium text-foreground"
-                onClick={() => {
-                  selectSession(session.session_id);
-                  void loadCurrentSessionMessages();
-                }}
-                type="button"
+            <div key={group}>
+              <p
+                className="px-2 pb-1 pt-3 text-caption font-medium text-muted-foreground"
+                data-slot={`session-group-${group}`}
               >
-                {/* D4-T1:命中片段用 <mark> 高亮(定位不区分大小写,展示保留
-                    原始大小写);未命中时整段以普通 span 渲染。用
-                    effectiveQuery 而非 debounced(review 修正):清空查询后
-                    高亮随列表一起立即消失,防抖等待期高亮与列表一致。 */}
-                {highlightMatch(session.session_id, effectiveQuery).map(
-                  (segment, index) =>
-                    segment.highlighted ? (
-                      <mark className="bg-amber-200/70 text-inherit" key={index}>
-                        {segment.text}
-                      </mark>
-                    ) : (
-                      <span key={index}>{segment.text}</span>
-                    ),
-                )}
-              </button>
-              <button
-                aria-label={`归档会话 ${session.session_id}`}
-                className="ml-2 inline-flex size-7 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-foreground"
-                onClick={() => void archiveSession(session.session_id)}
-                type="button"
-              >
-                <Archive aria-hidden className="size-4" />
-              </button>
+                {sessionGroupLabel(group)}
+              </p>
+              {groupItems.map((session) => {
+                const selected = session.session_id === currentSessionId;
+
+                return (
+                  <div
+                    className={
+                      selected
+                        ? "group mb-1 flex items-center rounded-md bg-muted px-3 py-2"
+                        : "group mb-1 flex items-center rounded-md px-3 py-2 hover:bg-muted/60"
+                    }
+                    key={session.session_id}
+                  >
+                    <button
+                      className="min-w-0 flex-1 truncate text-left text-caption font-medium text-foreground"
+                      onClick={() => {
+                        selectSession(session.session_id);
+                        void loadCurrentSessionMessages();
+                      }}
+                      type="button"
+                    >
+                      {/* D4-T1:命中片段用 <mark> 高亮(定位不区分大小写,展示保留
+                          原始大小写);未命中时整段以普通 span 渲染。用
+                          effectiveQuery 而非 debounced(review 修正):清空查询后
+                          高亮随列表一起立即消失,防抖等待期高亮与列表一致。 */}
+                      {highlightMatch(session.session_id, effectiveQuery).map(
+                        (segment, index) =>
+                          segment.highlighted ? (
+                            <mark className="bg-amber-200/70 text-inherit" key={index}>
+                              {segment.text}
+                            </mark>
+                          ) : (
+                            <span key={index}>{segment.text}</span>
+                          ),
+                      )}
+                    </button>
+                    {/* D4-T7 review nit:归档视图下会话已是归档态,归档按钮
+                        是无效操作——仅未归档视图显示。 */}
+                    {!showArchived ? (
+                      <button
+                        aria-label={`归档会话 ${session.session_id}`}
+                        className="ml-2 inline-flex size-7 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-foreground"
+                        onClick={() => void archiveSession(session.session_id)}
+                        type="button"
+                      >
+                        <Archive aria-hidden className="size-4" />
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           );
         })}
       </div>
+
+      {/* D4-T7:归档视图切换。showArchived=true 时列表为归档会话,按钮
+          文案反转为「查看未归档」。恢复(取消归档)不在本期范围——core
+          SessionStore 无 unarchive 接口(D4-T7 降级口径:归档可查看即可)。 */}
+      <button
+        className="flex w-full items-center justify-center border-t border-border px-4 py-3 text-caption font-medium text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+        data-slot="archive-toggle"
+        onClick={onToggleArchived}
+        type="button"
+      >
+        {showArchived ? "查看未归档" : "查看归档"}
+      </button>
 
       {requestError && requestErrorPreset ? (
         <div
@@ -239,6 +295,10 @@ export function SessionSidebar({ onSessionSelected }: SessionSidebarProps = {}) 
   const requestError = useChatStore((state) => state.requestError);
   const selectSession = useChatStore((state) => state.selectSession);
   const sessions = useChatStore((state) => state.sessions);
+  // D4-T7:归档视图开关——容器从 store 订阅并转发,切换时由 store 触发
+  // 按新视图重新拉取。
+  const setShowArchived = useChatStore((state) => state.setShowArchived);
+  const showArchived = useChatStore((state) => state.showArchived);
 
   useEffect(() => {
     // 挂载时拉取会话列表(review blocking 修复:重构时勿删——store
@@ -260,9 +320,11 @@ export function SessionSidebar({ onSessionSelected }: SessionSidebarProps = {}) 
       currentSessionId={currentSessionId}
       isLoadingSessions={isLoadingSessions}
       loadCurrentSessionMessages={loadCurrentSessionMessages}
+      onToggleArchived={() => setShowArchived(!showArchived)}
       requestError={requestError}
       selectSession={handleSelectSession}
       sessions={sessions}
+      showArchived={showArchived}
     />
   );
 }

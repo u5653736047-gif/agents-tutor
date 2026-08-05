@@ -90,6 +90,10 @@ export type ChatStore = {
   selectSession(sessionId: string | null): void;
   sendMessage(message: string): Promise<void>;
   sessions: Session[];
+  // D4-T7:归档视图开关——true 时 refreshSessions 带 include_archived
+  // 拉取归档会话;setShowArchived 切换后立即按新视图重新拉取。
+  setShowArchived(show: boolean): void;
+  showArchived: boolean;
   streamSendMessage(message: string): Promise<void>;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
@@ -160,6 +164,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     isLoadingSessions: false,
     requestError: null,
     sessions: [],
+    showArchived: false,
     archiveSession: async (sessionId) => {
       // D4-T3 review 修正:切会话时 abort 活跃流——旧流继续在后台
       // 跑完浪费算力,且「切走再切回」时旧流剩余事件会重新通过会话
@@ -175,6 +180,11 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             state.currentSessionId === sessionId ? null : state.currentSessionId,
           sessions: state.sessions.filter((session) => session.session_id !== sessionId),
         }));
+        // D4-T7:归档成功后以服务端为准刷新列表(本地乐观移除之外再
+        // 拉一次)。未归档视图:该会话不再出现,与后端一致;归档视图:
+        // include_archived=true 会把该会话重新带回来,保持「归档列表
+        // = 服务端归档列表」语义。
+        void get().refreshSessions();
       } catch (error) {
         set({ requestError: asApiClientError(error) });
       }
@@ -237,7 +247,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
       }
       set({ isLoadingSessions: true, requestError: null });
       try {
-        const sessions = await client.listSessions();
+        // D4-T7:按当前归档视图拉取——showArchived=true 时带上
+        // include_archived=true,归档会话可见(api-client 已支持该参数)。
+        const sessions = await client.listSessions(get().showArchived);
         set({ isLoadingSessions: false, sessions });
       } catch (error) {
         set({ isLoadingSessions: false, requestError: asApiClientError(error) });
@@ -417,6 +429,16 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           });
         }
       }
+    },
+    // D4-T7:切换归档视图。先更新状态、再按新状态重新拉取
+    // (refreshSessions 内部从 get() 读 showArchived,set 之后立即调用
+    // 必然拿到新值)。与 D4-T5 的进行中去重不冲突:去重守卫只挡
+    // 「同一时刻并发」的重复请求,切换场景上一次拉取已完成;若恰逢
+    // 拉取进行中,本次切换被跳过(列表保持旧视图),下一次切换或
+    // 挂载拉取会纠正——可接受的轻微竞态,不做额外同步。
+    setShowArchived: (show) => {
+      set({ showArchived: show });
+      void get().refreshSessions();
     },
     // D2-T5:重新发送上一条消息。通道选择与首次发送一致:client 有
     // 流式能力(streamChatWithRetry / streamChat)时走 streamSendMessage

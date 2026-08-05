@@ -724,3 +724,64 @@ test("sendMessage saves response references and resets them when absent", async 
   await store.getState().sendMessage("无引用的提问");
   assert.equal(store.getState().references, null);
 });
+
+// D4-T7:归档视图(showArchived)与归档后刷新 ————————————————————
+test("setShowArchived toggles the flag and refetches with the archive flag", async () => {
+  const { createChatStore } = await loadChatStore();
+  const calls: Array<boolean | undefined> = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async (includeArchived) => {
+      calls.push(includeArchived);
+      return [session];
+    },
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  // 初始未归档:refreshSessions 显式传 false(= 只取未归档,与不传等价)
+  await store.getState().refreshSessions();
+  assert.deepEqual(calls, [false]);
+  assert.equal(store.getState().showArchived, false);
+
+  // 切换归档:状态更新并触发重新拉取(带 include_archived=true)
+  store.getState().setShowArchived(true);
+  // setShowArchived 内部以 void 触发异步 refreshSessions,等微任务落定
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, [false, true]);
+  assert.equal(store.getState().showArchived, true);
+  assert.deepEqual(store.getState().sessions, [session]);
+
+  // 切回未归档:同样按新状态重新拉取
+  store.getState().setShowArchived(false);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, [false, true, false]);
+  assert.equal(store.getState().showArchived, false);
+});
+
+test("archiveSession refreshes the session list after success", async () => {
+  const { createChatStore } = await loadChatStore();
+  let listCalls = 0;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => {
+      listCalls += 1;
+      return [session];
+    },
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  await store.getState().refreshSessions();
+  assert.equal(listCalls, 1);
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().archiveSession(session.session_id);
+  // 归档成功:本地乐观移除 + 触发列表刷新(与服务端对齐)
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(listCalls, 2);
+  assert.equal(store.getState().currentSessionId, null);
+  assert.equal(store.getState().requestError, null);
+});

@@ -87,8 +87,10 @@ test("the session sidebar renders a search box and all sessions on initial rende
     currentSessionId: null,
     isLoadingSessions: false,
     loadCurrentSessionMessages: () => undefined,
+    onToggleArchived: () => undefined,
     requestError: null,
     selectSession: () => undefined,
+    showArchived: false,
   };
   const markup = renderToStaticMarkup(
     createElement(SessionSidebarContent, { ...baseProps, sessions }),
@@ -129,4 +131,114 @@ test("SessionSidebar container forwards an optional onSessionSelected callback",
   );
   assert.match(source, /onSessionSelected\?: \(\) => void/);
   assert.match(source, /onSessionSelected\?\.\(\)/);
+});
+
+// D4-T7:归档视图 ————————————————————————————————
+// 归档切换按钮与空态均为展示层逻辑(依赖 showArchived prop),SSR 可测;
+// 切换触发重新拉取的行为在 chat-store.test.ts 覆盖。
+test("the sidebar renders the archive toggle and the archived empty state", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  const baseProps = {
+    archiveSession: () => undefined,
+    createSession: () => undefined,
+    currentSessionId: null,
+    isLoadingSessions: false,
+    loadCurrentSessionMessages: () => undefined,
+    onToggleArchived: () => undefined,
+    requestError: null,
+    selectSession: () => undefined,
+    showArchived: false,
+  };
+
+  // 未归档视图:切换按钮存在,文案为「查看归档」;无会话时为空态「暂无会话」
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, { ...baseProps, sessions: [] }),
+  );
+  assert.match(markup, /data-slot="archive-toggle"/);
+  assert.match(markup, /查看归档/);
+  assert.doesNotMatch(markup, /查看未归档/);
+  assert.match(markup, /暂无会话/);
+  assert.doesNotMatch(markup, /data-slot="archive-empty"/);
+
+  // 归档视图:按钮文案反转为「查看未归档」;无会话时显示归档空态
+  const archivedMarkup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, { ...baseProps, showArchived: true, sessions: [] }),
+  );
+  assert.match(archivedMarkup, /data-slot="archive-empty"/);
+  assert.match(archivedMarkup, /暂无归档会话/);
+  assert.match(archivedMarkup, /查看未归档/);
+  assert.doesNotMatch(archivedMarkup, /暂无会话/);
+});
+
+test("the sidebar groups sessions under time-based section titles", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  // 相对当前时间构造三个组的样本(UTC 方法,远离分组边界):
+  // 今天 = 当前 UTC 日零点;近 7 天 = 3 天前同一时刻;更早 = 30 天前。
+  const now = new Date();
+  const today = new Date(now);
+  today.setUTCHours(0, 0, 0, 0);
+  const recent = new Date(now);
+  recent.setUTCDate(recent.getUTCDate() - 3);
+  const older = new Date(now);
+  older.setUTCDate(older.getUTCDate() - 30);
+
+  const groupedSessions = [
+    { archived: false, created_at: older.toISOString(), session_id: "older-session", user_id: null },
+    { archived: false, created_at: recent.toISOString(), session_id: "recent-session", user_id: null },
+    { archived: false, created_at: today.toISOString(), session_id: "today-session", user_id: null },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, {
+      archiveSession: () => undefined,
+      createSession: () => undefined,
+      currentSessionId: null,
+      isLoadingSessions: false,
+      loadCurrentSessionMessages: () => undefined,
+      onToggleArchived: () => undefined,
+      requestError: null,
+      selectSession: () => undefined,
+      sessions: groupedSessions,
+      showArchived: false,
+    }),
+  );
+
+  // 三组标题均渲染,会话项保留在各自组内
+  assert.match(markup, /data-slot="session-group-today"/);
+  assert.match(markup, /data-slot="session-group-recent"/);
+  assert.match(markup, /data-slot="session-group-older"/);
+  assert.match(markup, /今天/);
+  assert.match(markup, /近 7 天/);
+  assert.match(markup, /更早/);
+  assert.match(markup, /today-session/);
+  assert.match(markup, /recent-session/);
+  assert.match(markup, /older-session/);
+});
+
+test("the sidebar omits section titles for empty groups", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  // 只有「更早」样本:今天 / 近 7 天标题不渲染,仅出现「更早」标题
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, {
+      archiveSession: () => undefined,
+      createSession: () => undefined,
+      currentSessionId: null,
+      isLoadingSessions: false,
+      loadCurrentSessionMessages: () => undefined,
+      onToggleArchived: () => undefined,
+      requestError: null,
+      selectSession: () => undefined,
+      sessions: [
+        { archived: false, created_at: "2020-01-01T00:00:00Z", session_id: "old-session", user_id: null },
+      ],
+      showArchived: false,
+    }),
+  );
+
+  assert.match(markup, /data-slot="session-group-older"/);
+  assert.doesNotMatch(markup, /data-slot="session-group-today"/);
+  assert.doesNotMatch(markup, /data-slot="session-group-recent"/);
 });
