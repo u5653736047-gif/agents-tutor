@@ -118,3 +118,15 @@ test("SessionSidebar container keeps the mount-time session refresh", async () =
   );
   assert.match(source, /useEffect\(\(\) => \{[\s\S]*?void refreshSessions\(\)/);
 });
+
+test("SessionSidebar container forwards an optional onSessionSelected callback", async () => {
+  // D4-T5:移动端抽屉「选中会话后自动收起」由容器可选回调实现(方案
+  // A);桌面分支不传,向后兼容。源码正则守卫:回调包装 selectSession
+  // 并透传(SSR 无法触发交互)。
+  const source = readFileSync(
+    new URL("../components/session-sidebar.tsx", import.meta.url),
+    "utf-8",
+  );
+  assert.match(source, /onSessionSelected\?: \(\) => void/);
+  assert.match(source, /onSessionSelected\?\.\(\)/);
+});

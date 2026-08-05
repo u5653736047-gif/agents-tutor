@@ -228,6 +228,13 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
       }
     },
     refreshSessions: async () => {
+      // D4-T5 review 修正:桌面静态侧栏与移动抽屉是两个组件实例,
+      // 打开抽屉会再次触发挂载拉取——进行中去重,避免重复请求
+      // (数据幂等,仅去网络开销;并发失败时下一次调用仍可重试,
+      // 因为失败路径会复位 isLoadingSessions)。
+      if (get().isLoadingSessions) {
+        return;
+      }
       set({ isLoadingSessions: true, requestError: null });
       try {
         const sessions = await client.listSessions();

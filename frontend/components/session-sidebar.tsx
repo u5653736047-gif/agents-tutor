@@ -220,9 +220,14 @@ export function SessionSidebarContent({
   );
 }
 
-// D4-T1:容器——从 store 订阅全部所需状态并转发给展示组件
-// (保持 SessionSidebar 无 props 签名,AppShell 与既有测试不受影响)。
-export function SessionSidebar() {
+// D4-T1:容器——从 store 订阅全部所需状态并转发给展示组件。
+// D4-T5:新增可选 prop onSessionSelected(移动端抽屉「选中会话后自动
+// 收起」用;桌面分支不传,向后兼容既有调用与测试)。
+type SessionSidebarProps = {
+  onSessionSelected?: () => void;
+};
+
+export function SessionSidebar({ onSessionSelected }: SessionSidebarProps = {}) {
   const archiveSession = useChatStore((state) => state.archiveSession);
   const createSession = useChatStore((state) => state.createSession);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
@@ -241,6 +246,13 @@ export function SessionSidebar() {
     void refreshSessions();
   }, [refreshSessions]);
 
+  // D4-T5:选中会话后回调(抽屉收起);注意点击「当前已选中会话」的
+  // 场景也调用(语义为「选择动作」而非「切换」,抽屉收起符合直觉)。
+  const handleSelectSession = (sessionId: string) => {
+    selectSession(sessionId);
+    onSessionSelected?.();
+  };
+
   return (
     <SessionSidebarContent
       archiveSession={archiveSession}
@@ -249,7 +261,7 @@ export function SessionSidebar() {
       isLoadingSessions={isLoadingSessions}
       loadCurrentSessionMessages={loadCurrentSessionMessages}
       requestError={requestError}
-      selectSession={selectSession}
+      selectSession={handleSelectSession}
       sessions={sessions}
     />
   );
