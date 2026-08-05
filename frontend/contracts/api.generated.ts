@@ -101,6 +101,72 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/knowledge/documents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Documents
+         * @description 列出通过 API 上传的文档元数据。
+         *
+         *     core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
+         *     delete_document / search),因此 API 层维护进程内注册表
+         *     (_document_registry):只登记经 POST /knowledge/documents 上传的
+         *     文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
+         *     (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
+         *     app 生命周期,测试各 app 实例隔离)。
+         */
+        get: operations["list_documents_knowledge_documents_get"];
+        put?: never;
+        /**
+         * Upload Document
+         * @description 上传 txt/pdf 文档入库(幂等替换),返回文档元数据回执。
+         *
+         *     - 扩展名白名单 / 大小上限 / 空文件都在 API 层拦截为 422,不依赖
+         *       core 运行时异常(大小在逐块读取时累计,不能信 Content-Length);
+         *     - document_id = 上传文件名 stem,source = 上传文件名(逻辑标识,
+         *       不泄漏文件系统路径):重传同名文件 → 同一 document_id → core
+         *       替换语义,旧内容被新内容覆盖;
+         *     - loader 解析失败(空文件/无文本/损坏 PDF)映射 422 invalid_request
+         *       (内容不可解析属请求问题);入库内部异常映射 500 internal_error,
+         *       不泄底层细节。
+         */
+        post: operations["upload_document_knowledge_documents_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents/{document_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Document
+         * @description 删除文档(幂等:文档不存在也返回 204,不报 404)。
+         *
+         *     core 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),
+         *     且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法
+         *     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
+         *     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
+         *     404 区分。注册表同步移除该条目。
+         */
+        delete: operations["delete_document_knowledge_documents__document_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/knowledge/search": {
         parameters: {
             query?: never;
@@ -231,6 +297,11 @@ export interface components {
          * @enum {string}
          */
         ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
+        /** Body_upload_document_knowledge_documents_post */
+        Body_upload_document_knowledge_documents_post: {
+            /** File */
+            file: string;
+        };
         /**
          * ChatRequest
          * @description One synchronous user message for a session.
@@ -406,6 +477,57 @@ export interface components {
             target_agent: components["schemas"]["WorkerAgentRole"];
             /** Task Content */
             task_content: string;
+        };
+        /**
+         * KnowledgeDocumentListEntry
+         * @description 知识库文档列表条目(只读元数据,不含内容)。
+         *
+         *     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
+         *     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+         */
+        KnowledgeDocumentListEntry: {
+            /**
+             * Chunk Count
+             * @default null
+             */
+            chunk_count?: number | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
+        };
+        /**
+         * KnowledgeDocumentListResponse
+         * @description 文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。
+         */
+        KnowledgeDocumentListResponse: {
+            /** Documents */
+            documents: components["schemas"]["KnowledgeDocumentListEntry"][];
+        };
+        /**
+         * KnowledgeDocumentUploadResponse
+         * @description 上传解析结果:文档已入库(幂等替换)后的元数据回执。
+         */
+        KnowledgeDocumentUploadResponse: {
+            /**
+             * Chunk Count
+             * @default null
+             */
+            chunk_count?: number | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
         };
         /**
          * KnowledgeSearchRequest
@@ -843,6 +965,151 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    list_documents_knowledge_documents_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    upload_document_knowledge_documents_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_document_knowledge_documents_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentUploadResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    delete_document_knowledge_documents__document_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };

@@ -26,6 +26,20 @@
         "title": "ApiErrorCode",
         "type": "string"
       },
+      "Body_upload_document_knowledge_documents_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_document_knowledge_documents_post",
+        "type": "object"
+      },
       "ChatRequest": {
         "additionalProperties": false,
         "description": "One synchronous user message for a session.",
@@ -444,6 +458,112 @@
           "task_content"
         ],
         "title": "HandoffRequest",
+        "type": "object"
+      },
+      "KnowledgeDocumentListEntry": {
+        "additionalProperties": false,
+        "description": "知识库文档列表条目(只读元数据,不含内容)。\n\npage_count / chunk_count 可空:txt 无页概念、core 未来接入清单\n能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。",
+        "properties": {
+          "chunk_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Chunk Count"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "page_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Count"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document_id",
+          "source"
+        ],
+        "title": "KnowledgeDocumentListEntry",
+        "type": "object"
+      },
+      "KnowledgeDocumentListResponse": {
+        "additionalProperties": false,
+        "description": "文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。",
+        "properties": {
+          "documents": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeDocumentListEntry"
+            },
+            "title": "Documents",
+            "type": "array"
+          }
+        },
+        "required": [
+          "documents"
+        ],
+        "title": "KnowledgeDocumentListResponse",
+        "type": "object"
+      },
+      "KnowledgeDocumentUploadResponse": {
+        "additionalProperties": false,
+        "description": "上传解析结果:文档已入库(幂等替换)后的元数据回执。",
+        "properties": {
+          "chunk_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Chunk Count"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "page_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Count"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document_id",
+          "source"
+        ],
+        "title": "KnowledgeDocumentUploadResponse",
         "type": "object"
       },
       "KnowledgeSearchRequest": {
@@ -1364,6 +1484,174 @@
           }
         },
         "summary": "Healthz"
+      }
+    },
+    "/knowledge/documents": {
+      "get": {
+        "description": "列出通过 API 上传的文档元数据。\n\ncore 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /\ndelete_document / search),因此 API 层维护进程内注册表\n(_document_registry):只登记经 POST /knowledge/documents 上传的\n文档——由 ingest_books 等脚本直接写入索引的文档不在列表内\n(core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随\napp 生命周期,测试各 app 实例隔离)。",
+        "operationId": "list_documents_knowledge_documents_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeDocumentListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "List Documents",
+        "tags": [
+          "knowledge"
+        ]
+      },
+      "post": {
+        "description": "上传 txt/pdf 文档入库(幂等替换),返回文档元数据回执。\n\n- 扩展名白名单 / 大小上限 / 空文件都在 API 层拦截为 422,不依赖\n  core 运行时异常(大小在逐块读取时累计,不能信 Content-Length);\n- document_id = 上传文件名 stem,source = 上传文件名(逻辑标识,\n  不泄漏文件系统路径):重传同名文件 → 同一 document_id → core\n  替换语义,旧内容被新内容覆盖;\n- loader 解析失败(空文件/无文本/损坏 PDF)映射 422 invalid_request\n  (内容不可解析属请求问题);入库内部异常映射 500 internal_error,\n  不泄底层细节。",
+        "operationId": "upload_document_knowledge_documents_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_document_knowledge_documents_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeDocumentUploadResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Upload Document",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/documents/{document_id}": {
+      "delete": {
+        "description": "删除文档(幂等:文档不存在也返回 204,不报 404)。\n\ncore 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),\n且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法\n区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——\n重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加\n404 区分。注册表同步移除该条目。",
+        "operationId": "delete_document_knowledge_documents__document_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Delete Document",
+        "tags": [
+          "knowledge"
+        ]
       }
     },
     "/knowledge/search": {
