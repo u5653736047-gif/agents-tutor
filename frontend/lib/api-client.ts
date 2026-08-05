@@ -44,6 +44,11 @@ export type KnowledgeDocumentUploadResponse =
 export type KnowledgeDocumentListResponse =
   components["schemas"]["KnowledgeDocumentListResponse"];
 export type KnowledgeDocumentEntry = components["schemas"]["KnowledgeDocumentListEntry"];
+// D6-T7:学习进度基础统计——直接取契约 StatsOverview(单一数据源):
+// session_count/message_count/agent_answer_counts(角色字符串→计数)/
+// last_activity_at(ISO 时间戳或 null,无活动为 null)。响应字段是
+// 契约 snake_case,request() 不做转换,页面按 snake_case 直接读取。
+export type StatsOverview = components["schemas"]["StatsOverview"];
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -96,6 +101,10 @@ export type ApiClient = {
     file: File,
     onProgress?: (fraction: number) => void,
   ): Promise<KnowledgeDocumentUploadResponse>;
+  // D6-T7:学习进度基础统计(只读聚合)——独立接口,不进入主会话 store
+  // (与 searchKnowledge 同一隔离哲学)。GET /stats/overview,响应
+  // 直接透传契约 StatsOverview;错误归一为 ApiClientError。
+  getStatsOverview(): Promise<StatsOverview>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
   ): Promise<void>;
@@ -302,6 +311,9 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         `/knowledge/documents/${encodeURIComponent(documentId)}`,
         { method: "DELETE" },
       ),
+    // D6-T7:学习进度——GET /stats/overview,响应直接透传契约字段
+    // (snake_case 原样,与 listDocuments 等先例一致)。
+    getStatsOverview: () => request<StatsOverview>(config, "/stats/overview"),
     // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>

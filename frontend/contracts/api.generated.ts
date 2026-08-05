@@ -281,6 +281,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/stats/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stats Overview
+         * @description 返回当前用户的学习进度基础统计(只读聚合)。
+         */
+        get: operations["stats_overview_stats_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -678,6 +698,29 @@ export interface components {
             session_id: string;
             /** User Id */
             user_id: string | null;
+        };
+        /**
+         * StatsOverview
+         * @description 学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。
+         *
+         *     - agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /
+         *       teaching_assistant / learning_assistant / evaluator),口径与
+         *       api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;
+         *     - last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at
+         *       的最大值(langchain-core 的 BaseMessage 无 created_at 字段,
+         *       消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。
+         */
+        StatsOverview: {
+            /** Agent Answer Counts */
+            agent_answer_counts: {
+                [key: string]: number;
+            };
+            /** Last Activity At */
+            last_activity_at: string | null;
+            /** Message Count */
+            message_count: number;
+            /** Session Count */
+            session_count: number;
         };
         /**
          * StreamEvent
@@ -1459,6 +1502,55 @@ export interface operations {
             };
             /** @description Unprocessable Entity */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    stats_overview_stats_overview_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatsOverview"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -182,6 +182,15 @@ export function AppShell({ apiConnected }: AppShellProps) {
             >
               知识库
             </Link>
+            {/* D6-T7:学习进度入口——独立页面 /stats(基础统计版),与
+                知识库入口并列,同样不经过主会话 store */}
+            <Link
+              className="text-caption text-muted-foreground hover:text-foreground"
+              data-slot="stats-link"
+              href="/stats"
+            >
+              进度
+            </Link>
             <div className="flex items-center gap-2 text-caption text-muted-foreground">
               {apiConnected ? (
                 <CircleCheck aria-hidden className="size-4 text-emerald-600" />

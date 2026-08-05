@@ -24,6 +24,7 @@ from api.knowledge import router as knowledge_router
 from api.openapi import install_openapi_contract
 from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
 from api.sessions import router as session_router
+from api.stats import router as stats_router
 from api.stream import router as stream_router
 from core.graph_builder import CollaborativeAgentGraph
 from core.knowledge.embedding import (
@@ -310,6 +311,7 @@ def create_app() -> FastAPI:
     app.include_router(stream_router)
     app.include_router(approval_router)
     app.include_router(session_router)
+    app.include_router(stats_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
 

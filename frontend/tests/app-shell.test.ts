@@ -190,3 +190,24 @@ test("the app shell knowledge link uses next/link with muted caption styling", (
   assert.match(source, /data-slot="knowledge-link"[\s\S]*?href="\/knowledge"/);
   assert.match(source, /text-caption text-muted-foreground hover:text-foreground/);
 });
+
+// D6-T7:顶栏学习进度入口——SSR 渲染 + 源码守卫,与 knowledge-link 并列。
+test("the app shell header links to the stats page", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /data-slot="stats-link"/);
+  assert.match(markup, /href="\/stats"/);
+  assert.match(markup, />进度</);
+  // 零回归:既有顶栏链接与元素仍在
+  assert.match(markup, /data-slot="knowledge-link"/);
+  assert.match(markup, /后端已连接/);
+  assert.match(markup, /data-slot="theme-toggle"/);
+});
+
+test("the app shell stats link uses next/link with muted caption styling", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  assert.match(source, /data-slot="stats-link"[\s\S]*?href="\/stats"/);
+  assert.match(source, /text-caption text-muted-foreground hover:text-foreground/);
+});

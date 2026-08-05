@@ -372,3 +372,64 @@ test("deleteDocument DELETEs /knowledge/documents/{id} and tolerates a 204 empty
   assert.equal(requests[0]?.init?.method, "DELETE");
   assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
 });
+
+// D6-T7:学习进度统计 ———————————————————————————————————————————————
+test("getStatsOverview GETs /stats/overview with the user header and passes the contract through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        agent_answer_counts: {
+          evaluator: 1,
+          learning_assistant: 2,
+          supervisor: 3,
+          teaching_assistant: 1,
+        },
+        last_activity_at: "2026-08-03T10:00:00+00:00",
+        message_count: 7,
+        session_count: 2,
+      });
+    },
+  });
+
+  const overview = await client.getStatsOverview();
+
+  assert.equal(requests[0]?.url, "https://api.example/stats/overview");
+  // GET 不显式设 method(浏览器默认),仍带用户头
+  assert.equal(requests[0]?.init?.method, undefined);
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  // 响应契约 snake_case 字段原样透传(与 Session 等先例一致)
+  assert.equal(overview.session_count, 2);
+  assert.equal(overview.message_count, 7);
+  assert.deepEqual(overview.agent_answer_counts, {
+    evaluator: 1,
+    learning_assistant: 2,
+    supervisor: 3,
+    teaching_assistant: 1,
+  });
+  assert.equal(overview.last_activity_at, "2026-08-03T10:00:00+00:00");
+});
+
+test("getStatsOverview normalizes stats errors like other endpoints", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          detail: { error_code: "internal_error", message: "The request could not be completed." },
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 500 },
+      ),
+  });
+
+  await assert.rejects(client.getStatsOverview(), (error: unknown) => {
+    assert.ok(error instanceof ApiClientError);
+    assert.equal(error.status, 500);
+    assert.equal(error.code, "internal_error");
+    return true;
+  });
+});

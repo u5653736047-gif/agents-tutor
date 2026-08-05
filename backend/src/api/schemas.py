@@ -397,6 +397,23 @@ class FeedbackResponse(ContractModel):
     received: bool = True
 
 
+class StatsOverview(ContractModel):
+    """学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。
+
+    - agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /
+      teaching_assistant / learning_assistant / evaluator),口径与
+      api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;
+    - last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at
+      的最大值(langchain-core 的 BaseMessage 无 created_at 字段,
+      消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。
+    """
+
+    session_count: int
+    message_count: int
+    agent_answer_counts: dict[str, int]
+    last_activity_at: str | None
+
+
 CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     Session,
     CreateSessionRequest,
@@ -418,6 +435,7 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ChatResponse,
     FeedbackRequest,
     FeedbackResponse,
+    StatsOverview,
     KnowledgeSearchRequest,
     SearchHitDto,
     KnowledgeSearchResponse,

@@ -921,6 +921,46 @@
         "title": "Session",
         "type": "object"
       },
+      "StatsOverview": {
+        "additionalProperties": false,
+        "description": "学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。\n\n- agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /\n  teaching_assistant / learning_assistant / evaluator),口径与\n  api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;\n- last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at\n  的最大值(langchain-core 的 BaseMessage 无 created_at 字段,\n  消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。",
+        "properties": {
+          "agent_answer_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Agent Answer Counts",
+            "type": "object"
+          },
+          "last_activity_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Activity At"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "session_count": {
+            "title": "Session Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_count",
+          "message_count",
+          "agent_answer_counts",
+          "last_activity_at"
+        ],
+        "title": "StatsOverview",
+        "type": "object"
+      },
       "StreamEvent": {
         "additionalProperties": false,
         "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」\n的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):\n- tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、\n  成功与否、耗时等摘要,绝不含工具参数与结果正文;\n- thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造\n  模型中间输出;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
@@ -2200,6 +2240,76 @@
         "summary": "Get Session History",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/stats/overview": {
+      "get": {
+        "description": "返回当前用户的学习进度基础统计(只读聚合)。",
+        "operationId": "stats_overview_stats_overview_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsOverview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Stats Overview",
+        "tags": [
+          "stats"
         ]
       }
     }
