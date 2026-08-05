@@ -99,7 +99,10 @@ export function HandoffCard({
 
   return (
     <section
-      className="overflow-hidden rounded-lg border border-border bg-card"
+      // D5-T2:审批卡片出现动画(tw-animate-css:淡入 + 底部轻滑入,时长/缓动
+      // 对齐 D5-T1 tokens);pending 为 null 时组件不渲染(上方早退),动画只
+      // 在卡片出现时播放一次;reduced-motion 由 globals.css 全局媒体查询关闭。
+      className="overflow-hidden rounded-lg border border-border bg-card animate-in fade-in-0 slide-in-from-bottom-1 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
       data-slot="handoff-card"
     >
       <header className="flex items-center justify-between border-b border-border px-4 py-2">

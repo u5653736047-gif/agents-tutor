@@ -241,3 +241,63 @@ test("MessageRow renders data-index on virtualized rows for measureElement", asy
   assert.match(markup, /data-message-role="user"/);
   assert.match(markup, /窗口中的问题/);
 });
+
+// D5-T2:动效与过渡(消息进入动画) ————————————————————————
+test("only the newest message carries the enter animation in full rendering", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: false,
+      messages: [
+        { agent: null, content: "历史问题", role: "user" },
+        { agent: "supervisor", content: "新回答", role: "assistant" },
+      ],
+      runError: null,
+      streamingAgent: null,
+      streamingMessage: null,
+    }),
+  );
+
+  // 两条消息仅最后一条(新消息)带 animate-in;历史消息不带,
+  // 避免虚拟化/滚动挂载时逐行重播动画闪动
+  assert.equal((markup.match(/animate-in/g) ?? []).length, 1);
+  // 按 SSR 输出顺序定位:animate-in 出现在第一条消息内容之后、
+  // 最后一条消息内容之前(即最后一条 article 的 class 上)
+  assert.ok(markup.indexOf("历史问题") < markup.indexOf("animate-in"));
+  assert.ok(markup.indexOf("animate-in") < markup.indexOf("新回答"));
+});
+
+test("the streaming bubble carries a fade-in animation", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: true,
+      messages: [],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: null,
+    }),
+  );
+
+  // 流式气泡挂载即新消息:class 含 animate-in fade-in-0(仅淡入,
+  // 内容逐字渲染时不做位移动画)
+  assert.match(
+    markup,
+    /<article class="[^"]*animate-in[^"]*"[^>]*data-slot="streaming-message"/,
+  );
+  assert.match(markup, /animate-in fade-in-0/);
+});
+
+test("the enter animation is limited to the newest message in source", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  // 全量路径仅最后一条传 animate(index === messages.length - 1);
+  // 虚拟化窗口路径不传(prop 默认 false),滚动挂载不闪动(review 防回归)
+  assert.match(panel, /animate=\{index === messages\.length - 1\}/);
+  // 虚拟化分支不带动画类(无 animate= 传参),仅全量分支出现
+  assert.equal((panel.match(/animate=\{/g) ?? []).length, 1);
+});

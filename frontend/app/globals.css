@@ -166,3 +166,18 @@ pre code.hljs {
   display: block;
   overflow-x: visible;
 }
+
+/* D5-T2:尊重系统「减少动态效果」偏好——关闭动画与平滑过渡
+   (WCAG 2.3.3;动画不阻塞交互)。组件层(D5-T2)的 animate-in 等
+   进入动画均依赖 animation/transition 属性,此处统一按 0.01ms
+   收敛,视觉上等于关闭;scroll-behavior 强制 auto 关闭平滑滚动。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

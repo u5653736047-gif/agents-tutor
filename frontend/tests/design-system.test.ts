@@ -118,3 +118,13 @@ test("bg-black 仅允许抽屉遮罩(app-shell.tsx),且 DESIGN_SYSTEM.md 已登�
   assert.match(designSystem, /bg-black\/40/);
   assert.match(designSystem, /抽屉遮罩/);
 });
+
+// D5-T2:动效与过渡——尊重系统「减少动态效果」偏好(WCAG 2.3.3)。
+test("globals.css 含 prefers-reduced-motion 全局关闭守卫", () => {
+  // 动画与过渡统一收敛为 0.01ms(视觉上等于关闭),滚动平滑关闭
+  assert.match(globals, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(globals, /animation-duration: 0\.01ms !important/);
+  assert.match(globals, /animation-iteration-count: 1 !important/);
+  assert.match(globals, /transition-duration: 0\.01ms !important/);
+  assert.match(globals, /scroll-behavior: auto !important/);
+});

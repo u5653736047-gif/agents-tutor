@@ -40,6 +40,9 @@ function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
 type MessageRowProps = {
   message: Message;
   index: number;
+  // D5-T2:消息进入动画开关——仅全量路径的最后一条(新消息)为 true,
+  // 虚拟化窗口行与历史消息为 false(滚动挂载不闪动,见 ConversationContent 注释)
+  animate?: boolean;
   // 虚拟化路径:行在列表中的真实索引,渲染为 data-index 供 measureElement 定位
   dataIndex?: number;
   // 虚拟化路径:useVirtualizer 的 measureElement(ref 回调),动态校正行高
@@ -49,6 +52,7 @@ type MessageRowProps = {
 export function MessageRow({
   message,
   index,
+  animate = false,
   dataIndex,
   measureRef,
 }: MessageRowProps) {
@@ -58,7 +62,16 @@ export function MessageRow({
 
   return (
     <article
-      className={isUser ? "flex justify-end" : "flex justify-start"}
+      // D5-T2:消息进入动画(tw-animate-css:淡入 + 底部轻滑入,时长/缓动
+      // 对齐 D5-T1 tokens)。仅新消息(animate=true)带类——CSS 动画只在
+      // 挂载时播放一次,历史/虚拟化行挂载时若带类会在滚动浏览时逐行闪动;
+      // reduced-motion 偏好由 globals.css 的全局媒体查询统一关闭。
+      className={
+        (isUser ? "flex justify-end" : "flex justify-start") +
+        (animate
+          ? " animate-in fade-in-0 slide-in-from-bottom-1 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
+          : "")
+      }
       data-index={measureRef ? rowIndex : undefined}
       data-message-role={message.role}
       ref={measureRef}
@@ -123,6 +136,9 @@ export function ConversationContent({
       {virtualItems == null
         ? messages.map((message, index) => (
             <MessageRow
+              // D5-T2:仅最后一条(新消息)带进入动画;历史消息不带,
+              // 避免虚拟化/滚动挂载时每行重播动画闪动
+              animate={index === messages.length - 1}
               key={message.created_at ?? `${message.role}-${index}`}
               message={message}
               index={index}
@@ -133,7 +149,9 @@ export function ConversationContent({
       {/* 流式气泡:isStreaming 期间渲染,或异常中断后保留已收到内容时继续展示 */}
       {isStreaming || streamingMessage ? (
         <article
-          className="flex justify-start"
+          // D5-T2:流式气泡挂载即新消息,带淡入动画(仅 fade-in,不用 slide——
+          // 内容逐字渲染时位移动画会与追加叠加显得跳动);时长对齐 D5-T1 tokens。
+          className="flex justify-start animate-in fade-in-0 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
           data-message-role="assistant"
           data-slot="streaming-message"
         >

@@ -56,13 +56,20 @@ export function AppShell({ apiConnected }: AppShellProps) {
           (w-72 与桌面列宽一致),内含同一个 SessionSidebar。 */}
       {sidebarOpen ? (
         <>
+          {/* D5-T2:进入动画——遮罩淡入(200ms,对齐 D5-T1 tokens);关闭时
+              条件渲染即时卸载无法播放退出动画,保持简单不做(若要关闭动画
+              需延迟卸载状态机,超出本任务范围;reduced-motion 下本就应无动画,
+              由 globals.css 全局媒体查询关闭)。 */}
           <div
             aria-hidden
-            className="fixed inset-0 z-30 bg-black/40"
+            className="fixed inset-0 z-30 animate-in fade-in-0 bg-black/40 duration-[var(--app-duration-normal)]"
             data-slot="sidebar-overlay"
             onClick={() => setSidebarOpen(false)}
           />
-          <div className="fixed inset-y-0 left-0 z-40 w-72">
+          {/* D5-T2:抽屉从左侧滑入(tw-animate-css slide-in-from-left-2 = 8px,
+              已验证该类存在),淡入 + 位移均为 transform/opacity 动效,
+              不触发重排。 */}
+          <div className="fixed inset-y-0 left-0 z-40 w-72 animate-in fade-in-0 slide-in-from-left-2 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]">
             {/* D4-T5:选中会话后自动收起抽屉(方案 A:容器可选回调)。 */}
             <SessionSidebar onSessionSelected={() => setSidebarOpen(false)} />
           </div>

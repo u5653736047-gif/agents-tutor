@@ -93,3 +93,19 @@ test("the theme toggle switches between light and dark themes", () => {
   assert.match(source, /切换到亮色模式/);
   assert.match(source, /切换到暗色模式/);
 });
+
+// D5-T2:抽屉/遮罩进入动画的源码正则守卫。SSR 初始态不渲染抽屉,
+// 动画类写在 JSX 里只在打开挂载时生效(无 mismatch);关闭走即时
+// 卸载不做退出动画(注释见组件)。
+test("the mobile drawer and overlay carry enter animations", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  // 遮罩:淡入(200ms,对齐 D5-T1 tokens)
+  assert.match(
+    source,
+    /className="[^"]*animate-in fade-in-0[^"]*"[^>]*data-slot="sidebar-overlay"/,
+  );
+  assert.match(source, /duration-\[var\(--app-duration-normal\)\]/);
+  // 抽屉:淡入 + 左侧滑入(tw-animate-css slide-in-from-left-2)
+  assert.match(source, /animate-in fade-in-0 slide-in-from-left-2/);
+});

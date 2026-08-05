@@ -34,6 +34,12 @@ test("the handoff card renders pending handoff details and decision buttons", as
 
   // 卡片容器、标题、目标 Agent 徽标(助教)、任务内容、计划步骤
   assert.match(markup, /data-slot="handoff-card"/);
+  // D5-T2:卡片出现动画(animate-in 类,SSR class 输出;pending 非空才渲染,
+  // 动画只在出现时播放一次)
+  assert.match(
+    markup,
+    /class="[^"]*animate-in fade-in-0[^"]*"[^>]*data-slot="handoff-card"/,
+  );
   assert.match(markup, /等待审批/);
   assert.match(markup, /助教/);
   assert.match(markup, /请整理第三周的学习笔记。/);
