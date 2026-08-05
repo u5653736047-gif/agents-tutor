@@ -952,7 +952,7 @@
 - 依赖：D7-T1。
 - 完成备注：
 
-### [ ] D7-T3 多模态消息渲染
+### [x] D7-T3 多模态消息渲染
 
 - 对应总清单：3.3.3（多模态输入）
 - 背景：`Message` 契约（`api/schemas.py` 135-141 行）只有 role/content/agent/
@@ -968,7 +968,18 @@
   - 前端测试：带 attachments 的消息渲染图片/链接；无 attachments 零渲染。
   - typecheck / build 通过。
 - 依赖：D7-T2。
-- 完成备注：
+- 完成备注：契约 Message.attachments(可选,core 无附件元数据映射置 None,
+  sessions._public_message 显式 None,chat.py 依赖默认值);前端 MessageRow
+  用户消息附件区(仅用户侧、无附件零渲染)。**review blocking 修复**:直链
+  <img>/<a> 无法携带 X-User-Id 头,后端按 anonymous 目录定位必然 404 破
+  图——改为 AttachmentPreview 组件:effect 内 fetch 带 X-User-Id:
+  DEMO_USER_ID 头拉 Blob → objectURL(图片内联预览新标签、PDF/其它下载
+  链接 download=原始名),加载中 Skeleton 占位、失败 attachment-failed 降
+  级文案;SSR 首帧 url=null 渲染占位无 mismatch;objectURL 在 cleanup
+  revoke(review should-fix,虚拟化滚动防 Blob 泄漏)。历史消息 attachments
+  =null 自然零渲染(诚实降级)。测试:+5(SSR 占位/鉴权 fetch 源码正则/零
+  附件零渲染/助手防御/MessageRow 附件区定位),后端 3 处断言扩展 + 2 处
+  精确相等补 attachments:null。后端 744 + 前端 220 全绿,契约重新生成。
 
 ---
 

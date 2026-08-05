@@ -736,6 +736,21 @@
             ],
             "default": null
           },
+          "attachments": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Attachments"
+          },
           "content": {
             "title": "Content",
             "type": "string"

@@ -517,3 +517,110 @@ test("feedback wiring covers both full and virtualized message paths in source",
   // 反馈走 store 独立 action(submitFeedback 订阅),与主流程解耦
   assert.match(panel, /useChatStore\(\(state\) => state\.submitFeedback\)/);
 });
+
+// D7-T3:多模态附件渲染 ————————————————————————————————————
+test("user message rows render attachment previews (SSR 占位 + 鉴权加载)", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const imageId = "img-abc";
+  const pdfId = "pdf-123";
+  const markup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: {
+        agent: null,
+        attachments: [
+          {
+            content_type: "image/png",
+            file_id: imageId,
+            name: "截图.png",
+            size: 2048,
+          },
+          {
+            content_type: "application/pdf",
+            file_id: pdfId,
+            name: "讲义.pdf",
+            size: 2 * 1024 * 1024,
+          },
+        ],
+        content: "请看附件",
+        role: "user",
+      },
+    }),
+  );
+
+  // 附件区在用户气泡内文本之后渲染
+  assert.match(markup, /data-slot="message-attachments"/);
+  assert.ok(markup.indexOf("请看附件") < markup.indexOf("message-attachments"));
+  // review blocking 修复:SSR 首帧 url=null,渲染加载占位(Skeleton)——
+  // 真实文件在 effect 内 fetch 带 X-User-Id 头后以 objectURL 呈现,
+  // 不再输出直链(直链无法携带自定义头,后端按 anonymous 目录定位必 404)。
+  assert.doesNotMatch(markup, /attachment-image"/);
+  assert.doesNotMatch(markup, /attachment-link"/);
+  assert.match(markup, /animate-pulse/);
+});
+
+test("attachment previews fetch with the X-User-Id header and build object URLs", async () => {
+  const source = readFileSync(panelPath, "utf8");
+
+  // 鉴权 fetch + Blob → objectURL(修复直链 404);失败降级文案
+  assert.match(source, /fetch\(getFileUrl\(attachment\.file_id\)/);
+  assert.match(source, /"X-User-Id": DEMO_USER_ID/);
+  assert.match(source, /URL\.createObjectURL\(blob\)/);
+  assert.match(source, /data-slot="attachment-failed"/);
+  assert.match(source, /attachment-image/);
+  assert.match(source, /attachment-link/);
+});
+
+test("message rows omit the attachment area when there are no attachments", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: { agent: null, content: "没有附件", role: "user" },
+    }),
+  );
+
+  // 无附件零渲染:data-slot 不出现(历史消息后端映射 attachments=null,
+  // 自然降级,渲染路径一致)
+  assert.doesNotMatch(markup, /data-slot="message-attachments"/);
+  assert.doesNotMatch(markup, /data-slot="attachment-image"/);
+  assert.doesNotMatch(markup, /data-slot="attachment-link"/);
+});
+
+test("assistant message rows never render attachments even if present", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: {
+        agent: "supervisor",
+        attachments: [
+          { content_type: "image/png", file_id: "x-1", name: "x.png", size: 1 },
+        ],
+        content: "回答",
+        role: "assistant",
+      },
+    }),
+  );
+
+  // 仅用户侧渲染附件(助手理论上不携带;防御性零渲染,data-slot 不出现)
+  assert.doesNotMatch(markup, /data-slot="message-attachments"/);
+  assert.doesNotMatch(markup, /data-slot="attachment-image"/);
+  assert.doesNotMatch(markup, /data-slot="attachment-link"/);
+});
+
+test("attachment rendering lives inside MessageRow so both render paths share it", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  // 附件区在 MessageRow 内(全量路径与虚拟化窗口路径共用同一渲染逻辑,
+  // 两路径自动生效,防回归)
+  assert.match(panel, /data-slot="message-attachments"/);
+  assert.match(panel, /data-slot="attachment-image"/);
+  assert.match(panel, /data-slot="attachment-link"/);
+  assert.match(panel, /getFileUrl\(attachment\.file_id\)/);
+  // 仅用户消息渲染(守卫在 role 分支内)
+  assert.match(panel, /isUser \? \(/);
+});

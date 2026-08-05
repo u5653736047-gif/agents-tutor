@@ -302,6 +302,7 @@ def test_confirm_handoff_resumes_in_a_worker_and_returns_chat_response(tmp_path:
         "content": "continued answer",
         "agent": "teaching_assistant",
         "created_at": None,
+        "attachments": None,
     }
     assert [event["sequence"] for event in response.json()["events"]] == [1, 2]
     assert response.json()["pending_handoff"] is None

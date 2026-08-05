@@ -155,6 +155,7 @@ def test_chat_creates_missing_session_runs_in_worker_and_returns_event_delta(tmp
         "content": "评估完成",
         "agent": "evaluator",
         "created_at": None,
+        "attachments": None,
     }
     assert response.json()["current_agent"] == "evaluator"
     assert [session.session_id for session in sessions] == ["session-1"]

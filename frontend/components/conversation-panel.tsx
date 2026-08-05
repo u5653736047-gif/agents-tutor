@@ -2,7 +2,7 @@
 
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { CircleAlert, LoaderCircle, WifiOff } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
@@ -15,6 +15,9 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ApiClientError, ChatResponse, Message } from "@/lib/api-client";
+// D7-T3:附件受控下载 URL(纯字符串拼接)。getFileUrl 是便捷入口,
+// 见 api-client 注释;实际取文件必须带 X-User-Id 头(见 AttachmentPreview)。
+import { DEMO_USER_ID, getFileUrl } from "@/lib/api-client";
 import { errorMessageFor } from "@/lib/error-messages";
 import { isNearBottom } from "@/lib/scroll-follow";
 import { useChatStore } from "@/stores/chat-store";
@@ -31,6 +34,102 @@ function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
     >
       助手
     </span>
+  );
+}
+
+// D7-T3:附件大小展示(可选增强)——B/KB/MB 简易格式化,零依赖。
+// 非图片附件链接上顺带展示体积,便于用户判断下载内容大小。
+function formatAttachmentSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// D7-T3 review blocking 修复:直链 <img>/<a> 指向 /files/{file_id} 无法
+// 携带 X-User-Id 自定义头,而后端下载端点按当前请求头消毒出 user_key
+// 定位文件(无头 → anonymous 目录),真实文件在 demo-user/ 目录下必然
+// 404 破图。改为 fetch 带鉴权头拉 Blob → objectURL:
+//   - 图片:objectURL 内联预览,点击新标签打开(objectURL 同源可开);
+//   - PDF/其它:objectURL 下载链接(download 属性用原始文件名);
+//   - 加载中显示骨架占位,失败显示降级文案(诚实降级,不破图)。
+// effect 内 await fetch 后 setState(异步回调,set-state-in-effect 只拦
+// 同步路径),SSR 首帧 url=null 渲染占位,无 hydration mismatch。
+function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["attachments"]>[number] }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const isImage = attachment.content_type?.startsWith("image/") ?? false;
+
+  useEffect(() => {
+    let ignore = false;
+    let objectUrl: string | null = null;
+    async function load() {
+      try {
+        const response = await fetch(getFileUrl(attachment.file_id), {
+          headers: { "X-User-Id": DEMO_USER_ID },
+        });
+        if (!response.ok) {
+          throw new Error(`file fetch failed: ${response.status}`);
+        }
+        const blob = await response.blob();
+        if (!ignore) {
+          objectUrl = URL.createObjectURL(blob);
+          setUrl(objectUrl);
+        }
+      } catch {
+        if (!ignore) {
+          setFailed(true);
+        }
+      }
+    }
+    void load();
+    return () => {
+      ignore = true;
+      // review should-fix:虚拟化滚动反复挂载/卸载,必须 revoke objectURL
+      // 防 Blob(上限 10MB)累积泄漏;url 状态在卸载后不再使用。
+      if (objectUrl !== null) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [attachment.file_id]);
+
+  if (failed) {
+    return (
+      <p className="text-caption text-destructive" data-slot="attachment-failed">
+        附件加载失败
+      </p>
+    );
+  }
+  if (url === null) {
+    // 加载占位:与图片缩略图高度接近,避免布局跳动
+    return <Skeleton className={isImage ? "h-40 w-40" : "h-6 w-48"} />;
+  }
+  return isImage ? (
+    <a
+      className="block w-fit"
+      href={url}
+      rel="noreferrer"
+      target="_blank"
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        alt={attachment.name}
+        className="max-h-40 rounded-md border border-border"
+        data-slot="attachment-image"
+        src={url}
+      />
+    </a>
+  ) : (
+    <a
+      className="w-fit max-w-full truncate text-primary-foreground underline underline-offset-2"
+      data-slot="attachment-link"
+      download={attachment.name}
+      href={url}
+    >
+      {attachment.name}
+      <span className="ml-1 text-caption opacity-70">
+        {formatAttachmentSize(attachment.size)}
+      </span>
+    </a>
   );
 }
 
@@ -96,7 +195,26 @@ export function MessageRow({
       >
         {!isUser ? <AssistantBadge agent={message.agent} /> : null}
         {isUser ? (
-          <p className="whitespace-pre-wrap">{message.content}</p>
+          <>
+            <p className="whitespace-pre-wrap">{message.content}</p>
+            {/* D7-T3:附件区——仅用户消息且携带附件时渲染(文本之后);
+                无附件零渲染(data-slot 不出现):历史消息后端映射
+                attachments=null,自然降级;助手消息理论上不携带附件,
+                防御性不渲染(仅用户侧)。 */}
+            {message.attachments && message.attachments.length > 0 ? (
+              <div
+                className="mt-3 flex flex-col items-start gap-2"
+                data-slot="message-attachments"
+              >
+                {message.attachments.map((attachment) => (
+                  <AttachmentPreview
+                    attachment={attachment}
+                    key={attachment.file_id}
+                  />
+                ))}
+              </div>
+            ) : null}
+          </>
         ) : (
           <div className="mt-2">
             <AssistantMarkdown content={message.content} />

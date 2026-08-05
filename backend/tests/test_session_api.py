@@ -180,12 +180,20 @@ def test_history_projects_only_safe_user_and_assistant_messages(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.json() == [
-        {"role": "user", "content": "请总结课程。", "agent": None, "created_at": None},
+        {
+            "role": "user",
+            "content": "请总结课程。",
+            "agent": None,
+            "created_at": None,
+            # D7-T3:core 消息无附件元数据,契约字段显式为 null
+            "attachments": None,
+        },
         {
             "role": "assistant",
             "content": "课程总结。",
             "agent": "evaluator",
             "created_at": None,
+            "attachments": None,
         },
     ]
     assert "secret-key" not in response.text
@@ -224,12 +232,13 @@ def test_history_prefers_agent_role_metadata_over_name(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json() == [
-        {"role": "user", "content": "你好", "agent": None, "created_at": None},
+        {"role": "user", "content": "你好", "agent": None, "created_at": None, "attachments": None},
         {
             "role": "assistant",
             "content": "督导回答",
             "agent": "supervisor",
             "created_at": None,
+            "attachments": None,
         },
     ]
 
@@ -276,31 +285,41 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
 
     assert response.status_code == 200
     assert response.json() == [
-        {"role": "user", "content": "旧问题", "agent": None, "created_at": None},
+        {"role": "user", "content": "旧问题", "agent": None, "created_at": None, "attachments": None},
         {
             "role": "assistant",
             "content": "旧回答",
             "agent": "evaluator",
             "created_at": None,
+            "attachments": None,
         },
-        {"role": "assistant", "content": "更旧的回答", "agent": None, "created_at": None},
+        {
+            "role": "assistant",
+            "content": "更旧的回答",
+            "agent": None,
+            "created_at": None,
+            "attachments": None,
+        },
         {
             "role": "assistant",
             "content": "脏数据回答",
             "agent": "teaching_assistant",
             "created_at": None,
+            "attachments": None,
         },
         {
             "role": "assistant",
             "content": "脏数据且无合法回退",
             "agent": None,
             "created_at": None,
+            "attachments": None,
         },
         {
             "role": "assistant",
             "content": "name 非法",
             "agent": None,
             "created_at": None,
+            "attachments": None,
         },
     ]
 

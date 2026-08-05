@@ -152,6 +152,9 @@ def _public_message(message: BaseMessage) -> Message | None:
         content=message.content,
         agent=_safe_agent(message),
         created_at=_safe_created_at(message),
+        # D7-T3:core 消息无附件元数据,预留字段显式置 None,契约完整;
+        # 前端据此零渲染,待 core 携带附件元数据后由这里透传。
+        attachments=None,
     )
 
 

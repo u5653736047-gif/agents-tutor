@@ -144,6 +144,9 @@ class Message(ContractModel):
     content: str
     agent: AgentRole | None = None
     created_at: datetime | None = None
+    # D7-T3:附件引用(可选;历史消息/非附件消息为 None)。core 消息当前
+    # 无附件元数据,映射侧保持 None——契约预留,前端按字段渲染。
+    attachments: list[Attachment] | None = None
 
 
 class RunEvent(ContractModel):

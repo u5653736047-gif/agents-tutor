@@ -690,6 +690,11 @@ export interface components {
         Message: {
             /** @default null */
             agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Attachments
+             * @default null
+             */
+            attachments?: components["schemas"]["Attachment"][] | null;
             /** Content */
             content: string;
             /**
