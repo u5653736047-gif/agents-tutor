@@ -1,0 +1,83 @@
+# 多智能体助教助学系统 - Docker Compose 编排
+#
+# 用法:
+#   1. 在仓库根目录配置 .env(复制 .env.example 并填入 DEEPSEEK_API_KEY 等);
+#   2. docker compose up -d --build;
+#   3. 浏览器打开 http://localhost:3000,API 文档在 http://localhost:8000/docs。
+#
+# 密钥处理:本文件不写死任何密钥,只做 ${VAR} 占位透传,真实值全部来自
+# 根目录 .env(compose 自动读取;.env 已被 .gitignore 忽略,不会入库)。
+# 本机没有 Docker 时此编排无法运行,骨架联调请改用 scripts/start-stage3.ps1。
+
+services:
+  api:
+    build:
+      context: ./backend
+    # 与 start-stage3.ps1 同一启动方式:create_app 是工厂函数,必须带
+    # --factory;容器内监听 0.0.0.0 以便 healthcheck 与跨容器访问。
+    command:
+      - uvicorn
+      - api.app:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      # ── DeepSeek 凭证:从宿主 .env 透传;API Key 缺失时 compose 直接报错 ──
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请在仓库根 .env 中配置 DEEPSEEK_API_KEY}
+      # ── 数据文件路径:容器内固定指向挂载卷 /app/data ──
+      # 后端默认路径用 __file__.parents[3] 按宿主仓库根解析,容器里会解析
+      # 到不可写的根目录 /,因此必须显式指定;宿主 .env 里若配了 Windows
+      # 风格路径(如 D:\...)对 Linux 容器无效,这里统一忽略。
+      API_SESSION_STORE_PATH: /app/data/api_sessions.sqlite3
+      API_CHECKPOINT_PATH: /app/data/api_checkpoints.sqlite3
+      API_KNOWLEDGE_DB_PATH: /app/data/knowledge.db
+      API_VECTOR_DB_PATH: /app/data/vector_knowledge.db
+      API_FEEDBACK_STORE_PATH: /app/data/feedback.jsonl
+      # embedding 模式透传,默认 auto(镜像已装 fastembed,即真实语义检索)
+      API_KNOWLEDGE_EMBEDDING: ${API_KNOWLEDGE_EMBEDDING:-auto}
+    ports:
+      # 暴露给宿主机:浏览器里的前端代码直接 fetch localhost:8000(跨源由
+      # 后端 CORS 放行 localhost:3000,见 backend/src/api/app.py);需要改
+      # 宿主端口时只改左侧映射值即可,右侧 8000 是容器内 uvicorn 端口。
+      - "8000:8000"
+    volumes:
+      # ── 数据卷:SQLite 会话/checkpoint/知识库/反馈全部落在宿主 ./data ──
+      # docker compose down 后数据保留(停止不丢数据);彻底删除卷用
+      # docker compose down -v(慎用,会连同知识库一起删)。
+      - ./data:/app/data
+    healthcheck:
+      # python:3.11-slim 镜像没有 curl/wget,用内置 urllib 探活 GET /healthz
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Next.js 在构建时把 NEXT_PUBLIC_* 内联进浏览器产物,运行时改环境
+        # 变量不生效,因此 API 地址必须走 build args 传入。这里用
+        # http://localhost:8000 而非 compose 内网服务名 http://api:8000:
+        # 该地址是浏览器里 fetch 的目标,用户浏览器解析不了 compose 内部
+        # 主机名;服务间调用(如 healthcheck)才使用服务名。
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # node:22-alpine 自带 busybox wget,探活首页
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped

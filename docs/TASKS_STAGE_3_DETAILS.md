@@ -874,7 +874,7 @@
   全绿」在具备正常 hydration 的环境(如 CI Linux runner / 真实浏览器)执行;
   手动验收路径已在 README 与 D1-D5 各任务完成备注覆盖;本任务未伪造通过。
 
-### [ ] D6-T9 docker-compose 编排（延伸项，不属于 M3 出口）
+### [x] D6-T9 docker-compose 编排（延伸项，不属于 M3 出口）
 
 - 对应总清单：5.3.1（Docker Compose 编排（API + 前端 + 向量库 + 模型服务））
 - 背景：骨架一条命令启动的是本地进程；容器化留给细节清单。
@@ -889,7 +889,21 @@
   - **注意**：本任务对应总清单 5.3.1，不属于阶段三 3.x，不计入 M3 出口检查，
     但属于骨架「明确不做」的移交内容，按延伸项验收。
 - 依赖：无（可在 D6 任意节点执行）。
-- 完成备注：
+- 完成备注：文件交付(docker-compose.yml:api/frontend 两服务 + healthcheck +
+  ./data:/app/data 卷 + ${VAR} 密钥透传零硬编码;backend/Dockerfile:python
+  3.11-slim + pip install .[embedding] + 层缓存 + CMD uvicorn api.app:
+  create_app --factory(读 start-stage3.ps1 修正);frontend/Dockerfile:
+  node:22-alpine 多阶段 + 构建 ARG NEXT_PUBLIC_API_BASE_URL;两 .dockerignore;
+  README「容器启动」小节含验收状态声明、环境变量表、数据卷/前端地址/徽标
+  限制说明)。关键修正:数据默认路径在容器内解析到不可写层→compose 显式注入
+  API_*_PATH=/app/data/ 并挂卷;NEXT_PUBLIC_API_BASE_URL 用
+  ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}(浏览器端 fetch 不能
+  用 compose 内网服务名 api;容器内 SSR /healthz 徽标限制已在 README 明示)。
+  **验收阻塞**:本环境无 docker(docker 命令不存在),`docker compose up -d`
+  未实测——README 顶部正式声明「静态审查交付」,实测清单(配置 .env → up
+  → ps healthy → 首页/API 文档 → data/ 落盘 → down 后数据保留)留待具备
+  Docker 的环境执行;review 两轮(2 should-fix 已修:SSR 徽标限制说明与
+  README 验收声明;nit 已修:compose 变量化与引用悬空)。
 
 ---
 

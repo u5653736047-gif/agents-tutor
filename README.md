@@ -92,6 +92,68 @@ embedding_provider=FastEmbedProvider vector_dimension=512`）或
 文档中用同一 `demo-user` 和会话 ID 查询 / 提交 handoff 的 `confirm` 或 `reject`，
 再刷新前端验证历史，最后归档会话。审批卡片的完整前端交互属于后续细节清单。
 
+## 容器启动（Docker Compose）
+
+> ⚠️ **验收状态**：本小节由静态审查交付（开发环境无 Docker，未能执行
+> `docker compose up -d` 实测）。YAML/Dockerfile 经逐行人工校验，但
+> 首次使用请按下方启动步骤自行验证；若发现与描述不符，以实测为准
+> 并回报修正。
+
+在具备 Docker 的环境下，可用 Compose 一键拉起前后端，无需本机安装
+Python/Node。仓库根目录的 `docker-compose.yml` 编排两个服务：
+
+| 服务 | 镜像来源 | 对外端口 | 说明 |
+| --- | --- | --- | --- |
+| `api` | `backend/Dockerfile`（python:3.11-slim） | `8000` | FastAPI + uvicorn，已含 `[embedding]` 可选组（fastembed，语义检索开箱可用） |
+| `frontend` | `frontend/Dockerfile`（node:22-alpine） | `3000` | Next.js 生产构建（`next start`） |
+
+启动前先在仓库根目录配置 `.env`（复制 `.env.example` 并填入
+`DEEPSEEK_API_KEY`），然后执行：
+
+```bash
+docker compose up -d --build
+```
+
+浏览器打开 `http://localhost:3000`，API 文档在 `http://localhost:8000/docs`。
+停止与清理：
+
+```bash
+docker compose down      # 停止服务；data/ 数据卷保留
+docker compose down -v   # 停止并删除卷（连同 data/ 数据，慎用）
+```
+
+### 容器版环境变量
+
+与骨架联调一致：密钥与可选配置都来自根目录 `.env`，compose 只做 `${VAR}`
+占位透传，不写死任何密钥（`.env` 已被 Git 忽略）。
+
+| 变量 | 容器内行为 |
+| --- | --- |
+| `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` | 必填，从 `.env` 透传；`DEEPSEEK_API_KEY` 缺失时 `docker compose up` 直接报错 |
+| `API_SESSION_STORE_PATH` 等 5 个 `API_*_PATH` | 容器内固定指向挂载卷 `/app/data/...`。后端默认路径按宿主仓库根解析（`__file__.parents[3]`），容器里会落到不可写的根目录 `/`，必须显式指定；宿主 `.env` 里的 Windows 风格路径对容器无效 |
+| `API_KNOWLEDGE_EMBEDDING` | 可选，默认 `auto`；镜像已装 fastembed，`auto` 即真实语义检索 |
+| `NEXT_PUBLIC_API_BASE_URL` | 前端构建参数，默认 `http://localhost:8000`（见下方说明） |
+
+### 数据卷与前端 API 地址说明
+
+- **数据卷**：`api` 服务的 `./data:/app/data` 把 SQLite 会话、checkpoint、
+  知识库与反馈文件都保留在宿主机 `data/`，`docker compose down` 后数据
+  仍在；`data/knowledge.db` 等可直接复用宿主机现有产物，重建知识库用
+  宿主机脚本 `backend/scripts/ingest_books.py`。注意：若现有向量库维度与
+  容器内 fastembed 不匹配（如宿主是 256 维哈希库），检索会自动降级为纯
+  词法，不阻断启动。
+- **前端 API 地址**：`NEXT_PUBLIC_*` 由 Next.js 在构建时内联进浏览器产物，
+  运行时改环境变量无效，所以 compose 用 build args 传入
+  `http://localhost:8000`（宿主端口映射到 `api` 容器）。不能传 compose
+  内网服务名 `http://api:8000`——那是浏览器里 fetch 的目标地址，用户
+  浏览器解析不了 `api` 主机名；服务间调用（如 healthcheck）才用服务名。
+  已知限制：首页的连接状态徽标由**服务端组件** `app/page.tsx` 在容器内
+  fetch `/healthz` 得出，容器内 `localhost` 指向容器自身——因此容器部署
+  下首页徽标可能显示「后端暂不可用」，但浏览器端实际请求（对话/检索等）
+  仍走 `8000:8000` 映射正常可用。如需徽标准确，可设
+  `SERVER_API_BASE_URL=http://api:8000` 并让 `app/page.tsx` 使用它
+  （当前未实现，列为后续优化）。
+
 ## 验证
 
 ```powershell

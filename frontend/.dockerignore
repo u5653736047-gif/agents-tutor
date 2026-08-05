@@ -1,0 +1,9 @@
+# 前端镜像构建上下文排除项
+node_modules/
+.next/
+out/
+test-results/
+playwright-report/
+tests/
+e2e/
+tsconfig.tsbuildinfo
