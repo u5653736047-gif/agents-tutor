@@ -785,3 +785,57 @@ test("archiveSession refreshes the session list after success", async () => {
   assert.equal(store.getState().currentSessionId, null);
   assert.equal(store.getState().requestError, null);
 });
+
+// D6-T2:submitFeedback 只转发、不写 requestError、失败原样抛 —————
+test("submitFeedback forwards to the client without touching requestError", async () => {
+  const { createChatStore } = await loadChatStore();
+  const calls: Array<{ rating: string; comment?: string }> = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+    submitFeedback: async (input) => {
+      // 归一:忽略未提供的可选键,便于精确断言
+      calls.push({
+        rating: input.rating,
+        ...(input.comment ? { comment: input.comment } : {}),
+      });
+    },
+  });
+
+  await store.getState().submitFeedback({ rating: "up" });
+  assert.deepEqual(calls, [{ rating: "up" }]);
+  // 反馈独立于主流程:成功不产生 requestError
+  assert.equal(store.getState().requestError, null);
+
+  await store.getState().submitFeedback({ rating: "down", comment: "这段回答有误" });
+  assert.deepEqual(calls, [
+    { rating: "up" },
+    { rating: "down", comment: "这段回答有误" },
+  ]);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("submitFeedback rethrows client failures for the component to surface", async () => {
+  const { createChatStore } = await loadChatStore();
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [],
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+    submitFeedback: async () => {
+      throw new Error("storage full");
+    },
+  });
+
+  // 失败原样抛给调用方(feedback-buttons 组件 catch 显示错误行),
+  // 且不写入全局 requestError(静默降级,不阻塞对话)
+  await assert.rejects(
+    () => store.getState().submitFeedback({ rating: "up" }),
+    /storage full/,
+  );
+  assert.equal(store.getState().requestError, null);
+});

@@ -432,3 +432,88 @@ test("skeleton placeholders are hidden from assistive tech in source", () => {
     /aria-hidden\s*\n\s*className="flex justify-start"\s*\n\s*data-slot="message-skeleton"/,
   );
 });
+
+// D6-T2:回答反馈交互挂载 —————————————————————————————————————
+test("assistant rows render feedback buttons when wired, user rows never do", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      feedbackSessionId: "session-1",
+      isSending: false,
+      isStreaming: false,
+      messages: [
+        { agent: null, content: "用户的问题", role: "user" },
+        { agent: "supervisor", content: "助手的回答", role: "assistant" },
+      ],
+      onFeedback: async () => undefined,
+      runError: null,
+      streamingAgent: null,
+      streamingMessage: null,
+    }),
+  );
+
+  // 仅 assistant 行渲染反馈按钮(全量路径),user 行没有
+  assert.equal((markup.match(/data-slot="feedback-up"/g) ?? []).length, 1);
+  assert.equal((markup.match(/data-slot="feedback-down"/g) ?? []).length, 1);
+  // 反馈按钮位于 assistant 消息气泡之后(气泡下方)
+  assert.ok(markup.indexOf("助手的回答") < markup.indexOf('data-slot="feedback-up"'));
+});
+
+test("conversation content renders no feedback buttons when not wired", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: false,
+      messages: [{ agent: "supervisor", content: "回答", role: "assistant" }],
+      runError: null,
+      streamingAgent: null,
+      streamingMessage: null,
+    }),
+  );
+
+  // 未接线(无 feedbackSessionId)零渲染——既有调用与测试行为不变
+  assert.doesNotMatch(markup, /data-slot="feedback-up"/);
+});
+
+test("MessageRow renders feedback buttons only for assistant rows", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const assistantMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      feedbackSessionId: "session-1",
+      index: 0,
+      message: { agent: "supervisor", content: "回答", role: "assistant" },
+      onFeedback: async () => undefined,
+    }),
+  );
+  assert.match(assistantMarkup, /data-slot="feedback-up"/);
+  assert.match(assistantMarkup, /data-slot="feedback-down"/);
+
+  const userMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      feedbackSessionId: "session-1",
+      index: 1,
+      message: { agent: null, content: "问题", role: "user" },
+      onFeedback: async () => undefined,
+    }),
+  );
+  assert.doesNotMatch(userMarkup, /data-slot="feedback-up"/);
+});
+
+test("feedback wiring covers both full and virtualized message paths in source", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  // 全量路径(ConversationContent 内透传)与虚拟化窗口路径(ConversationPanel
+  // 直接渲染 MessageRow)都要把反馈参数传给消息行
+  assert.match(panel, /feedbackSessionId=\{feedbackSessionId\}/);
+  assert.match(panel, /feedbackSessionId=\{currentSessionId \?\? undefined\}/);
+  assert.ok((panel.match(/feedbackSessionId=/g) ?? []).length >= 3);
+  // MessageRow 内仅 assistant 行渲染 FeedbackButtons(且会话 + 回调
+  // 同时提供才渲染)
+  assert.match(panel, /!isUser && feedbackSessionId && onFeedback/);
+  // 反馈走 store 独立 action(submitFeedback 订阅),与主流程解耦
+  assert.match(panel, /useChatStore\(\(state\) => state\.submitFeedback\)/);
+});

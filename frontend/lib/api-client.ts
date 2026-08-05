@@ -16,6 +16,19 @@ export type HandoffDecision = components["schemas"]["HandoffDecisionRequest"];
 export type Message = components["schemas"]["Message"];
 export type PendingHandoffResponse = components["schemas"]["PendingHandoffResponse"];
 export type Session = components["schemas"]["Session"];
+// D6-T2:反馈评分方向与受理响应,直接取生成契约(单一数据源)
+export type FeedbackRating = components["schemas"]["FeedbackRating"];
+export type FeedbackResponse = components["schemas"]["FeedbackResponse"];
+// D6-T2:反馈提交入参(camelCase 调用侧语义;发送前由 submitFeedback
+// 转成契约 snake_case:session_id/message_id/comment/error_code)
+export type FeedbackInput = {
+  sessionId: string;
+  messageId?: string;
+  rating: FeedbackRating;
+  comment?: string;
+  errorCode?: string;
+};
+export type FeedbackResult = { received: boolean };
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -50,6 +63,10 @@ export type ApiClient = {
   getSessionMessages(sessionId: string): Promise<Message[]>;
   listSessions(includeArchived?: boolean): Promise<Session[]>;
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
+  // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话接口解耦:错误与
+  // 其它接口一样归一为 ApiClientError,由调用方(FeedbackButtons)
+  // 决定呈现方式,不进入主流程错误状态。
+  submitFeedback(input: FeedbackInput): Promise<FeedbackResult>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
   ): Promise<void>;
@@ -190,6 +207,20 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         body: JSON.stringify(payload),
         method: "POST",
       }),
+    // D6-T2:反馈接口——只发契约 FeedbackRequest 的脱敏字段(不含消息
+    // 全文);可选字段未传不落键(契约可空)。错误归一由 request() 完成
+    // (非 200 抛 ApiClientError,含 errorDetail 解析)。
+    submitFeedback: (input) =>
+      request<FeedbackResponse>(config, "/feedback", {
+        body: JSON.stringify({
+          session_id: input.sessionId,
+          rating: input.rating,
+          ...(input.messageId !== undefined ? { message_id: input.messageId } : {}),
+          ...(input.comment !== undefined ? { comment: input.comment } : {}),
+          ...(input.errorCode !== undefined ? { error_code: input.errorCode } : {}),
+        }),
+        method: "POST",
+      }).then((response) => ({ received: response.received ?? false })),
     // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>

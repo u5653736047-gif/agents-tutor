@@ -7,6 +7,7 @@ import {
   apiClient,
   type ApiClient,
   type ChatResponse,
+  type FeedbackInput,
   type HandoffDecision,
   type Message,
   type PendingHandoffResponse,
@@ -28,6 +29,10 @@ type ChatStoreClient = Pick<
   // 使用它;未注入(旧测试 stub)时退回底层 streamChat,失败不降级
   // (保持 D1-T1 行为)。
   streamChatWithRetry?: ApiClient["streamChatWithRetry"];
+  // D6-T2:反馈提交——可选:既有测试注入的 stub 未实现,正式 apiClient
+  // 一定实现;submitFeedback action 在未注入时直接跳过(与 decideHandoff
+  // 同模式)。
+  submitFeedback?: ApiClient["submitFeedback"];
 };
 // NonNullable:响应字段可选(含 undefined),store 语义统一为 null
 // (所有写入点都用 ?? null 归一化)——否则组件 props 会收到 undefined。
@@ -97,6 +102,10 @@ export type ChatStore = {
   streamSendMessage(message: string): Promise<void>;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
+  // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话流程解耦:不写
+  // requestError,失败由调用方(FeedbackButtons)catch 后在组件内
+  // 错误行呈现——反馈失败静默降级,不阻塞对话。
+  submitFeedback(input: FeedbackInput): Promise<void>;
   taskPlan: TaskPlan | null;
   taskResults: TaskResult[] | null;
 };
@@ -439,6 +448,18 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     setShowArchived: (show) => {
       set({ showArchived: show });
       void get().refreshSessions();
+    },
+    // D6-T2:提交反馈。action 只做转发:成功 resolve,失败原样抛给调用方
+    // (FeedbackButtons 内 catch 后显示组件内错误行)——刻意不写
+    // requestError,反馈独立于主对话流程,失败不阻塞对话、不污染
+    // 主流程错误状态。stub 未注入 submitFeedback 时静默跳过
+    // (与 decideHandoff 同模式)。
+    submitFeedback: async (input) => {
+      const submit = client.submitFeedback;
+      if (!submit) {
+        return;
+      }
+      await submit(input);
     },
     // D2-T5:重新发送上一条消息。通道选择与首次发送一致:client 有
     // 流式能力(streamChatWithRetry / streamChat)时走 streamSendMessage

@@ -122,3 +122,63 @@ test("the handoff client only serializes supported decision fields", async () =>
     interrupt_id: "interrupt-1",
   });
 });
+
+// D6-T2:反馈提交 ———————————————————————————————————————————————
+test("submitFeedback posts snake_case fields with the user header", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{
+    body: string | null;
+    init: RequestInit | undefined;
+    url: string;
+  }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ body: String(init?.body ?? null), init, url: String(input) });
+      return Response.json({ received: true });
+    },
+  });
+
+  const result = await client.submitFeedback({
+    sessionId: "session/1",
+    messageId: "2026-08-03T00:00:00Z",
+    rating: "down",
+    comment: "回答有误",
+    errorCode: "model_call_failed",
+  });
+
+  assert.equal(requests[0]?.url, "https://api.example/feedback");
+  assert.equal(requests[0]?.init?.method, "POST");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    session_id: "session/1",
+    message_id: "2026-08-03T00:00:00Z",
+    rating: "down",
+    comment: "回答有误",
+    error_code: "model_call_failed",
+  });
+  assert.equal(result.received, true);
+});
+
+test("submitFeedback omits optional fields and normalizes the response", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (_input, init) => {
+      requests.push({ body: String(init?.body ?? null) });
+      return Response.json({});
+    },
+  });
+
+  const result = await client.submitFeedback({ sessionId: "s1", rating: "up" });
+
+  // 未传的可选字段不落键(契约可空);空文本 comment 仍会带上(点踩
+  // 纠错空文本也允许提交)
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    session_id: "s1",
+    rating: "up",
+  });
+  // 契约 received 默认 true 但可能缺省,归一为严格布尔语义
+  assert.equal(result.received, false);
+});

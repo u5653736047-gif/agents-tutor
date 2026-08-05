@@ -9,6 +9,7 @@ import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
 import { CollaborationPanel } from "@/components/collaboration-panel";
+import { FeedbackButtons } from "@/components/feedback-buttons";
 import { HandoffCard } from "@/components/handoff-card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -48,6 +49,11 @@ type MessageRowProps = {
   dataIndex?: number;
   // 虚拟化路径:useVirtualizer 的 measureElement(ref 回调),动态校正行高
   measureRef?: (node: HTMLElement | null) => void;
+  // D6-T2:反馈挂载参数——assistant 行在气泡下方渲染 FeedbackButtons;
+  // 反馈提交失败由 FeedbackButtons 内部错误行呈现,不进入主流程错误。
+  // 两者同时提供才渲染(既有调用不传,行为不变)。
+  feedbackSessionId?: string;
+  onFeedback?: (rating: "up" | "down", comment?: string) => Promise<void> | void;
 };
 
 export function MessageRow({
@@ -56,6 +62,8 @@ export function MessageRow({
   animate = false,
   dataIndex,
   measureRef,
+  feedbackSessionId,
+  onFeedback,
 }: MessageRowProps) {
   const isUser = message.role === "user";
   // 虚拟化行必须带 data-index(measureElement 依赖);全量路径不渲染
@@ -68,7 +76,9 @@ export function MessageRow({
       // 挂载时播放一次,历史/虚拟化行挂载时若带类会在滚动浏览时逐行闪动;
       // reduced-motion 偏好由 globals.css 的全局媒体查询统一关闭。
       className={
-        (isUser ? "flex justify-end" : "flex justify-start") +
+        // D6-T2:assistant 行改为纵向堆叠(flex-col),气泡下方容纳
+        // 反馈按钮;布局等价(气泡仍按内容宽度、受 max-w-[80%] 约束)
+        (isUser ? "flex justify-end" : "flex flex-col items-start") +
         (animate
           ? " animate-in fade-in-0 slide-in-from-bottom-1 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
           : "")
@@ -93,6 +103,16 @@ export function MessageRow({
           </div>
         )}
       </div>
+      {/* D6-T2:反馈按钮——仅 assistant 行、且调用方接线(会话 + 回调)
+          时渲染;messageId 用 created_at(权威历史消息才有,乐观/流式
+          消息为 undefined 时不带,契约 message_id 可空) */}
+      {!isUser && feedbackSessionId && onFeedback ? (
+        <FeedbackButtons
+          messageId={message.created_at ?? undefined}
+          onFeedback={onFeedback}
+          sessionId={feedbackSessionId}
+        />
+      ) : null}
     </article>
   );
 }
@@ -113,6 +133,10 @@ type ConversationContentProps = {
   // (短会话既有行为);非 null = 长会话虚拟化,消息行由 ConversationPanel
   // 用 MessageRow 窗口渲染,这里只保留流式气泡/错误块/发送指示等尾部块。
   virtualItems?: { index: number }[] | null;
+  // D6-T2:反馈挂载参数(透传给每条消息行)——非空时 assistant 行渲染
+  // 反馈按钮;未提供(既有调用/测试)时零渲染,行为不变
+  feedbackSessionId?: string;
+  onFeedback?: (rating: "up" | "down", comment?: string) => Promise<void> | void;
 };
 
 export function ConversationContent({
@@ -125,6 +149,8 @@ export function ConversationContent({
   streamingAgent,
   streamingMessage,
   virtualItems,
+  feedbackSessionId,
+  onFeedback,
 }: ConversationContentProps) {
   // D2-T5:网络失败/超时(code===null)预设,供消息流下方的网络错误块使用
   const networkPreset = errorMessageFor(null);
@@ -154,9 +180,11 @@ export function ConversationContent({
               // D5-T2:仅最后一条(新消息)带进入动画;历史消息不带,
               // 避免虚拟化/滚动挂载时每行重播动画闪动
               animate={index === messages.length - 1}
+              feedbackSessionId={feedbackSessionId}
               key={message.created_at ?? `${message.role}-${index}`}
               message={message}
               index={index}
+              onFeedback={onFeedback}
             />
           ))
         : null}
@@ -317,6 +345,7 @@ export function ConversationContent({
 export function ConversationPanel() {
   // D2-T2:协作过程面板所需数据(计划、结果、事件、活跃 Agent)由这里订阅后传入
   const currentAgent = useChatStore((state) => state.currentAgent);
+  const currentSessionId = useChatStore((state) => state.currentSessionId);
   // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
   const decideHandoff = useChatStore((state) => state.decideHandoff);
   const events = useChatStore((state) => state.events);
@@ -334,6 +363,9 @@ export function ConversationPanel() {
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
+  // D6-T2:反馈提交 action——与主对话流程解耦(不写 requestError),
+  // 失败由 FeedbackButtons 组件内错误行呈现
+  const submitFeedback = useChatStore((state) => state.submitFeedback);
   const taskPlan = useChatStore((state) => state.taskPlan);
   const taskResults = useChatStore((state) => state.taskResults);
   const endRef = useRef<HTMLDivElement>(null);
@@ -374,6 +406,15 @@ export function ConversationPanel() {
       el.scrollHeight,
     );
   };
+
+  // D6-T2:反馈提交回调——闭包绑定当前会话(无会话时不渲染反馈按钮,
+  // 见 MessageRow 的 feedbackSessionId 守卫);messageId 由 MessageRow
+  // 从消息 created_at 注入。store action 不写 requestError,失败由
+  // FeedbackButtons 内部错误行呈现(任务「失败静默降级,不阻塞对话」)。
+  const handleFeedback = currentSessionId
+    ? (rating: "up" | "down", comment?: string) =>
+        submitFeedback({ rating, sessionId: currentSessionId, comment })
+    : undefined;
 
   useEffect(() => {
     // D4-T8:用户上翻浏览(followBottom=false)时不打扰,
@@ -426,18 +467,22 @@ export function ConversationPanel() {
                 return (
                   <MessageRow
                     dataIndex={item.index}
+                    feedbackSessionId={currentSessionId ?? undefined}
                     index={item.index}
                     key={message.created_at ?? `msg-${item.index}`}
                     measureRef={virtualizer.measureElement}
                     message={message}
+                    onFeedback={handleFeedback}
                   />
                 );
               })
             : null}
           <ConversationContent
+            feedbackSessionId={currentSessionId ?? undefined}
             isSending={isSending}
             isStreaming={isStreaming}
             messages={messages}
+            onFeedback={handleFeedback}
             onRetry={
               lastSentMessage ? () => void retryLastMessage() : undefined
             }
