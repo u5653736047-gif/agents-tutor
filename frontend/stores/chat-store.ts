@@ -6,6 +6,7 @@ import {
   ApiClientError,
   apiClient,
   type ApiClient,
+  type AttachmentInput,
   type ChatResponse,
   type FeedbackInput,
   type HandoffDecision,
@@ -93,13 +94,16 @@ export type ChatStore = {
   retryLastMessage(): Promise<void>;
   runError: RunError | null;
   selectSession(sessionId: string | null): void;
-  sendMessage(message: string): Promise<void>;
+  // D7-T2:附件引用列表(camelCase 语义即契约字段,file_id 等单字段名
+  // 无转换)。可选参数向后兼容:既有调用不传,行为不变。
+  sendMessage(message: string, attachments?: AttachmentInput[]): Promise<void>;
   sessions: Session[];
   // D4-T7:归档视图开关——true 时 refreshSessions 带 include_archived
   // 拉取归档会话;setShowArchived 切换后立即按新视图重新拉取。
   setShowArchived(show: boolean): void;
   showArchived: boolean;
-  streamSendMessage(message: string): Promise<void>;
+  // D7-T2:附件引用列表(与 sendMessage 同一语义)。可选参数向后兼容。
+  streamSendMessage(message: string, attachments?: AttachmentInput[]): Promise<void>;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
   // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话流程解耦:不写
@@ -372,7 +376,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       }
     },
-    sendMessage: async (message) => {
+    sendMessage: async (message, attachments) => {
       const sessionId = get().currentSessionId;
       if (!sessionId) {
         set({
@@ -403,7 +407,13 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         messages: [...state.messages, optimistic],
       }));
       try {
-        const response = await client.sendChat({ message, session_id: sessionId });
+        const response = await client.sendChat({
+          message,
+          session_id: sessionId,
+          // D7-T2:附件随消息提交(契约 ChatRequest.attachments,可空)。
+          // 未传不落键——既有调用与后端骨架行为完全不变。
+          ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        });
         const messages = await client.getSessionMessages(sessionId);
         if (get().currentSessionId === sessionId) {
           // D2-T3:response 字段合并抽到公共 applyChatResponse(与
@@ -464,6 +474,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     // D2-T5:重新发送上一条消息。通道选择与首次发送一致:client 有
     // 流式能力(streamChatWithRetry / streamChat)时走 streamSendMessage
     // (当前 UI 主通道),否则走 sendMessage(同步通道,既有降级语义)。
+    // D7-T2:重发仅携带文本——附件引用是一次性提交的本地回执,失败
+    // 重发场景不自动补带(附件文件已在服务端,孤儿回收是后端职责)。
     retryLastMessage: async () => {
       const message = get().lastSentMessage;
       if (!message) {
@@ -475,7 +487,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         await get().sendMessage(message);
       }
     },
-    streamSendMessage: async (message) => {
+    streamSendMessage: async (message, attachments) => {
       const sessionId = get().currentSessionId;
       if (!sessionId) {
         set({
@@ -483,6 +495,10 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         });
         return;
       }
+
+      // D7-T2:附件消息——stream-client 已扩展 attachments 透传(与同步
+      // 通道同契约),正常走流式主通道获得流式体验;重试耗尽降级到同步
+      // sendMessage 时同样携带附件(见降级分支)。
 
       // D1-T3:优先走带断线重连的通道(指数退避 + fromSequence 续传);
       // 未注入重试通道的旧 stub 退回底层 streamChat(D1-T1 行为不变)。
@@ -575,6 +591,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           await retryStream({
             sessionId,
             message,
+            attachments,
             maxRetries: _STREAM_RETRY_LIMIT,
             onEvent: dispatch,
             signal: controller.signal,
@@ -584,6 +601,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           await plainStream({
             sessionId,
             message,
+            attachments,
             onEvent: dispatch,
             signal: controller.signal,
           });
@@ -640,7 +658,10 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
               }));
             }
             try {
-              await get().sendMessage(message);
+              // D7-T2:降级重发同样携带附件引用(与首次发送一致;当前
+              // 附件消息不会进入本分支——流式分流在上游,此处防御性
+              // 透传,待流式附件支持后自然衔接)。
+              await get().sendMessage(message, attachments);
             } catch {
               // sendMessage 内部已处理错误(requestError / 会话守卫),无需再处理
             }

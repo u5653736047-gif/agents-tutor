@@ -839,3 +839,89 @@ test("submitFeedback rethrows client failures for the component to surface", asy
   );
   assert.equal(store.getState().requestError, null);
 });
+
+// D7-T2:附件透传 ———————————————————————————————————————————————
+test("sendMessage forwards attachments into the ChatRequest body", async () => {
+  const { createChatStore } = await loadChatStore();
+  const bodies: Array<Record<string, unknown>> = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage],
+    listSessions: async () => [session],
+    sendChat: async (payload) => {
+      bodies.push(payload as unknown as Record<string, unknown>);
+      return { events: [], session_id: session.session_id };
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const attachments = [
+    { content_type: "image/png", file_id: "abc123.png", name: "diagram.png", size: 1024 },
+  ];
+  await store.getState().sendMessage("看图", attachments);
+
+  // 附件回执按契约 ChatRequest.attachments 原样透传进 body
+  assert.deepEqual(bodies[0], {
+    attachments,
+    message: "看图",
+    session_id: session.session_id,
+  });
+});
+
+test("sendMessage omits the attachments key when none are provided", async () => {
+  // 向后兼容:不传附件时 body 与既有行为逐字节一致(不落 attachments 键)
+  const { createChatStore } = await loadChatStore();
+  const bodies: Array<Record<string, unknown>> = [];
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage],
+    listSessions: async () => [session],
+    sendChat: async (payload) => {
+      bodies.push(payload as unknown as Record<string, unknown>);
+      return { events: [], session_id: session.session_id };
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().sendMessage("普通消息");
+
+  assert.deepEqual(bodies[0], { message: "普通消息", session_id: session.session_id });
+});
+
+test("streamSendMessage carries attachments on the streaming channel", async () => {
+  // D7-T2:stream-client 已扩展 attachments 透传(与同步通道同契约),
+  // 有附件消息正常走流式主通道(获得流式体验),重试耗尽才降级同步。
+  const { createChatStore } = await loadChatStore();
+  const bodies: Array<Record<string, unknown>> = [];
+  let streamCalls = 0;
+  let streamAttachments: unknown = "not-called";
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage],
+    listSessions: async () => [session],
+    sendChat: async (payload) => {
+      bodies.push(payload as unknown as Record<string, unknown>);
+      return { events: [], session_id: session.session_id };
+    },
+    streamChatWithRetry: async (options) => {
+      streamCalls += 1;
+      streamAttachments = options.attachments;
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const attachments = [
+    { content_type: "text/plain", file_id: "note.txt", name: "note.txt", size: 42 },
+  ];
+  await store.getState().streamSendMessage("带附件", attachments);
+
+  // 附件消息:流式通道被调用且收到 attachments,同步通道零调用
+  assert.equal(streamCalls, 1);
+  assert.deepEqual(streamAttachments, attachments);
+  assert.equal(bodies.length, 0);
+  assert.equal(store.getState().isStreaming, false);
+  assert.equal(store.getState().isSending, false);
+});

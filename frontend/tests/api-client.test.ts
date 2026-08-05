@@ -433,3 +433,80 @@ test("getStatsOverview normalizes stats errors like other endpoints", async () =
     return true;
   });
 });
+
+// D7-T2:聊天附件 ———————————————————————————————————————————————
+test("uploadFile posts FormData under the file field and passes the receipt through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json(
+        {
+          content_type: "image/png",
+          file_id: "abc123.png",
+          name: "diagram.png",
+          size: 1024,
+          url: "/files/abc123.png",
+        },
+        { status: 201 },
+      );
+    },
+  });
+
+  const file = new File(["png"], "diagram.png", { type: "image/png" });
+  const receipt = await client.uploadFile(file);
+
+  assert.equal(requests[0]?.url, "https://api.example/files");
+  assert.equal(requests[0]?.init?.method, "POST");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  // body 为 FormData、字段名 "file";Content-Type 不客户端强设
+  // (浏览器自动带 multipart boundary,与 uploadDocument 同通道)
+  assert.ok(requests[0]?.init?.body instanceof FormData);
+  assert.equal((requests[0]?.init?.body as FormData).get("file"), file);
+  assert.equal(new Headers(requests[0]?.init?.headers).has("Content-Type"), false);
+  // 响应透传契约字段(file_id/name/content_type/size/url,单字段名原样)
+  assert.equal(receipt.file_id, "abc123.png");
+  assert.equal(receipt.name, "diagram.png");
+  assert.equal(receipt.content_type, "image/png");
+  assert.equal(receipt.size, 1024);
+  assert.equal(receipt.url, "/files/abc123.png");
+});
+
+test("uploadFile normalizes upload failures like other endpoints", async () => {
+  const { ApiClientError, createApiClient } = await loadApiClient();
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          detail: { error_code: "invalid_request", message: "文件类型或大小不符。" },
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 422 },
+      ),
+  });
+
+  await assert.rejects(client.uploadFile(new File(["x"], "bad.exe")), (error: unknown) => {
+    assert.ok(error instanceof ApiClientError);
+    assert.equal(error.status, 422);
+    assert.equal(error.code, "invalid_request");
+    assert.equal(error.message, "文件类型或大小不符。");
+    return true;
+  });
+});
+
+test("getFileUrl builds the controlled download URL with an encoded file id", async () => {
+  const { createApiClient } = await loadApiClient();
+  const client = createApiClient({ baseUrl: "https://api.example/" });
+
+  // 注入 base 拼接(尾斜杠剥除);file_id 特殊字符经 encodeURIComponent 兜底
+  assert.equal(client.getFileUrl("abc123.png"), "https://api.example/files/abc123.png");
+  assert.equal(client.getFileUrl("a/b.png"), "https://api.example/files/a%2Fb.png");
+});
+
+test("the module-level getFileUrl proxies the default client", async () => {
+  const { apiBaseUrl, getFileUrl } = await loadApiClient();
+
+  assert.equal(getFileUrl("abc123.png"), `${apiBaseUrl}/files/abc123.png`);
+});

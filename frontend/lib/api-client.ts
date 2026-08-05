@@ -44,6 +44,12 @@ export type KnowledgeDocumentUploadResponse =
 export type KnowledgeDocumentListResponse =
   components["schemas"]["KnowledgeDocumentListResponse"];
 export type KnowledgeDocumentEntry = components["schemas"]["KnowledgeDocumentListEntry"];
+// D7-T2:聊天附件——上传回执与附件引用直接取契约(单一数据源):
+// FileUploadResponse(file_id/name/content_type/size/url)与 Attachment
+// (file_id/name/content_type/size)同源;字段均为契约单字段名(无多词
+// 复合),调用侧直接透传,不做 camelCase 转换。
+export type FileUploadReceipt = components["schemas"]["FileUploadResponse"];
+export type AttachmentInput = components["schemas"]["Attachment"];
 // D6-T7:学习进度基础统计——直接取契约 StatsOverview(单一数据源):
 // session_count/message_count/agent_answer_counts(角色字符串→计数)/
 // last_activity_at(ISO 时间戳或 null,无活动为 null)。响应字段是
@@ -105,6 +111,13 @@ export type ApiClient = {
   // (与 searchKnowledge 同一隔离哲学)。GET /stats/overview,响应
   // 直接透传契约 StatsOverview;错误归一为 ApiClientError。
   getStatsOverview(): Promise<StatsOverview>;
+  // D7-T2:聊天附件——uploadFile 走 multipart/form-data(field 名
+  // "file",与 uploadDocument 同一 FormData 通道,错误归一为
+  // ApiClientError);getFileUrl 纯字符串拼接(不 fetch),供
+  // <img>/<a> 直接使用(file_id 为服务端生成的 uuid 安全段,
+  // encodeURIComponent 兜底防路径注入)。
+  getFileUrl(fileId: string): string;
+  uploadFile(file: File): Promise<FileUploadReceipt>;
   streamChat(
     options: Omit<StreamChatOptions, "baseUrl" | "fetchImpl" | "userId">,
   ): Promise<void>;
@@ -314,6 +327,20 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // D6-T7:学习进度——GET /stats/overview,响应直接透传契约字段
     // (snake_case 原样,与 listDocuments 等先例一致)。
     getStatsOverview: () => request<StatsOverview>(config, "/stats/overview"),
+    // D7-T2:附件上传——与 uploadDocument 同一 FormData 模式(field 名
+    // "file",request() 对 FormData 不设 Content-Type,浏览器自动带
+    // multipart boundary)。无进度回调:上传中态由组件 pendingFiles
+    // 状态表达,失败抛 ApiClientError(含 errorDetail 解析)。
+    uploadFile: (file) => {
+      const body = new FormData();
+      body.append("file", file);
+      return request<FileUploadReceipt>(config, "/files", { body, method: "POST" });
+    },
+    // D7-T2:受控下载 URL——仅拼接不 fetch:<img>/<a> 直接使用。
+    // 注:GET /files/{file_id} 按 X-User-Id 用户隔离校验(匿名访问
+    // 他人文件 404),浏览器直链无法带自定义头,该缺口由 D7-T3 的
+    // 展示层决定如何补(本期只提供 URL 拼接)。
+    getFileUrl: (fileId) => `${config.baseUrl}/files/${encodeURIComponent(fileId)}`,
     // 流式对话:baseUrl/userId/fetchImpl/timeoutMs 由注入配置填充,
     // 调用方只需传 sessionId/message/onEvent(及可选的 signal)。
     streamChat: (options) =>
@@ -338,3 +365,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 }
 
 export const apiClient = createApiClient();
+
+// D7-T2:模块级便捷入口——组件(chat-input)直接 import,代理默认
+// apiClient(同一注入配置);需要注入自定义 fetch/baseUrl 的场景走
+// createApiClient 的接口方法。
+export function uploadFile(file: File): Promise<FileUploadReceipt> {
+  return apiClient.uploadFile(file);
+}
+
+export function getFileUrl(fileId: string): string {
+  return apiClient.getFileUrl(fileId);
+}

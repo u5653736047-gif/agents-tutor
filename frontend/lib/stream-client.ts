@@ -14,6 +14,10 @@ export interface StreamChatOptions {
   userId: string;
   sessionId: string;
   message: string;
+  // D7-T2:附件引用列表(契约 ChatRequest.attachments)——流式通道与同步
+  // 通道同契约,有附件时一并提交;缺省 undefined 不落 body 字段。
+  // 类型直接引用生成契约,store→stream 间字段零漂移(review nit)。
+  attachments?: components["schemas"]["Attachment"][];
   onEvent: StreamEventCallback;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
@@ -77,6 +81,7 @@ async function readErrorDetail(response: Response): Promise<{
 
 export async function streamChat(options: StreamChatOptions): Promise<void> {
   const {
+    attachments,
     baseUrl,
     fetchImpl = fetch,
     fromSequence = 0,
@@ -109,7 +114,14 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       response = await fetchImpl(
         `${baseUrl}/chat/stream?from_sequence=${fromSequence}`,
         {
-          body: JSON.stringify({ message, session_id: sessionId }),
+          body: JSON.stringify({
+            message,
+            session_id: sessionId,
+            // D7-T2:流式通道同契约透传附件(见 StreamChatOptions.attachments);
+            // 条件展开:缺省不落字段,与既有请求体逐字节一致(既有测试
+            // 零回归)。
+            ...(attachments && attachments.length > 0 ? { attachments } : {}),
+          }),
           headers: {
             "Content-Type": "application/json",
             "X-User-Id": userId,
