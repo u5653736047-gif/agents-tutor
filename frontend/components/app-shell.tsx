@@ -1,6 +1,7 @@
 "use client";
 
-import { CircleCheck, CircleX, Menu } from "lucide-react";
+import { CircleCheck, CircleX, Menu, Moon, Sun } from "lucide-react";
+import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
 import { ConversationPanel } from "@/components/conversation-panel";
@@ -17,6 +18,10 @@ export function AppShell({ apiConnected }: AppShellProps) {
   // D4-T5:移动端抽屉状态。初始 false,SSR 首屏不渲染抽屉/遮罩,
   // 开合全部发生在客户端交互之后(SSR 安全)。
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // D4-T6:主题切换。图标 CSS 类驱动无需 mounted;aria-label/onClick
+  // 直接读 resolvedTheme(SSR 首帧 undefined,hydration 后校准)。
+  const { resolvedTheme, setTheme } = useTheme();
 
   // D4-T5:抽屉打开期间注册 keydown 监听,Esc 关闭;关闭后移除监听。
   useEffect(() => {
@@ -83,13 +88,31 @@ export function AppShell({ apiConnected }: AppShellProps) {
               <h2 className="text-title font-semibold text-foreground">对话区</h2>
             </div>
           </div>
-          <div className="flex items-center gap-2 text-caption text-muted-foreground">
-            {apiConnected ? (
-              <CircleCheck aria-hidden className="size-4 text-emerald-600" />
-            ) : (
-              <CircleX aria-hidden className="size-4 text-destructive" />
-            )}
-            <span>{apiConnected ? "后端已连接" : "后端暂不可用"}</span>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 text-caption text-muted-foreground">
+              {apiConnected ? (
+                <CircleCheck aria-hidden className="size-4 text-emerald-600" />
+              ) : (
+                <CircleX aria-hidden className="size-4 text-destructive" />
+              )}
+              <span>{apiConnected ? "后端已连接" : "后端暂不可用"}</span>
+            </div>
+            {/* D4-T6:主题切换按钮。图标用 CSS 类驱动(亮色显月亮/
+                暗色显太阳,next-themes 内联脚本在 hydration 前设置
+                html 的 dark 类,CSS 即时生效——无 JS 状态、无闪烁、
+                不触发 react-hooks 的 effect setState lint);aria-label
+                与 onClick 用 resolvedTheme(SSR 首帧 undefined 显示
+                「切换到暗色模式」,hydration 后校准)。 */}
+            <button
+              aria-label={resolvedTheme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}
+              className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              data-slot="theme-toggle"
+              onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
+              type="button"
+            >
+              <Moon aria-hidden className="size-5 dark:hidden" />
+              <Sun aria-hidden className="hidden size-5 dark:block" />
+            </button>
           </div>
         </header>
 

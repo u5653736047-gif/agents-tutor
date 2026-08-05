@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 @import "tw-animate-css";
 /* D3-T1:KaTeX 公式样式。@import 必须在 tailwind 指令前(全局层)——
    组件内 import CSS 会被 tsx(测试运行器)拒绝(无 CSS 处理),故在此
@@ -49,6 +50,31 @@
   --space-6: 1.5rem;
   --space-8: 2rem;
 }
+
+/* D4-T6:暗色语义 token(shadcn 暗色变量,oklch;基准色复用 :root,
+   只覆盖语义映射,保证 Tailwind 的 bg-background 等类在 .dark 下
+   自动取暗色值)。亮色/暗色仅通过 <html class="dark"> 切换。 */
+.dark {
+  --background: oklch(0.141 0.005 285.823);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.21 0.006 285.885);
+  --card-foreground: oklch(0.985 0 0);
+  --primary: var(--brand);
+  --primary-foreground: oklch(0.985 0.002 247.84);
+  --muted: oklch(0.269 0.01 285.91);
+  --muted-foreground: oklch(0.708 0.015 285.47);
+  --border: oklch(0.269 0.01 285.91);
+  --destructive: oklch(0.704 0.191 22.216);
+}
+
+/* D4-T6:暗色下代码块与页面背景区分——pre 底色提亮一档(neutral-800),
+   文字保持浅色;仅 .dark 生效,亮色不受影响。 */
+.dark pre {
+  background-color: var(--neutral-800);
+}
+
+/* D4-T6:角色徽章色(--role-*)与 KaTeX 继承色为中等饱和度,亮/暗两
+   模式均可读,不覆盖。 */
 
 @theme inline {
   --color-background: var(--background);

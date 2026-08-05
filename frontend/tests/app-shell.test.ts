@@ -66,3 +66,30 @@ test("the app shell closes the mobile drawer on overlay, Escape, and session sel
   // (选中会话即收起);桌面分支不传(向后兼容)
   assert.match(source, /onSessionSelected=\{\(\) => setSidebarOpen\(false\)\}/);
 });
+
+// D4-T6:主题切换的 SSR 断言。useTheme 在无 ThemeProvider 时返回默认值
+// (next-themes 不抛错),SSR 初始态 mounted=false → 月亮图标 +
+// 「切换到暗色模式」;点击互切是客户端交互,由源码正则守卫。
+test("the app shell renders the theme toggle in its initial state", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /data-slot="theme-toggle"/);
+  assert.match(markup, /切换到暗色模式/);
+});
+
+// D4-T6:主题切换逻辑的源码正则守卫(CSS 类驱动图标 + setTheme)。
+test("the theme toggle switches between light and dark themes", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  // 图标 CSS 类驱动:亮色显月亮(dark:hidden)、暗色显太阳(dark:block)
+  // ——next-themes 内联脚本在 hydration 前设置 html 的 dark 类,CSS
+  // 即时生效,无 JS 状态、无闪烁(react-hooks 新 lint 拦截 effect 内
+  // setState,mounted 模式被弃用,注释见组件)。
+  assert.match(source, /<Moon aria-hidden className="size-5 dark:hidden" \/>/);
+  assert.match(source, /<Sun aria-hidden className="hidden size-5 dark:block" \/>/);
+  // aria-label 与 onClick 读 resolvedTheme,点击在亮/暗之间互切
+  assert.match(source, /setTheme\(resolvedTheme === "dark" \? "light" : "dark"\)/);
+  assert.match(source, /切换到亮色模式/);
+  assert.match(source, /切换到暗色模式/);
+});
