@@ -1,5 +1,6 @@
 "use client";
 
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { CircleAlert, LoaderCircle, WifiOff } from "lucide-react";
 import { useEffect, useRef } from "react";
 
@@ -13,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import type { AgentRole } from "@/lib/agent-roles";
 import type { ApiClientError, ChatResponse, Message } from "@/lib/api-client";
 import { errorMessageFor } from "@/lib/error-messages";
+import { isNearBottom } from "@/lib/scroll-follow";
 import { useChatStore } from "@/stores/chat-store";
 
 function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
@@ -30,6 +32,57 @@ function AssistantBadge({ agent }: { agent: AgentRole | null | undefined }) {
   );
 }
 
+// D4-T8:单条消息行——ConversationContent(全量路径)与 ConversationPanel
+// (虚拟化窗口路径)共用,渲染逻辑单点,保证两种模式输出一致。
+// dataIndex/measureRef 仅在虚拟化路径传入:virtual-core 的 measureElement
+// 靠 data-index 属性定位行索引(默认 indexAttribute),全量路径不输出
+// 该属性,SSR 输出与既有完全一致。
+type MessageRowProps = {
+  message: Message;
+  index: number;
+  // 虚拟化路径:行在列表中的真实索引,渲染为 data-index 供 measureElement 定位
+  dataIndex?: number;
+  // 虚拟化路径:useVirtualizer 的 measureElement(ref 回调),动态校正行高
+  measureRef?: (node: HTMLElement | null) => void;
+};
+
+export function MessageRow({
+  message,
+  index,
+  dataIndex,
+  measureRef,
+}: MessageRowProps) {
+  const isUser = message.role === "user";
+  // 虚拟化行必须带 data-index(measureElement 依赖);全量路径不渲染
+  const rowIndex = dataIndex ?? index;
+
+  return (
+    <article
+      className={isUser ? "flex justify-end" : "flex justify-start"}
+      data-index={measureRef ? rowIndex : undefined}
+      data-message-role={message.role}
+      ref={measureRef}
+    >
+      <div
+        className={
+          isUser
+            ? "max-w-[80%] rounded-lg bg-primary px-4 py-3 text-body text-primary-foreground"
+            : "max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground"
+        }
+      >
+        {!isUser ? <AssistantBadge agent={message.agent} /> : null}
+        {isUser ? (
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        ) : (
+          <div className="mt-2">
+            <AssistantMarkdown content={message.content} />
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
 type ConversationContentProps = {
   isSending: boolean;
   isStreaming: boolean;
@@ -42,6 +95,10 @@ type ConversationContentProps = {
   runError: NonNullable<ChatResponse["run_error"]> | null;
   streamingAgent: AgentRole | null;
   streamingMessage: Message | null;
+  // D4-T8:虚拟化窗口参数。null/缺省 = 未启用虚拟化,消息行全量渲染
+  // (短会话既有行为);非 null = 长会话虚拟化,消息行由 ConversationPanel
+  // 用 MessageRow 窗口渲染,这里只保留流式气泡/错误块/发送指示等尾部块。
+  virtualItems?: { index: number }[] | null;
 };
 
 export function ConversationContent({
@@ -53,6 +110,7 @@ export function ConversationContent({
   runError,
   streamingAgent,
   streamingMessage,
+  virtualItems,
 }: ConversationContentProps) {
   // D2-T5:网络失败/超时(code===null)预设,供消息流下方的网络错误块使用
   const networkPreset = errorMessageFor(null);
@@ -60,34 +118,17 @@ export function ConversationContent({
 
   return (
     <>
-      {messages.map((message, index) => {
-        const isUser = message.role === "user";
-
-        return (
-          <article
-            className={isUser ? "flex justify-end" : "flex justify-start"}
-            data-message-role={message.role}
-            key={message.created_at ?? `${message.role}-${index}`}
-          >
-            <div
-              className={
-                isUser
-                  ? "max-w-[80%] rounded-lg bg-primary px-4 py-3 text-body text-primary-foreground"
-                  : "max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground"
-              }
-            >
-              {!isUser ? <AssistantBadge agent={message.agent} /> : null}
-              {isUser ? (
-                <p className="whitespace-pre-wrap">{message.content}</p>
-              ) : (
-                <div className="mt-2">
-                  <AssistantMarkdown content={message.content} />
-                </div>
-              )}
-            </div>
-          </article>
-        );
-      })}
+      {/* D4-T8:未启用虚拟化时全量渲染消息行(短会话既有行为);
+          启用时消息行由 ConversationPanel 虚拟渲染,此处仅渲染尾部块 */}
+      {virtualItems == null
+        ? messages.map((message, index) => (
+            <MessageRow
+              key={message.created_at ?? `${message.role}-${index}`}
+              message={message}
+              index={index}
+            />
+          ))
+        : null}
 
       {/* 流式气泡:isStreaming 期间渲染,或异常中断后保留已收到内容时继续展示 */}
       {isStreaming || streamingMessage ? (
@@ -221,9 +262,50 @@ export function ConversationPanel() {
   const taskPlan = useChatStore((state) => state.taskPlan);
   const taskResults = useChatStore((state) => state.taskResults);
   const endRef = useRef<HTMLDivElement>(null);
+  // D4-T8:滚动容器 ref——既是 virtualizer 的 getScrollElement,
+  // 也是 onScroll 贴底判定的目标元素
+  const parentRef = useRef<HTMLDivElement>(null);
+  // D4-T8:是否跟随底部(新消息自动滚动)。初始 true;用户上翻时
+  // onScroll 置 false 暂停跟随,回到底部后自动恢复。
+  const followBottom = useRef(true);
+
+  // D4-T8:长会话(>50 条)启用消息列表虚拟化,只渲染视口附近的行,
+  // 避免数千条消息的 DOM 开销;短会话禁用(虚拟化对小列表无收益,
+  // 且动态测量有抖动),保持既有全量渲染行为与 SSR 输出。
+  const virtualizer = useVirtualizer<HTMLDivElement, HTMLElement>({
+    count: messages.length,
+    getScrollElement: () => parentRef.current,
+    // 文本行高不定,96px 仅作首屏估算,measureElement 挂载后按实际校正
+    estimateSize: () => 96,
+    // 与既有 key 逻辑一致(created_at 优先,index 兜底)
+    getItemKey: (index) => messages[index]?.created_at ?? `msg-${index}`,
+    enabled: messages.length > 50,
+    overscan: 8,
+    // 与内容列 flex gap-4 一致:虚拟位置按「行高 + gap」累加,
+    // 否则长列表底部会累积 16px×N 的偏差,滚动不到最后一条消息
+    gap: 16,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+  // 与 enabled 同源判断,渲染期直接可用(virtualizer 自身状态不参与)
+  const isVirtualized = messages.length > 50;
+  const totalSize = virtualizer.getTotalSize();
+
+  const handleScroll = () => {
+    const el = parentRef.current;
+    if (!el) return;
+    followBottom.current = isNearBottom(
+      el.scrollTop,
+      el.clientHeight,
+      el.scrollHeight,
+    );
+  };
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
+    // D4-T8:用户上翻浏览(followBottom=false)时不打扰,
+    // 回到底部后由 onScroll 恢复跟随
+    if (followBottom.current) {
+      endRef.current?.scrollIntoView({ block: "end" });
+    }
   }, [
     currentAgent,
     events,
@@ -242,8 +324,35 @@ export function ConversationPanel() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto" data-slot="message-list">
+      <div
+        className="min-h-0 flex-1 overflow-y-auto"
+        data-slot="message-list"
+        onScroll={handleScroll}
+        ref={parentRef}
+      >
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
+          {/* D4-T8:虚拟化前 spacer——把首行推到估算位置(首帧未测量
+              时为 0,随测量/滚动更新) */}
+          {isVirtualized && virtualItems.length > 0 ? (
+            <div style={{ height: virtualItems[0]?.start ?? 0 }} />
+          ) : null}
+          {isVirtualized
+            ? virtualItems.map((item) => {
+                // count 与 messages 同源,理论上不会缺项;防御 undefined
+                // 避免越界渲染(noUncheckedIndexedAccess)
+                const message = messages[item.index];
+                if (!message) return null;
+                return (
+                  <MessageRow
+                    dataIndex={item.index}
+                    index={item.index}
+                    key={message.created_at ?? `msg-${item.index}`}
+                    measureRef={virtualizer.measureElement}
+                    message={message}
+                  />
+                );
+              })
+            : null}
           <ConversationContent
             isSending={isSending}
             isStreaming={isStreaming}
@@ -255,6 +364,7 @@ export function ConversationPanel() {
             runError={runError ?? null}
             streamingAgent={streamingAgent}
             streamingMessage={streamingMessage}
+            virtualItems={isVirtualized ? virtualItems : null}
           />
           {/* D2-T2:协作过程面板——消息流与输入区之间,展示计划与事件 */}
           <CollaborationPanel
@@ -284,6 +394,18 @@ export function ConversationPanel() {
               最后一轮回答,跟随该轮的回答与协作过程一起展示;store
               的 references 为 null 时组件零渲染,不占位 */}
           <CitationList citations={references} />
+          {/* D4-T8:虚拟化尾 spacer——补足未渲染行的估算高度,
+              保证滚动条总高度与全量模式一致 */}
+          {isVirtualized ? (
+            <div
+              style={{
+                height: Math.max(
+                  0,
+                  totalSize - (virtualItems[virtualItems.length - 1]?.end ?? 0),
+                ),
+              }}
+            />
+          ) : null}
           <div data-slot="conversation-end" ref={endRef} />
         </div>
       </div>
