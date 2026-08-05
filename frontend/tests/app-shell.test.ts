@@ -58,13 +58,41 @@ test("the app shell closes the mobile drawer on overlay, Escape, and session sel
   assert.match(source, /setSidebarOpen\(true\)/);
   // 遮罩点击收起
   assert.match(source, /data-slot="sidebar-overlay"/);
-  assert.match(source, /onClick=\{\(\) => setSidebarOpen\(false\)\}/);
+  // D5-T5:遮罩/选中会话/Esc 统一走 closeDrawer(关闭 + 焦点归还单点)
+  assert.match(source, /onClick=\{closeDrawer\}/);
   // Esc 关闭:仅抽屉打开时注册 keydown 监听
   assert.match(source, /addEventListener\("keydown"/);
   assert.match(source, /event\.key === "Escape"/);
+  // D5-T5:Esc 处理器调用 closeDrawer 而非直接 setSidebarOpen(false)
+  assert.match(source, /event\.key === "Escape"\) \{\s*\n\s*closeDrawer\(\);/);
   // 方案 A:移动抽屉分支给 SessionSidebar 传 onSessionSelected 回调
-  // (选中会话即收起);桌面分支不传(向后兼容)
-  assert.match(source, /onSessionSelected=\{\(\) => setSidebarOpen\(false\)\}/);
+  // (选中会话即收起;D5-T5 走 closeDrawer 归还焦点)
+  assert.match(source, /onSessionSelected=\{closeDrawer\}/);
+});
+
+// D5-T5:抽屉焦点管理源码正则守卫——打开时焦点移入抽屉容器(tabIndex=-1),
+// 关闭(遮罩/Esc/选中会话)统一经 closeDrawer 归还汉堡按钮。动态焦点行为
+// 无法在 SSR/无 jsdom 环境运行,实现要点由源码正则锁定,完整流程走手动验收。
+test("the mobile drawer moves focus in on open and returns it on close", () => {
+  const source = readFileSync(appShellPath, "utf8");
+
+  // 抽屉容器 tabIndex={-1} + ref:可被程序化聚焦
+  assert.match(source, /data-slot="sidebar-drawer"/);
+  assert.match(source, /tabIndex=\{-1\}/);
+  assert.match(source, /ref=\{drawerRef\}/);
+  // 打开时焦点移入:effect 内只做 DOM 焦点同步(focus(),不 setState——
+  // react-hooks lint 认可「与外部系统同步」的合法用法)
+  assert.match(
+    source,
+    /if \(sidebarOpen\) \{\s*\n\s*drawerRef\.current\?\.focus\(\)/,
+  );
+  // 关闭统一入口:setState + 焦点归还汉堡按钮(useCallback 空依赖稳定)
+  assert.match(
+    source,
+    /const closeDrawer = useCallback\(\(\) => \{\s*\n\s*setSidebarOpen\(false\);\s*\n\s*toggleRef\.current\?\.focus\(\)/,
+  );
+  // 汉堡按钮持有 ref(归还目标)
+  assert.match(source, /data-slot="sidebar-toggle"[\s\S]*?ref=\{toggleRef\}/);
 });
 
 // D4-T6:主题切换的 SSR 断言。useTheme 在无 ThemeProvider 时返回默认值

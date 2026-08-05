@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import test from "node:test";
@@ -117,4 +117,34 @@ test("the handoff card renders the modify entry while collapsed by default", asy
   // 初始收起:提交/取消按钮不渲染
   assert.doesNotMatch(markup, /data-slot="handoff-modify-submit"/);
   assert.doesNotMatch(markup, /data-slot="handoff-modify-cancel"/);
+});
+
+// D5-T5:可访问性——卡片 aria-live 播报 + tabIndex 焦点进入。SSR 锁定
+// 静态输出(aria-live/tabindex);焦点移入 effect 是客户端行为,由源码
+// 正则守卫(无 jsdom,焦点行为走手动验收)。
+test("the handoff card announces via aria-live and is programmatically focusable", async () => {
+  const { HandoffCard } = await loadHandoffCard();
+
+  const markup = renderToStaticMarkup(
+    createElement(HandoffCard, {
+      isDeciding: false,
+      onDecide: () => {},
+      pending,
+    }),
+  );
+
+  // 卡片容器:aria-live="polite"(出现时读屏播报「等待审批」+ 任务摘要)
+  // + tabindex="-1"(可被程序化聚焦,焦点移入见 effect)
+  assert.match(markup, /aria-live="polite"/);
+  assert.match(markup, /data-slot="handoff-card"[^>]*tabindex="-1"/);
+});
+
+test("the handoff card moves focus in when a pending handoff appears", () => {
+  const source = readFileSync(cardPath, "utf8");
+
+  // effect 依赖 [pending]:仅「出现/更换」时聚焦,isDeciding 等重渲染
+  // 不抢焦点;effect 内只做 DOM 焦点同步(focus(),不 setState)
+  assert.match(source, /useEffect\(\(\) => \{\s*\n\s*if \(!pending\) \{\s*\n\s*return;\s*\n\s*\}\s*\n\s*cardRef\.current\?\.focus\(\)/);
+  assert.match(source, /ref=\{cardRef\}/);
+  assert.match(source, /tabIndex=\{-1\}/);
 });

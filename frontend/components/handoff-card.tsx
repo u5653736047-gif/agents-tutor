@@ -11,7 +11,7 @@
 // store 层透传测试与代码审查保障。本地校验:提交的修改至少一项与原始值
 // 不同(任务内容需非空白),与后端「modify 至少携带一个非空修改字段」的
 // 422 语义对齐。
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 
 import { AgentBadge } from "@/components/agent-badge";
@@ -60,6 +60,22 @@ export function HandoffCard({
   const [taskContent, setTaskContent] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
 
+  // D5-T5:卡片出现时焦点移入——容器 tabIndex={-1} 使其可聚焦。effect 内
+  // 只做 DOM 焦点同步(focus()),不 setState(react-hooks lint:与外部系统
+  // 同步合法)。依赖 [pending]:仅「出现/更换」时聚焦一次,isDeciding 等
+  // 重渲染不抢焦点;SSR 不运行 effect,无 hydration 影响。
+  // 取舍:卡片不是模态对话框——确认/拒绝/修改是主动操作,不做 Esc 关闭;
+  // 决定后卡片卸载,焦点落回 body(浏览器默认),不额外归还到触发按钮
+  // (触发按钮在父组件 ConversationPanel,跨组件归还复杂度超出验收口径
+  // 「打开时进入、关闭时归还」)。
+  const cardRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!pending) {
+      return;
+    }
+    cardRef.current?.focus();
+  }, [pending]);
+
   if (!pending) {
     return null;
   }
@@ -99,11 +115,20 @@ export function HandoffCard({
 
   return (
     <section
+      // D5-T5:aria-live="polite"——卡片从无到有挂载时,读屏播报卡片内容
+      // (标题「等待审批」+ 任务摘要);决策后卡片卸载即停止播报,状态变化
+      // 可感知。取舍:aria-live 区域内含可聚焦按钮(确认/拒绝),理想做法
+      // 是 live region 与交互区分离,此处保持简单(卡片整体为区域),
+      // 播报内容短、不频繁,可接受。
+      aria-live="polite"
       // D5-T2:审批卡片出现动画(tw-animate-css:淡入 + 底部轻滑入,时长/缓动
       // 对齐 D5-T1 tokens);pending 为 null 时组件不渲染(上方早退),动画只
       // 在卡片出现时播放一次;reduced-motion 由 globals.css 全局媒体查询关闭。
       className="overflow-hidden rounded-lg border border-border bg-card animate-in fade-in-0 slide-in-from-bottom-1 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
       data-slot="handoff-card"
+      // D5-T5:tabIndex={-1} + ref——可被程序化聚焦(焦点移入见上方 effect)
+      ref={cardRef}
+      tabIndex={-1}
     >
       <header className="flex items-center justify-between border-b border-border px-4 py-2">
         <h3 className="text-caption font-medium text-foreground">等待审批</h3>

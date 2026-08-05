@@ -167,6 +167,18 @@ pre code.hljs {
   overflow-x: visible;
 }
 
+/* D5-T5:键盘焦点可见性——focus-visible 统一高亮环(shadcn 语义 ring
+   token,亮/暗自动适配);仅键盘/辅助输入触发,鼠标点击不显示。
+   组件级已有 focus-visible:ring 的类(如 chat-input 的
+   focus-visible:ring-2 ring-ring)会与此全局 outline 叠加成双视觉环
+   (outline 在外、box-shadow ring 在内),视觉统一可接受——全局 outline
+   作为基线兜底,组件级 ring 更具体负责精细样式。 */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: var(--app-radius-sm, 0.25rem);
+}
+
 /* D5-T2:尊重系统「减少动态效果」偏好——关闭动画与平滑过渡
    (WCAG 2.3.3;动画不阻塞交互)。组件层(D5-T2)的 animate-in 等
    进入动画均依赖 animation/transition 属性,此处统一按 0.01ms

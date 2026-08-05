@@ -2,7 +2,7 @@
 
 import { CircleCheck, CircleX, Menu, Moon, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
-import { useEffect, useSyncExternalStore, useState } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore, useState } from "react";
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
@@ -55,23 +55,54 @@ export function AppShell({ apiConnected }: AppShellProps) {
   // 开合全部发生在客户端交互之后(SSR 安全)。
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
+  // D5-T5:焦点管理引用——drawerRef 指向抽屉容器(tabIndex=-1 使其可聚焦,
+  // 打开时焦点移入);toggleRef 指向汉堡按钮(关闭时焦点归还)。两者均为
+  // 稳定引用,useCallback 空依赖安全(见 closeDrawer)。
+  const drawerRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
+  // D5-T5:关闭抽屉统一入口——遮罩点击/选中会话/Esc 全部走这里,
+  // setState + 焦点归还汉堡按钮单点收敛(不再散落 setSidebarOpen(false))。
+  // useCallback 空依赖:内部只引用 setSidebarOpen 与 toggleRef(均稳定),
+  // 符合 exhaustive-deps;回调内访问 ref 的 .current 是调用期行为,不违反
+  // react-hooks 的「渲染期不得访问 ref」规则。
+  const closeDrawer = useCallback(() => {
+    setSidebarOpen(false);
+    toggleRef.current?.focus();
+  }, []);
+
+  // D5-T5:抽屉打开时焦点移入抽屉容器。effect 内只做 DOM 焦点同步
+  // (focus()),不 setState——react-hooks lint 拦截 effect 内 setState,
+  // 但「与外部系统同步(焦点/滚动)」的 DOM 操作是合法用法。
+  // 完整焦点陷阱(Tab 循环限制在抽屉内)未实现:侧栏场景下焦点移入 +
+  // 遮罩 aria-hidden + 关闭归还已满足键盘可操作需求,完整 trap 留给
+  // 真正的模态对话框场景(验收口径:进入 + 归还)。
+  useEffect(() => {
+    if (sidebarOpen) {
+      drawerRef.current?.focus();
+    }
+  }, [sidebarOpen]);
+
   // D4-T6:主题切换。图标 CSS 类驱动无需 mounted;aria-label/onClick
   // 直接读 resolvedTheme(SSR 首帧 undefined,hydration 后校准)。
   const { resolvedTheme, setTheme } = useTheme();
 
   // D4-T5:抽屉打开期间注册 keydown 监听,Esc 关闭;关闭后移除监听。
+  // D5-T5:Esc 走 closeDrawer(而非直接 setSidebarOpen),保证焦点归还
+  // 与遮罩/选中会话路径一致;closeDrawer 为 useCallback 稳定引用,
+  // 依赖数组 [sidebarOpen, closeDrawer] 完整且不随渲染变化。
   useEffect(() => {
     if (!sidebarOpen) {
       return;
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setSidebarOpen(false);
+        closeDrawer();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [sidebarOpen]);
+  }, [closeDrawer, sidebarOpen]);
 
   return (
     <main
@@ -100,14 +131,22 @@ export function AppShell({ apiConnected }: AppShellProps) {
             aria-hidden
             className="fixed inset-0 z-30 animate-in fade-in-0 bg-black/40 duration-[var(--app-duration-normal)]"
             data-slot="sidebar-overlay"
-            onClick={() => setSidebarOpen(false)}
+            onClick={closeDrawer}
           />
           {/* D5-T2:抽屉从左侧滑入(tw-animate-css slide-in-from-left-2 = 8px,
               已验证该类存在),淡入 + 位移均为 transform/opacity 动效,
               不触发重排。 */}
-          <div className="fixed inset-y-0 left-0 z-40 w-72 animate-in fade-in-0 slide-in-from-left-2 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]">
-            {/* D4-T5:选中会话后自动收起抽屉(方案 A:容器可选回调)。 */}
-            <SessionSidebar onSessionSelected={() => setSidebarOpen(false)} />
+          {/* D5-T5:抽屉容器 tabIndex={-1} 使其可被程序化聚焦(focus()),
+              打开时焦点移入(见上方 effect);ref 持有供聚焦。 */}
+          <div
+            className="fixed inset-y-0 left-0 z-40 w-72 animate-in fade-in-0 slide-in-from-left-2 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
+            data-slot="sidebar-drawer"
+            ref={drawerRef}
+            tabIndex={-1}
+          >
+            {/* D4-T5:选中会话后自动收起抽屉(方案 A:容器可选回调)。
+                D5-T5:走 closeDrawer,焦点归还汉堡按钮。 */}
+            <SessionSidebar onSessionSelected={closeDrawer} />
           </div>
         </>
       ) : null}
@@ -122,6 +161,7 @@ export function AppShell({ apiConnected }: AppShellProps) {
               className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground md:hidden"
               data-slot="sidebar-toggle"
               onClick={() => setSidebarOpen(true)}
+              ref={toggleRef}
               type="button"
             >
               <Menu aria-hidden className="size-5" />

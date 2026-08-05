@@ -324,7 +324,11 @@ test("the streaming bubble shows a skeleton before the first stream event", asyn
   assert.match(markup, /data-slot="streaming-message"/);
   assert.match(markup, /data-slot="streaming-skeleton"/);
   assert.doesNotMatch(markup, /data-slot="message-skeleton"/);
-  assert.doesNotMatch(markup, /正在生成/);
+  // D5-T3:首事件前不渲染 LoaderCircle 指示文案「正在生成…」;
+  // D5-T5:sr-only 播报行(「助手正在生成回答…」)此时存在
+  assert.doesNotMatch(markup, /正在生成…/);
+  assert.match(markup, /data-slot="live-status"/);
+  assert.match(markup, /助手正在生成回答…/);
 });
 
 test("the streaming bubble switches to real content once the first event arrives", async () => {
@@ -357,9 +361,74 @@ test("sending and streaming placeholders go through the Skeleton component in so
   const panel = readFileSync(panelPath, "utf8");
 
   // review 防回归:同步发送态与流式首事件前占位必须走 Skeleton 骨架
-  // (不得回归为「正在生成回答…」等文案),两个 data-slot 可区分测试
+  // (不得回归为纯文案占位),两个 data-slot 可区分测试
   assert.match(panel, /data-slot="message-skeleton"/);
   assert.match(panel, /data-slot="streaming-skeleton"/);
   assert.match(panel, /<Skeleton /);
-  assert.doesNotMatch(panel, /正在生成回答/);
+  // D5-T5:唯一允许的「正在生成回答」文案是 aria-live 的 sr-only 播报行
+  // (live-status)——骨架占位不得回归为纯文案
+  assert.equal((panel.match(/正在生成回答/g) ?? []).length, 1);
+  assert.match(panel, /data-slot="live-status"/);
+  assert.match(panel, /助手正在生成回答…/);
+});
+
+// D5-T5:可访问性——aria-live 消息流区与 sr-only 状态播报 ————————————
+test("the message list is an aria-live region and announces streaming state", async () => {
+  // SSR 消息流区:aria-live="polite" 落在 data-slot="message-list" 上
+  // (ConversationPanel 直接 SSR:chat-store/api-client 无浏览器 API 访问,
+  // useVirtualizer 服务端返回空窗口,既有短会话路径全量渲染)
+  const { ConversationPanel } = await loadConversationPanel();
+  const markup = renderToStaticMarkup(createElement(ConversationPanel));
+
+  assert.match(markup, /aria-live="polite"[^>]*data-slot="message-list"/);
+  // 空闲态无播报行
+  assert.doesNotMatch(markup, /data-slot="live-status"/);
+});
+
+test("streaming and sending states render a sr-only live status line", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+
+  const streamingMarkup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: false,
+      isStreaming: true,
+      messages: [],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: null,
+    }),
+  );
+  // 流式:sr-only 状态行 + 播报文本(读屏可感知生成进行中)
+  assert.match(streamingMarkup, /class="sr-only"[^>]*data-slot="live-status"/);
+  assert.match(streamingMarkup, /助手正在生成回答…/);
+
+  const sendingMarkup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      isSending: true,
+      isStreaming: false,
+      messages: [],
+      runError: null,
+      streamingAgent: null,
+      streamingMessage: null,
+    }),
+  );
+  // 发送态:播报「正在发送…」
+  assert.match(sendingMarkup, /data-slot="live-status"/);
+  assert.match(sendingMarkup, /正在发送…/);
+});
+
+test("skeleton placeholders are hidden from assistive tech in source", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  // D5-T5:骨架是视觉占位,aria-hidden 避免读屏朗读骨架噪音
+  // (进行中状态由 sr-only live-status 播报)。断言与 JSX 属性顺序一致:
+  // aria-hidden → className → data-slot 在同一元素内
+  assert.match(
+    panel,
+    /aria-hidden\s*\n\s*className="mt-2 space-y-2"\s*\n\s*data-slot="streaming-skeleton"/,
+  );
+  assert.match(
+    panel,
+    /aria-hidden\s*\n\s*className="flex justify-start"\s*\n\s*data-slot="message-skeleton"/,
+  );
 });

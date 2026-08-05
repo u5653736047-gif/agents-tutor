@@ -132,6 +132,20 @@ export function ConversationContent({
 
   return (
     <>
+      {/* D5-T5:aria-live 状态播报——D5-T3 骨架替换纯文本占位后,读屏用户
+          无法感知生成进行中;此 sr-only 文本位于消息流区(data-slot=
+          "message-list")的 aria-live="polite" 区域内,进入/离开时由读屏
+          自然播报(流式进行中/发送中状态文案,见下方 JSX)。结束不播报:
+          live region 内容清空即表示结束,读屏可感知(「完成」播报需在
+          渲染期比较 isStreaming 变化,D4-T5 教训:渲染期访问 ref 被
+          react-hooks lint 拦截,放弃)。isStreaming 优先于 isSending
+          (流式期间两者理论上互斥)。 */}
+      {isStreaming || isSending ? (
+        <p className="sr-only" data-slot="live-status">
+          {isStreaming ? "助手正在生成回答…" : "正在发送…"}
+        </p>
+      ) : null}
+
       {/* D4-T8:未启用虚拟化时全量渲染消息行(短会话既有行为);
           启用时消息行由 ConversationPanel 虚拟渲染,此处仅渲染尾部块 */}
       {virtualItems == null
@@ -171,12 +185,21 @@ export function ConversationContent({
               // LoaderCircle「正在生成…」指示。review nit:以 null 判定
               // 「首事件前」,空内容回答不误判为骨架。
               streamingMessage === null ? (
-                <div className="mt-2 space-y-2" data-slot="streaming-skeleton">
+                <div
+                  aria-hidden
+                  className="mt-2 space-y-2"
+                  data-slot="streaming-skeleton"
+                >
                   <Skeleton className="h-3 w-full" />
                   <Skeleton className="h-3 w-4/5" />
                 </div>
               ) : (
-                <div className="mt-2 flex items-center gap-2 text-caption text-muted-foreground">
+                // D5-T5:视觉指示 aria-hidden——「正在生成…」是视觉占位,
+                // 进行中状态已由 sr-only live-status 播报,避免读屏重复朗读
+                <div
+                  aria-hidden
+                  className="mt-2 flex items-center gap-2 text-caption text-muted-foreground"
+                >
                   <LoaderCircle aria-hidden className="size-4 animate-spin" />
                   正在生成…
                 </div>
@@ -266,9 +289,15 @@ export function ConversationContent({
       {/* D5-T3:同步路径发送骨架——结构与助手气泡对齐(徽章占位 + 两行
           文本占位),渐进式:发送中显示骨架,流式首事件到达后切换真实
           气泡(下方 streaming-message 块);骨架自身 animate-pulse 呼吸,
-          不再叠加 D5-T2 进入动画(两种动画叠加无意义且费电)。 */}
+          不再叠加 D5-T2 进入动画(两种动画叠加无意义且费电)。
+          D5-T5:骨架是视觉占位,aria-hidden 避免读屏朗读骨架噪音
+          (进行中状态由上方 sr-only live-status 播报)。 */}
       {isSending ? (
-        <article className="flex justify-start" data-slot="message-skeleton">
+        <article
+          aria-hidden
+          className="flex justify-start"
+          data-slot="message-skeleton"
+        >
           <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
             <div className="flex items-center gap-2">
               <Skeleton className="size-5 rounded-full" />
@@ -371,6 +400,12 @@ export function ConversationPanel() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div
+        // D5-T5:aria-live="polite"——消息流更新(新消息追加/流式内容逐段
+        // 进入)时读屏播报新增内容;sr-only live-status 状态行位于区域内,
+        // 生成中/发送中状态自然播报。取舍:理想做法是 live region 与可聚焦
+        // 控件分离,但消息行含按钮(重试等)且更新频繁,整体区域播报增量
+        // 内容、噪音可控,保持简单。
+        aria-live="polite"
         className="min-h-0 flex-1 overflow-y-auto"
         data-slot="message-list"
         onScroll={handleScroll}
