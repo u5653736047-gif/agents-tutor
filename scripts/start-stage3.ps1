@@ -24,6 +24,7 @@ function Import-Stage3Environment {
     "API_VECTOR_DB_PATH",
     "API_KNOWLEDGE_EMBEDDING",
     "API_FEEDBACK_STORE_PATH",
+    "API_UPLOAD_DIR",
     "NEXT_PUBLIC_API_BASE_URL"
   )
 
@@ -127,6 +128,7 @@ $managedEnvironmentNames = @(
   "API_VECTOR_DB_PATH",
   "API_KNOWLEDGE_EMBEDDING",
   "API_FEEDBACK_STORE_PATH",
+  "API_UPLOAD_DIR",
   "NEXT_PUBLIC_API_BASE_URL",
   "PYTHONPATH"
 )
@@ -154,6 +156,9 @@ try {
   if ([string]::IsNullOrWhiteSpace($env:API_FEEDBACK_STORE_PATH)) {
     $env:API_FEEDBACK_STORE_PATH = Join-Path $runtimeDataDirectory "feedback.jsonl"
   }
+  if ([string]::IsNullOrWhiteSpace($env:API_UPLOAD_DIR)) {
+    $env:API_UPLOAD_DIR = Join-Path $runtimeDataDirectory "uploads"
+  }
   if ([string]::IsNullOrWhiteSpace($env:NEXT_PUBLIC_API_BASE_URL)) {
     $env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:$ApiPort"
   }
@@ -169,7 +174,7 @@ try {
   # 清理列表与 $managedEnvironmentNames 的 API 专用变量保持同步：
   # 这些 env 只应存在于 API 子进程，不能泄漏给前端子进程（工作单 T2
   # 新增三个知识库变量）。
-  foreach ($name in @("DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "API_SESSION_STORE_PATH", "API_CHECKPOINT_PATH", "API_KNOWLEDGE_DB_PATH", "API_VECTOR_DB_PATH", "API_KNOWLEDGE_EMBEDDING", "API_FEEDBACK_STORE_PATH", "PYTHONPATH")) {
+  foreach ($name in @("DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "API_SESSION_STORE_PATH", "API_CHECKPOINT_PATH", "API_KNOWLEDGE_DB_PATH", "API_VECTOR_DB_PATH", "API_KNOWLEDGE_EMBEDDING", "API_FEEDBACK_STORE_PATH", "API_UPLOAD_DIR", "PYTHONPATH")) {
     Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
   }
   $frontendStartInfo = @{

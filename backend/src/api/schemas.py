@@ -123,6 +123,10 @@ class ChatRequest(ContractModel):
 
     session_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    # D7-T1:附件引用(契约扩展预留)——chat 路由当前忽略该字段(缺失
+    # 或携带均不影响现有行为),由 D7-T3 或后续 core 能力决定如何进入
+    # 模型上下文;留空列表与 None 等价。
+    attachments: list[Attachment] | None = None
 
     @field_validator("session_id", "message")
     @classmethod
@@ -334,6 +338,38 @@ class KnowledgeDocumentListResponse(ContractModel):
     documents: list[KnowledgeDocumentListEntry]
 
 
+class Attachment(ContractModel):
+    """聊天消息附件引用(D7-T1 契约扩展预留)。
+
+    - file_id / name / content_type / size 由上传回执(FILE-UPLOAD)填充;
+    - 骨架期 chat 路由忽略该字段不影响现有行为(见 ChatRequest 注释),由
+      D7-T3 或后续 core 能力决定如何进入模型上下文。
+    """
+
+    file_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=255)
+    content_type: str | None = None
+    size: int = Field(ge=0)
+
+
+class FileUploadResponse(ContractModel):
+    """文件上传回执(D7-T1):url 为受控下载的相对路径。
+
+    - file_id 是服务端生成的 uuid4().hex + 白名单后缀(落盘名),url 形如
+      /files/{file_id}——客户端凭 url 即可 GET 下载,url 不含原始文件名
+      (后者只作展示字段 name);
+    - content_type 由服务端按扩展名映射,不信任客户端伪造的类型;
+    - name 是原始文件名(仅展示用;落盘名是 uuid,见 api/files.py 的
+      防穿越设计)。
+    """
+
+    file_id: str
+    name: str
+    content_type: str | None
+    size: int
+    url: str
+
+
 class TaskPlanStep(ContractModel):
     """One planned worker task."""
 
@@ -442,6 +478,8 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     KnowledgeDocumentListEntry,
     KnowledgeDocumentUploadResponse,
     KnowledgeDocumentListResponse,
+    FileUploadResponse,
+    Attachment,
 )
 
 

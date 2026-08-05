@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 from api.approvals import router as approval_router
 from api.chat import router as chat_router
 from api.feedback import router as feedback_router
+from api.files import router as files_router
 from api.knowledge import router as knowledge_router
 from api.openapi import install_openapi_contract
 from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
@@ -314,6 +315,7 @@ def create_app() -> FastAPI:
     app.include_router(stats_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
+    app.include_router(files_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
