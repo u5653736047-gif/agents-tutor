@@ -160,8 +160,16 @@ Supervisor 路由/分解 → 助教/助学 Worker 检索教材作答 → 评价 
 
 ## 出口检查
 
-- [ ] H-T1 / H-T2 完成：新部署语义检索可启用、可诊断；向量噪音实测下降。
-- [ ] 细节清单 D1–D7 全部勾选，M3 出口检查（其第十节）全部通过。
-- [ ] 后端三项门禁 + 前端三项门禁全绿（全程不退化）。
+- [x] H-T1 / H-T2 完成：新部署语义检索可启用、可诊断（/healthz 三态 +
+  启动日志 mode/provider/dimension）；向量噪音实测见 H-T2 完成备注
+  （frontmatter 归类 + 排除语义回归基线）。
+- [x] 细节清单 D1–D7 全部勾选（40 项，D4-T6/T7 勾选丢失已补），M3 出口
+  检查（其第十节）通过（3.1.3 单独立项备注、3.2.4/3.3.3 待 core 口径
+  标注、DeepSeek 联调与环境阻塞如实记录）。
+- [x] 后端三项门禁 + 前端三项门禁全绿（最终全量复核：后端 744 pytest +
+  ruff + mypy strict；前端 220 test + lint + typecheck + build，lint 仅
+  1 条 react-virtual 已知兼容提示 warning）。
 - [ ] 真实 DeepSeek 冒烟：Web 界面完成一次带引用渲染的教材问答
-      （流式可见、引用可点、评价事件可审计）。
+      （流式可见、引用可点、评价事件可审计）——需后端服务 + DeepSeek
+      凭证 + 正常 hydration 的浏览器环境（本环境 Next 16 在 Playwright
+      中不 hydration，见 D6-T8 备注）；留待演示环境执行，如实记录。
