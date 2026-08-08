@@ -15,20 +15,26 @@
 :root {
   --brand: oklch(0.546 0.245 262.88);
   --brand-foreground: oklch(0.985 0.002 247.84);
-  --neutral-50: oklch(0.985 0.002 247.84);
-  --neutral-100: oklch(0.951 0.009 264.37);
-  --neutral-200: oklch(0.89 0.012 264.37);
-  --neutral-300: oklch(0.81 0.016 264.37);
-  --neutral-400: oklch(0.67 0.02 264.37);
-  --neutral-500: oklch(0.507 0.022 264.37);
-  --neutral-600: oklch(0.4 0.022 264.37);
-  --neutral-700: oklch(0.31 0.021 264.37);
-  --neutral-800: oklch(0.255 0.019 264.37);
-  --neutral-900: oklch(0.205 0.017 264.37);
+  /* UX-20260807#4:中性阶整体压深一档(画布与纯白卡片拉开 ~15/255
+     亮度差,卡片/侧栏分层立现)+ 色相对齐品牌蓝 hue 262.88、chroma
+     微升(页面底色带品牌冷蓝温,不再「无色灰」)。语义映射仍走
+     var(),组件零改动。 */
+  --neutral-50: oklch(0.955 0.004 247.86);
+  --neutral-100: oklch(0.925 0.011 262.88);
+  --neutral-200: oklch(0.87 0.013 262.88);
+  --neutral-300: oklch(0.81 0.018 262.88);
+  --neutral-400: oklch(0.67 0.022 262.88);
+  --neutral-500: oklch(0.507 0.024 262.88);
+  --neutral-600: oklch(0.4 0.024 262.88);
+  --neutral-700: oklch(0.31 0.023 262.88);
+  --neutral-800: oklch(0.255 0.021 262.88);
+  --neutral-900: oklch(0.205 0.019 262.88);
   --role-supervisor: oklch(0.546 0.245 262.88);
   --role-teaching-assistant: oklch(0.52 0.12 193);
   --role-learning-assistant: oklch(0.57 0.14 153);
-  --role-evaluator: oklch(0.66 0.14 75);
+  /* UX-20260807#4:evaluator L 0.66 → 0.55——黄字 on 白对比 3.18 →
+     ~4.95:1,修复已知弱项(单值 token,暗色对比略降但仍在 3:1 以上)。 */
+  --role-evaluator: oklch(0.55 0.14 75);
   --app-font-sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
   --background: var(--neutral-50);
   --foreground: var(--neutral-900);
@@ -45,6 +51,11 @@
   --input: var(--neutral-200);
   --ring: var(--brand);
   --destructive: oklch(0.577 0.245 27.33);
+  /* UX-20260807#4:语义色补齐——成功/警告/信息此前靠组件内 emerald/
+     amber 硬编码,现收编为 token(与角色色同走「30/10/100 配色公式」)。 */
+  --success: oklch(0.53 0.16 152);
+  --warning: oklch(0.55 0.17 75);
+  --info: var(--brand);
   --app-radius-sm: 0.375rem;
   --app-radius-md: 0.625rem;
   --app-radius-lg: 0.875rem;
@@ -67,18 +78,24 @@
    只覆盖语义映射,保证 Tailwind 的 bg-background 等类在 .dark 下
    自动取暗色值)。亮色/暗色仅通过 <html class="dark"> 切换。 */
 .dark {
-  --background: oklch(0.141 0.005 285.823);
+  /* UX-20260807#4:暗色背景/边框色相对齐品牌蓝 hue 262.88(原 285.x
+     紫灰),与亮色同一品牌冷蓝温;含 --input 与 --muted-foreground,
+     保持「暗色 input 与 border 同值」不变量。 */
+  --background: oklch(0.141 0.005 262.88);
   --foreground: oklch(0.985 0 0);
-  --card: oklch(0.21 0.006 285.885);
+  --card: oklch(0.21 0.006 262.88);
   --card-foreground: oklch(0.985 0 0);
   --primary: var(--brand);
   --primary-foreground: oklch(0.985 0.002 247.84);
-  --muted: oklch(0.269 0.01 285.91);
-  --muted-foreground: oklch(0.708 0.015 285.47);
-  --border: oklch(0.269 0.01 285.91);
+  --muted: oklch(0.269 0.01 262.88);
+  --muted-foreground: oklch(0.708 0.015 262.88);
+  --border: oklch(0.269 0.01 262.88);
   --destructive: oklch(0.704 0.191 22.216);
+  --success: oklch(0.72 0.15 152);
+  --warning: oklch(0.76 0.15 75);
+  --info: oklch(0.72 0.16 262.88);
   /* D5-T1:暗色 input 边框与 border 同值,焦点环沿用品牌色。 */
-  --input: oklch(0.269 0.01 285.91);
+  --input: oklch(0.269 0.01 262.88);
   --ring: var(--brand);
 }
 
@@ -102,6 +119,9 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-brand: var(--brand);
@@ -125,6 +145,10 @@
   --text-caption--line-height: 1.25rem;
   --text-body: 0.9375rem;
   --text-body--line-height: 1.625rem;
+  /* UX-20260807#3:heading 字号档(18px)——Markdown h2 层级用,介于
+     body(15px)与 title(24px)之间,补全字阶 caption/body/heading/title/display。 */
+  --text-heading: 1.125rem;
+  --text-heading--line-height: 1.75rem;
   --text-title: 1.5rem;
   --text-title--line-height: 2rem;
   --text-display: 2rem;
@@ -165,6 +189,18 @@ pre code.hljs {
   padding: 0;
   display: block;
   overflow-x: visible;
+}
+
+/* UX-20260807#3:Markdown 正文内联代码——Tailwind preflight 重置后行内
+   code 无底色且 text-caption(12px)缩水,嵌在 15px 正文里几乎不可见。
+   :not(pre) > code 只命中行内 code(块代码保持 12px/neutral-900 底现状);
+   13px ≈ 正文 87%,灰底(--muted)+ 前景色,亮/暗自动适配。 */
+.markdown-body :not(pre) > code {
+  font-size: 0.8125rem;
+  background-color: var(--muted);
+  border-radius: var(--app-radius-sm);
+  padding: 0.125rem 0.375rem;
+  color: var(--foreground);
 }
 
 /* D5-T5:键盘焦点可见性——focus-visible 统一高亮环(shadcn 语义 ring

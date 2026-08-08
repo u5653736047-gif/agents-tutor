@@ -19,41 +19,55 @@
 
 ### 1.1 基准色(单一值,亮/暗共用)
 
+> UX-20260807#4:中性阶整体压深一档(`--neutral-50` 页面背景与纯白卡片
+> 拉开 ~15/255 亮度差,卡片/两栏分层立现),色相对齐品牌蓝 hue 262.88、
+> chroma 微升——页面底色自带品牌冷蓝温。注意 `--neutral-50` 同时是亮色
+> 代码块字色 `text-neutral-50`,压深后在 `neutral-900` 底上对比仍极高。
+
 | Token | 值 | 用途 | 示例类名 |
 | --- | --- | --- | --- |
 | `--brand` | `oklch(0.546 0.245 262.88)` | 品牌主色(蓝) | `bg-brand`、`text-brand` |
 | `--brand-foreground` | `oklch(0.985 0.002 247.84)` | 品牌色上的前景 | `text-brand-foreground` |
-| `--neutral-50` | `oklch(0.985 0.002 247.84)` | 最浅中性色(页面背景基准) | `bg-neutral-50` |
-| `--neutral-100` | `oklch(0.951 0.009 264.37)` | 浅中性(muted 底) | `bg-neutral-100` |
-| `--neutral-200` | `oklch(0.89 0.012 264.37)` | 浅中性(边框基准) | `border-neutral-200` |
-| `--neutral-300` | `oklch(0.81 0.016 264.37)` | 中性(代码块浅色文字) | `text-neutral-300` |
-| `--neutral-400` | `oklch(0.67 0.02 264.37)` | 中性 | `text-neutral-400` |
-| `--neutral-500` | `oklch(0.507 0.022 264.37)` | 中深中性(muted 前景基准) | `text-neutral-500` |
-| `--neutral-600` | `oklch(0.4 0.022 264.37)` | 深中性 | `text-neutral-600` |
-| `--neutral-700` | `oklch(0.31 0.021 264.37)` | 深中性(代码块按钮边框) | `border-neutral-700` |
-| `--neutral-800` | `oklch(0.255 0.019 264.37)` | 深中性(代码块底、暗色 pre 提亮) | `bg-neutral-800` |
-| `--neutral-900` | `oklch(0.205 0.017 264.37)` | 最深中性(代码块底、前景基准) | `bg-neutral-900` |
+| `--neutral-50` | `oklch(0.955 0.004 247.86)` | 最浅中性色(页面背景基准) | `bg-neutral-50` |
+| `--neutral-100` | `oklch(0.925 0.011 262.88)` | 浅中性(muted 底) | `bg-neutral-100` |
+| `--neutral-200` | `oklch(0.87 0.013 262.88)` | 浅中性(边框基准) | `border-neutral-200` |
+| `--neutral-300` | `oklch(0.81 0.018 262.88)` | 中性(代码块浅色文字) | `text-neutral-300` |
+| `--neutral-400` | `oklch(0.67 0.022 262.88)` | 中性 | `text-neutral-400` |
+| `--neutral-500` | `oklch(0.507 0.024 262.88)` | 中深中性(muted 前景基准) | `text-neutral-500` |
+| `--neutral-600` | `oklch(0.4 0.024 262.88)` | 深中性 | `text-neutral-600` |
+| `--neutral-700` | `oklch(0.31 0.023 262.88)` | 深中性(代码块按钮边框) | `border-neutral-700` |
+| `--neutral-800` | `oklch(0.255 0.021 262.88)` | 深中性(代码块底、暗色 pre 提亮) | `bg-neutral-800` |
+| `--neutral-900` | `oklch(0.205 0.019 262.88)` | 最深中性(代码块底、前景基准) | `bg-neutral-900` |
 
 ### 1.2 语义色(亮/暗双值)
 
 | Token | 亮色值 | 暗色值(.dark) | 用途 | 示例类名 |
 | --- | --- | --- | --- | --- |
-| `--background` | `var(--neutral-50)` | `oklch(0.141 0.005 285.823)` | 页面背景 | `bg-background` |
+| `--background` | `var(--neutral-50)` | `oklch(0.141 0.005 262.88)` | 页面背景 | `bg-background` |
 | `--foreground` | `var(--neutral-900)` | `oklch(0.985 0 0)` | 正文前景 | `text-foreground` |
-| `--card` | `oklch(1 0 0)` | `oklch(0.21 0.006 285.885)` | 卡片/面板/侧栏底 | `bg-card` |
+| `--card` | `oklch(1 0 0)` | `oklch(0.21 0.006 262.88)` | 卡片/面板/侧栏底 | `bg-card` |
 | `--card-foreground` | `var(--neutral-900)` | `oklch(0.985 0 0)` | 卡片前景 | `text-card-foreground` |
 | `--primary` | `var(--brand)` | `var(--brand)` | 主操作/用户消息气泡 | `bg-primary`、`text-primary` |
 | `--primary-foreground` | `var(--brand-foreground)` | `oklch(0.985 0.002 247.84)` | 主操作上的前景 | `text-primary-foreground` |
-| `--muted` | `var(--neutral-100)` | `oklch(0.269 0.01 285.91)` | 弱化底(选中会话/悬浮) | `bg-muted` |
-| `--muted-foreground` | `var(--neutral-500)` | `oklch(0.708 0.015 285.47)` | 弱化前景(辅助文案) | `text-muted-foreground` |
-| `--border` | `var(--neutral-200)` | `oklch(0.269 0.01 285.91)` | 边框/分隔线 | `border-border` |
+| `--muted` | `var(--neutral-100)` | `oklch(0.269 0.01 262.88)` | 弱化底(悬浮) | `bg-muted` |
+| `--muted-foreground` | `var(--neutral-500)` | `oklch(0.708 0.015 262.88)` | 弱化前景(辅助文案) | `text-muted-foreground` |
+| `--border` | `var(--neutral-200)` | `oklch(0.269 0.01 262.88)` | 边框/分隔线 | `border-border` |
 | `--destructive` | `oklch(0.577 0.245 27.33)` | `oklch(0.704 0.191 22.216)` | 错误/危险 | `text-destructive`、`bg-destructive` |
-| `--input`(D5-T1 补齐) | `var(--neutral-200)` | `oklch(0.269 0.01 285.91)` | 输入框边框 | `border-input` |
+| `--success`(UX-20260807#4 新增) | `oklch(0.53 0.16 152)` | `oklch(0.72 0.15 152)` | 成功(在线状态/已完成徽章/✓) | `text-success`、`border-success/30 bg-success/10 text-success` |
+| `--warning`(UX-20260807#4 新增) | `oklch(0.55 0.17 75)` | `oklch(0.76 0.15 75)` | 警告(搜索高亮 mark) | `bg-warning/20` |
+| `--info`(UX-20260807#4 新增) | `var(--brand)` | `oklch(0.72 0.16 262.88)` | 信息 | `text-info` |
+| `--input`(D5-T1 补齐) | `var(--neutral-200)` | `oklch(0.269 0.01 262.88)` | 输入框边框 | `border-input` |
 | `--ring`(D5-T1 补齐) | `var(--brand)` | `var(--brand)` | 焦点环 | `ring-ring`、`focus-visible:ring-ring` |
 
 > D5-T1 说明:`border-input` / `ring-ring` 类此前已被 chat-input 引用但 CSS
 > 缺 `--input`/`--ring`,类不生效;已按 shadcn 惯例补齐(亮色与 border 同值,
 > 暗色与暗色 border 同值),焦点环统一品牌色。
+>
+> UX-20260807#4 说明:① 成功/警告/信息此前靠组件内 emerald/amber 硬编码,
+> 现收编为语义 token,组件统一走 `text-success` / `bg-warning/20` 等,
+> 全仓 emerald/amber 清零;② 暗色各值色相对齐品牌蓝 hue 262.88,保持
+> 「暗色 input 与 border 同值」不变量;③ 选中会话改用
+> `bg-primary/10 ring-1 ring-primary/25`(品牌化,见 §3.1 侧栏条目)。
 
 ### 1.3 角色色(四角色徽章,单一值)
 
@@ -62,7 +76,7 @@
 | `--role-supervisor` | `oklch(0.546 0.245 262.88)` | Supervisor(蓝,同品牌) | `text-role-supervisor` |
 | `--role-teaching-assistant` | `oklch(0.52 0.12 193)` | 助教(青) | `text-role-teaching-assistant` |
 | `--role-learning-assistant` | `oklch(0.57 0.14 153)` | 助学(绿) | `text-role-learning-assistant` |
-| `--role-evaluator` | `oklch(0.66 0.14 75)` | 评价(黄) | `text-role-evaluator` |
+| `--role-evaluator` | `oklch(0.55 0.14 75)` | 评价(黄) | `text-role-evaluator` |
 
 ### 1.4 字体 / 圆角 / 间距 / 动效
 
@@ -71,6 +85,7 @@
 | 字体 | `--app-font-sans` | `"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif` | 全站字体 | `font-sans`(body 默认) |
 | 字号 | `--text-caption` | `0.75rem`(行高 1.25rem) | 辅助/徽章小字 | `text-caption` |
 | 字号 | `--text-body` | `0.9375rem`(行高 1.625rem) | 正文/消息 | `text-body` |
+| 字号 | `--text-heading` | `1.125rem`(行高 1.75rem) | Markdown h2/区块小标题(UX-20260807#3 新增) | `text-heading` |
 | 字号 | `--text-title` | `1.5rem`(行高 2rem) | 区块标题 | `text-title` |
 | 字号 | `--text-display` | `2rem`(行高 2.5rem) | 大标题 | `text-display` |
 | 圆角 | `--app-radius-sm` | `0.375rem` | 小控件/图标按钮 | `rounded-sm` |
@@ -107,7 +122,7 @@ API 契约 `AgentRole`)。
 | supervisor | `oklch(0.546 0.245 262.88)`(蓝) | `border-role-supervisor/30 bg-role-supervisor/10 text-role-supervisor` | Supervisor |
 | teaching_assistant | `oklch(0.52 0.12 193)`(青) | `border-role-teaching-assistant/30 bg-role-teaching-assistant/10 text-role-teaching-assistant` | 助教 |
 | learning_assistant | `oklch(0.57 0.14 153)`(绿) | `border-role-learning-assistant/30 bg-role-learning-assistant/10 text-role-learning-assistant` | 助学 |
-| evaluator | `oklch(0.66 0.14 75)`(黄) | `border-role-evaluator/30 bg-role-evaluator/10 text-role-evaluator` | 评价 |
+| evaluator | `oklch(0.55 0.14 75)`(黄) | `border-role-evaluator/30 bg-role-evaluator/10 text-role-evaluator` | 评价 |
 
 徽章样式约定(AgentBadge 基类,所有角色一致):
 
@@ -123,13 +138,13 @@ inline-flex items-center rounded-full border px-2 py-0.5 text-caption font-mediu
 
 ### 2.2 亮/暗对比度说明
 
-- 四个角色色亮度在 0.52–0.66(oklch L),对亮色 card(≈1.0)与暗色 card
+- 四个角色色亮度在 0.52–0.57(oklch L),对亮色 card(≈1.0)与暗色 card
   (≈0.21)均有可用对比度;
 - D4-T6 决策:角色色为中等饱和度,两模式均不覆盖(globals.css 有注释),
   本版维持「不覆盖」;
-- 已知弱项:evaluator(黄,L=0.66)在亮色纯白 card 上的小字对比度约 3:1,
-  低于正文 AA 4.5:1;因徽章为小号加粗字 + 10% 底色陪衬,暂列已知项,不
-  单独调色;若后续放大字号或强调可读性,优先调 `--role-evaluator` 单点。
+- UX-20260807#4 取舍:evaluator(黄)L 由 0.66 下调至 0.55——亮色纯白
+  card 上小字对比度 3.18 → ~4.95:1,修复已知弱项;单值 token 同时作用于
+  暗色,暗色对比略降但仍在 3:1 以上(小号加粗字 + 10% 底色陪衬),可接受。
 
 #### 检查清单
 
@@ -152,7 +167,7 @@ inline-flex items-center rounded-full border px-2 py-0.5 text-caption font-mediu
 | 消息气泡 | 用户:`max-w-[80%] rounded-lg bg-primary px-4 py-3 text-body text-primary-foreground`;助手:`max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground` | conversation-panel.tsx |
 | 错误块 | `flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3` | 运行错误/网络错误统一 |
 | 代码块 | `pre`: `overflow-x-auto rounded-md bg-neutral-900 p-3 pt-8 text-neutral-50`;复制按钮:`rounded border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-caption text-neutral-300 hover:bg-neutral-700` | 中性色阶固定档(两模式统一深底浅字,github-dark 依赖);`.dark pre` 提亮为 `--neutral-800` |
-| 侧栏条目 | 选中 `bg-muted`、未选中 `hover:bg-muted/60`,`rounded-md px-3 py-2` | session-sidebar |
+| 侧栏条目 | 选中 `bg-primary/10 ring-1 ring-primary/25`(UX-20260807#4 品牌化)、未选中 `hover:bg-muted/60`,`rounded-md px-3 py-2` | session-sidebar |
 | 徽章类(状态/标签) | 胶囊 `rounded-full border px-2 py-0.5 text-caption font-medium`,配色走 `border-{色}/30 bg-{色}/10 text-{色}` 公式 | 计划状态/角色徽章 |
 | 面板分隔 | `border-b/border-t border-border` + 段内 `px-4 py-2/3` | 面板头部/区块 |
 
@@ -177,7 +192,7 @@ rgb 字面量、未发现 `bg-white`/`text-black` 硬编码**;以下为文档明
 | conversation-panel.tsx:69/70/140 | `max-w-[80%]` | 消息气泡宽度上限 | 布局,允许 |
 | citation-list.tsx:72 | `grid-cols-[auto_1fr]` | 引用元信息两列网格 | 布局,允许 |
 | 图标/控件尺寸 | `size-3.5/4/5/7/9`、`h-8/9`、`min-h-24`、`max-h-48` | Tailwind 内置档位 | 尺寸档,允许 |
-| 色值:`text-emerald-600`(app-shell.tsx:94 在线状态、collaboration-panel.tsx:117 成功勾)、`text-emerald-700`(collaboration-panel.tsx:38 已完成徽章,暗色须配 `dark:text-emerald-400`)、`bg-amber-200/70`(session-sidebar.tsx:221 搜索高亮,暗色须配 `dark:bg-amber-400/30`) | 状态色(内置色阶,非浅色残留) | 语义,允许(暗色变体要求见第 4 节) |
+| 色值:状态色已收编为语义 token(UX-20260807#4)——成功 `text-success` / `border-success/30 bg-success/10 text-success`,警告高亮 `bg-warning/20`(配 `text-inherit`);全仓 emerald/amber 硬编码清零 | 状态色(语义 token,两模式自动适配) | 语义,允许 |
 
 「无硬编码魔法值残留」验收口径:**语义类优先**;个别布局魔法值以上表为
 界,新值必须先登记再使用;`bg-white`/`text-black` 及任何 oklch/hex/rgb
@@ -200,7 +215,8 @@ rgb 字面量、未发现 `bg-white`/`text-black` 硬编码**;以下为文档明
   (app/layout.tsx),SSR 首屏跟随 `prefers-color-scheme`,内联脚本 hydration
   前设类防闪烁;app-shell 顶栏按钮手动切换,图标由 `dark:` 变体驱动;
 - `.dark` 段只覆盖语义映射(背景/前景/card/muted/border/destructive/
-  input/ring),基准色与角色色不覆盖;`@theme inline` 映射名两模式共用。
+  success/warning/info/input/ring),基准色与角色色不覆盖;`@theme inline`
+  映射名两模式共用。
 
 ### 4.2 组件暗色注意点
 
@@ -210,13 +226,14 @@ rgb 字面量、未发现 `bg-white`/`text-black` 硬编码**;以下为文档明
 | 角色徽章 | 维持 D4-T6「不覆盖」决策;见第 2.2 节已知项 |
 | 输入焦点环 | `ring-ring` 暗色下仍为品牌色(亮度 0.546,on 暗底 ≥ 3:1,作焦点指示可辨识) |
 | 对比度 | 正文/小字语义色须 ≥ WCAG AA:正文 4.5:1、`text-caption`(12px)加粗 3:1;`muted-foreground` 两模式均满足 |
-| D5-T1 暗色修复 | ① 搜索高亮 mark:亮色 `bg-amber-200/70`,暗色必须配 `dark:bg-amber-400/30`(否则近白继承文字落在浅黄底上不可读);② 计划「已完成」徽章:`text-emerald-700` 暗色下过暗,必须配 `dark:text-emerald-400`(修复 diff 见 D5-T1 交付报告) |
+| D5-T1 暗色修复 | ① 搜索高亮 mark、② 计划「已完成」徽章此前靠 amber/emerald + `dark:` 变体手工适配;UX-20260807#4 已收编为 `--warning`/`--success` 语义 token(亮/暗双值),组件不再需要 `dark:` 变体 |
 | 动效 | D5-T2 动效使用 `--app-duration-*`/`--app-ease-*`;`prefers-reduced-motion` 的媒体查询在组件层处理(本文档不强制) |
 
 #### 检查清单
 
 - [ ] 新暗色值只进 `.dark` 段,不写死组件内
-- [ ] 组件内浅色背景(amber-200 类)必须带 `dark:` 深色变体
+- [ ] 状态色一律走 `--success`/`--warning`/`--info` 语义 token(两模式双值),
+      不再用内置色阶 + `dark:` 变体手工适配
 - [ ] 自测两模式截图对比,焦点环/禁用态可辨识
 - [ ] 不动 `@theme inline` 与 `.hljs` 覆盖
 
