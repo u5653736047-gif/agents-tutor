@@ -125,7 +125,10 @@ export function SessionSidebarContent({
 
   return (
     <aside
-      className="flex min-h-screen w-72 flex-col border-r border-border bg-card"
+      // UX-20260808#2:min-h-screen → h-dvh——固定视口高度,内部
+      // 「flex-1 overflow-y-auto」的会话列表才真正成为独立滚动容器;
+      // 桌面(grid 行高=视口)与移动端抽屉(inset-y-0)两种挂载都成立。
+      className="flex h-dvh w-72 flex-col border-r border-border bg-card"
       data-slot="session-sidebar"
     >
       <div className="flex items-center justify-between border-b border-border px-4 py-4">

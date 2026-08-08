@@ -155,7 +155,12 @@ export function AppShell({ apiConnected }: AppShellProps) {
     <main
       // D4-T5:断点语义——移动端单栏(grid-cols-1,主区独占整行),
       // md 起恢复桌面两栏(18rem 侧栏 + 自适应主区)。
-      className="grid min-h-screen grid-cols-1 bg-background md:grid-cols-[18rem_minmax(0,1fr)]"
+      // UX-20260808#2:min-h-screen → h-dvh + overflow-hidden——「最小一屏」
+      // 会让整页随消息撑高、浏览器滚动 body(侧栏被一起顶走);固定视口
+      // 高度后,侧栏会话列表与消息区各自成为独立滚动容器(两者内部均有
+      // flex-1 overflow-y-auto,此前因祖先无高度上限从未生效)。dvh 兼容
+      // 移动端浏览器地址栏伸缩。
+      className="grid h-dvh grid-cols-1 overflow-hidden bg-background md:grid-cols-[18rem_minmax(0,1fr)]"
       data-layout="desktop-two-column"
       data-slot="app-shell"
     >
@@ -198,7 +203,10 @@ export function AppShell({ apiConnected }: AppShellProps) {
         </>
       ) : null}
 
-      <section className="flex min-w-0 flex-col" data-slot="conversation-area">
+      {/* UX-20260808#2:h-dvh 与主容器对齐——消息区(ConversationPanel 内
+          flex-1 overflow-y-auto)以本 section 为高度上限独立滚动;
+          min-w-0 保留(grid 子项横向防撑破)。 */}
+      <section className="flex h-dvh min-w-0 flex-col" data-slot="conversation-area">
         {/* D4-T5:汉堡按钮仅移动端可见(md:hidden),位于顶栏左侧;抽屉
             打开后遮罩(固定全屏)会盖住它,关闭走遮罩/Esc/选中会话。 */}
         <header className="flex items-center justify-between border-b border-border px-4 py-4 md:px-8">
