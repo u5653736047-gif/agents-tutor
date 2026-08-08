@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from core.sessions import SessionRecord, SessionStore
+from core.sessions import SessionRecord, SessionStore, derive_session_title
 
 
 def test_session_store_creates_and_lists_immutable_records(tmp_path: Path) -> None:
@@ -166,3 +166,82 @@ def test_archive_failure_rolls_back_and_releases_the_write_lock(tmp_path: Path) 
         with sqlite3.connect(database_path, timeout=0) as independent:
             independent.execute("BEGIN IMMEDIATE")
             independent.rollback()
+
+
+def test_derive_session_title_normalizes_whitespace_and_truncates() -> None:
+    # 换行/缩进等连续空白压缩为单个空格(侧栏单行展示)
+    assert derive_session_title("  什么是\n  注意力机制?  ") == "什么是 注意力机制?"
+    # 短标题原样返回
+    assert derive_session_title("你好") == "你好"
+    # 超长按 30 字截断并加省略号
+    assert derive_session_title("字" * 40) == "字" * 30 + "…"
+    # 全空白返回 None(防御;ChatRequest 已拒绝空白消息)
+    assert derive_session_title("  \n\t ") is None
+
+
+def test_session_store_sets_title_once_and_persists(tmp_path: Path) -> None:
+    database_path = tmp_path / "sessions.sqlite"
+    with SessionStore(database_path) as store:
+        store.create_session("session-1", user_id="user-1")
+
+        assert store.set_title_if_absent("session-1", "首条消息标题", user_id="user-1") is True
+        # 只写一次:后续写入返回 False,标题保持首次值
+        assert store.set_title_if_absent("session-1", "后续消息", user_id="user-1") is False
+        # 不存在的会话静默 0 行(与归档同款语义)
+        assert store.set_title_if_absent("missing", "标题", user_id="user-1") is False
+
+    with SessionStore(database_path) as reopened:
+        assert [record.title for record in reopened.list_sessions(user_id="user-1")] == [
+            "首条消息标题"
+        ]
+
+
+@pytest.mark.parametrize("title", ["", "   "])
+def test_session_store_rejects_blank_titles(tmp_path: Path, title: str) -> None:
+    with (
+        SessionStore(tmp_path / "sessions.sqlite") as store,
+        pytest.raises(ValueError, match="title"),
+    ):
+        store.create_session("session-1", user_id="user-1")
+        store.set_title_if_absent("session-1", title, user_id="user-1")
+
+
+def test_session_store_migrates_legacy_database_without_title_column(tmp_path: Path) -> None:
+    database_path = tmp_path / "sessions.sqlite"
+    # 模拟 title 列加入前的旧库:老表结构 + 一行存量会话
+    with sqlite3.connect(database_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE sessions (
+                user_key TEXT NOT NULL,
+                user_id TEXT,
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_key, session_id)
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO sessions (user_key, user_id, session_id, created_at, archived)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            ("value:6:user-1", "user-1", "legacy-session", "2026-01-01T00:00:00+00:00"),
+        )
+
+    with SessionStore(database_path) as store:
+        # 迁移后:老行可读,title 为 None(前端回退显示 session_id)
+        records = store.list_sessions(user_id="user-1")
+        assert [record.session_id for record in records] == ["legacy-session"]
+        assert [record.title for record in records] == [None]
+        # 迁移后的库可正常补标题
+        assert (
+            store.set_title_if_absent("legacy-session", "旧会话标题", user_id="user-1") is True
+        )
+
+    # 重开幂等:迁移不重复执行,已写标题保留
+    with SessionStore(database_path) as reopened:
+        assert [record.title for record in reopened.list_sessions(user_id="user-1")] == [
+            "旧会话标题"
+        ]

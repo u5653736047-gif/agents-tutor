@@ -282,3 +282,59 @@ test("the sidebar loading branch goes through the Skeleton component in source",
   assert.match(source, /isLoadingSessions \?[\s\S]*?<Skeleton /);
   assert.doesNotMatch(source, /正在加载会话/);
 });
+
+// UX-20260808#1:会话标题 ————————————————————————————————
+test("filterSessions also matches session titles case-insensitively", async () => {
+  const { filterSessions } = await loadSessionSidebar();
+
+  const titledSessions = [
+    { archived: false, created_at: "2025-01-01T00:00:00Z", session_id: "session-abc-1", user_id: null, title: "什么是注意力机制" },
+    { archived: false, created_at: "2025-01-02T00:00:00Z", session_id: "session-def-2", user_id: null, title: "Backprop 入门" },
+  ];
+
+  // 标题命中
+  assert.deepEqual(
+    filterSessions(titledSessions, "注意力").map((session) => session.session_id),
+    ["session-abc-1"],
+  );
+  // 标题大小写不敏感
+  assert.deepEqual(
+    filterSessions(titledSessions, "backprop").map((session) => session.session_id),
+    ["session-def-2"],
+  );
+  // session_id 仍可搜(标题 + ID 双字段匹配)
+  assert.deepEqual(
+    filterSessions(titledSessions, "def").map((session) => session.session_id),
+    ["session-def-2"],
+  );
+});
+
+test("the sidebar renders the session title and falls back to session_id", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, {
+      archiveSession: () => undefined,
+      createSession: () => undefined,
+      currentSessionId: null,
+      isLoadingSessions: false,
+      loadCurrentSessionMessages: () => undefined,
+      onToggleArchived: () => undefined,
+      requestError: null,
+      selectSession: () => undefined,
+      sessions: [
+        // 有标题:正文展示标题,完整 session_id 收进悬浮提示(title 属性)
+        { archived: false, created_at: "2025-01-01T00:00:00Z", session_id: "titled-session-id", user_id: null, title: "机器学习学习路径" },
+        // 无标题(存量老会话,契约为 null):正文回退 session_id
+        { archived: false, created_at: "2025-01-02T00:00:00Z", session_id: "legacy-session-id", user_id: null, title: null },
+      ],
+      showArchived: false,
+    }),
+  );
+
+  assert.match(markup, /机器学习学习路径/);
+  assert.match(markup, /title="titled-session-id"/);
+  // 有标题时正文不再把 session_id 当展示文本
+  assert.doesNotMatch(markup, />titled-session-id</);
+  assert.match(markup, />legacy-session-id</);
+});

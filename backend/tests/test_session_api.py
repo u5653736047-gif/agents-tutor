@@ -341,3 +341,21 @@ def test_session_routes_publish_pydantic_contracts_in_openapi() -> None:
         history_responses["400"]["content"]["application/json"]["schema"]["$ref"]
         == "#/components/schemas/ErrorResponse"
     )
+
+
+def test_session_response_carries_nullable_title(tmp_path: Path) -> None:
+    """UX-20260808#1:会话契约携带 title——新建为 None,写入后随列表返回。"""
+    app, store = _session_app(tmp_path)
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(app, "POST", "/sessions", headers=headers, json={"session_id": "session-1"})
+        )
+        store.set_title_if_absent("session-1", "什么是注意力机制", user_id="user-1")
+        listed = asyncio.run(_request(app, "GET", "/sessions", headers=headers))
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert created.json()["title"] is None
+    assert [session["title"] for session in listed.json()] == ["什么是注意力机制"]

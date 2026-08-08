@@ -12,7 +12,8 @@ import { groupSessions, sessionGroupLabel, type SessionGroup } from "@/lib/sessi
 import { useChatStore } from "@/stores/chat-store";
 
 // D4-T1:会话搜索——过滤与高亮抽为纯函数,组件与测试共用。
-// 过滤只匹配 session_id,不区分大小写;空查询(含纯空白)返回全部。
+// UX-20260808#1:过滤同时匹配标题与 session_id(不区分大小写);
+// 标题为可选(存量老会话为 null),空查询(含纯空白)返回全部。
 export function filterSessions(sessions: Session[], query: string): Session[] {
   const keyword = query.trim().toLowerCase();
   if (!keyword) {
@@ -20,7 +21,9 @@ export function filterSessions(sessions: Session[], query: string): Session[] {
   }
 
   return sessions.filter((session) =>
-    session.session_id.toLowerCase().includes(keyword),
+    [session.title ?? "", session.session_id].some((text) =>
+      text.toLowerCase().includes(keyword),
+    ),
   );
 }
 
@@ -149,7 +152,7 @@ export function SessionSidebarContent({
           className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-caption text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
           data-slot="session-search"
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索会话 ID…"
+          placeholder="搜索会话…"
           type="search"
           value={query}
         />
@@ -236,13 +239,21 @@ export function SessionSidebarContent({
                         selectSession(session.session_id);
                         void loadCurrentSessionMessages();
                       }}
+                      // UX-20260808#1:悬浮提示保留完整 session_id(标题
+                      // 截断/重名时仍可区分)
+                      title={session.session_id}
                       type="button"
                     >
                       {/* D4-T1:命中片段用 <mark> 高亮(定位不区分大小写,展示保留
                           原始大小写);未命中时整段以普通 span 渲染。用
                           effectiveQuery 而非 debounced(review 修正):清空查询后
-                          高亮随列表一起立即消失,防抖等待期高亮与列表一致。 */}
-                      {highlightMatch(session.session_id, effectiveQuery).map(
+                          高亮随列表一起立即消失,防抖等待期高亮与列表一致。
+                          UX-20260808#1:展示文本为标题,无标题(存量老会话)
+                          回退 session_id——高亮与展示文本同源。 */}
+                      {highlightMatch(
+                        session.title ?? session.session_id,
+                        effectiveQuery,
+                      ).map(
                         (segment, index) =>
                           segment.highlighted ? (
                             // UX-20260807#4:高亮色走语义 warning token

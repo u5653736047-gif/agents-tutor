@@ -39,7 +39,7 @@ from core.events import EventType
 from core.events import RunError as CoreRunError
 from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
-from core.sessions import SessionStore
+from core.sessions import SessionStore, derive_session_title
 from core.state import AgentState, PendingHandoffApproval
 from core.state import TaskPlan as CoreTaskPlan
 from core.state import TaskStepResult as CoreTaskStepResult
@@ -338,6 +338,21 @@ def _ensure_session(session_store: SessionStore, session_id: str, user_id: str |
             raise
 
 
+def _ensure_session_with_title(
+    session_store: SessionStore, session_id: str, user_id: str | None, message: str
+) -> None:
+    """Ensure the session exists, then title it from its first user message.
+
+    侧栏列表不再只显示 session_id:标题取首条用户消息的压缩截断,
+    且只写一次(set_title_if_absent)——后续消息/断线重连回放不会
+    覆盖;存量老会话在下次发消息时按同规则补标题。
+    """
+    _ensure_session(session_store, session_id, user_id)
+    title = derive_session_title(message)
+    if title is not None:
+        session_store.set_title_if_absent(session_id, title, user_id=user_id)
+
+
 async def pending_handoff_for_session(
     graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
 ) -> PendingHandoff | None:
@@ -394,7 +409,13 @@ async def chat(
         )
 
     async with active_session_lock:
-        await run_in_threadpool(_ensure_session, session_store, payload.session_id, user_id)
+        await run_in_threadpool(
+            _ensure_session_with_title,
+            session_store,
+            payload.session_id,
+            user_id,
+            payload.message,
+        )
         previous_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id
         )

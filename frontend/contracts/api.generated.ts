@@ -809,6 +809,11 @@ export interface components {
             created_at: string;
             /** Session Id */
             session_id: string;
+            /**
+             * Title
+             * @default null
+             */
+            title?: string | null;
             /** User Id */
             user_id: string | null;
         };

@@ -73,6 +73,7 @@ def _session_response(record: SessionRecord) -> Session:
         user_id=record.user_id,
         created_at=record.created_at,
         archived=record.archived,
+        title=record.title,
     )
 
 

@@ -89,7 +89,10 @@ export type ChatStore = {
   // D3-T4:本轮回答的引用列表(null = 无引用,与后端「无引用不携带」
   // 契约一致;组件层零渲染降级)
   references: Citation[] | null;
-  refreshSessions(): Promise<void>;
+  // UX-20260808#1:quiet=true 时后台静默换新(不切换 isLoadingSessions、
+  // 不闪骨架)——用于消息完成后补拉标题等「列表已在展示」的场景;
+  // 缺省 false 维持挂载/重试/归档切换时的骨架加载态。
+  refreshSessions(options?: { quiet?: boolean }): Promise<void>;
   requestError: ApiClientError | null;
   retryLastMessage(): Promise<void>;
   runError: RunError | null;
@@ -257,7 +260,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       }
     },
-    refreshSessions: async () => {
+    refreshSessions: async (options) => {
       // D4-T5 review 修正:桌面静态侧栏与移动抽屉是两个组件实例,
       // 打开抽屉会再次触发挂载拉取——进行中去重,避免重复请求
       // (数据幂等,仅去网络开销;并发失败时下一次调用仍可重试,
@@ -266,14 +269,20 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
       sessionsRefreshInFlight = true;
-      set({ isLoadingSessions: true, requestError: null });
+      // UX-20260808#1:quiet 模式不动 isLoadingSessions 与 requestError
+      // ——列表原地换新不闪骨架;后台补拉失败静默(标题下次刷新再补),
+      // 绝不覆盖历史拉取等主流程刚写入的错误。
+      const quiet = options?.quiet ?? false;
+      set(quiet ? {} : { isLoadingSessions: true, requestError: null });
       try {
         // D4-T7:按当前归档视图拉取——showArchived=true 时带上
         // include_archived=true,归档会话可见(api-client 已支持该参数)。
         const sessions = await client.listSessions(get().showArchived);
-        set({ isLoadingSessions: false, sessions });
+        set(quiet ? { sessions } : { isLoadingSessions: false, sessions });
       } catch (error) {
-        set({ isLoadingSessions: false, requestError: asApiClientError(error) });
+        if (!quiet) {
+          set({ isLoadingSessions: false, requestError: asApiClientError(error) });
+        }
       } finally {
         sessionsRefreshInFlight = false;
       }
@@ -436,6 +445,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             messages,
           }));
         }
+        // UX-20260808#1:消息落库后后端已按首条消息补标题——静默刷新
+        // 会话列表(quiet 不闪骨架),侧栏尽快以标题替换 session_id。
+        void get().refreshSessions({ quiet: true });
       } catch (error) {
         if (get().currentSessionId === sessionId) {
           // D4-T2:失败回滚——只移除本次追加的乐观消息。按对象引用
@@ -650,6 +662,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             set({ requestError: asApiClientError(historyError) });
           }
         }
+        // UX-20260808#1:与 sendMessage 同步路径一致——消息落库后静默
+        // 刷新会话列表,让后端补写的标题尽快替换侧栏的 session_id。
+        void get().refreshSessions({ quiet: true });
       } catch (error) {
         // 此处只处理流式通道(streamChatWithRetry / streamChat)抛出的错误。
         // D4-T3 review 修正:用户点击「停止生成」(abort)恰逢后端错误

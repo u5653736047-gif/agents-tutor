@@ -1,7 +1,7 @@
 """SQLite storage for conversation metadata."""
 
 # 会话元数据与图 checkpoint 是「两本账」：这里只记录会话的 id/用户/
-# 创建时间/归档状态，对话内容与图状态都在 checkpoint 里（两者通过
+# 创建时间/归档状态/列表标题，对话内容与图状态都在 checkpoint 里（两者通过
 # session_id 关联，归档只隐藏列表、不删任何数据）。
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ class SessionRecord:
     user_id: str | None
     created_at: datetime
     archived: bool = False
+    # 侧栏展示标题（首条用户消息提炼，只写一次）；老数据为 None，
+    # 前端回退显示 session_id。
+    title: str | None = None
 
 
 class SessionStore:
@@ -44,10 +47,18 @@ class SessionStore:
                         session_id TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         archived INTEGER NOT NULL DEFAULT 0,
+                        title TEXT,
                         PRIMARY KEY (user_key, session_id)
                     )
                     """
                 )
+                # 增量迁移：老库（title 列加入前建的表）走 CREATE TABLE IF NOT
+                # EXISTS 是空操作，必须单独 ALTER 补列；新库已含该列，跳过。
+                if "title" not in {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(sessions)")
+                }:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
         except BaseException:
             connection.close()
             raise
@@ -101,7 +112,7 @@ class SessionStore:
     ) -> list[SessionRecord]:
         """List one user's sessions in creation order."""
         query = """
-            SELECT session_id, user_id, created_at, archived
+            SELECT session_id, user_id, created_at, archived, title
             FROM sessions
             WHERE user_key = ?
         """
@@ -131,6 +142,28 @@ class SessionStore:
                     """,
                     (self._user_key(user_id), session_id),
                 )
+            return cursor.rowcount > 0
+
+    def set_title_if_absent(
+        self,
+        session_id: str,
+        title: str,
+        user_id: str | None = None,
+    ) -> bool:
+        """Set the sidebar title once; an existing title is never overwritten."""
+        if not title.strip():
+            raise ValueError("title must not be empty")
+        with self._lock, self._connection:
+            # 只写一次(WHERE title IS NULL):后续消息不得覆盖首条消息
+            # 提炼的标题;对不存在的会话静默 0 行(与归档同款语义)。
+            cursor = self._connection.execute(
+                """
+                UPDATE sessions
+                SET title = ?
+                WHERE user_key = ? AND session_id = ? AND title IS NULL
+                """,
+                (title, self._user_key(user_id), session_id),
+            )
             return cursor.rowcount > 0
 
     def close(self) -> None:
@@ -166,7 +199,26 @@ class SessionStore:
             user_id=cast(str | None, row["user_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             archived=bool(row["archived"]),
+            title=cast(str | None, row["title"]),
         )
 
 
-__all__ = ["SessionRecord", "SessionStore"]
+SESSION_TITLE_MAX_LENGTH = 30
+
+
+def derive_session_title(message: str) -> str | None:
+    """从首条用户消息提炼侧栏标题：压缩空白、截断 30 字。
+
+    换行/缩进等连续空白归一为单个空格（侧栏单行展示）；全空白返回
+    None（调用方不写标题，理论上来不了——ChatRequest 已拒绝空白消息，
+    这里做防御）。超长截断并加省略号。
+    """
+    normalized = " ".join(message.split())
+    if not normalized:
+        return None
+    if len(normalized) <= SESSION_TITLE_MAX_LENGTH:
+        return normalized
+    return normalized[:SESSION_TITLE_MAX_LENGTH].rstrip() + "…"
+
+
+__all__ = ["SessionRecord", "SessionStore", "derive_session_title"]

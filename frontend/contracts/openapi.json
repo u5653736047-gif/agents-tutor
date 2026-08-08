@@ -1028,6 +1028,18 @@
             "title": "Session Id",
             "type": "string"
           },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
           "user_id": {
             "anyOf": [
               {

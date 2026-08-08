@@ -758,3 +758,38 @@ def test_chat_response_task_plan_degrades_to_none_on_wrong_types(tmp_path: Path)
     assert response.status_code == 200
     assert response.json()["task_plan"] is None
     assert response.json()["task_results"] is None
+
+
+def test_chat_titles_session_from_first_message_only(tmp_path: Path) -> None:
+    """UX-20260808#1:首条用户消息提炼为会话标题,且只写一次。
+
+    侧栏列表不再只显示 session_id:标题 = 消息压缩空白后截断;
+    同会话后续消息不得覆盖首个标题(set_title_if_absent)。
+    """
+    graph = ChatGraph(
+        {
+            "messages": [AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        first = asyncio.run(
+            _post_chat(
+                app,
+                {"session_id": "session-1", "message": "  什么是\n  注意力机制?  "},
+            )
+        )
+        second = asyncio.run(
+            _post_chat(app, {"session_id": "session-1", "message": "后续消息不改标题"})
+        )
+        records = store.list_sessions(user_id="user-1")
+    finally:
+        store.close()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert [record.title for record in records] == ["什么是 注意力机制?"]
