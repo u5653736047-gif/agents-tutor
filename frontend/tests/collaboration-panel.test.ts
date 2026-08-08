@@ -77,6 +77,27 @@ test("the collaboration panel renders events in sequence order with tool summari
   assert.doesNotMatch(markup, /done/);
 });
 
+test("the collaboration panel renders coalesced subagent output", async () => {
+  const { CollaborationPanel } = await loadCollaborationPanel();
+  const events = [
+    {
+      agent: "learning_assistant",
+      content: "子代理正在整理知识点",
+      event_type: "message_delta",
+      message_id: "worker-answer",
+      sequence: 2,
+    },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(CollaborationPanel, { ...emptyProps, events }),
+  );
+
+  assert.match(markup, /data-slot="subagent-message"/);
+  assert.match(markup, /助学/);
+  assert.match(markup, /子代理正在整理知识点/);
+});
+
 test("the collaboration panel shows plan steps with current highlight and result marks", async () => {
   const { CollaborationPanel } = await loadCollaborationPanel();
 

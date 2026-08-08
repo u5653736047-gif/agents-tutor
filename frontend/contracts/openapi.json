@@ -1196,6 +1196,18 @@
             ],
             "default": null
           },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message Id"
+          },
           "plan_step_sequence": {
             "anyOf": [
               {
@@ -1252,11 +1264,12 @@
         "type": "object"
       },
       "StreamEventType": {
-        "description": "Public event protocol reserved for future streaming support.",
+        "description": "Public SSE protocol for token deltas and safe execution events.",
         "enum": [
           "thinking",
           "tool_call",
           "tool_result",
+          "message_delta",
           "message_end",
           "agent_switch",
           "error",
@@ -1508,7 +1521,7 @@
     },
     "/chat/stream": {
       "post": {
-        "description": "SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端\n回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新\n消息,启动新 run。",
+        "description": "SSE 原生流式聊天(token + 安全运行事件)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence;若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发\n权威 message_end + done,不启动新 run(消息补发);默认 0 表示发新\n消息,启动新 run。",
         "operationId": "chat_stream_chat_stream_post",
         "parameters": [
           {

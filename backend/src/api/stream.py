@@ -1,20 +1,17 @@
-"""SSE 事件级流式聊天端点(D1-T1,D1-T3 断线重连与消息补发)。
+"""SSE 原生流式聊天端点(D1-T1,D1-T3 断线重连与消息补发)。
 
 与 POST /chat 的差异:POST /chat 在一个请求内等待完整 run 结束并返回
-最终契约;本端点把 run 放到后台线程,事件按 sequence 增量通过 SSE
-帧逐条推送,最后以 message_end(携带最终消息全文)+ done 收尾。
-
-为什么是「事件级」而不是 token 级:core 是同步 ReAct 编排
-(CollaborativeAgentGraph.run 一次性跑完一轮),没有 token 流可暴露;
-可流式化的粒度是运行事件(RunEvent),由 checkpoint 的 get_state 轮询
-增量读取。thinking 事件只带固定占位文本,message_end 一次性携带全文。
+最终契约;本端点消费 LangGraph 的 messages/custom 双通道,正文 token
+与安全运行事件按 sequence 增量通过 SSE 推送,最后以 message_end
+(携带权威全文)+ done 收尾。没有原生 stream() 的兼容图仍使用 checkpoint
+轮询事件,但生产图不走该降级路径。
 
 D1-T3 断线重连与消息补发:客户端可在查询参数传 from_sequence
-(上次收到的最新 sequence)。若 checkpoint 中已存在比 from_sequence
-更新的运行事件且最近一轮已结束(最后事件是终态),本端点直接回放
-剩余事件 + done,不启动新 run(避免断线重试导致整轮重复执行);
-否则按正常路径启动新 run。sequence 跨轮次全局递增(core 侧 events
-通道跨轮累积),回放只对 from_sequence > 0 生效——正常发新消息时
+(上次收到的最新公开 sequence)。若 checkpoint 中最近一轮已结束
+(最后事件是终态),本端点直接回放剩余事件并补发
+权威 message_end + done,不启动新 run(避免断线重试导致整轮重复执行);
+否则按正常路径启动新 run。core 事件序列随 checkpoint 跨轮累积，
+token 帧则只属于当前公开流；回放只对 from_sequence > 0 生效——正常发新消息时
 默认 from_sequence=0 必须启动新 run,否则会把上一轮误判为重连回放。
 
 事件安全红线(与 api/chat.py 同口径):
@@ -33,21 +30,24 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
-from typing import Annotated, cast
+from collections.abc import AsyncIterator, Mapping
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from langchain_core.messages import AIMessageChunk
 from starlette.concurrency import run_in_threadpool
 
 from api.chat import (
     PENDING_RESUME_ERROR_PREFIX,
-    _ensure_session,
+    _ensure_session_with_title,
     _final_assistant_message,
     _previous_message_count,
     _previous_sequence,
     _public_agent,
+    _public_event,
     _public_events,
+    _public_run_error,
     _response_references,
     session_busy_response,
     session_lock,
@@ -120,6 +120,24 @@ def _sse_frame(event: StreamEvent) -> str:
     return f"data: {json.dumps(event.model_dump(mode='json'), ensure_ascii=False)}\n\n"
 
 
+def _state_error_event(
+    state: AgentState,
+    sequence: int,
+    session_id: str,
+) -> StreamEvent | None:
+    """把 checkpoint 中的运行失败转换为脱敏 SSE 错误事件。"""
+    run_error = _public_run_error(state.get("run_error"))
+    if run_error is None:
+        return None
+    return StreamEvent(
+        event_type=StreamEventType.ERROR,
+        sequence=sequence,
+        session_id=session_id,
+        agent=run_error.agent,
+        error_code=run_error.error_code,
+    )
+
+
 async def _error_event_for(
     graph: CollaborativeAgentGraph,
     session_id: str,
@@ -162,7 +180,7 @@ async def _cancel_background_task(task: asyncio.Task[AgentState]) -> None:
         await task
 
 
-async def _wait_for_run(background_task: asyncio.Task[AgentState]) -> None:
+async def _wait_for_run(background_task: asyncio.Task[Any]) -> None:
     """等待后台 run 自然完成(不取消,不取结果)。
 
     线程池里的同步 run 无法被 asyncio 取消:断连后若直接退出生成器,
@@ -181,6 +199,210 @@ async def _wait_for_run(background_task: asyncio.Task[AgentState]) -> None:
         _LOGGER.info("stream disconnected: background run finished with error")
 
 
+def _text_delta(chunk: object) -> str:
+    """只提取公开文本块；reasoning/tool-call 块与附加字段一律忽略。"""
+    if not isinstance(chunk, AIMessageChunk):
+        return ""
+    content = chunk.content
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") not in {"text", "text_delta"}:
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+def _stream_agent(metadata: object) -> object:
+    if not isinstance(metadata, Mapping):
+        return None
+    return metadata.get("agent_role") or metadata.get("langgraph_node")
+
+
+async def _native_stream_events(
+    graph: CollaborativeAgentGraph,
+    payload: ChatRequest,
+    request: Request,
+    user_id: str | None,
+    previous_state: AgentState | None,
+    from_sequence: int,
+) -> AsyncIterator[str]:
+    """把 LangGraph messages/custom 原生流桥接为 SSE，不轮询 checkpoint。"""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    def pump() -> None:
+        try:
+            for item in graph.stream(
+                payload.message,
+                payload.session_id,
+                user_id,
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, ("item", item))
+        except Exception as error:  # noqa: BLE001 - 稳定错误映射在异步边界完成
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", error))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+
+    pump_task = asyncio.create_task(run_in_threadpool(pump))
+    sequence = max(_previous_sequence(previous_state), from_sequence)
+    previous_count = _previous_message_count(previous_state)
+    last_send_at = time.monotonic()
+    error_emitted = False
+    try:
+        while True:
+            try:
+                item_type, item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_POLL_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                if await request.is_disconnected():
+                    await _wait_for_run(pump_task)
+                    return
+                if (
+                    time.monotonic() - last_send_at
+                    > _KEEPALIVE_INTERVAL_SECONDS
+                ):
+                    yield ": keepalive\n\n"
+                    last_send_at = time.monotonic()
+                continue
+
+            if item_type == "error":
+                sequence += 1
+                yield _sse_frame(
+                    await _error_event_for(
+                        graph,
+                        payload.session_id,
+                        sequence,
+                        cast(Exception, item),
+                        user_id,
+                    )
+                )
+                return
+            if item_type == "end":
+                break
+            if not (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], str)
+            ):
+                continue
+            mode, data = item
+            stream_event: StreamEvent | None = None
+            if mode == "messages" and isinstance(data, tuple) and len(data) == 2:
+                chunk, metadata = data
+                delta = _text_delta(chunk)
+                if delta:
+                    sequence += 1
+                    message_id = getattr(chunk, "id", None)
+                    stream_event = StreamEvent(
+                        event_type=StreamEventType.MESSAGE_DELTA,
+                        sequence=sequence,
+                        session_id=payload.session_id,
+                        agent=_public_agent(_stream_agent(metadata)),
+                        content=delta,
+                        message_id=(message_id if isinstance(message_id, str) else None),
+                    )
+            elif mode == "custom" and isinstance(data, Mapping):
+                raw_event = data.get("event") if data.get("kind") == "run_event" else None
+                if isinstance(raw_event, Mapping):
+                    try:
+                        core_event = CoreRunEvent.model_validate(raw_event)
+                    except (TypeError, ValueError):
+                        core_event = None
+                    if core_event is not None:
+                        public_event = _public_event(core_event)
+                        if public_event is not None and public_event.event_type not in {
+                            StreamEventType.MESSAGE_END,
+                            StreamEventType.DONE,
+                        }:
+                            sequence += 1
+                            stream_event = _stream_event_from_run_event(
+                                public_event,
+                                payload.session_id,
+                            ).model_copy(update={"sequence": sequence})
+            if stream_event is not None:
+                yield _sse_frame(stream_event)
+                if stream_event.event_type is StreamEventType.ERROR:
+                    error_emitted = True
+                last_send_at = time.monotonic()
+
+        await pump_task
+        state = await run_in_threadpool(
+            graph.get_state,
+            payload.session_id,
+            user_id,
+        )
+        if state is None:
+            sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.ERROR,
+                    sequence=sequence,
+                    session_id=payload.session_id,
+                    error_code=ApiErrorCode.INTERNAL_ERROR,
+                )
+            )
+            return
+        state_error = _state_error_event(
+            state,
+            sequence + 1,
+            payload.session_id,
+        )
+        if state_error is not None:
+            if not error_emitted:
+                sequence += 1
+                yield _sse_frame(state_error)
+        elif not error_emitted:
+            final_message = _final_assistant_message(state, previous_count)
+            if final_message is None:
+                sequence += 1
+                yield _sse_frame(
+                    StreamEvent(
+                        event_type=StreamEventType.ERROR,
+                        sequence=sequence,
+                        session_id=payload.session_id,
+                        agent=_public_agent(state.get("current_agent")),
+                        error_code=ApiErrorCode.INTERNAL_ERROR,
+                    )
+                )
+            else:
+                sequence += 1
+                yield _sse_frame(
+                    StreamEvent(
+                        event_type=StreamEventType.MESSAGE_END,
+                        sequence=sequence,
+                        session_id=payload.session_id,
+                        agent=_public_agent(state.get("current_agent")),
+                        content=final_message.content,
+                        message=final_message,
+                        citations=_response_references(state, previous_count),
+                    )
+                )
+        sequence += 1
+        yield _sse_frame(
+            StreamEvent(
+                event_type=StreamEventType.DONE,
+                sequence=sequence,
+                session_id=payload.session_id,
+            )
+        )
+    finally:
+        if not pump_task.done():
+            await _wait_for_run(pump_task)
+
+
 async def _stream_events(
     graph: CollaborativeAgentGraph,
     session_store: SessionStore,
@@ -190,19 +412,23 @@ async def _stream_events(
     active_session_lock: asyncio.Lock,
     from_sequence: int = 0,
 ) -> AsyncIterator[str]:
-    """SSE 生成器:锁内启动后台 run,轮询增量事件,收尾推送 message_end + done。
+    """SSE 生成器：锁内转发原生流，兼容图则轮询，最后推权威终态。
 
     会话锁在生成器内持有(而不是路由函数内):锁必须覆盖整个流式
     推送期间,才能让并发的第二次请求在 locked() 检查时命中 session_busy。
 
     from_sequence(D1-T3):客户端断线重连时传「上次收到的最新 sequence」。
-    若 checkpoint 已存在比 from_sequence 更新的终态轮次,直接回放剩余
-    事件 + done,不启动新 run;否则正常启动新 run(默认 0 表示发新消息,
+    若 checkpoint 中最近一轮已结束,直接回放剩余事件并补权威全文
+    + done,不启动新 run;否则正常启动新 run(默认 0 表示发新消息,
     必须启动新 run——回放仅对 from_sequence > 0 生效,见模块 docstring)。
     """
     async with active_session_lock:
         await run_in_threadpool(
-            _ensure_session, session_store, payload.session_id, user_id
+            _ensure_session_with_title,
+            session_store,
+            payload.session_id,
+            user_id,
+            payload.message,
         )
         # 只读一次 checkpoint:回放检查与正常路径的 previous_state 共用
         # 同一份状态,避免重复取(两者本就要求同一时刻的快照)。
@@ -215,49 +441,96 @@ async def _stream_events(
         last_event = events[-1] if events else None
         if (
             from_sequence > 0
+            and current_state is not None
             and last_event is not None
             and last_event.event_type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED)
-            and last_event.sequence > from_sequence
         ):
-            # D1-T3 回放:上次连接中断后重连——最近一轮已结束(最后事件
-            # 是终态)且存在比 from_sequence 更新的运行事件,直接回放
-            # 剩余事件 + done,不启动新 run(避免重复执行)。回放路径
-            # 不合成 message_end 全文:前端在 done 后调用历史接口拉
-            # 权威消息(D1-T3 验收「重连后回放剩余事件并以 done 收尾」)。
+            # D1-T3 回放:token 帧使用 SSE 公开序列、不会写入 core
+            # checkpoint,因此 from_sequence 可能远大于 core 终态序列。
+            # 只要调用方明确传了重连游标且最近一轮已经终止,就绝不能
+            # 重跑代理；先回放仍可见的运行事件,再补发权威全文。
+            error_replayed = False
             for event in _public_events(events, from_sequence):
                 if event.event_type in (
                     StreamEventType.MESSAGE_END,
                     StreamEventType.DONE,
                 ):
-                    # 与正常流一致:终态不推映射版(message_end 的全文
-                    # 与 done 由收尾统一合成,回放路径只合成 done)。
+                    # 与正常流一致:终态不推映射版，权威 message_end
+                    # 与 done 由下方收尾统一合成。
                     continue
-                yield _sse_frame(
-                    _stream_event_from_run_event(event, payload.session_id)
-                )
-            # done 的 sequence 必须大于「真实终态序列」:公开事件序列
-            # 可能有间隙(TASK_RESULTS_AGGREGATED 等被 EVENT_TYPE_MAP
-            # 过滤),用 events[-1].sequence + 1 而非 last_sequence + 1
-            # (review 修正)——保证调用方把 done.sequence 传回时,回放
-            # 条件「终态 > from_sequence」必然不成立,下一条消息正常
-            # 启动新 run,不会被误判为回放而静默吞掉。
-            done_sequence = last_event.sequence + 1
+                stream_event = _stream_event_from_run_event(event, payload.session_id)
+                yield _sse_frame(stream_event)
+                if stream_event.event_type is StreamEventType.ERROR:
+                    error_replayed = True
+            replay_sequence = max(from_sequence, last_event.sequence)
+            state_error = _state_error_event(
+                current_state,
+                replay_sequence + 1,
+                payload.session_id,
+            )
+            if state_error is not None:
+                if not error_replayed:
+                    replay_sequence += 1
+                    yield _sse_frame(state_error)
+            elif not error_replayed:
+                final_message = _final_assistant_message(current_state, 0)
+                replay_sequence += 1
+                if final_message is None:
+                    yield _sse_frame(
+                        StreamEvent(
+                            event_type=StreamEventType.ERROR,
+                            sequence=replay_sequence,
+                            session_id=payload.session_id,
+                            agent=_public_agent(current_state.get("current_agent")),
+                            error_code=ApiErrorCode.INTERNAL_ERROR,
+                        )
+                    )
+                else:
+                    yield _sse_frame(
+                        StreamEvent(
+                            event_type=StreamEventType.MESSAGE_END,
+                            sequence=replay_sequence,
+                            session_id=payload.session_id,
+                            agent=_public_agent(current_state.get("current_agent")),
+                            content=final_message.content,
+                            message=final_message,
+                            citations=_response_references(current_state, 0),
+                        )
+                    )
+            replay_sequence += 1
             yield _sse_frame(
                 StreamEvent(
                     event_type=StreamEventType.DONE,
-                    sequence=done_sequence,
+                    sequence=replay_sequence,
                     session_id=payload.session_id,
                 )
             )
             return
 
         previous_state = current_state
+        # 真实 CollaborativeAgentGraph 暴露 LangGraph 原生 messages/custom
+        # 流：正文 token 与运行事件直接到达，不再等 checkpoint 轮询。
+        # 旧测试替身/兼容实现没有 stream() 时仍走下方事件级轮询路径。
+        native_stream = getattr(graph, "stream", None)
+        if callable(native_stream):
+            async for frame in _native_stream_events(
+                graph,
+                payload,
+                request,
+                user_id,
+                previous_state,
+                from_sequence,
+            ):
+                yield frame
+            return
+
         last_sequence = _previous_sequence(previous_state)
         previous_count = _previous_message_count(previous_state)
         background_task = asyncio.create_task(
             run_in_threadpool(graph.run, payload.message, payload.session_id, user_id)
         )
         last_send_at = time.monotonic()
+        error_emitted = False
         try:
             while True:
                 await asyncio.sleep(_POLL_INTERVAL_SECONDS)
@@ -285,9 +558,13 @@ async def _stream_events(
                         # (协议约定:带 content 的 message_end 才是终态)。
                         continue
                     last_sequence = event.sequence
-                    yield _sse_frame(
-                        _stream_event_from_run_event(event, payload.session_id)
+                    stream_event = _stream_event_from_run_event(
+                        event,
+                        payload.session_id,
                     )
+                    yield _sse_frame(stream_event)
+                    if stream_event.event_type is StreamEventType.ERROR:
+                        error_emitted = True
                     last_send_at = time.monotonic()
 
                 # 事件稀疏的长 run:定期发 SSE 注释帧,防止中间代理
@@ -320,25 +597,48 @@ async def _stream_events(
                         )
                         return
 
-                    final_message = _final_assistant_message(state, previous_count)
-                    if final_message is not None:
+                    state_error = _state_error_event(
+                        state,
+                        last_sequence + 1,
+                        payload.session_id,
+                    )
+                    if state_error is not None:
+                        if not error_emitted:
+                            last_sequence += 1
+                            yield _sse_frame(state_error)
+                    elif not error_emitted:
+                        final_message = _final_assistant_message(state, previous_count)
                         last_sequence += 1
-                        yield _sse_frame(
-                            StreamEvent(
-                                event_type=StreamEventType.MESSAGE_END,
-                                sequence=last_sequence,
-                                session_id=payload.session_id,
-                                agent=_public_agent(state.get("current_agent")),
-                                content=final_message.content,
-                                message=final_message,
-                                # D3-T5:message_end 携带本轮引用(与
-                                # POST /chat 的 references 同源,复用
-                                # _response_references 两级口径)——流式
-                                # 主通道的引用渲染依赖它(前端在 message_end
-                                # 事件读取 citations 存入 store)。
-                                citations=_response_references(state, previous_count),
+                        if final_message is None:
+                            yield _sse_frame(
+                                StreamEvent(
+                                    event_type=StreamEventType.ERROR,
+                                    sequence=last_sequence,
+                                    session_id=payload.session_id,
+                                    agent=_public_agent(state.get("current_agent")),
+                                    error_code=ApiErrorCode.INTERNAL_ERROR,
+                                )
                             )
-                        )
+                        else:
+                            yield _sse_frame(
+                                StreamEvent(
+                                    event_type=StreamEventType.MESSAGE_END,
+                                    sequence=last_sequence,
+                                    session_id=payload.session_id,
+                                    agent=_public_agent(state.get("current_agent")),
+                                    content=final_message.content,
+                                    message=final_message,
+                                    # D3-T5:message_end 携带本轮引用(与
+                                    # POST /chat 的 references 同源,复用
+                                    # _response_references 两级口径)——流式
+                                    # 主通道的引用渲染依赖它(前端在 message_end
+                                    # 事件读取 citations 存入 store)。
+                                    citations=_response_references(
+                                        state,
+                                        previous_count,
+                                    ),
+                                )
+                            )
                     last_sequence += 1
                     yield _sse_frame(
                         StreamEvent(
@@ -364,14 +664,14 @@ async def chat_stream(
     user_id: Annotated[str | None, Depends(current_user_id)],
     from_sequence: int = Query(default=0, ge=0),
 ) -> Response:
-    """SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。
+    """SSE 原生流式聊天(token + 安全运行事件)。
 
     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
 
     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
-    sequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端
-    回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新
+    sequence;若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
+    权威 message_end + done,不启动新 run(消息补发);默认 0 表示发新
     消息,启动新 run。
     """
     graph = _graph(request)

@@ -322,7 +322,7 @@ export function AppShell({ apiConnected }: AppShellProps) {
                 <ol className="mt-3 list-decimal space-y-2 pl-5 text-body text-muted-foreground">
                   <li>创建会话：点击左侧「新建会话」，或直接选一个示例问题</li>
                   <li>提问：在输入框描述你的问题，等待多智能体协作回答</li>
-                  <li>查看审批与协作过程：审批卡片确认任务，协作面板看事件时间线</li>
+                  <li>查看结果：需要时确认审批，最终答案会在原对话中持续生成</li>
                 </ol>
                 <button
                   className="mt-4 rounded-md border border-border px-3 py-1.5 text-caption text-muted-foreground hover:bg-muted hover:text-foreground"

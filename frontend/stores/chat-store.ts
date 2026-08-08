@@ -569,6 +569,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         messages: [...state.messages, optimistic],
       }));
 
+      let activeSupervisorMessageId: string | null = null;
       // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
       const dispatch = (event: StreamEvent) => {
         // 旧会话的流事件不回写新会话状态(与 sendMessage 的会话守卫一致)
@@ -577,18 +578,72 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
         switch (event.event_type) {
           case "thinking":
-            // thinking 的 content 只是占位文本,不进消息体,仅更新当前 agent
-            set({ streamingAgent: event.agent ?? null });
+            // 安全思考摘要进入协作时间线；不进入回答正文。
+            set((state) => ({
+              events: [...state.events, event],
+              streamingAgent: event.agent ?? null,
+            }));
             break;
           case "tool_call":
           case "tool_result":
             // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)
             set((state) => ({ events: [...state.events, event] }));
             break;
+          case "message_delta": {
+            const delta = event.content ?? "";
+            if (event.agent === "supervisor") {
+              const messageId = event.message_id ?? "supervisor";
+              const continuesCurrent = activeSupervisorMessageId === messageId;
+              activeSupervisorMessageId = messageId;
+              set((state) => ({
+                streamingAgent: "supervisor",
+                streamingMessage: {
+                  agent: "supervisor",
+                  content: `${continuesCurrent ? (state.streamingMessage?.content ?? "") : ""}${delta}`,
+                  created_at: undefined,
+                  role: "assistant",
+                },
+              }));
+              break;
+            }
+
+            // 子代理 token 不混入主回答气泡；按 message_id 合并为一条
+            // 阶段性结果，避免每个 token 生成一个时间线 DOM 节点。
+            set((state) => {
+              const messageId = event.message_id ?? `${event.agent ?? "agent"}-${event.sequence}`;
+              const existingIndex = state.events.findIndex(
+                (item) =>
+                  item.event_type === "message_delta" &&
+                  "message_id" in item &&
+                  item.message_id === messageId,
+              );
+              if (existingIndex < 0) {
+                return {
+                  events: [...state.events, event],
+                  streamingAgent: event.agent ?? null,
+                };
+              }
+              const events = [...state.events];
+              const existing = events[existingIndex];
+              const previousContent =
+                existing && "content" in existing ? (existing.content ?? "") : "";
+              events[existingIndex] = {
+                ...event,
+                content: `${previousContent}${delta}`,
+                message_id: messageId,
+              };
+              return { events, streamingAgent: event.agent ?? null };
+            });
+            break;
+          }
           case "agent_switch":
             // D2-T2:流式路径没有 ChatResponse,用最后一条 agent_switch
             // 的目标 Agent 作为当前活跃 Agent(与面板内的兜底逻辑一致)。
-            set({ currentAgent: event.agent ?? null, streamingAgent: event.agent ?? null });
+            set((state) => ({
+              currentAgent: event.agent ?? null,
+              events: [...state.events, event],
+              streamingAgent: event.agent ?? null,
+            }));
             break;
           case "message_end": {
             const streamed: Message = event.message ?? {
@@ -598,6 +653,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
               role: "assistant",
             };
             set({
+              streamingAgent: event.agent ?? null,
               streamingMessage: streamed,
               // D3-T5:流式主通道的引用由 message_end 事件携带(与
               // POST /chat 的 references 同源);未携带时为 null。

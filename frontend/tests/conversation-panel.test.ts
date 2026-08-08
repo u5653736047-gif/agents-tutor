@@ -49,6 +49,13 @@ test("the conversation panel keeps an end anchor for automatic scrolling", () =>
   assert.match(panel, /data-slot="conversation-end"/);
 });
 
+test("the conversation page keeps transient collaboration telemetry out of the chat", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  assert.doesNotMatch(panel, /import \{ CollaborationPanel \}/);
+  assert.doesNotMatch(panel, /<CollaborationPanel/);
+});
+
 // D2-T5:错误降级 UX——runError 分类渲染与重试按钮 ———————————————————
 test("the conversation panel renders a categorized run error with a retry button when onRetry is provided", async () => {
   const { ConversationContent } = await loadConversationPanel();

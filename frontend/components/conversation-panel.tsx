@@ -8,7 +8,6 @@ import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
-import { CollaborationPanel } from "@/components/collaboration-panel";
 import { FeedbackButtons } from "@/components/feedback-buttons";
 import { HandoffCard } from "@/components/handoff-card";
 import { Button } from "@/components/ui/button";
@@ -492,12 +491,9 @@ export function ConversationContent({
 }
 
 export function ConversationPanel() {
-  // D2-T2:协作过程面板所需数据(计划、结果、事件、活跃 Agent)由这里订阅后传入
-  const currentAgent = useChatStore((state) => state.currentAgent);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
   const decideHandoff = useChatStore((state) => state.decideHandoff);
-  const events = useChatStore((state) => state.events);
   const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
   // UX-20260807#2:拉历史加载态——此前无组件订阅(「死状态」),切换会话
   // 期间消息区空白;现在驱动 ConversationContent 的加载骨架。
@@ -518,8 +514,6 @@ export function ConversationPanel() {
   // D6-T2:反馈提交 action——与主对话流程解耦(不写 requestError),
   // 失败由 FeedbackButtons 组件内错误行呈现
   const submitFeedback = useChatStore((state) => state.submitFeedback);
-  const taskPlan = useChatStore((state) => state.taskPlan);
-  const taskResults = useChatStore((state) => state.taskResults);
   const endRef = useRef<HTMLDivElement>(null);
   // D4-T8:滚动容器 ref——既是 virtualizer 的 getScrollElement,
   // 也是 onScroll 贴底判定的目标元素
@@ -575,8 +569,6 @@ export function ConversationPanel() {
       endRef.current?.scrollIntoView({ block: "end" });
     }
   }, [
-    currentAgent,
-    events,
     isDecidingHandoff,
     isSending,
     isStreaming,
@@ -586,8 +578,6 @@ export function ConversationPanel() {
     runError,
     streamingAgent,
     streamingMessage,
-    taskPlan,
-    taskResults,
   ]);
 
   return (
@@ -645,14 +635,7 @@ export function ConversationPanel() {
             streamingMessage={streamingMessage}
             virtualItems={isVirtualized ? virtualItems : null}
           />
-          {/* D2-T2:协作过程面板——消息流与输入区之间,展示计划与事件 */}
-          <CollaborationPanel
-            currentAgent={currentAgent}
-            events={events}
-            taskPlan={taskPlan}
-            taskResults={taskResults}
-          />
-          {/* D2-T3:审批卡片——协作面板之后、输入区之前;错误文案只映射
+          {/* D2-T3:审批卡片——消息之后、输入区之前;错误文案只映射
               审批相关错误码,其它 requestError 仍由侧栏等现有路径处理。
               handoff_not_pending 不在此映射:store 收到该码会清除并刷新
               pending,卡片随之消失,错误行永远不会显示(死分支已删,
@@ -670,7 +653,7 @@ export function ConversationPanel() {
             pending={pendingHandoff}
           />
           {/* D3-T4:引用卡片——消息列表尾部(审批卡片之后),引用对应
-              最后一轮回答,跟随该轮的回答与协作过程一起展示;store
+              最后一轮回答,跟随该轮回答一起展示;store
               的 references 为 null 时组件零渲染,不占位 */}
           <CitationList citations={references} />
           {/* D4-T8:虚拟化尾 spacer——补足未渲染行的估算高度,

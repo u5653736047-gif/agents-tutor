@@ -3,7 +3,7 @@
 // D2-T2:协作过程面板。
 // 展示一次运行的两块信息:
 //   1. 计划步骤条(task_plan):后端规划的步骤,叠加 task_results 的执行结果;
-//   2. 事件时间线(events):thinking / tool_call / tool_result / agent_switch 摘要。
+//   2. 事件时间线(events):思考/工具摘要、Agent 切换与子代理阶段性输出。
 // 纯展示组件:所有数据由父组件(ConversationPanel)从 store 订阅后以 props 传入,
 // 自身不订阅 store,便于 SSR 渲染与组件测试。对 null / 空数组健壮。
 import { ChevronDown, ChevronUp } from "lucide-react";
@@ -243,6 +243,32 @@ function EventTimeline({
               >
                 <span aria-hidden>→</span>
                 {event.agent ? <AgentBadge agent={event.agent} /> : <span>切换 Agent</span>}
+              </li>
+            );
+          }
+          case "message_delta": {
+            // store 已按 message_id 合并 token；这里只展示专业 Agent 的
+            // 阶段性输出，Supervisor 正文由主消息气泡负责。
+            if (event.agent === "supervisor") {
+              return null;
+            }
+            return (
+              <li
+                className={cn(
+                  "rounded-md border border-border bg-muted/40 px-3 py-2 text-caption",
+                  isActive && "border-primary/40",
+                )}
+                data-slot="subagent-message"
+                key={`message_delta-${event.sequence}`}
+                {...activeProps}
+              >
+                <div className="flex items-center gap-2">
+                  {event.agent ? <AgentBadge agent={event.agent} /> : null}
+                  <span className="text-muted-foreground">阶段性结果</span>
+                </div>
+                <p className="mt-1 whitespace-pre-wrap text-foreground">
+                  {eventContent(event)}
+                </p>
               </li>
             );
           }

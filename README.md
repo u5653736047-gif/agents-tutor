@@ -7,7 +7,10 @@
 
 - Supervisor、助教、助学、评价四个同构 Agent
 - “模型决策 → 工具执行 → 结果观察”ReAct 循环
-- Supervisor 通过 `handoff` 工具进行节点路由
+- 生产链路以 Supervisor 为主智能体，通过 `ask_*` 工具等待专业 Agent 完成并整合结果
+- SSE 原生 token 流，以及思考摘要、工具调用和子代理阶段输出
+- “思考”仅展示可审计的执行摘要，不公开模型原始推理文本或工具参数/结果正文
+- 兼容原有 `handoff` / 人工审批编排模式（非生产默认）
 - 工具名称唯一校验、角色权限和结构化错误
 - 安全运行事件以及 handoff、Agent 切换上限
 - 可选 SQLite 持久化，按 `user_id + session_id` 逻辑分区
@@ -88,9 +91,10 @@ embedding_provider=FastEmbedProvider vector_dimension=512`）或
 浏览器打开 `http://127.0.0.1:3000`；前端固定使用演示用户 `demo-user`（请求头
 `X-User-Id`），API 文档位于 `http://127.0.0.1:8000/docs`。
 
-骨架期的手动验收路径是：在前端创建会话并提问，确认带角色徽章的回答；在 API
-文档中用同一 `demo-user` 和会话 ID 查询 / 提交 handoff 的 `confirm` 或 `reject`，
-再刷新前端验证历史，最后归档会话。审批卡片的完整前端交互属于后续细节清单。
+手动验收路径：在前端创建会话并提问，确认 Supervisor 的主回答按 token 增量出现；
+需要专业 Agent 时，Supervisor 会在同一轮内等待其完成并整合结果，不提前结束会话。
+最后切换或刷新页面验证权威全文仍在历史中，再归档会话。模型或编排失败时，对话区应
+显示稳定错误提示，不能只结束加载状态而没有回答。
 
 ## 容器启动（Docker Compose）
 

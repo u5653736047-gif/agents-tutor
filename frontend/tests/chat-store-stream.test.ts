@@ -115,10 +115,10 @@ test("streaming lifecycle merges the final message and tracks the active agent",
   assert.equal(state.streamingAgent, null);
   assert.equal(state.streamingMessage, null);
   assert.deepEqual(state.messages, [assistantMessage]);
-  // 摘要事件(tool_call)追加进 events 列表
+  // 安全思考摘要、工具调用与 Agent 切换都进入协作时间线。
   assert.deepEqual(
     state.events.map((event) => event.event_type),
-    ["tool_call"],
+    ["thinking", "tool_call", "agent_switch"],
   );
   // 生命周期:流式期间 isStreaming 一直为 true
   assert.ok(observations.every((item) => item.isStreaming === true));
@@ -138,6 +138,67 @@ test("streaming lifecycle merges the final message and tracks the active agent",
     (messagesAtHistoryFetch as Array<{ content: string }>).map((item) => item.content),
     ["请解释流式概念", "流式回答"],
   );
+});
+
+test("message deltas grow the supervisor bubble and coalesce subagent output", async () => {
+  const supervisorSnapshots: string[] = [];
+  const store = await createStreamStore({
+    getSessionMessages: async () => [assistantMessage],
+    streamChat: async ({ onEvent }) => {
+      onEvent({
+        agent: "supervisor",
+        content: "流",
+        event_type: "message_delta",
+        message_id: "supervisor-answer",
+        sequence: 1,
+        session_id: "session-1",
+      });
+      supervisorSnapshots.push(store.getState().streamingMessage?.content ?? "");
+      onEvent({
+        agent: "supervisor",
+        content: "式",
+        event_type: "message_delta",
+        message_id: "supervisor-answer",
+        sequence: 2,
+        session_id: "session-1",
+      });
+      supervisorSnapshots.push(store.getState().streamingMessage?.content ?? "");
+      onEvent({
+        agent: "learning_assistant",
+        content: "子",
+        event_type: "message_delta",
+        message_id: "worker-answer",
+        sequence: 3,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "任务",
+        event_type: "message_delta",
+        message_id: "worker-answer",
+        sequence: 4,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "流式完成",
+        event_type: "message_end",
+        sequence: 5,
+        session_id: "session-1",
+      });
+      onEvent({ event_type: "done", sequence: 6, session_id: "session-1" });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("解释流式");
+
+  assert.deepEqual(supervisorSnapshots, ["流", "流式"]);
+  const workerMessages = store
+    .getState()
+    .events.filter((event) => event.event_type === "message_delta");
+  assert.equal(workerMessages.length, 1);
+  assert.equal("content" in workerMessages[0]! ? workerMessages[0].content : null, "子任务");
 });
 
 test("an error event sets runError and the stream still finishes cleanly", async () => {

@@ -41,11 +41,12 @@ class MessageRole(str, Enum):
 
 
 class StreamEventType(str, Enum):
-    """Public event protocol reserved for future streaming support."""
+    """Public SSE protocol for token deltas and safe execution events."""
 
     THINKING = "thinking"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    MESSAGE_DELTA = "message_delta"
     MESSAGE_END = "message_end"
     AGENT_SWITCH = "agent_switch"
     ERROR = "error"
@@ -191,7 +192,8 @@ class StreamEvent(ContractModel):
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | ApiErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
-    content: str | None = None  # thinking 占位 / message_end 全文
+    content: str | None = None  # thinking 摘要 / message_delta 增量 / message_end 全文
+    message_id: str | None = None  # 同一模型消息的增量关联键
     message: Message | None = None  # message_end 的完整消息(可选)
     citations: list[Citation] | None = None
     current_agent: AgentRole | None = None

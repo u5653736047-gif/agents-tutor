@@ -124,6 +124,7 @@ def test_stream_event_values_match_the_public_protocol() -> None:
         "thinking",
         "tool_call",
         "tool_result",
+        "message_delta",
         "message_end",
         "agent_switch",
         "error",
