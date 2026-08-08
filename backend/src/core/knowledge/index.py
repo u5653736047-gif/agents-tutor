@@ -184,6 +184,8 @@ def _metadata_where_clause(
     return " AND ".join(clauses), params
 
 
+# 可替换的索引契约：未来向量索引只需实现 upsert / delete_document / search
+# 三个方法即可接入检索链路，调用方不关心底层是内存、SQLite 还是向量库。
 class KnowledgeIndex(Protocol):
     """Small contract that future vector indexes can implement."""
 
@@ -221,10 +223,12 @@ class InMemoryKnowledgeIndex:
         self._chunks: dict[str, KnowledgeChunk] = {}
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
+        # 同 chunk_id 的旧分块直接覆盖（整文档替换入库时旧版残片不会残留）。
         for chunk in chunks:
             self._chunks[chunk.chunk_id] = chunk
 
     def delete_document(self, document_id: str) -> None:
+        # 重建字典：只保留不属于该文档的 chunk。
         self._chunks = {
             chunk_id: chunk
             for chunk_id, chunk in self._chunks.items()
@@ -239,7 +243,7 @@ class InMemoryKnowledgeIndex:
         metadata_filter: dict[str, str] | None = None,
     ) -> list[SearchHit]:
         """词法检索：先按 metadata_filter 过滤，再打分、排序、截断 top_k。"""
-        if not query.strip() or top_k <= 0:
+        if not query.strip() or top_k <= 0:  # 空查询或非法 top_k 直接返回空
             return []
 
         query_terms = _lexical_terms(query)
@@ -268,6 +272,7 @@ class InMemoryKnowledgeIndex:
                 )
             )
 
+        # 分数降序，同分按 chunk_id 排序保证输出顺序稳定。
         hits.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
         return hits[:top_k]
 
@@ -382,7 +387,7 @@ class SqliteKnowledgeIndex:
         WHERE 提前剔除不匹配行（JSON1 json_each），剩下的行在 Python
         侧打分、排序、截断 top_k——与 InMemoryKnowledgeIndex 完全一致。
         """
-        if not query.strip() or top_k <= 0:
+        if not query.strip() or top_k <= 0:  # 空查询或非法 top_k 直接返回空
             return []
 
         query_terms = _lexical_terms(query)
@@ -440,6 +445,7 @@ class SqliteKnowledgeIndex:
                 )
             )
 
+        # 同内存版：分数降序，同分按 chunk_id 排序。
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [
             SearchHit(
@@ -543,9 +549,11 @@ class SqliteKnowledgeIndex:
 
 def _lexical_terms(text: str) -> set[str]:
     """Extract lowercase English words plus Chinese characters and pairs."""
+    # 英文/数字词统一转小写（检索时大小写不敏感）。
     terms = {match.group().lower() for match in _ENGLISH_WORD.finditer(text)}
     for match in _CHINESE_RUN.finditer(text):
         run = match.group()
+        # 中文按「单字 + 相邻两字组合」拆词：两字词（如 "线性"）也能被命中。
         terms.update(run)
         terms.update(run[index : index + 2] for index in range(len(run) - 1))
     return terms

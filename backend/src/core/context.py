@@ -44,6 +44,7 @@ def trim_message_history(
 
     history = list(messages)
     if not history:
+        # 空历史：无需裁剪，但 token 预算仍要把前缀提示词算进去
         empty_token_count = (
             _count_tokens(
                 token_counter or count_context_tokens,
@@ -58,11 +59,13 @@ def trim_message_history(
             token_count=empty_token_count,
         )
 
+    # 先按条数选出「最近 N 条」作候选集（不限制条数时全部入选）
     selected = (
         set(range(len(history)))
         if max_messages is None
         else set(range(max(0, len(history) - max_messages), len(history)))
     )
+    # 最近一条用户消息是对话的落点，无论条数限制必须保留
     latest_human = next(
         (
             index
@@ -76,12 +79,14 @@ def trim_message_history(
         selected.add(latest_human)
         hard_limit += 1
 
+    # 工具调用必须整组保留：缺父调用的孤儿结果剔除，组内成员不齐的整组剔除
     tool_groups, incomplete_parents, orphan_results = _tool_groups(history)
     selected.difference_update(orphan_results)
     # Tool Call 必须整组保留，缺失或越界则整组删除。
     for parent in incomplete_parents:
         selected.difference_update(tool_groups[parent])
 
+    # 组内任一成员入选则补全整组；会突破条数上限时整组放弃（保持原子性）
     for parent, group in tool_groups.items():
         if parent in incomplete_parents or selected.isdisjoint(group):
             continue
@@ -91,6 +96,7 @@ def trim_message_history(
             selected.update(group)
 
     token_count: int | None = None
+    # 还有 token 预算时，再以「原子组」为单位从新到旧往里装
     if max_tokens is not None:
         selected, token_count = _trim_by_tokens(
             history,
@@ -138,6 +144,7 @@ def _trim_by_tokens(
             units.append(group)
             grouped_indexes.update(group)
     units.extend({index} for index in selected - grouped_indexes)
+    # 按组内最新消息的下标倒序排列 = 时间从近到远
     units.sort(key=max, reverse=True)
 
     if token_counter is None:
@@ -158,7 +165,7 @@ def _trim_by_tokens(
             *(history[index] for index in sorted(candidate)),
         )
         if _count_tokens(token_counter, candidate_messages) > max_tokens:
-            break
+            break  # 超预算即停止：这里就是从新到旧的截断点
         kept.update(unit)
     return kept, None
 
@@ -175,6 +182,7 @@ def _trim_by_additive_default(
     mandatory_messages = tuple(
         history[index] for index in sorted(mandatory)
     )
+    # 默认估算器逐消息向上取整可累加：先数必留消息，再逐组相加避免重复扫描
     running_count = count_context_tokens(
         (*prefix_messages, *mandatory_messages)
     )
@@ -226,11 +234,11 @@ def _tool_groups(
             for tool_call in message.tool_calls:
                 call_id = tool_call.get("id")
                 if not call_id:
-                    invalid_parents.add(index)
+                    invalid_parents.add(index)  # 缺 id 的调用：组不完整，判无效
                     continue
                 normalized_id = str(call_id)
                 if normalized_id in expected_ids[index]:
-                    invalid_parents.add(index)
+                    invalid_parents.add(index)  # 重复 id 的调用：同样判无效
                     continue
                 expected_ids[index].add(normalized_id)
                 call_parents[normalized_id] = index
@@ -240,11 +248,12 @@ def _tool_groups(
         normalized_id = str(message.tool_call_id)
         parent = call_parents.get(normalized_id)
         if parent is None:
-            orphan_results.add(index)
+            orphan_results.add(index)  # 找不到父调用的结果消息：孤儿，剔除
             continue
         groups[parent].add(index)
         observed_ids[parent].add(normalized_id)
 
+    # 不完整父消息 = 调用本身无效 + 有调用但结果没配齐；这些组整组剔除
     incomplete_parents = invalid_parents | {
         parent
         for parent, expected in expected_ids.items()

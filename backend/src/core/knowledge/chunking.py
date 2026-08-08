@@ -11,6 +11,7 @@ from .frontmatter import classify_frontmatter
 from .models import KnowledgeChunk, KnowledgeDocument
 
 
+# 校验分块窗口参数：块大小必须为正，重叠必须满足 0 <= overlap < chunk_size。
 def _validate_window(chunk_size: int, overlap: int) -> None:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than zero")
@@ -41,10 +42,11 @@ def chunk_document(
     headings = _find_headings(document.content)
 
     chunks: list[KnowledgeChunk] = []
+    # 固定窗口滑动切分：窗口长度恒为 chunk_size（文末不足则截短）。
     start = 0
     while start < len(document.content):
         end = min(start + chunk_size, len(document.content))
-        page = document.page if document.page is not None else 0
+        page = document.page if document.page is not None else 0  # 非 PDF 文档无页码，用 0 占位
         metadata = document.metadata.copy()
         metadata.update(_section_metadata(start, headings))
         # H-T2：前言/目录启发式（目录行/讨论链接页等噪音 chunk 的治理，
@@ -68,6 +70,8 @@ def chunk_document(
         )
         if end == len(document.content):
             break
+        # 下一个窗口从 end - overlap 开始，与上一个窗口重叠 overlap 个字符：
+        # 重叠保证切在窗口边界附近的内容不会被一刀切漏，跨窗口语义不丢失。
         start = end - overlap
     return chunks
 

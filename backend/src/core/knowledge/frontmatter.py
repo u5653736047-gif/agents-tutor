@@ -84,7 +84,7 @@ def classify_frontmatter(content: str, page: int | None) -> bool:
        → 极短行密度 + 页码靠前（纯页码列，如 i/ii/iii/iv/v）；
     6. 否则不是前言/目录类。
     """
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    lines = [line.strip() for line in content.splitlines() if line.strip()]  # 空行不计入统计
     if not lines:
         return False
     # 讨论链接碎片页：行数极少（几乎全是链接/页码残留）才算噪音；
@@ -94,10 +94,10 @@ def classify_frontmatter(content: str, page: int | None) -> bool:
     ):
         return True
 
-    toc_count = sum(1 for line in lines if _is_toc_line(line))
-    toc_ratio = toc_count / len(lines)
-    short_count = sum(1 for line in lines if len(line) <= _SHORT_LINE)
-    short_ratio = short_count / len(lines)
+    toc_count = sum(1 for line in lines if _is_toc_line(line))  # 目录行数
+    toc_ratio = toc_count / len(lines)  # 目录行占比：越高越像目录页
+    short_count = sum(1 for line in lines if len(line) <= _SHORT_LINE)  # 极短行数
+    short_ratio = short_count / len(lines)  # 极短行占比：高则像纯页码/残留列
 
     if toc_ratio >= _TOC_RATIO_STRONG:
         return True

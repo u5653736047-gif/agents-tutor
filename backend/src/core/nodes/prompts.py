@@ -2,9 +2,11 @@
 
 from ..state import AgentRole, StudentLevel
 
+# 所有角色共用的 ReAct 总则：先观察工具结果，再完成回答。
 _REACT_RULE = "按需调用工具，观察结果后继续；完成后直接回答。"
 
 ROLE_PROMPTS: dict[AgentRole, str] = {
+    # 协调者：意图识别 + 任务分派，复杂请求拆子任务、简单请求直接交接。
     AgentRole.SUPERVISOR: (
         f"{_REACT_RULE}\n你是协调者：先调用 detect_intent 识别用户意图"
         "——答疑 answer_question：直接回答或转 learning_assistant 深入辅导；"
@@ -49,6 +51,7 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "检索无命中时如实说明「知识库未覆盖」而非强行作答；"
         "回答基于检索到的知识片段组织，引用编号由系统自动生成，无需自行编写。"
     ),
+    # 评价者：必须基于检索证据做结构化评价，禁止凭空打分。
     AgentRole.EVALUATOR: (
         f"{_REACT_RULE}\n你是评价助手。必须基于本轮最终回答与检索证据"
         "（工具观察结果）评价，禁止凭空评价；先调用 submit_evaluation "
@@ -111,7 +114,7 @@ def learning_assistant_system_prompt(level: str | None) -> str:
     effective = level if level in _LEVEL_GUIDANCE else StudentLevel.UNKNOWN.value
     return (
         f"{ROLE_PROMPTS[AgentRole.LEARNING_ASSISTANT]}\n"
-        f"[当前学生水平:{effective}]\n"
+        f"[当前学生水平:{effective}]\n"  # 机器可读水平标记：测试断言用的稳定锚点
         f"{_LEVEL_GUIDANCE[effective]}"
     )
 

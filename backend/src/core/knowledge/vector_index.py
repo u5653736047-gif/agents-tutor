@@ -360,6 +360,8 @@ class SqliteVectorKnowledgeIndex:
             for chunk, vector in zip(chunk_list, vectors)
         ]
         with self._lock:
+            # INSERT OR REPLACE：同 chunk_id 幂等覆盖（重复入库 / 整文档替换
+            # 语义下旧向量被直接重写，不报错）。
             self._conn.executemany(
                 "INSERT OR REPLACE INTO chunk_vectors "
                 "(chunk_id, document_id, content, source, page, start, end, "

@@ -142,6 +142,8 @@ class KnowledgeService:
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
         document_batch = list(documents)
+        # 批内坐标唯一性校验：同一 (document_id, page) 不允许重复出现，
+        # 保证「整文档替换」时每个坐标只对应一份内容。
         coordinates: set[tuple[str, int | None]] = set()
         for document in document_batch:
             coordinate = (document.document_id, document.page)

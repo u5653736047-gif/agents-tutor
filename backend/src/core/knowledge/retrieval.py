@@ -608,7 +608,7 @@ def adaptive_search(
     refine_history: list[str] = []
     current_query = query
     refine_count = 0
-    while True:
+    while True:  # 每轮 = 一次完整 multi_query_search（首轮 + refine 重检轮）
         hits = multi_query_search(
             index,
             current_query,
@@ -688,7 +688,7 @@ def adaptive_search(
             )
         refine_history.append(refined)
         current_query = refined
-        refine_count += 1
+        refine_count += 1  # 重检次数 +1，达到 max_refine_rounds 上限即停止
 
 
 def _safe_policy(policy: RetrievalPolicy, query: str) -> RetrievalDecision:

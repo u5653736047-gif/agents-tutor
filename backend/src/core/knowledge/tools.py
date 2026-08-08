@@ -127,7 +127,7 @@ def create_search_knowledge_tool(
         # 刻意不输出每轮 query（查询正文）：查询已在工具调用参数与
         # 工具结果审计中，元数据与事件再记一遍就是双重存储 + 敏感
         # 正文外泄（事件载荷同理，见 events.py 的 retrieval_* 注释）。
-        last_round = meta.rounds[-1] if meta.rounds else None
+        last_round = meta.rounds[-1] if meta.rounds else None  # 末轮即最终决策依据轮
         payload: dict[str, Any] = {
             "found": bool(result.hits),
             "hits": [

@@ -231,6 +231,7 @@ class CollaborativeAgentGraph:
         checkpointer: BaseCheckpointSaver[str] | None = None,
         interrupt_before_handoff: bool = False,
     ) -> None:
+        # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
         if max_handoffs <= 0:
             raise ValueError("max_handoffs must be positive")
         if max_agent_switches <= 0:
@@ -240,6 +241,7 @@ class CollaborativeAgentGraph:
                 "interrupt_before_handoff requires a configured checkpointer"
             )
 
+        # 权限配置校验：每个业务工具都必须有显式角色白名单（None 视为配置错误）
         permissions = tool_permissions or {}
         business_tool_names = {business_tool.name for business_tool in tools}
         permission_names = set(permissions)
@@ -284,6 +286,7 @@ class CollaborativeAgentGraph:
             submit_evaluation,
             allowed_roles={AgentRole.EVALUATOR},
         )
+        # 业务工具：按外部权限白名单注册（未授权角色调用会被工具层拒绝）
         for business_tool in tools:
             registry.register(
                 business_tool,
@@ -355,6 +358,7 @@ class CollaborativeAgentGraph:
         """把 ReAct 结果转换为 LangGraph 状态更新。"""
 
         def node(state: AgentState) -> AgentState:
+            # 上游已判死（run_error 非空）：原样透传终止，不让本节点覆盖失败结果
             existing_error = state.get("run_error")
             if existing_error is not None:
                 return cast(
@@ -362,6 +366,7 @@ class CollaborativeAgentGraph:
                     {"next_agent": None, "run_error": existing_error},
                 )
 
+            # 防御性校验：上一轮指定的 next_agent 必须是已注册角色，防外部注入非法目标
             existing_target = state.get("next_agent")
             registered_targets = {role.value for role in self.agents}
             if (
@@ -395,6 +400,7 @@ class CollaborativeAgentGraph:
                     },
                 )
 
+            # 计划 Worker 预检：本节点须是计划当前步骤的目标角色，且结果前缀与游标一致
             preflight_plan, preflight_error = _planned_worker_preflight(
                 state,
                 agent.role,
@@ -424,6 +430,7 @@ class CollaborativeAgentGraph:
                     )
                 return cast(AgentState, preflight_updates)
 
+            # Supervisor 轮：计划已完成则把子任务结果拼成消息注入上下文，供模型聚合作答
             aggregation_results: list[TaskStepResult] | None = None
             run_state = state
             if agent.role is AgentRole.SUPERVISOR:
@@ -533,9 +540,9 @@ class CollaborativeAgentGraph:
                 tool_results,
             )
             updates["messages"] = updated_messages
-            target = _handoff_target(tool_results)
-            new_plan = _task_plan_from_results(tool_results)
-            existing_plan = _task_plan_from_state(state)
+            target = _handoff_target(tool_results)  # 本轮模型请求的转交目标
+            new_plan = _task_plan_from_results(tool_results)  # 本轮模型新建的计划
+            existing_plan = _task_plan_from_state(state)  # 已持久化的活动计划
             # ── S2-T1 意图识别：解析模型分类，并对「意图不明」做分派拦截 ──
             # 原理：detect_intent 是 Supervisor 决策前的必备工具（prompt 约定），
             # 其成功结果经 _intent_from_results 校验后成为本轮权威意图。若模型
@@ -604,11 +611,12 @@ class CollaborativeAgentGraph:
                     updates["task_context"] = TaskContext.model_validate(
                         existing_context
                     ).model_copy(update=context_update)
+            # 计划取舍：有活动计划则沿用（再新建会触发下方替换拦截），否则采纳本轮新建
             plan = existing_plan or new_plan
             replacing_plan = new_plan is not None and existing_plan is not None
             if new_plan is not None and existing_plan is None:
                 updates["task_plan"] = new_plan
-                updates["task_results"] = []
+                updates["task_results"] = []  # 新计划从零收集子任务结果
             events = cast(list[RunEvent], updates.get("events", []))
             sequence = max(
                 (
@@ -618,6 +626,7 @@ class CollaborativeAgentGraph:
                 default=-1,
             )
 
+            # 事件发射闭包：统一递增序列号并追加进 events，后续分支只需调用
             def emit(
                 event_type: EventType,
                 event_agent: str,
@@ -851,11 +860,13 @@ class CollaborativeAgentGraph:
             if reference_verification is not None:
                 updates["reference_verification"] = reference_verification
 
+            # 本轮默认收口值：不转交、无错误；后续分支按需覆盖
             handoff_count = state.get("handoff_count", 0)
             switch_count = state.get("agent_switch_count", 0)
             updates["next_agent"] = None
             updates["run_error"] = None
 
+            # 失败收口闭包：写 run_error、把活动计划标 FAILED、补发失败事件
             def fail(error: RunError) -> AgentState:
                 updates["run_error"] = error
                 if plan is not None and plan.status not in {
@@ -886,6 +897,7 @@ class CollaborativeAgentGraph:
                 updates["events"] = events
                 return cast(AgentState, updates)
 
+            # 计划 Worker 的模型调用失败/迭代超限视为可重试：不判死，由调度节点再分派
             planned_worker = (
                 agent.role is not AgentRole.SUPERVISOR
                 and plan is not None
@@ -1011,6 +1023,7 @@ class CollaborativeAgentGraph:
                         )
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
+                # Worker 轮：按活动计划记录本步骤结果并推进游标，完成后交回 Supervisor
                 if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
                     step = plan.steps[plan.current_step_index]
                     if step.target_agent is not agent.role:
@@ -1114,6 +1127,7 @@ class CollaborativeAgentGraph:
             default=-1,
         )
 
+        # 分派前先查转交/切换上限：超限直接以失败收口，不把超限轮交给 Worker
         limit_error: RunError | None = None
         if handoff_count + 1 > self.max_handoffs:
             limit_error = RunError(
@@ -1153,6 +1167,7 @@ class CollaborativeAgentGraph:
                 },
             )
 
+        # 正常分派：确定下一 Worker；审批开启时挂起等人确认，否则直接注入描述
         updates: dict[str, object] = {
             "current_agent": AgentRole.SUPERVISOR.value,
             "next_agent": step.target_agent.value,
@@ -1226,6 +1241,7 @@ class CollaborativeAgentGraph:
                 reject_updates,
             )
 
+        # 人工通过：决定字段优先，缺省回退到原提案
         target = decision.target_agent or proposal.target_agent
         task_content = decision.task_content or proposal.task_content
         planned = _task_plan_for_proposal(state, proposal)
@@ -1287,6 +1303,7 @@ class CollaborativeAgentGraph:
                 )
             ],
         }
+        # 计划型审批：把人工修正（目标/描述）写回当前计划步骤，保证后续调度一致
         if planned is not None:
             step_index = planned.current_step_index
             steps = list(planned.steps)
@@ -1315,18 +1332,18 @@ class CollaborativeAgentGraph:
     def _route(state: AgentState) -> str:
         """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
         if state.get("run_error") is not None:
-            return "end"
+            return "end"  # 已判死：终止
         if state.get("pending_handoff") is not None:
-            return _HANDOFF_APPROVAL_NODE
+            return _HANDOFF_APPROVAL_NODE  # 有审批请求：先去人工确认 gate
         next_agent = state.get("next_agent")
         if next_agent in {role.value for role in AgentRole}:
-            return next_agent
+            return next_agent  # 模型指定了合法目标：直接转交
         plan = _task_plan_from_state(state)
         if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
-            return _TASK_PLAN_DISPATCH_NODE
+            return _TASK_PLAN_DISPATCH_NODE  # 活动计划：由调度节点决定下一 Worker
         if state.get("current_agent") != AgentRole.SUPERVISOR.value:
-            return AgentRole.SUPERVISOR.value
-        return "end"
+            return AgentRole.SUPERVISOR.value  # Worker 收尾：交回 Supervisor
+        return "end"  # 无待办：终止
 
     def run(
         self,
@@ -1354,6 +1371,7 @@ class CollaborativeAgentGraph:
                     f"存在待恢复执行，请先调用 {resume_method}"
                 )
             if snapshot.values:
+                # 会话已有历史：以新用户消息开启新一轮，仅重置本轮临时字段（level 刻意保留）
                 state = cast(
                     AgentState,
                     {
@@ -1384,6 +1402,7 @@ class CollaborativeAgentGraph:
                     },
                 )
             else:
+                # 全新会话：从零构建初始状态并写入首条用户消息
                 state = create_initial_state(session_id=session_id, user_id=user_id)
                 state["messages"] = [HumanMessage(content=user_input)]
             return cast(AgentState, app.invoke(state, config=config))
@@ -1407,6 +1426,7 @@ class CollaborativeAgentGraph:
                 raise ValueError(
                     "当前会话等待人工 handoff 决策，请调用 resume_handoff()"
                 )
+            # None 输入表示「纯恢复」：不注入新消息，仅继续执行被打断的图
             return cast(AgentState, app.invoke(None, config=config))
 
     def resume_handoff(
@@ -1428,6 +1448,7 @@ class CollaborativeAgentGraph:
             current_id = pending.interrupt_id
             if decision.interrupt_id != current_id:
                 raise ValueError("interrupt_id 与当前 handoff 断点不匹配")
+            # 用人工决定恢复被中断的 gate（resume 键以 interrupt_id 定位断点）
             command: Command[str] = Command(
                 resume={
                     current_id: decision.model_dump(mode="json"),
@@ -1971,6 +1992,7 @@ def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | No
     return None
 
 
+# 宽容读取持久化计划：checkpoint 反序列化后可能是 dict，统一归一为模型
 def _task_plan_from_state(state: AgentState) -> TaskPlan | None:
     raw_plan = state.get("task_plan")
     return None if raw_plan is None else TaskPlan.model_validate(raw_plan)
@@ -1992,6 +2014,7 @@ def _task_plan_for_proposal(
     return plan
 
 
+# 宽容读取任务结果列表（checkpoint 反序列化后可能是 dict）
 def _task_results_from_state(state: AgentState) -> list[TaskStepResult]:
     return [
         TaskStepResult.model_validate(result)
@@ -1999,6 +2022,7 @@ def _task_results_from_state(state: AgentState) -> list[TaskStepResult]:
     ]
 
 
+# 计划 Worker 轮开始前的防御性预检：目标角色或结果前缀不符则直接判死，不让 Worker 空跑
 def _planned_worker_preflight(
     state: AgentState,
     role: AgentRole,
@@ -2045,6 +2069,7 @@ def _validate_task_result_prefix(
             raise ValueError("task result does not match plan step")
 
 
+# 计划已完成时取出全部子任务结果；不完整或游标不一致则抛错，由 _wrap 安全收口
 def _ready_task_results(state: AgentState) -> list[TaskStepResult] | None:
     plan = _task_plan_from_state(state)
     if plan is None or plan.status is not TaskPlanStatus.COMPLETED:
@@ -2067,6 +2092,7 @@ def _terminal_agent_output(messages: Sequence[BaseMessage]) -> str | None:
     return output or None
 
 
+# 把子任务结果拼成结构化 SystemMessage 注入 Supervisor 上下文，供聚合作答
 def _task_results_message(
     plan: TaskPlan,
     results: Sequence[TaskStepResult],
@@ -2093,6 +2119,7 @@ def _task_results_message(
     )
 
 
+# 模型未产出聚合回答时的兜底：把成功/失败子任务结果拼成纯文本总结
 def _deterministic_aggregation(
     plan: TaskPlan,
     results: Sequence[TaskStepResult],
@@ -2124,6 +2151,7 @@ def _deterministic_aggregation(
     return "\n".join(sections)
 
 
+# 用聚合文本覆盖终端回答（仅换 content，角色/引用元数据原样保留）
 def _replace_terminal_ai_output(
     messages: Sequence[BaseMessage],
     content: str,
@@ -2140,6 +2168,7 @@ def _replace_terminal_ai_output(
     raise RuntimeError("aggregation completed without a terminal AIMessage")
 
 
+# 在聚合回答后追加「未完成子任务」提示，让用户看到失败项
 def _append_missing_results_notice(
     messages: Sequence[BaseMessage],
     plan: TaskPlan,
@@ -2174,6 +2203,7 @@ def _append_missing_results_notice(
     raise RuntimeError("aggregation completed without a terminal AIMessage")
 
 
+# 终态输出无效时，把该角色的完成事件改标为失败（保证事件审计口径一致）
 def _mark_agent_completion_invalid(
     events: Sequence[RunEvent],
     role: AgentRole,

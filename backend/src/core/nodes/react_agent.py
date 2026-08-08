@@ -75,12 +75,13 @@ class ReActAgentNode:
 
     def run(self, state: AgentState) -> ReActResult:
         """运行到模型给出最终回答，或达到最大轮数。"""
+        # 先快照会话起点；本轮新增的消息/事件暂存于本地变量，结束时统一写回状态。
         persisted_history = list(state.get("messages", []))
         extra = dict(state.get("extra", {}))
         generated: list[BaseMessage] = []
         tool_results: list[ToolResult] = []
         events: list[RunEvent] = []
-        sequence = max(
+        sequence = max(  # 从历史事件续接序号，保证全会话事件递增
             (event.sequence for event in state.get("events", [])),
             default=-1,
         )
@@ -97,6 +98,7 @@ class ReActAgentNode:
         system_message = SystemMessage(content=system_prompt)
 
         def model_context() -> list[BaseMessage]:
+            # 组装本轮模型上下文：会话历史 + 本轮新增，超预算时裁剪，统计信息写进 extra。
             combined = [*persisted_history, *generated]
             if (
                 self.max_context_messages is None
@@ -126,6 +128,7 @@ class ReActAgentNode:
             return [system_message, *history]
 
         def emit(event_type: EventType, **values: Any) -> None:
+            # 小工具：生成带自增序号的事件暂存，节点结束时统一写回状态。
             nonlocal sequence
             sequence += 1
             events.append(
@@ -140,10 +143,11 @@ class ReActAgentNode:
 
         emit(EventType.AGENT_STARTED)
 
+        # ReAct 主循环：模型决策 → 工具执行 → 结果观察，直到模型直接回答或用尽轮数。
         for iteration in range(1, self.max_iterations + 1):
             messages = model_context()
             try:
-                response = self.model.invoke(messages)
+                response = self.model.invoke(messages)  # 模型决策：可能给最终回答，也可能请求调用工具
             except Exception:  # noqa: BLE001 - 模型边界只公开稳定错误分类
                 error = RunError(
                     error_code=ErrorCode.MODEL_CALL_FAILED,
@@ -164,7 +168,7 @@ class ReActAgentNode:
                     extra,
                     error,
                 )
-            if not response.tool_calls:
+            if not response.tool_calls:  # 没有工具请求 → 模型已给出最终回答，本轮结束
                 generated.append(response)
                 emit(
                     EventType.AGENT_COMPLETED,
@@ -179,6 +183,7 @@ class ReActAgentNode:
                     extra,
                 )
 
+            # 脱敏：写回历史前把内部工具名换成对外名称，避免内部命名泄漏给下游。
             public_tool_calls = [
                 (self.tool_executor.public_tool_name(tool_call), tool_call)
                 for tool_call in response.tool_calls
@@ -213,7 +218,7 @@ class ReActAgentNode:
             )
 
             # 工具返回的 ToolMessage 会进入下一轮模型输入，形成 Observation。
-            for public_name, tool_call in public_tool_calls:
+            for public_name, tool_call in public_tool_calls:  # 逐个执行，异常已包装成失败结果
                 emit(
                     EventType.TOOL_STARTED,
                     tool_name=public_name,
@@ -229,6 +234,7 @@ class ReActAgentNode:
                     error_code=execution.result.error_code,
                 )
 
+        # 兜底：轮数用尽仍未给出最终回答，按迭代上限错误结束。
         error = RunError(
             error_code=ErrorCode.REACT_ITERATION_LIMIT,
             message=f"ReAct 循环达到最大轮数：{self.max_iterations}",
