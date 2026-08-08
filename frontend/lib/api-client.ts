@@ -190,9 +190,17 @@ async function request<T>(
     headers.set("Content-Type", "application/json");
   }
 
+  // 2026-08-07 prod 验收事故根因修复:必须解构后再调用 fetchImpl。
+  // 浏览器原生 fetch 是 WebIDL 方法,要求 this 为 window/undefined;
+  // 直接 config.fetchImpl(...) 成员调用会把 this 绑定为 config 对象,
+  // 原生 fetch 同步抛 "Failed to execute 'fetch' on 'Window': Illegal
+  // invocation" → request() catch → 所有 API 请求静默失败且零网络活动
+  // (带扩展的浏览器因扩展 hook 了 window.fetch 为普通函数反而正常,
+  // 掩盖了此 bug;Playwright/无痕等干净浏览器 100% 复现)。
+  const fetchImpl = config.fetchImpl;
   let response: Response;
   try {
-    response = await config.fetchImpl(`${config.baseUrl}${path}`, {
+    response = await fetchImpl(`${config.baseUrl}${path}`, {
       ...init,
       headers,
       signal: controller.signal,
