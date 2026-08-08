@@ -170,11 +170,18 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
   // 调用外)——非响应式字段,不触发渲染;多个 store 实例各自持有
   // 自己的 controller,不会串(cancelStreaming 只 abort 本实例的流)。
   let activeStreamController: AbortController | null = null;
+  // UX-20260807#2:refreshSessions 进行中去重改用非响应式闭包标志——
+  // isLoadingSessions 初始值改为 true(修侧栏首帧闪空态)后不能再兼任
+  // 「请求在飞」标记,否则首次挂载拉取会被守卫误拦。
+  let sessionsRefreshInFlight = false;
 
   return create<ChatStore>()((set, get) => ({
     ...emptyConversationState(),
     currentSessionId: null,
-    isLoadingSessions: false,
+    // UX-20260807#2:初始值改为 true——挂载 effect 才发起拉取,首帧
+    // sessions 空且未加载会闪现「暂无会话」;初始 true 首帧即渲染侧栏
+    // 骨架(与 knowledge 页 listLoading 初始 true 的先例一致)。
+    isLoadingSessions: true,
     requestError: null,
     sessions: [],
     showArchived: false,
@@ -255,9 +262,10 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
       // 打开抽屉会再次触发挂载拉取——进行中去重,避免重复请求
       // (数据幂等,仅去网络开销;并发失败时下一次调用仍可重试,
       // 因为失败路径会复位 isLoadingSessions)。
-      if (get().isLoadingSessions) {
+      if (sessionsRefreshInFlight) {
         return;
       }
+      sessionsRefreshInFlight = true;
       set({ isLoadingSessions: true, requestError: null });
       try {
         // D4-T7:按当前归档视图拉取——showArchived=true 时带上
@@ -266,6 +274,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         set({ isLoadingSessions: false, sessions });
       } catch (error) {
         set({ isLoadingSessions: false, requestError: asApiClientError(error) });
+      } finally {
+        sessionsRefreshInFlight = false;
       }
     },
     selectSession: (sessionId) => {
@@ -522,7 +532,18 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
       const controller = new AbortController();
       activeStreamController = controller;
 
-      set({
+      // UX-20260807#1:乐观回显——与 sendMessage 同构,流式请求发起前
+      // 先把用户消息追加进 messages(输入框立即清空后用户能看到自己
+      // 说了什么)。run 结束/失败/降级后权威历史整体替换 messages,
+      // 乐观消息自然被覆盖,无需去重。
+      const optimistic: Message = {
+        agent: null,
+        content: message,
+        created_at: undefined,
+        role: "user",
+      };
+
+      set((state) => ({
         isStreaming: true,
         requestError: null,
         runError: null,
@@ -533,7 +554,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         // events 在 run 开始时重置(与 sendMessage 一致):契约中事件是
         // 本轮增量,累积会让时间线跨 run 交错(review 修正)。
         events: [],
-      });
+        messages: [...state.messages, optimistic],
+      }));
 
       // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
       const dispatch = (event: StreamEvent) => {
@@ -642,6 +664,23 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           return;
         }
         if (get().currentSessionId === sessionId) {
+          // UX-20260807#1:失败回滚——按对象引用移除本次追加的乐观消息
+          // (复用 sendMessage 的按引用查找模式)。降级分支随后走
+          // sendMessage,其内部会重新追加新的乐观消息,不会重复。
+          set((state) => {
+            const messages = [...state.messages];
+            let index = -1;
+            for (let i = messages.length - 1; i >= 0; i -= 1) {
+              if (messages[i] === optimistic) {
+                index = i;
+                break;
+              }
+            }
+            if (index !== -1) {
+              messages.splice(index, 1);
+            }
+            return { messages };
+          });
           if (retryStream) {
             // D1-T3 降级:重试通道耗尽(重试 + 续传均失败)后走同步通道
             // 保证消息一致。sendMessage 内部「POST + 拉全量」以历史为

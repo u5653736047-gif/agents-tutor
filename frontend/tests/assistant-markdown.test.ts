@@ -19,7 +19,8 @@ test("assistant Markdown renders formatting and code blocks without raw HTML", a
     }),
   );
 
-  assert.match(markup, /<strong>重点<\/strong>/);
+  // UX-20260807#3:strong 补结构映射(font-semibold)后带类断言
+  assert.match(markup, /<strong class="font-semibold">重点<\/strong>/);
   assert.match(markup, /font-mono/);
   assert.match(markup, /bg-neutral-900/);
   assert.doesNotMatch(markup, /<script/i);

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore, useState } from "
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
+import { apiBaseUrl } from "@/lib/api-base-url";
 import { isOnboardingSeen, markOnboardingSeen, subscribeOnboarding } from "@/lib/onboarding";
 import { useChatStore } from "@/stores/chat-store";
 
@@ -84,9 +85,54 @@ export function AppShell({ apiConnected }: AppShellProps) {
     }
   }, [sidebarOpen]);
 
-  // D4-T6:主题切换。图标 CSS 类驱动无需 mounted;aria-label/onClick
-  // 直接读 resolvedTheme(SSR 首帧 undefined,hydration 后校准)。
+  // D4-T6 修订(hydration 修复):主题切换。图标仍用 CSS 类驱动(亮色显
+  // 月亮/暗色显太阳,next-themes 内联脚本在 hydration 前设置 html 的
+  // dark 类,CSS 即时生效——无 JS 状态、无闪烁);但 aria-label 不能直接
+  // 读 resolvedTheme:SSR 首帧 resolvedTheme 恒 undefined(三元走假分支
+  // 输出「切换到暗色模式」),暗色系统用户的客户端首帧解析为 dark 走真
+  // 分支输出「切换到亮色模式」→ 服务端/客户端首帧属性不一致,
+  // React 报 hydration mismatch。改用 mounted 门控(useSyncExternalStore
+  // 的「服务端快照 + 客户端快照」模式,与 D5-T4 引导标记同一先例;
+  // 不用 effect 内 setMounted——react-hooks 的 set-state-in-effect 拦截
+  // 同步 setState):SSR 与客户端首帧都取服务端快照(false)渲染固定值
+  // 「切换到暗色模式」,hydration 完成后切真实值。onClick 保留读
+  // resolvedTheme 的原始表达式(点击必然发生在 hydration 之后,mounted
+  // 已为 true,行为与修复前一致)。
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
   const { resolvedTheme, setTheme } = useTheme();
+  const isDark = mounted && resolvedTheme === "dark";
+
+  // D8 修复:后端连接状态自愈——apiConnected 是 SSR 时的一次性健康探测
+  // 快照,后端在页面打开后才就绪(如 docker compose 先起前端、后端尚在
+  // 启动,或后端中途重启恢复)时,徽章会永久停留在「后端暂不可用」且无
+  // 重探机制。这里仅当当前未连接时每 10s 客户端重探 /healthz,恢复后
+  // 停止轮询;已连接时不产生额外请求(运行中掉线由各接口的 requestError
+  // 通道呈现,不重复打扰)。setState 全部发生在 await 后的异步回调里,
+  // 不触发 react-hooks 的 set-state-in-effect 规则。
+  const [connected, setConnected] = useState(apiConnected);
+
+  useEffect(() => {
+    if (connected) {
+      return;
+    }
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const response = await fetch(`${apiBaseUrl}/healthz`, { cache: "no-store" });
+          if (response.ok && (await response.json()).status === "ok") {
+            setConnected(true);
+          }
+        } catch {
+          // 后端仍不可达:保持「后端暂不可用」,下一轮再试
+        }
+      })();
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [connected]);
 
   // D4-T5:抽屉打开期间注册 keydown 监听,Esc 关闭;关闭后移除监听。
   // D5-T5:Esc 走 closeDrawer(而非直接 setSidebarOpen),保证焦点归还
@@ -176,7 +222,8 @@ export function AppShell({ apiConnected }: AppShellProps) {
             {/* D6-T4:知识库检索测试入口(教师端)——独立页面 /knowledge,
                 不经过主会话 store;小链接样式与顶栏辅助文案一致 */}
             <Link
-              className="text-caption text-muted-foreground hover:text-foreground"
+              // UX-20260807#4:顶栏入口 hover 品牌化(交互热区变蓝)
+              className="text-caption text-muted-foreground hover:text-primary"
               data-slot="knowledge-link"
               href="/knowledge"
             >
@@ -185,28 +232,31 @@ export function AppShell({ apiConnected }: AppShellProps) {
             {/* D6-T7:学习进度入口——独立页面 /stats(基础统计版),与
                 知识库入口并列,同样不经过主会话 store */}
             <Link
-              className="text-caption text-muted-foreground hover:text-foreground"
+              // UX-20260807#4:顶栏入口 hover 品牌化(交互热区变蓝)
+              className="text-caption text-muted-foreground hover:text-primary"
               data-slot="stats-link"
               href="/stats"
             >
               进度
             </Link>
             <div className="flex items-center gap-2 text-caption text-muted-foreground">
-              {apiConnected ? (
-                <CircleCheck aria-hidden className="size-4 text-emerald-600" />
+              {connected ? (
+                <CircleCheck aria-hidden className="size-4 text-success" />
               ) : (
                 <CircleX aria-hidden className="size-4 text-destructive" />
               )}
-              <span>{apiConnected ? "后端已连接" : "后端暂不可用"}</span>
+              <span>{connected ? "后端已连接" : "后端暂不可用"}</span>
             </div>
             {/* D4-T6:主题切换按钮。图标用 CSS 类驱动(亮色显月亮/
                 暗色显太阳,next-themes 内联脚本在 hydration 前设置
                 html 的 dark 类,CSS 即时生效——无 JS 状态、无闪烁、
                 不触发 react-hooks 的 effect setState lint);aria-label
-                与 onClick 用 resolvedTheme(SSR 首帧 undefined 显示
-                「切换到暗色模式」,hydration 后校准)。 */}
+                走 mounted 门控:未 mounted(SSR 首帧与客户端首帧)渲染
+                与 SSR 一致的固定值「切换到暗色模式」,mounted 后再按
+                resolvedTheme 校准——修复「SSR 输出暗色、客户端首帧
+                亮色」导致的 hydration 属性不匹配(根因见上方注释)。 */}
             <button
-              aria-label={resolvedTheme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}
+              aria-label={isDark ? "切换到亮色模式" : "切换到暗色模式"}
               className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
               data-slot="theme-toggle"
               onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
@@ -240,7 +290,8 @@ export function AppShell({ apiConnected }: AppShellProps) {
               <div className="mt-4 grid gap-2">
                 {EXAMPLE_QUESTIONS.map((question) => (
                   <button
-                    className="rounded-md border border-border px-4 py-2 text-left text-body text-foreground hover:bg-muted"
+                    // UX-20260807#4:hover 品牌化——替换(非叠加)原灰底
+                    className="rounded-md border border-border px-4 py-2 text-left text-body text-foreground hover:border-primary/40 hover:bg-primary/5"
                     data-slot="example-question"
                     key={question}
                     onClick={() => startExample(question)}

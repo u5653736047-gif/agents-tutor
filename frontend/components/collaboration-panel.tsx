@@ -35,7 +35,9 @@ const planStatusPresentation: Record<
   active: { label: "进行中", className: "border-primary/30 bg-primary/10 text-primary" },
   completed: {
     label: "已完成",
-    className: "border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400",
+    // UX-20260807#4:成功色走语义 success token(替代 emerald 硬编码,
+    // 两模式自动适配),与角色徽章同一「30/10/100 配色公式」。
+    className: "border-success/30 bg-success/10 text-success",
   },
   cancelled: { label: "已取消", className: "border-border bg-muted text-muted-foreground" },
   failed: { label: "失败", className: "border-destructive/30 bg-destructive/10 text-destructive" },
@@ -114,7 +116,7 @@ function PlanSteps({
               {result ? (
                 <div className="mt-1 flex items-center gap-1">
                   {result.success ? (
-                    <span aria-label="成功" className="text-emerald-600">
+                    <span aria-label="成功" className="text-success">
                       ✓
                     </span>
                   ) : (

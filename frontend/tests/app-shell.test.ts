@@ -18,7 +18,10 @@ test("the application shell renders a desktop session sidebar and empty conversa
   assert.match(markup, /data-layout="desktop-two-column"/);
   assert.match(markup, /data-slot="session-sidebar"/);
   assert.match(markup, /新建会话/);
-  assert.match(markup, /暂无会话/);
+  // UX-20260807#2:isLoadingSessions 初始 true——SSR 首帧渲染侧栏骨架
+  // 而非「暂无会话」空态(修首帧闪空态)
+  assert.match(markup, /data-slot="session-skeleton"/);
+  assert.doesNotMatch(markup, /暂无会话/);
   assert.match(markup, /data-slot="conversation-area"/);
   assert.match(markup, /后端已连接/);
 });
@@ -188,7 +191,8 @@ test("the app shell knowledge link uses next/link with muted caption styling", (
 
   assert.match(source, /import Link from "next\/link"/);
   assert.match(source, /data-slot="knowledge-link"[\s\S]*?href="\/knowledge"/);
-  assert.match(source, /text-caption text-muted-foreground hover:text-foreground/);
+  // UX-20260807#4:顶栏入口 hover 品牌化(hover:text-primary)
+  assert.match(source, /text-caption text-muted-foreground hover:text-primary/);
 });
 
 // D6-T7:顶栏学习进度入口——SSR 渲染 + 源码守卫,与 knowledge-link 并列。
@@ -209,5 +213,6 @@ test("the app shell stats link uses next/link with muted caption styling", () =>
   const source = readFileSync(appShellPath, "utf8");
 
   assert.match(source, /data-slot="stats-link"[\s\S]*?href="\/stats"/);
-  assert.match(source, /text-caption text-muted-foreground hover:text-foreground/);
+  // UX-20260807#4:顶栏入口 hover 品牌化(hover:text-primary)
+  assert.match(source, /text-caption text-muted-foreground hover:text-primary/);
 });

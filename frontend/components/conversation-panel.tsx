@@ -236,6 +236,10 @@ export function MessageRow({
 }
 
 type ConversationContentProps = {
+  // UX-20260807#2:切换会话拉历史期间(isLoadingMessages && 无消息)渲染
+  // 加载骨架,区分「正在加载」与「会话是空的」。可选:既有调用不传时
+  // 零渲染,行为不变。
+  isLoadingMessages?: boolean;
   isSending: boolean;
   isStreaming: boolean;
   messages: Message[];
@@ -258,6 +262,7 @@ type ConversationContentProps = {
 };
 
 export function ConversationContent({
+  isLoadingMessages = false,
   isSending,
   isStreaming,
   messages,
@@ -289,6 +294,32 @@ export function ConversationContent({
           {isStreaming ? "助手正在生成回答…" : "正在发送…"}
         </p>
       ) : null}
+
+      {/* UX-20260807#2:切换会话拉历史期间的加载骨架——复用 isSending 的
+          message-skeleton 结构(徽章占位 + 两行文本占位),仅 isLoadingMessages
+          且无消息时渲染,区分「正在加载」与「会话是空的」;加载结束后由
+          消息行或既有空态接替。data-slot 与发送骨架区分,测试可独立断言。 */}
+      {isLoadingMessages && messages.length === 0
+        ? [0, 1, 2].map((index) => (
+            <article
+              aria-hidden
+              className="flex justify-start"
+              data-slot="history-skeleton"
+              key={index}
+            >
+              <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="size-5 rounded-full" />
+                  <Skeleton className="h-4 w-16" />
+                </div>
+                <div className="mt-3 space-y-2">
+                  <Skeleton className="h-3 w-full" />
+                  <Skeleton className="h-3 w-4/5" />
+                </div>
+              </div>
+            </article>
+          ))
+        : null}
 
       {/* D4-T8:未启用虚拟化时全量渲染消息行(短会话既有行为);
           启用时消息行由 ConversationPanel 虚拟渲染,此处仅渲染尾部块 */}
@@ -468,6 +499,9 @@ export function ConversationPanel() {
   const decideHandoff = useChatStore((state) => state.decideHandoff);
   const events = useChatStore((state) => state.events);
   const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
+  // UX-20260807#2:拉历史加载态——此前无组件订阅(「死状态」),切换会话
+  // 期间消息区空白;现在驱动 ConversationContent 的加载骨架。
+  const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const lastSentMessage = useChatStore((state) => state.lastSentMessage);
@@ -597,6 +631,7 @@ export function ConversationPanel() {
             : null}
           <ConversationContent
             feedbackSessionId={currentSessionId ?? undefined}
+            isLoadingMessages={isLoadingMessages}
             isSending={isSending}
             isStreaming={isStreaming}
             messages={messages}

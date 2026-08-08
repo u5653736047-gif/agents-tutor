@@ -132,10 +132,11 @@ test("streaming lifecycle merges the final message and tracks the active agent",
     (observations[3]?.streamingMessage as { content?: string } | null)?.content,
     "流式回答",
   );
-  // 收尾时流式消息已并入消息列表(拉权威历史前一刻可见)
+  // 收尾时流式消息已并入消息列表(拉权威历史前一刻可见)。
+  // UX-20260807#1:乐观用户消息在流式发起前已追加,此时位于列表首位。
   assert.deepEqual(
     (messagesAtHistoryFetch as Array<{ content: string }>).map((item) => item.content),
-    ["流式回答"],
+    ["请解释流式概念", "流式回答"],
   );
 });
 
@@ -362,9 +363,10 @@ test("streamSendMessage finishes normally via the retry channel after internal r
   assert.equal(state.requestError, null);
   assert.equal(state.degradedNotice, null);
   // 流式消息并入消息列表后再拉权威历史,消息一致。
+  // UX-20260807#1:乐观用户消息在流式发起前已追加,此时位于列表首位。
   assert.deepEqual(
     (messagesAtHistoryFetch as Array<{ content: string }>).map((item) => item.content),
-    ["重连后的回答"],
+    ["会中断的请求", "重连后的回答"],
   );
   assert.deepEqual(state.messages, [assistantMessage]);
 });

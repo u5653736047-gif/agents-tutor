@@ -68,6 +68,10 @@ type SessionSidebarContentProps = {
   // D4-T7:归档视图开关——true 时列表为归档会话(store 按此拉取),
   // 按钮文案与空态随之切换。
   onToggleArchived: () => void;
+  // D8 修复:错误块「重试」回调——断网/后端重启等请求失败后提供恢复
+  // 入口(容器转发 store.refreshSessions,重试前自动清 requestError)。
+  // 可选:未提供(既有测试注入)时不渲染按钮,行为不变。
+  onRetrySessions?: () => void;
   requestError: ApiClientError | null;
   selectSession: (sessionId: string) => void;
   sessions: Session[];
@@ -81,6 +85,7 @@ export function SessionSidebarContent({
   isLoadingSessions,
   loadCurrentSessionMessages,
   onToggleArchived,
+  onRetrySessions,
   requestError,
   selectSession,
   sessions,
@@ -218,7 +223,9 @@ export function SessionSidebarContent({
                   <div
                     className={
                       selected
-                        ? "group mb-1 flex items-center rounded-md bg-muted px-3 py-2"
+                        ? // UX-20260807#4:选中态品牌化——品牌蓝 10% 底 +
+                          // 25% 环,替代灰底(全页唯一选中态不再被灰淹没)
+                          "group mb-1 flex items-center rounded-md bg-primary/10 px-3 py-2 ring-1 ring-primary/25"
                         : "group mb-1 flex items-center rounded-md px-3 py-2 hover:bg-muted/60"
                     }
                     key={session.session_id}
@@ -238,7 +245,10 @@ export function SessionSidebarContent({
                       {highlightMatch(session.session_id, effectiveQuery).map(
                         (segment, index) =>
                           segment.highlighted ? (
-                            <mark className="bg-amber-200/70 text-inherit dark:bg-amber-400/30" key={index}>
+                            // UX-20260807#4:高亮色走语义 warning token
+                            // (替代 amber 硬编码,两模式自动适配);
+                            // text-inherit 必须保留,否则暗色回退黑字。
+                            <mark className="bg-warning/20 text-inherit" key={index}>
                               {segment.text}
                             </mark>
                           ) : (
@@ -290,6 +300,20 @@ export function SessionSidebarContent({
           <p className="mt-0.5 text-caption text-muted-foreground">
             {requestErrorPreset.detail}
           </p>
+          {/* D8 修复:请求失败(网络/超时/服务错误)后给出显式恢复入口——
+              点击重新拉取会话列表(store 的 refreshSessions 重试前自动
+              清 requestError)。此前错误块只有文案没有动作,后端短暂
+              不可用恢复后必须手动做一次交互才能重试。 */}
+          {onRetrySessions ? (
+            <button
+              className="mt-2 rounded-md border border-border px-3 py-1.5 text-caption font-medium text-foreground hover:bg-muted hover:text-foreground"
+              data-slot="sidebar-request-retry"
+              onClick={onRetrySessions}
+              type="button"
+            >
+              重试
+            </button>
+          ) : null}
         </div>
       ) : null}
     </aside>
@@ -341,6 +365,7 @@ export function SessionSidebar({ onSessionSelected }: SessionSidebarProps = {}) 
       isLoadingSessions={isLoadingSessions}
       loadCurrentSessionMessages={loadCurrentSessionMessages}
       onToggleArchived={() => setShowArchived(!showArchived)}
+      onRetrySessions={() => void refreshSessions()}
       requestError={requestError}
       selectSession={handleSelectSession}
       sessions={sessions}
