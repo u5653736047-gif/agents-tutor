@@ -15,6 +15,7 @@ venv/
 .vscode/
 .reasonix/
 reasonix.toml
+.claude/settings.local.json
 .tools/
 *.swp
 *.swo
