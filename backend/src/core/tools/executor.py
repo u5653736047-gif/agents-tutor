@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import dataclass
 from math import isfinite
 from time import perf_counter
@@ -79,6 +80,13 @@ class ToolExecutor:
             max_workers=_TOOL_WORKER_COUNT,  # 固定 4 个线程并行执行工具
             thread_name_prefix="tool-executor",
         )
+        # 子代理本身会在执行期间再次调用本执行器中的业务工具。若两层
+        # 共用一个池，并发子代理占满全部线程后会互相等待内部工具，形成
+        # 线程饥饿。单独的池隔离父级等待与子级业务调用。
+        self._subagent_pool = ThreadPoolExecutor(
+            max_workers=_TOOL_WORKER_COUNT,
+            thread_name_prefix="subagent-executor",
+        )
 
     def timeout_seconds_for(self, tool_name: str) -> float:
         """返回指定工具的超时秒数，未覆盖时使用全局配置。"""
@@ -124,7 +132,23 @@ class ToolExecutor:
                 error_code = ErrorCode.TOOL_EXECUTION_FAILED
             else:
                 try:
-                    future = self._pool.submit(tool.invoke, dict(args))  # 丢进线程池，主流程不卡住
+                    # 复制当前 ContextVar 上下文再进入工具线程。LangGraph 的
+                    # stream writer 与子代理运行上下文都通过 ContextVar
+                    # 传播；直接 submit 会在新线程丢失它们，导致工具内部
+                    # 的 token/进度事件无法回到父运行。
+                    runtime_context = copy_context()
+                    extras = getattr(tool, "extras", None)
+                    execution_pool = (
+                        self._subagent_pool
+                        if isinstance(extras, Mapping)
+                        and extras.get("subagent") is True
+                        else self._pool
+                    )
+                    future = execution_pool.submit(
+                        runtime_context.run,
+                        tool.invoke,
+                        dict(args),
+                    )
                     done, _ = wait(
                         {future},
                         timeout=self.timeout_seconds_for(tool.name),

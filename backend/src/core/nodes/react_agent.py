@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langgraph.config import get_stream_writer
 
 from ..context import (
     MessageTokenCounter,
@@ -34,6 +35,10 @@ class ChatModel(Protocol):
     def invoke(self, messages: list[BaseMessage]) -> AIMessage:
         """根据消息生成回答或 Tool Call。"""
         ...
+
+
+def _noop_stream_writer(_: object) -> None:
+    """Direct node calls have no LangGraph runtime and therefore no stream sink."""
 
 
 class ReActAgentNode:
@@ -87,6 +92,12 @@ class ReActAgentNode:
         )
         session_id = state.get("session_id")
         started_at = perf_counter()
+        # graph.stream(custom) 场景下 writer 会立即送出事件；节点被直接
+        # 调用（单测/独立复用）时没有 LangGraph runtime，安全退化为空写入器。
+        try:
+            stream_writer = get_stream_writer()
+        except RuntimeError:
+            stream_writer = _noop_stream_writer
         # S2-T2 分层讲解：有 prompt_builder 时按当前状态动态生成系统
         # 提示词（如 learning_assistant 按 state["level"] 分层讲解），
         # 否则沿用构造时固定的 system_prompt——默认行为与改动前完全一致。
@@ -131,14 +142,19 @@ class ReActAgentNode:
             # 小工具：生成带自增序号的事件暂存，节点结束时统一写回状态。
             nonlocal sequence
             sequence += 1
-            events.append(
-                RunEvent(
-                    event_type=event_type,
-                    sequence=sequence,
-                    session_id=session_id,
-                    agent=self.role.value,
-                    **values,
-                )
+            event = RunEvent(
+                event_type=event_type,
+                sequence=sequence,
+                session_id=session_id,
+                agent=self.role.value,
+                **values,
+            )
+            events.append(event)
+            stream_writer(
+                {
+                    "kind": "run_event",
+                    "event": event.model_dump(mode="json"),
+                }
             )
 
         emit(EventType.AGENT_STARTED)

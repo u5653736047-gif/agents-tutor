@@ -15,6 +15,7 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
+import core.nodes.react_agent as react_agent_module
 from core.events import ErrorCode, EventType, RunError, RunEvent
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole, create_initial_state
@@ -210,6 +211,71 @@ def test_react_agent_returns_direct_answer_without_tool() -> None:
     ]
     assert {event.session_id for event in result.updates["events"]} == {None}
     assert result.updates["events"][-1].success is True
+
+
+def test_react_agent_publishes_events_while_the_iteration_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent/工具事件走 live writer，不等节点结束才批量可见。"""
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        react_agent_module,
+        "get_stream_writer",
+        lambda: published.append,
+        raising=False,
+    )
+
+    @tool
+    def observed_tool() -> str:
+        """检查工具真正执行前，tool_started 已经发布。"""
+        event_types = [item["event"]["event_type"] for item in published]  # type: ignore[index]
+        assert event_types == ["agent_started", "tool_started"]
+        return "observation"
+
+    class InspectingModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+            self.calls += 1
+            event_types = [item["event"]["event_type"] for item in published]  # type: ignore[index]
+            if self.calls == 1:
+                assert event_types == ["agent_started"]
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "observed_tool",
+                            "args": {},
+                            "id": "observed-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            assert event_types == [
+                "agent_started",
+                "tool_started",
+                "tool_completed",
+            ]
+            return AIMessage(content="done")
+
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=InspectingModel(),
+        tool_executor=ToolExecutor([observed_tool]),
+    )
+
+    result = agent.run(create_initial_state(session_id="live-events"))
+
+    assert result.error is None
+    assert [item["kind"] for item in published] == ["run_event"] * 4
+    assert [item["event"]["event_type"] for item in published] == [  # type: ignore[index]
+        "agent_started",
+        "tool_started",
+        "tool_completed",
+        "agent_completed",
+    ]
     assert result.updates["events"][-1].duration_ms is not None
 
 

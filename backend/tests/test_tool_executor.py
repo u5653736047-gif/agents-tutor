@@ -1,6 +1,8 @@
 """工具执行器测试。"""
 
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from threading import Event, Thread
 
 import pytest
@@ -71,6 +73,84 @@ def test_tool_executor_records_successful_result() -> None:
     assert execution.result.output == "6"
     assert execution.result.tool_name == "double"
     assert execution.result.error_code is None
+
+
+def test_tool_executor_propagates_runtime_context_into_tool_thread() -> None:
+    """子代理工具需要继承 LangGraph 的流写入器与当前运行上下文。"""
+    runtime_marker: ContextVar[str] = ContextVar(
+        "tool_executor_runtime_marker",
+        default="missing",
+    )
+
+    @tool
+    def read_runtime_marker() -> str:
+        """返回调用线程继承到的运行标记。"""
+        return runtime_marker.get()
+
+    token = runtime_marker.set("present")
+    try:
+        execution = ToolExecutor([read_runtime_marker]).execute(
+            {
+                "name": "read_runtime_marker",
+                "args": {},
+                "id": "context-call",
+                "type": "tool_call",
+            },
+            AgentRole.SUPERVISOR,
+        )
+    finally:
+        runtime_marker.reset(token)
+
+    assert execution.result.success is True
+    assert execution.result.output == "present"
+
+
+def test_nested_agent_tools_do_not_starve_the_business_tool_pool() -> None:
+    """并发子代理占满线程时，其内部工具仍必须有线程可执行。"""
+    executor_holder: dict[str, ToolExecutor] = {}
+
+    @tool
+    def inner_tool() -> str:
+        """模拟子代理内部调用的知识工具。"""
+        return "inner-result"
+
+    @tool(extras={"subagent": True})
+    def outer_agent_tool() -> str:
+        """模拟会等待完整子代理运行的父级工具。"""
+        nested = executor_holder["executor"].execute(
+            {
+                "name": "inner_tool",
+                "args": {},
+                "id": "inner-call",
+                "type": "tool_call",
+            },
+            AgentRole.LEARNING_ASSISTANT,
+        )
+        return str(nested.message.content)
+
+    executor = ToolExecutor(
+        [inner_tool, outer_agent_tool],
+        tool_timeout_seconds=1.0,
+    )
+    executor_holder["executor"] = executor
+    outer_call = {
+        "name": "outer_agent_tool",
+        "args": {},
+        "id": "outer-call",
+        "type": "tool_call",
+    }
+
+    with ThreadPoolExecutor(max_workers=4) as callers:
+        executions = list(
+            callers.map(
+                lambda _: executor.execute(outer_call, AgentRole.SUPERVISOR),
+                range(4),
+            )
+        )
+
+    assert [execution.result.output for execution in executions] == [
+        "inner-result"
+    ] * 4
 
 
 @pytest.mark.parametrize(

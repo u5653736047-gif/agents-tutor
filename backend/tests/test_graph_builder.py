@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -51,6 +53,17 @@ class FailingModel:
         raise RuntimeError("secret=/srv/private/model-token")
 
 
+class ToolAwareStreamingModel(FakeListChatModel):
+    """FakeListChatModel 加上测试所需的工具绑定兼容层。"""
+
+    def bind_tools(
+        self,
+        tools: Sequence[object],
+        **kwargs: Any,
+    ) -> ToolAwareStreamingModel:
+        return self
+
+
 def count_context_messages(messages: Sequence[BaseMessage]) -> int:
     return len(messages)
 
@@ -63,6 +76,23 @@ def handoff_response(target: str = "teaching_assistant") -> AIMessage:
                 "name": "handoff",
                 "args": {"target": target},
                 "id": "handoff-approval",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def subagent_response(
+    tool_name: str = "ask_learning_assistant",
+    task: str = "解释梯度下降",
+) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": tool_name,
+                "args": {"task": task},
+                "id": "subagent-call",
                 "type": "tool_call",
             }
         ],
@@ -122,6 +152,69 @@ def test_handoff_interrupt_requires_checkpointer() -> None:
         )
 
     assert model.calls == []
+
+
+def test_tool_orchestration_waits_for_subagent_then_supervisor_integrates() -> None:
+    """子代理是同步工具：完成结果回到 Supervisor 后，本轮才结束。"""
+    model = ScriptedModel(
+        [
+            subagent_response(),
+            AIMessage(content="子代理给出的梯度下降讲解"),
+            AIMessage(content="整合回答：子代理给出的梯度下降讲解"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
+
+    state = graph.run("请解释梯度下降", session_id="tool-session")
+
+    assert "ask_learning_assistant" in model.bound_tool_names
+    subagent_tool = graph.registry.get("ask_learning_assistant")
+    assert subagent_tool is not None
+    assert subagent_tool.extras.get("subagent") is True
+    assert len(model.calls) == 3
+    assert "助学助手" in str(model.calls[1][0].content)
+    assert "子代理给出的梯度下降讲解" in str(model.calls[2])
+    assert state["current_agent"] == AgentRole.SUPERVISOR.value
+    assert state.get("pending_handoff") is None
+    assert state.get("next_agent") is None
+    assert state["messages"][-1].content == "整合回答：子代理给出的梯度下降讲解"
+    assert [event.event_type for event in state["events"]] == [
+        EventType.AGENT_STARTED,
+        EventType.TOOL_STARTED,
+        EventType.AGENT_STARTED,
+        EventType.AGENT_COMPLETED,
+        EventType.TOOL_COMPLETED,
+        EventType.AGENT_COMPLETED,
+        EventType.RUN_COMPLETED,
+    ]
+    assert [event.agent for event in state["events"][:6]] == [
+        AgentRole.SUPERVISOR.value,
+        AgentRole.SUPERVISOR.value,
+        AgentRole.LEARNING_ASSISTANT.value,
+        AgentRole.LEARNING_ASSISTANT.value,
+        AgentRole.SUPERVISOR.value,
+        AgentRole.SUPERVISOR.value,
+    ]
+
+
+def test_graph_stream_exposes_model_chunks_with_agent_metadata() -> None:
+    """真实 LangChain ChatModel 即使用 invoke，也由 LangGraph 逐 chunk 转发。"""
+    graph = CollaborativeAgentGraph(
+        model=ToolAwareStreamingModel(responses=["stream"]),
+        orchestration_mode="tool",
+    )
+
+    items = list(graph.stream("hello", session_id="stream-session"))
+    message_items = [data for mode, data in items if mode == "messages"]
+    chunks = [data[0] for data in message_items]
+    metadata = [data[1] for data in message_items]
+
+    assert "".join(
+        chunk.content for chunk in chunks if isinstance(chunk.content, str)
+    ) == "stream"
+    assert {item.get("agent_role") for item in metadata} == {
+        AgentRole.SUPERVISOR.value
+    }
 
 
 def test_handoff_interrupts_before_worker_dispatch() -> None:

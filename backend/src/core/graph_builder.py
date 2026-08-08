@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Hashable, Mapping, Sequence
+from collections.abc import Collection, Hashable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from threading import RLock
 from typing import Any, Literal, cast
 
@@ -31,6 +32,7 @@ from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
 from .knowledge.models import Citation
 from .nodes import ReActAgentNode, create_agent_nodes
+from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
 from .nodes.react_agent import ChatModel
 from .state import (
     REFERENCES_METADATA_KEY,
@@ -59,17 +61,42 @@ from .state import (
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
+OrchestrationMode = Literal["handoff", "tool"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
 _TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
 _TASK_RESULTS_MARKER = "[TASK_RESULTS]"
+_SUBAGENT_TOOL_NAMES: dict[AgentRole, str] = {
+    AgentRole.TEACHING_ASSISTANT: "ask_teaching_assistant",
+    AgentRole.LEARNING_ASSISTANT: "ask_learning_assistant",
+    AgentRole.EVALUATOR: "ask_evaluator",
+}
+_SUBAGENT_TOOL_TIMEOUT_SECONDS = 180.0
+_ACTIVE_PARENT_STATE: ContextVar[AgentState | None] = ContextVar(
+    "active_parent_agent_state",
+    default=None,
+)
+_SUBAGENT_EVENT_TRACES: ContextVar[list[list[RunEvent]] | None] = ContextVar(
+    "subagent_event_traces",
+    default=None,
+)
 
 # ── S2-T4 引用收集：产出结构化引用的检索工具名集合 ──
 # 这是「按证据类型过滤检索类工具」的依据：只有这些工具的成功输出才会
 # 被解析出 Citation 并挂到最终回答（见 _citations_from_tool_results 注释）。
 # 新增检索类工具时在此追加工具名即可，无需改其他代码；读取侧
 # （message_references）不依赖此常量，直接读消息元数据。
-_CITATION_TOOL_NAMES = frozenset({"search_knowledge"})
+_CITATION_TOOL_NAMES = frozenset(
+    {"search_knowledge", *_SUBAGENT_TOOL_NAMES.values()}
+)
+
+
+class _SubagentTaskInput(BaseModel):
+    """Supervisor 交给专业 Agent 的隔离任务描述。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(min_length=1, max_length=8000)
 
 
 class _TaskPlanInput(BaseModel):
@@ -230,6 +257,7 @@ class CollaborativeAgentGraph:
         max_agent_switches: int = 8,
         checkpointer: BaseCheckpointSaver[str] | None = None,
         interrupt_before_handoff: bool = False,
+        orchestration_mode: OrchestrationMode = "handoff",
     ) -> None:
         # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
         if max_handoffs <= 0:
@@ -239,6 +267,12 @@ class CollaborativeAgentGraph:
         if interrupt_before_handoff and checkpointer is None:
             raise ValueError(
                 "interrupt_before_handoff requires a configured checkpointer"
+            )
+        if orchestration_mode not in {"handoff", "tool"}:
+            raise ValueError("orchestration_mode must be 'handoff' or 'tool'")
+        if orchestration_mode == "tool" and interrupt_before_handoff:
+            raise ValueError(
+                "tool orchestration does not support interrupt_before_handoff"
             )
 
         # 权限配置校验：每个业务工具都必须有显式角色白名单（None 视为配置错误）
@@ -261,11 +295,19 @@ class CollaborativeAgentGraph:
             raise ValueError(f"tool_permissions 不允许业务工具权限为 None：{names}")
 
         registry = ToolRegistry()
-        registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})
-        registry.register(
-            create_task_plan,
-            allowed_roles={AgentRole.SUPERVISOR},
-        )
+        self.orchestration_mode = orchestration_mode
+        if orchestration_mode == "handoff":
+            registry.register(handoff, allowed_roles={AgentRole.SUPERVISOR})
+            registry.register(
+                create_task_plan,
+                allowed_roles={AgentRole.SUPERVISOR},
+            )
+        else:
+            for target_role, tool_name in _SUBAGENT_TOOL_NAMES.items():
+                registry.register(
+                    self._create_subagent_tool(target_role, tool_name),
+                    allowed_roles={AgentRole.SUPERVISOR},
+                )
         # S2-T1 意图识别：detect_intent 仅 Supervisor 可用，
         # 与 handoff / create_task_plan 一样由模型在 ReAct 循环中调用。
         registry.register(
@@ -298,6 +340,13 @@ class CollaborativeAgentGraph:
         self.checkpointer = checkpointer
         self.interrupt_before_handoff = interrupt_before_handoff
         self._persistence_lock = RLock()
+        effective_tool_timeouts = dict(tool_timeouts or {})
+        if orchestration_mode == "tool":
+            for tool_name in _SUBAGENT_TOOL_NAMES.values():
+                effective_tool_timeouts.setdefault(
+                    tool_name,
+                    _SUBAGENT_TOOL_TIMEOUT_SECONDS,
+                )
         # 创建4个同构的agent，均遵循react设计范式
         self.agents = create_agent_nodes(
             model=model,
@@ -307,11 +356,79 @@ class CollaborativeAgentGraph:
             max_context_tokens=max_context_tokens,
             context_token_counter=context_token_counter,
             tool_timeout_seconds=tool_timeout_seconds,
-            tool_timeouts=tool_timeouts,
+            tool_timeouts=effective_tool_timeouts,
+            prompt_overrides=(
+                {
+                    AgentRole.SUPERVISOR: (
+                        TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
+                    )
+                }
+                if orchestration_mode == "tool"
+                else None
+            ),
         )
 
         # 图缓存，避免重复编译
         self._app: CompiledAgentGraph | None = None
+
+    def _create_subagent_tool(
+        self,
+        target_role: AgentRole,
+        tool_name: str,
+    ) -> BaseTool:
+        """创建一个会等待目标 Agent 完成并返回结果的同步工具。"""
+
+        def invoke_subagent(task: str) -> str:
+            return self._run_subagent(target_role, task)
+
+        return tool(
+            tool_name,
+            args_schema=_SubagentTaskInput,
+            description=(
+                f"将一个边界清晰的任务交给 {target_role.value}，"
+                "等待完成后返回可供主智能体整合的结果。"
+            ),
+            extras={"subagent": True},
+        )(invoke_subagent)
+
+    def _run_subagent(self, target_role: AgentRole, task: str) -> str:
+        """在隔离消息上下文中执行专业 Agent，并返回有界结构化结果。"""
+        parent = _ACTIVE_PARENT_STATE.get()
+        child_state = create_initial_state(
+            session_id=None if parent is None else parent.get("session_id"),
+            user_id=None if parent is None else parent.get("user_id"),
+        )
+        child_state["messages"] = [HumanMessage(content=task)]
+        if parent is not None:
+            child_state["level"] = parent.get("level")
+            child_state["task_context"] = parent.get("task_context")
+
+        result = self.agents[target_role].run(child_state)
+        traces = _SUBAGENT_EVENT_TRACES.get()
+        if traces is not None:
+            traces.append(
+                cast(list[RunEvent], result.updates.get("events", []))
+            )
+        if result.error is not None:
+            raise RuntimeError("subagent execution failed")
+        output = _terminal_agent_output(result.messages)
+        if output is None:
+            raise RuntimeError("subagent returned no final output")
+        citations = _citations_from_tool_results(
+            cast(list[ToolResult], result.updates.get("tool_results", []))
+        )
+        return json.dumps(
+            {
+                "agent": target_role.value,
+                "output": output,
+                "found": bool(citations),
+                "hits": [
+                    {"citation": citation.model_dump(mode="json")}
+                    for citation in citations
+                ],
+            },
+            ensure_ascii=False,
+        )
 
     def build(self) -> CompiledAgentGraph:
         """构建一次并缓存可执行图。"""
@@ -489,7 +606,14 @@ class CollaborativeAgentGraph:
                         },
                     )
 
-            result = agent.run(run_state)
+            subagent_traces: list[list[RunEvent]] = []
+            parent_state_token = _ACTIVE_PARENT_STATE.set(run_state)
+            trace_token = _SUBAGENT_EVENT_TRACES.set(subagent_traces)
+            try:
+                result = agent.run(run_state)
+            finally:
+                _SUBAGENT_EVENT_TRACES.reset(trace_token)
+                _ACTIVE_PARENT_STATE.reset(parent_state_token)
 
             updates = dict(result.updates)
             # ── 注入「产出 Agent 角色」元数据：写入会话历史的唯一闸口 ──
@@ -618,6 +742,12 @@ class CollaborativeAgentGraph:
                 updates["task_plan"] = new_plan
                 updates["task_results"] = []  # 新计划从零收集子任务结果
             events = cast(list[RunEvent], updates.get("events", []))
+            if subagent_traces:
+                events = _interleave_subagent_traces(
+                    state,
+                    events,
+                    subagent_traces,
+                )
             sequence = max(
                 (
                     event.sequence
@@ -1345,6 +1475,78 @@ class CollaborativeAgentGraph:
             return AgentRole.SUPERVISOR.value  # Worker 收尾：交回 Supervisor
         return "end"  # 无待办：终止
 
+    @staticmethod
+    def _new_run_state(
+        user_input: str,
+        session_id: str,
+        user_id: str | None,
+        persisted_values: Mapping[str, Any] | None = None,
+    ) -> AgentState:
+        """为 invoke/stream 共用地构造本轮输入，避免两条入口语义漂移。"""
+        if persisted_values:
+            return cast(
+                AgentState,
+                {
+                    "messages": [HumanMessage(content=user_input)],
+                    "next_agent": None,
+                    "pending_handoff": None,
+                    "intent": None,
+                    "evaluation": None,
+                    "reference_verification": None,
+                    "task_plan": None,
+                    "task_results": [],
+                    "run_error": None,
+                    "handoff_count": 0,
+                    "agent_switch_count": 0,
+                },
+            )
+        state = create_initial_state(session_id=session_id, user_id=user_id)
+        state["messages"] = [HumanMessage(content=user_input)]
+        return state
+
+    def stream(
+        self,
+        user_input: str,
+        session_id: str = "demo",
+        user_id: str | None = None,
+    ) -> Iterator[tuple[str, Any]]:
+        """直接转发 LangGraph messages/custom 流，供 API 实时消费。"""
+        self._user_key(user_id)
+        self._session_key(session_id)
+        app = self.build()
+        if self.checkpointer is None:
+            state = self._new_run_state(user_input, session_id, user_id)
+            yield from cast(
+                Iterator[tuple[str, Any]],
+                app.stream(state, stream_mode=["messages", "custom"]),
+            )
+            return
+
+        config = self._thread_config(session_id, user_id)
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            if snapshot.next:
+                resume_method = (
+                    "resume_handoff()" if snapshot.interrupts else "resume()"
+                )
+                raise RuntimeError(
+                    f"存在待恢复执行，请先调用 {resume_method}"
+                )
+            state = self._new_run_state(
+                user_input,
+                session_id,
+                user_id,
+                cast(Mapping[str, Any], snapshot.values),
+            )
+            yield from cast(
+                Iterator[tuple[str, Any]],
+                app.stream(
+                    state,
+                    config=config,
+                    stream_mode=["messages", "custom"],
+                ),
+            )
+
     def run(
         self,
         user_input: str,
@@ -1356,8 +1558,7 @@ class CollaborativeAgentGraph:
         self._session_key(session_id)
         app = self.build()
         if self.checkpointer is None:
-            state = create_initial_state(session_id=session_id, user_id=user_id)
-            state["messages"] = [HumanMessage(content=user_input)]
+            state = self._new_run_state(user_input, session_id, user_id)
             return cast(AgentState, app.invoke(state))
 
         config = self._thread_config(session_id, user_id)
@@ -1370,41 +1571,12 @@ class CollaborativeAgentGraph:
                 raise RuntimeError(
                     f"存在待恢复执行，请先调用 {resume_method}"
                 )
-            if snapshot.values:
-                # 会话已有历史：以新用户消息开启新一轮，仅重置本轮临时字段（level 刻意保留）
-                state = cast(
-                    AgentState,
-                    {
-                        "messages": [HumanMessage(content=user_input)],
-                        "next_agent": None,
-                        "pending_handoff": None,
-                        # S2-T1：每轮重新识别意图，旧意图随新轮清除，
-                        # 避免上一轮的意图误导本轮路由。
-                        "intent": None,
-                        # S2-T3：评价结论是「本轮结论」（与 intent 同构），
-                        # 新轮重置为 None——若跨轮保留，上一轮的评价徽章
-                        # 会误导后续轮次的展示与审计。
-                        "evaluation": None,
-                        # S2-T5：引用校验结论是「本轮事实记录」（与
-                        # evaluation 同构），新轮重置为 None——若跨轮保留，
-                        # 上一轮的校验结论会误导本轮审计（引用真实性是
-                        # 按轮判定的，旧轮结论只属于旧轮）。
-                        "reference_verification": None,
-                        # S2-T2：这里刻意不重置 level——学生水平是「跨轮
-                        # 保留的画像」（与 intent 相反），只有模型再次调用
-                        # detect_level 时才覆盖；若随新轮重置，已建立的
-                        # 水平画像会丢失，分层讲解也随之失效。
-                        "task_plan": None,
-                        "task_results": [],
-                        "run_error": None,
-                        "handoff_count": 0,
-                        "agent_switch_count": 0,
-                    },
-                )
-            else:
-                # 全新会话：从零构建初始状态并写入首条用户消息
-                state = create_initial_state(session_id=session_id, user_id=user_id)
-                state["messages"] = [HumanMessage(content=user_input)]
+            state = self._new_run_state(
+                user_input,
+                session_id,
+                user_id,
+                cast(Mapping[str, Any], snapshot.values),
+            )
             return cast(AgentState, app.invoke(state, config=config))
 
     def resume(
@@ -1540,6 +1712,41 @@ class CollaborativeAgentGraph:
             }
             for role, agent in self.agents.items()
         }
+
+
+def _interleave_subagent_traces(
+    state: AgentState,
+    parent_events: Sequence[RunEvent],
+    traces: Sequence[Sequence[RunEvent]],
+) -> list[RunEvent]:
+    """把子代理事件插回对应工具调用之间，并统一重排会话序号。"""
+    combined: list[RunEvent] = []
+    trace_index = 0
+    subagent_tools = frozenset(_SUBAGENT_TOOL_NAMES.values())
+    for event in parent_events:
+        combined.append(event)
+        if (
+            event.event_type is EventType.TOOL_STARTED
+            and event.tool_name in subagent_tools
+            and trace_index < len(traces)
+        ):
+            combined.extend(traces[trace_index])
+            trace_index += 1
+
+    previous_sequence = max(
+        (event.sequence for event in state.get("events", [])),
+        default=-1,
+    )
+    session_id = state.get("session_id")
+    return [
+        event.model_copy(
+            update={
+                "sequence": previous_sequence + index + 1,
+                "session_id": session_id,
+            }
+        )
+        for index, event in enumerate(combined)
+    ]
 
 
 def _citations_from_tool_results(

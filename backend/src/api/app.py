@@ -270,7 +270,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.graph = CollaborativeAgentGraph(
                 model=cast(ChatModel, create_deepseek_model(model_settings)),
                 checkpointer=checkpointer,
-                interrupt_before_handoff=True,
+                # 生产链路采用 supervisor-as-primary：Worker 作为可等待
+                # 的工具调用，结果返回 supervisor 后由其整合本轮答案。
+                # 不在委派处 interrupt，避免请求在子代理响应前提前结束。
+                orchestration_mode="tool",
                 # 业务工具与授权：search_knowledge 只授给需要产出知识
                 # 内容的两个 Worker（理由见模块底部 _KNOWLEDGE_TOOL_PERMISSIONS
                 # 的注释）；graph_builder 会校验权限声明完整（缺工具或

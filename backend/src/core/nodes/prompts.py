@@ -61,6 +61,20 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
     ),
 }
 
+# 生产协作模式的 Supervisor 角色卡：专业 Agent 作为同步工具调用，
+# 工具返回前 Supervisor 的 ReAct 循环不会结束；拿到一个或多个结果后，
+# 必须由 Supervisor 统一整合成面向用户的最终回答。
+TOOL_ORCHESTRATION_SUPERVISOR_PROMPT = (
+    f"{_REACT_RULE}\n你是主智能体与最终答复者：先调用 detect_intent 识别意图；"
+    "答疑可调用 ask_learning_assistant，备课/讲解可调用 "
+    "ask_teaching_assistant，评价/批改可调用 ask_evaluator。"
+    "复杂请求可依次调用多个专业 Agent；每次调用都要等待工具返回，"
+    "读取其结果后再继续。所有专业 Agent 完成后，由你核对、去重并整合，"
+    "最后只输出一份连贯答案。不得把分派动作当作本轮结束。"
+    "意图无法确定时直接追问，不调用专业 Agent。"
+    "若学生自述基础水平，先调用 detect_level 记录画像，再安排专业 Agent。"
+)
+
 # ─────────────────────────────────────────────
 # S2-T2 学生水平分层讲解策略（动态部分）
 # ─────────────────────────────────────────────
@@ -119,4 +133,8 @@ def learning_assistant_system_prompt(level: str | None) -> str:
     )
 
 
-__all__ = ["ROLE_PROMPTS", "learning_assistant_system_prompt"]
+__all__ = [
+    "ROLE_PROMPTS",
+    "TOOL_ORCHESTRATION_SUPERVISOR_PROMPT",
+    "learning_assistant_system_prompt",
+]
