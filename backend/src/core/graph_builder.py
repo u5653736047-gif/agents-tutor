@@ -231,6 +231,7 @@ class CollaborativeAgentGraph:
         checkpointer: BaseCheckpointSaver[str] | None = None,
         interrupt_before_handoff: bool = False,
     ) -> None:
+        # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
         if max_handoffs <= 0:
             raise ValueError("max_handoffs must be positive")
         if max_agent_switches <= 0:
@@ -240,6 +241,7 @@ class CollaborativeAgentGraph:
                 "interrupt_before_handoff requires a configured checkpointer"
             )
 
+        # 权限配置校验：每个业务工具都必须有显式角色白名单（None 视为配置错误）
         permissions = tool_permissions or {}
         business_tool_names = {business_tool.name for business_tool in tools}
         permission_names = set(permissions)
@@ -284,6 +286,7 @@ class CollaborativeAgentGraph:
             submit_evaluation,
             allowed_roles={AgentRole.EVALUATOR},
         )
+        # 业务工具：按外部权限白名单注册（未授权角色调用会被工具层拒绝）
         for business_tool in tools:
             registry.register(
                 business_tool,
@@ -355,6 +358,7 @@ class CollaborativeAgentGraph:
         """把 ReAct 结果转换为 LangGraph 状态更新。"""
 
         def node(state: AgentState) -> AgentState:
+            # 上游已判死（run_error 非空）：原样透传终止，不让本节点覆盖失败结果
             existing_error = state.get("run_error")
             if existing_error is not None:
                 return cast(
@@ -362,6 +366,7 @@ class CollaborativeAgentGraph:
                     {"next_agent": None, "run_error": existing_error},
                 )
 
+            # 防御性校验：上一轮指定的 next_agent 必须是已注册角色，防外部注入非法目标
             existing_target = state.get("next_agent")
             registered_targets = {role.value for role in self.agents}
             if (
@@ -395,6 +400,7 @@ class CollaborativeAgentGraph:
                     },
                 )
 
+            # 计划 Worker 预检：本节点须是计划当前步骤的目标角色，且结果前缀与游标一致
             preflight_plan, preflight_error = _planned_worker_preflight(
                 state,
                 agent.role,
@@ -424,6 +430,7 @@ class CollaborativeAgentGraph:
                     )
                 return cast(AgentState, preflight_updates)
 
+            # Supervisor 轮：计划已完成则把子任务结果拼成消息注入上下文，供模型聚合作答
             aggregation_results: list[TaskStepResult] | None = None
             run_state = state
             if agent.role is AgentRole.SUPERVISOR:
@@ -533,9 +540,9 @@ class CollaborativeAgentGraph:
                 tool_results,
             )
             updates["messages"] = updated_messages
-            target = _handoff_target(tool_results)
-            new_plan = _task_plan_from_results(tool_results)
-            existing_plan = _task_plan_from_state(state)
+            target = _handoff_target(tool_results)  # 本轮模型请求的转交目标
+            new_plan = _task_plan_from_results(tool_results)  # 本轮模型新建的计划
+            existing_plan = _task_plan_from_state(state)  # 已持久化的活动计划
             # ── S2-T1 意图识别：解析模型分类，并对「意图不明」做分派拦截 ──
             # 原理：detect_intent 是 Supervisor 决策前的必备工具（prompt 约定），
             # 其成功结果经 _intent_from_results 校验后成为本轮权威意图。若模型
@@ -604,11 +611,12 @@ class CollaborativeAgentGraph:
                     updates["task_context"] = TaskContext.model_validate(
                         existing_context
                     ).model_copy(update=context_update)
+            # 计划取舍：有活动计划则沿用（再新建会触发下方替换拦截），否则采纳本轮新建
             plan = existing_plan or new_plan
             replacing_plan = new_plan is not None and existing_plan is not None
             if new_plan is not None and existing_plan is None:
                 updates["task_plan"] = new_plan
-                updates["task_results"] = []
+                updates["task_results"] = []  # 新计划从零收集子任务结果
             events = cast(list[RunEvent], updates.get("events", []))
             sequence = max(
                 (
@@ -618,6 +626,7 @@ class CollaborativeAgentGraph:
                 default=-1,
             )
 
+            # 事件发射闭包：统一递增序列号并追加进 events，后续分支只需调用
             def emit(
                 event_type: EventType,
                 event_agent: str,
@@ -628,6 +637,17 @@ class CollaborativeAgentGraph:
                 degraded: bool | None = None,
                 event_intent: str | None = None,
                 event_verdict: str | None = None,
+                # S4-T3 检索决策：RETRIEVAL_DECISION 事件携带的工具名与
+                # 决策摘要字段（语义见 events.py 的 retrieval_* 注释）。
+                # 全部默认 None，既有调用方零改动、旧事件不携带。
+                event_tool_name: str | None = None,
+                retrieval_needed: bool | None = None,
+                retrieval_need_reason: str | None = None,
+                retrieval_threshold_met: bool | None = None,
+                retrieval_stopped_reason: str | None = None,
+                retrieval_rounds: int | None = None,
+                retrieval_hit_count: int | None = None,
+                retrieval_top_score: float | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -643,6 +663,14 @@ class CollaborativeAgentGraph:
                         degraded=degraded,
                         intent=event_intent,
                         evaluation_verdict=event_verdict,
+                        tool_name=event_tool_name,
+                        retrieval_needed=retrieval_needed,
+                        retrieval_need_reason=retrieval_need_reason,
+                        retrieval_threshold_met=retrieval_threshold_met,
+                        retrieval_stopped_reason=retrieval_stopped_reason,
+                        retrieval_rounds=retrieval_rounds,
+                        retrieval_hit_count=retrieval_hit_count,
+                        retrieval_top_score=retrieval_top_score,
                     )
                 )
 
@@ -661,6 +689,34 @@ class CollaborativeAgentGraph:
                     EventType.INTENT_DETECTED,
                     agent.role.value,
                     event_intent=intent.value,
+                )
+
+            # ── S4-T3 检索决策事件：把 search_knowledge 元数据转成事件 ──
+            # 转换位置为什么在这里（core 侧 _wrap 而非 knowledge 包）：
+            # knowledge 包刻意零依赖 core/events.py（零耦合方向见
+            # retrieval.py 模块注释第 8 节第 4 点）——工具结果里的
+            # metadata 是纯 JSON 结构，由本文件解析成 RunEvent 追加进
+            # events 通道（随 checkpoint 持久化，供评价 Agent 与审计
+            # 链路读取「检索是否达标、为何停止」）。
+            # 脱敏：事件只记决策摘要，不记查询正文（正文已在工具调用
+            # 参数与 tool_results 审计中）——与 evaluation 事件「只记
+            # 结论摘要」同一原则。每个 search_knowledge 成功结果发一个
+            # 事件（agent=当前角色、tool_name="search_knowledge"），
+            # 序列号由 emit 闭包统一递增，与既有事件顺序自洽。
+            # 未启用自适应（工具输出无 metadata）→ 解析结果为空，
+            # 不发任何事件——「默认零回归、无新事件」由此保证。
+            for decision in _retrieval_decisions_from_results(tool_results):
+                emit(
+                    EventType.RETRIEVAL_DECISION,
+                    agent.role.value,
+                    event_tool_name="search_knowledge",
+                    retrieval_needed=decision["needed"],
+                    retrieval_need_reason=decision["need_reason"],
+                    retrieval_threshold_met=decision["threshold_met"],
+                    retrieval_stopped_reason=decision["stopped_reason"],
+                    retrieval_rounds=decision["rounds"],
+                    retrieval_hit_count=decision["hit_count"],
+                    retrieval_top_score=decision["top_score"],
                 )
 
             # ── S2-T3 评价结论：解析 submit_evaluation 结果并写入 state/事件 ──
@@ -804,11 +860,13 @@ class CollaborativeAgentGraph:
             if reference_verification is not None:
                 updates["reference_verification"] = reference_verification
 
+            # 本轮默认收口值：不转交、无错误；后续分支按需覆盖
             handoff_count = state.get("handoff_count", 0)
             switch_count = state.get("agent_switch_count", 0)
             updates["next_agent"] = None
             updates["run_error"] = None
 
+            # 失败收口闭包：写 run_error、把活动计划标 FAILED、补发失败事件
             def fail(error: RunError) -> AgentState:
                 updates["run_error"] = error
                 if plan is not None and plan.status not in {
@@ -839,6 +897,7 @@ class CollaborativeAgentGraph:
                 updates["events"] = events
                 return cast(AgentState, updates)
 
+            # 计划 Worker 的模型调用失败/迭代超限视为可重试：不判死，由调度节点再分派
             planned_worker = (
                 agent.role is not AgentRole.SUPERVISOR
                 and plan is not None
@@ -964,6 +1023,7 @@ class CollaborativeAgentGraph:
                         )
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
+                # Worker 轮：按活动计划记录本步骤结果并推进游标，完成后交回 Supervisor
                 if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
                     step = plan.steps[plan.current_step_index]
                     if step.target_agent is not agent.role:
@@ -1067,6 +1127,7 @@ class CollaborativeAgentGraph:
             default=-1,
         )
 
+        # 分派前先查转交/切换上限：超限直接以失败收口，不把超限轮交给 Worker
         limit_error: RunError | None = None
         if handoff_count + 1 > self.max_handoffs:
             limit_error = RunError(
@@ -1106,6 +1167,7 @@ class CollaborativeAgentGraph:
                 },
             )
 
+        # 正常分派：确定下一 Worker；审批开启时挂起等人确认，否则直接注入描述
         updates: dict[str, object] = {
             "current_agent": AgentRole.SUPERVISOR.value,
             "next_agent": step.target_agent.value,
@@ -1179,6 +1241,7 @@ class CollaborativeAgentGraph:
                 reject_updates,
             )
 
+        # 人工通过：决定字段优先，缺省回退到原提案
         target = decision.target_agent or proposal.target_agent
         task_content = decision.task_content or proposal.task_content
         planned = _task_plan_for_proposal(state, proposal)
@@ -1240,6 +1303,7 @@ class CollaborativeAgentGraph:
                 )
             ],
         }
+        # 计划型审批：把人工修正（目标/描述）写回当前计划步骤，保证后续调度一致
         if planned is not None:
             step_index = planned.current_step_index
             steps = list(planned.steps)
@@ -1268,18 +1332,18 @@ class CollaborativeAgentGraph:
     def _route(state: AgentState) -> str:
         """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
         if state.get("run_error") is not None:
-            return "end"
+            return "end"  # 已判死：终止
         if state.get("pending_handoff") is not None:
-            return _HANDOFF_APPROVAL_NODE
+            return _HANDOFF_APPROVAL_NODE  # 有审批请求：先去人工确认 gate
         next_agent = state.get("next_agent")
         if next_agent in {role.value for role in AgentRole}:
-            return next_agent
+            return next_agent  # 模型指定了合法目标：直接转交
         plan = _task_plan_from_state(state)
         if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
-            return _TASK_PLAN_DISPATCH_NODE
+            return _TASK_PLAN_DISPATCH_NODE  # 活动计划：由调度节点决定下一 Worker
         if state.get("current_agent") != AgentRole.SUPERVISOR.value:
-            return AgentRole.SUPERVISOR.value
-        return "end"
+            return AgentRole.SUPERVISOR.value  # Worker 收尾：交回 Supervisor
+        return "end"  # 无待办：终止
 
     def run(
         self,
@@ -1307,6 +1371,7 @@ class CollaborativeAgentGraph:
                     f"存在待恢复执行，请先调用 {resume_method}"
                 )
             if snapshot.values:
+                # 会话已有历史：以新用户消息开启新一轮，仅重置本轮临时字段（level 刻意保留）
                 state = cast(
                     AgentState,
                     {
@@ -1337,6 +1402,7 @@ class CollaborativeAgentGraph:
                     },
                 )
             else:
+                # 全新会话：从零构建初始状态并写入首条用户消息
                 state = create_initial_state(session_id=session_id, user_id=user_id)
                 state["messages"] = [HumanMessage(content=user_input)]
             return cast(AgentState, app.invoke(state, config=config))
@@ -1360,6 +1426,7 @@ class CollaborativeAgentGraph:
                 raise ValueError(
                     "当前会话等待人工 handoff 决策，请调用 resume_handoff()"
                 )
+            # None 输入表示「纯恢复」：不注入新消息，仅继续执行被打断的图
             return cast(AgentState, app.invoke(None, config=config))
 
     def resume_handoff(
@@ -1381,6 +1448,7 @@ class CollaborativeAgentGraph:
             current_id = pending.interrupt_id
             if decision.interrupt_id != current_id:
                 raise ValueError("interrupt_id 与当前 handoff 断点不匹配")
+            # 用人工决定恢复被中断的 gate（resume 键以 interrupt_id 定位断点）
             command: Command[str] = Command(
                 resume={
                     current_id: decision.model_dump(mode="json"),
@@ -1824,6 +1892,98 @@ def _evaluation_from_results(
     return None
 
 
+def _retrieval_decisions_from_results(
+    tool_results: Sequence[ToolResult],
+) -> list[dict[str, Any]]:
+    """从本轮 search_knowledge 成功结果解析检索决策元数据（S4-T3）。
+
+    与 _intent_from_results 同一哲学（写入端严格、读取端宽容）：
+    - 只处理 tool_name == "search_knowledge" 且 success、输出非空的
+      结果（复用 _CITATION_TOOL_NAMES 常量，新增检索类工具时一处
+      生效）；
+    - 输出是工具固定的 JSON 结构，metadata 键缺失（未启用自适应
+      的旧路径输出）→ 跳过，不发事件——这是「默认零回归、无新
+      事件」的落点（工具未注入 adaptive 配置时输出不含 metadata，
+      历史 ToolResult 同样兼容）；
+    - 解析失败 / 字段类型不合法 → 跳过该结果（脏数据不击穿运行，
+      与 _intent_from_results 的宽容读取一致）；
+    - 数值字段值域不合法（rounds / hit_count / top_score 为负数）→
+      按 0 兜底，不跳过整条：负数只影响该字段，决策字段（needed /
+      threshold_met / stopped_reason）仍可读；若原样透传，emit 时
+      RunEvent 的 ge=0 校验会抛 ValidationError 击穿 _wrap（该 emit
+      不在 try 内），故必须在解析层先兜底（I-1 修复，与「脏数据不
+      击穿」承诺一致）。
+
+    脱敏：只取决策摘要字段（needed / need_reason / threshold_met /
+    stopped_reason / rounds / hit_count / top_score），不取每轮
+    query——查询正文已在工具调用参数与 tool_results 审计中，事件
+    载荷不重复记录（与 events.py 的 retrieval_* 字段注释同一口径）。
+    """
+    decisions: list[dict[str, Any]] = []
+    for result in tool_results:
+        if (
+            result.tool_name not in _CITATION_TOOL_NAMES
+            or not result.success
+            or not result.output
+        ):
+            continue
+        try:
+            payload = json.loads(result.output)
+        except (TypeError, ValueError):
+            # ValueError 已覆盖 json.JSONDecodeError（其父类），
+            # 解析失败视为脏数据，跳过该工具结果。
+            continue
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(metadata, dict):
+            # 无 metadata 键 = 未启用自适应检索（旧路径输出），
+            # 不发检索决策事件。
+            continue
+        needed = metadata.get("needed")
+        rounds = metadata.get("rounds")
+        if not isinstance(needed, bool) or not (
+            isinstance(rounds, int) and not isinstance(rounds, bool)
+        ):
+            # 核心字段缺失/类型不合法 → 脏数据，跳过（宽容读取）。
+            continue
+        threshold_met = metadata.get("threshold_met")
+        hit_count = metadata.get("hit_count")
+        top_score = metadata.get("top_score")
+        need_reason = metadata.get("need_reason")
+        stopped_reason = metadata.get("stopped_reason")
+        decisions.append(
+            {
+                "needed": needed,
+                "need_reason": need_reason if isinstance(need_reason, str) else "",
+                "threshold_met": (
+                    threshold_met if isinstance(threshold_met, bool) else None
+                ),
+                "stopped_reason": (
+                    stopped_reason if isinstance(stopped_reason, str) else ""
+                ),
+                # 值域兜底（I-1）：类型合法但数值为负（脏数据）时按 0
+                # 兜底——原样透传会让 RunEvent 的 ge=0 校验抛
+                # ValidationError 击穿 _wrap（emit 不在 try 内）。
+                # 选择「按 0 兜底」而非「跳过整条」：负数只影响该字段，
+                # 决策字段仍可读，粒度最细（见函数 docstring）。
+                # 用 max(x, 0) 表达「下限 0」而非三元式（ruff FURB136）。
+                "rounds": max(rounds, 0),
+                "hit_count": (
+                    max(hit_count, 0)
+                    if isinstance(hit_count, int)
+                    and not isinstance(hit_count, bool)
+                    else 0
+                ),
+                "top_score": (
+                    max(top_score, 0.0)
+                    if isinstance(top_score, (int, float))
+                    and not isinstance(top_score, bool)
+                    else 0.0
+                ),
+            }
+        )
+    return decisions
+
+
 def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | None:
     """只解析本次 Supervisor 成功创建的最后一个结构化计划。"""
     for result in reversed(tool_results):
@@ -1832,6 +1992,7 @@ def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | No
     return None
 
 
+# 宽容读取持久化计划：checkpoint 反序列化后可能是 dict，统一归一为模型
 def _task_plan_from_state(state: AgentState) -> TaskPlan | None:
     raw_plan = state.get("task_plan")
     return None if raw_plan is None else TaskPlan.model_validate(raw_plan)
@@ -1853,6 +2014,7 @@ def _task_plan_for_proposal(
     return plan
 
 
+# 宽容读取任务结果列表（checkpoint 反序列化后可能是 dict）
 def _task_results_from_state(state: AgentState) -> list[TaskStepResult]:
     return [
         TaskStepResult.model_validate(result)
@@ -1860,6 +2022,7 @@ def _task_results_from_state(state: AgentState) -> list[TaskStepResult]:
     ]
 
 
+# 计划 Worker 轮开始前的防御性预检：目标角色或结果前缀不符则直接判死，不让 Worker 空跑
 def _planned_worker_preflight(
     state: AgentState,
     role: AgentRole,
@@ -1906,6 +2069,7 @@ def _validate_task_result_prefix(
             raise ValueError("task result does not match plan step")
 
 
+# 计划已完成时取出全部子任务结果；不完整或游标不一致则抛错，由 _wrap 安全收口
 def _ready_task_results(state: AgentState) -> list[TaskStepResult] | None:
     plan = _task_plan_from_state(state)
     if plan is None or plan.status is not TaskPlanStatus.COMPLETED:
@@ -1928,6 +2092,7 @@ def _terminal_agent_output(messages: Sequence[BaseMessage]) -> str | None:
     return output or None
 
 
+# 把子任务结果拼成结构化 SystemMessage 注入 Supervisor 上下文，供聚合作答
 def _task_results_message(
     plan: TaskPlan,
     results: Sequence[TaskStepResult],
@@ -1954,6 +2119,7 @@ def _task_results_message(
     )
 
 
+# 模型未产出聚合回答时的兜底：把成功/失败子任务结果拼成纯文本总结
 def _deterministic_aggregation(
     plan: TaskPlan,
     results: Sequence[TaskStepResult],
@@ -1985,6 +2151,7 @@ def _deterministic_aggregation(
     return "\n".join(sections)
 
 
+# 用聚合文本覆盖终端回答（仅换 content，角色/引用元数据原样保留）
 def _replace_terminal_ai_output(
     messages: Sequence[BaseMessage],
     content: str,
@@ -2001,6 +2168,7 @@ def _replace_terminal_ai_output(
     raise RuntimeError("aggregation completed without a terminal AIMessage")
 
 
+# 在聚合回答后追加「未完成子任务」提示，让用户看到失败项
 def _append_missing_results_notice(
     messages: Sequence[BaseMessage],
     plan: TaskPlan,
@@ -2035,6 +2203,7 @@ def _append_missing_results_notice(
     raise RuntimeError("aggregation completed without a terminal AIMessage")
 
 
+# 终态输出无效时，把该角色的完成事件改标为失败（保证事件审计口径一致）
 def _mark_agent_completion_invalid(
     events: Sequence[RunEvent],
     role: AgentRole,

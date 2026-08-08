@@ -20,6 +20,7 @@ def load_text(
     source = Path(path)
     public_source = _public_source(source, source_label)
     content = source.read_text(encoding="utf-8").strip()
+    # 空文件直接拒绝入库（空文档没有检索价值）。
     if not content:
         raise ValueError(f"Text file '{source.name}' is empty")
 
@@ -72,14 +73,15 @@ def iter_pdf_pages(
     except Exception as exc:
         raise ValueError(f"Cannot read PDF '{source.name}': {exc}") from exc
 
+    # 整份 PDF 的所有页共用一个 document_id，页与页之间靠 page 字段区分。
     resolved_id = document_id if document_id is not None else _default_document_id(source)
     total_pages = len(reader.pages)
     found_nonempty = False
     try:
-        for page_number, page in enumerate(reader.pages, start=1):
+        for page_number, page in enumerate(reader.pages, start=1):  # 页码从 1 开始
             if progress is not None:
                 progress(page_number, total_pages)
-            content = (page.extract_text() or "").strip()
+            content = (page.extract_text() or "").strip()  # 无文本页返回 None，空串兜底后跳过
             if content:
                 found_nonempty = True
                 yield KnowledgeDocument(
@@ -91,6 +93,7 @@ def iter_pdf_pages(
     except Exception as exc:
         raise ValueError(f"Cannot extract text from PDF '{source.name}': {exc}") from exc
 
+    # 整份 PDF 一页可提取文本都没有，直接报错避免静默入库空文档。
     if not found_nonempty:
         raise ValueError(f"PDF '{source.name}' contains no extractable text")
 
@@ -104,6 +107,7 @@ def _public_source(source: Path, source_label: str | None) -> str:
 
 def _default_document_id(source: Path) -> str:
     """Derive a stable ID without embedding the absolute path in the ID itself."""
+    # 用路径哈希做稳定 ID：同一路径每次生成的 ID 一致，且不暴露本地路径。
     normalized_path = os.path.normcase(str(source.resolve()))
     digest = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()
     return f"{source.stem}:{digest}"

@@ -19,9 +19,10 @@ from ..state import AgentRole, ToolResult
 from .registry import ToolRegistry
 
 UNKNOWN_TOOL_NAME = "unknown_tool"
-DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0  # 工具默认超时 30 秒
 _TOOL_WORKER_COUNT = 4
 
+# 错误码 → 中文提示的固定映射，模型只看到稳定文案，不暴露内部异常
 _SAFE_ERRORS = {
     ErrorCode.TOOL_UNKNOWN: "未注册工具",
     ErrorCode.TOOL_UNAUTHORIZED: "当前角色无权调用该工具",
@@ -50,12 +51,13 @@ class ToolExecutor:
         tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
         tool_timeouts: Mapping[str, float] | None = None,
     ) -> None:
+        # 三种入参方式统一成一份注册表：工具列表、现成注册表、或列表就地转注册表
         if isinstance(tools, ToolRegistry):
             if registry is not None:
                 raise ValueError("不能重复指定工具注册表")
             registry = tools
         elif registry is None:
-            registry = ToolRegistry(tools)
+            registry = ToolRegistry(tools)  # 只给了列表，就地建注册表
         elif tools:
             raise ValueError("不能同时指定工具列表和工具注册表")
         self.registry = registry
@@ -65,7 +67,7 @@ class ToolExecutor:
         )
         configured_timeouts = dict(tool_timeouts or {})
         registered_names = {tool.name for tool in self.registry.list_tools()}
-        unknown_names = set(configured_timeouts) - registered_names
+        unknown_names = set(configured_timeouts) - registered_names  # 配置里出现未注册工具名，多半是拼写错误
         if unknown_names:
             names = ", ".join(sorted(unknown_names))
             raise ValueError(f"tool_timeouts 包含未注册工具：{names}")
@@ -74,7 +76,7 @@ class ToolExecutor:
             for name, timeout in configured_timeouts.items()
         }
         self._pool = ThreadPoolExecutor(
-            max_workers=_TOOL_WORKER_COUNT,
+            max_workers=_TOOL_WORKER_COUNT,  # 固定 4 个线程并行执行工具
             thread_name_prefix="tool-executor",
         )
 
@@ -85,7 +87,7 @@ class ToolExecutor:
     def public_tool_name(self, tool_call: Mapping[str, Any]) -> str:
         """只公开注册表中的规范名称，避免模型生成名称进入持久状态。"""
         requested_name = str(tool_call.get("name") or "")
-        tool = self.registry.get(requested_name)
+        tool = self.registry.get(requested_name)  # 只认注册过的名字，模型伪造的名称统一归为 unknown
         return tool.name if tool is not None else UNKNOWN_TOOL_NAME
 
     def execute(
@@ -98,48 +100,49 @@ class ToolExecutor:
         requested_name = str(tool_call.get("name") or "")
         tool_name = self.public_tool_name(tool_call)
         args = tool_call.get("args", {})
-        started_at = perf_counter()
+        started_at = perf_counter()  # 开始计时，用于输出耗时统计
 
         tool = self.registry.get(requested_name)
         success = False
         output = ""
         error_code: ErrorCode | None = None
 
+        # 安检流水线：工具存在 → 角色授权 → 参数校验 → 线程池执行
         if tool is None:
             error_code = ErrorCode.TOOL_UNKNOWN
-        elif not self.registry.is_authorized(requested_name, agent_role):
+        elif not self.registry.is_authorized(requested_name, agent_role):  # 工具在，但角色无权调用
             error_code = ErrorCode.TOOL_UNAUTHORIZED
-        elif not isinstance(args, Mapping):
+        elif not isinstance(args, Mapping):  # 参数连字典都不是，直接判无效
             error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
         else:
             try:
                 input_schema = cast(type[BaseModel], tool.get_input_schema())
-                input_schema.model_validate(dict(args))
-            except ValidationError:
+                input_schema.model_validate(dict(args))  # 按 pydantic schema 校验参数
+            except ValidationError:  # 校验不过 → 参数无效，模型重新生成参数
                 error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
             except Exception:  # noqa: BLE001 - Schema 边界只公开稳定错误分类
                 error_code = ErrorCode.TOOL_EXECUTION_FAILED
             else:
                 try:
-                    future = self._pool.submit(tool.invoke, dict(args))
+                    future = self._pool.submit(tool.invoke, dict(args))  # 丢进线程池，主流程不卡住
                     done, _ = wait(
                         {future},
                         timeout=self.timeout_seconds_for(tool.name),
                     )
-                    if not done:
+                    if not done:  # 超过时限还没跑完，按超时处理
                         # 只能取消尚未开始的任务；运行中的线程会自行结束，不做危险强杀。
                         future.cancel()
                         error_code = ErrorCode.TOOL_TIMEOUT
                     else:
-                        output = _to_text(future.result())
+                        output = _to_text(future.result())  # 成功：输出统一转文本
                         success = True
                 except Exception:  # noqa: BLE001 - 工具边界只公开稳定错误分类
                     error_code = ErrorCode.TOOL_EXECUTION_FAILED
 
-        error = None if error_code is None else _SAFE_ERRORS[error_code]
-        duration_ms = (perf_counter() - started_at) * 1000
-        content = output if success else f"错误：{error}"
-        result = ToolResult(
+        error = None if error_code is None else _SAFE_ERRORS[error_code]  # 只暴露稳定的错误分类提示
+        duration_ms = (perf_counter() - started_at) * 1000  # 记录耗时，供系统侧统计
+        content = output if success else f"错误：{error}"  # 失败时喂给模型的是错误文案
+        result = ToolResult(  # 结构化记录：留给系统分析用
             tool_call_id=call_id,
             tool_name=tool_name,
             agent_role=agent_role,
@@ -149,7 +152,7 @@ class ToolExecutor:
             error_code=error_code,
             duration_ms=duration_ms,
         )
-        message = ToolMessage(
+        message = ToolMessage(  # 文本消息：直接作为模型的观察结果
             content=content,
             tool_call_id=call_id,
             name=tool_name,
@@ -167,8 +170,8 @@ def _validate_timeout(value: float, field_name: str) -> float:
 def _to_text(value: Any) -> str:
     """将工具输出稳定地转换为模型可读取的文本。"""
     if isinstance(value, str):
-        return value
+        return value  # 文本原样返回，不额外加引号
     try:
-        return json.dumps(value, ensure_ascii=False, default=str)
+        return json.dumps(value, ensure_ascii=False, default=str)  # 复杂对象转 JSON，中文不转义
     except TypeError:
-        return str(value)
+        return str(value)  # 序列化失败兜底：直接转字符串

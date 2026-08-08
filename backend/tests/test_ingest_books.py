@@ -25,13 +25,16 @@ from ingest_books import (
     ingest_book,
     load_manifest,
     main,
+    relabel_frontmatter,
     select_books,
     verify_cases,
 )
 
+from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
-from core.knowledge.models import KnowledgeDocument
+from core.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from core.knowledge.service import KnowledgeService
+from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
 
 # ── 小工具：构造清单 JSON 与占位书文件 ────────────────────────────
 
@@ -777,3 +780,426 @@ def test_main_semantic_chunking_flag(tmp_path: Path) -> None:
         assert hit.chunk.metadata["chunking"] == "semantic"
     finally:
         reopened.close()
+
+
+# ── S3-T4 embedding provider 选择（--provider hash | fastembed）──
+
+
+class _StubFastEmbedProvider:
+    """fastembed 的测试替身：512 维确定性向量，不联网不加载模型。
+
+    真实 FastEmbedProvider 首次构造会联网下载 bge-small-zh-v1.5 模型
+    （约 100MB），CI/无网环境不可用；替身保持 512 维与真实模型一致，
+    用于验证 --provider fastembed 的传参路径与维度语义。
+    """
+
+    instances = 0  # 构造计数：验证「向量库不存在时不应构造 provider」
+
+    def __init__(self) -> None:
+        type(self).instances += 1
+        self.dimension = 512
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vector = [0.0] * self.dimension
+        vector[0] = 1.0  # 非零向量：归一化不会除零
+        return [list(vector) for _ in texts]
+
+
+@pytest.fixture
+def stub_fastembed(monkeypatch: pytest.MonkeyPatch) -> type[_StubFastEmbedProvider]:
+    """把 ingest_books.FastEmbedProvider 换成测试替身（不联网、可计数）。"""
+    _StubFastEmbedProvider.instances = 0
+    monkeypatch.setattr("ingest_books.FastEmbedProvider", _StubFastEmbedProvider)
+    return _StubFastEmbedProvider
+
+
+def test_main_provider_rejects_invalid_value(tmp_path: Path) -> None:
+    """--provider 非法值：argparse choices 拒绝，退出码 2（SystemExit）。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--books-dir",
+                str(books_dir),
+                "--db",
+                str(db_path),
+                "--vector-db",
+                str(tmp_path / "vector_knowledge.db"),
+                "--provider",
+                "bogus",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("provider", ["hash", "fastembed"])
+def test_main_verify_accepts_provider_values(
+    tmp_path: Path,
+    stub_fastembed: type[_StubFastEmbedProvider],
+    provider: str,
+) -> None:
+    """--verify 接受合法 provider 值；向量库不存在时不构造 provider。
+
+    fastembed 首次构造会联网下载模型——向量库文件不存在时检索注定
+    降级为纯词法，此时不应构造 provider（替身构造计数保持 0，证明
+    不会白白触发下载）。
+
+    注意：verify 只验证检索不写入，必须先入库（词法库有数据，词法
+    检索才有命中基础）；不带 --vector 入库则向量库不会被创建，正
+    是「向量库不存在」的验证前提。
+    """
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    # 先入库（词法库有数据，verify 的词法检索才有命中基础）；不带
+    # --vector，向量库不会被创建 → 向量库不存在 → verify 走纯词法。
+    assert main(common) == 0
+    assert main([*common, "--verify", "--provider", provider]) == 0
+    assert _StubFastEmbedProvider.instances == 0
+
+
+def test_main_fastembed_provider_end_to_end(
+    tmp_path: Path, stub_fastembed: type[_StubFastEmbedProvider]
+) -> None:
+    """fastembed 全流程：入库建 512 维向量库 → 同 provider verify 混合检索。
+
+    验证 --provider 传参正确性：向量库以所选 provider 的维度写入，
+    --verify 用同一 provider 能打开并走混合检索（PASS）。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 1) --vector --provider fastembed：入库成功，向量库以 512 维写入。
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 0
+    assert vector_db.exists()
+    # 用同维度替身重开向量库：构造时维度守卫校验通过（不抛错）即证明
+    # 库内向量是 512 维（hash 为 256 维，会因维度不符而拒绝打开）。
+    reopened = SqliteVectorKnowledgeIndex(vector_db, provider=_StubFastEmbedProvider())
+    reopened.close()
+
+    # 2) --verify --provider fastembed：同一 provider 打开向量库 → 混合检索 PASS。
+    assert main([*common, "--verify", "--provider", "fastembed"]) == 0
+
+
+def test_main_verify_with_fastembed_degrades_on_hash_built_vector_db(
+    tmp_path: Path, stub_fastembed: type[_StubFastEmbedProvider]
+) -> None:
+    """hash 建的 256 维向量库 + fastembed verify：维度不匹配 → 降级纯词法。
+
+    verify 允许降级：旧维度库打不开时自动退回词法单路，不报错、
+    退出码 0 仍成立（与 hybrid.py open_vector_index_if_available
+    的降级语义一致）；真正换 provider 需 --force 重建向量库。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 先用默认 hash（256 维）建向量库。
+    assert main([*common, "--vector"]) == 0
+    # 再用 fastembed（512 维）verify：维度不匹配 → 自动降级纯词法 → 仍 PASS。
+    assert main([*common, "--verify", "--provider", "fastembed"]) == 0
+
+
+class _ExplodingFastEmbedProvider:
+    """构造即抛 RuntimeError 的 fastembed 替身：模拟未安装/模型下载失败。"""
+
+    def __init__(self) -> None:
+        raise RuntimeError("fastembed 未安装或模型下载失败")
+
+
+def test_main_vector_with_fastembed_build_failure_returns_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """fastembed 构造失败（未安装/下载失败）：显式报错退出码 2，不静默回退哈希。
+
+    用户显式选了 fastembed，静默换回哈希会与库维度错位——必须让用户
+    看到失败原因而不是悄悄降级。
+    """
+    monkeypatch.setattr("ingest_books.FastEmbedProvider", _ExplodingFastEmbedProvider)
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 2
+    captured = capsys.readouterr()
+    assert "错误:" in captured.err
+    assert "fastembed" in captured.err
+
+
+def test_main_vector_with_fastembed_against_hash_vector_db_returns_2(
+    tmp_path: Path,
+    stub_fastembed: type[_StubFastEmbedProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """旧维度（hash 256 维）向量库 + fastembed --vector：显式报错退出码 2。
+
+    维度守卫发生在打开旧库的构造期（早于 --force 清完成标记），
+    --force 无法绕过——必须删除向量库文件或改用新的 --vector-db 路径
+    重建（错误提示明确给出该指引，且不 traceback 崩溃）。
+    """
+    manifest_path, books_dir, db_path, tmp = _cli_manifest(tmp_path)
+    vector_db = tmp / "vector_knowledge.db"
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        "--vector-db",
+        str(vector_db),
+    ]
+
+    # 先用默认 hash（256 维）建向量库。
+    assert main([*common, "--vector"]) == 0
+    # 换 fastembed（512 维）带 --vector 重开旧库：维度不匹配 → 显式报错
+    # 退出码 2（不 traceback 崩溃）；旧向量库文件保留、未被破坏。
+    assert main([*common, "--vector", "--provider", "fastembed"]) == 2
+    assert vector_db.exists()
+    captured = capsys.readouterr()
+    assert "删除向量库文件" in captured.err
+    assert "--force" in captured.err
+
+
+# ── H-T2 前言/目录增量重标注（--relabel-frontmatter）──────────────
+
+
+def test_relabel_frontmatter_idempotent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """relabel 幂等：第一遍更新、第二遍无变化；两库 metadata_json 同步更新。
+
+    构造：手工写入一个「目录特征」chunk（metadata 无 chunk_class 键，
+    模拟 H-T2 之前入库的旧数据）与一个正文 chunk。relabel 后词法与
+    向量两库的 metadata_json 都被补上/保持正确，且不重算向量（直接
+    UPDATE，不依赖 embedding provider）。
+    """
+    lexical_path = tmp_path / "kb.db"
+    vector_path = tmp_path / "vector.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    vector = SqliteVectorKnowledgeIndex(vector_path, provider=HashEmbeddingProvider())
+    try:
+        toc_chunk = KnowledgeChunk(
+            chunk_id="book-a:5:0:20",
+            document_id="book-a",
+            content="1 Introduction 1\n2 Fundamentals 15",
+            source="book-a",
+            page=5,
+            start=0,
+            end=20,
+            metadata={},
+        )
+        body_chunk = KnowledgeChunk(
+            chunk_id="book-a:5:20:45",
+            document_id="book-a",
+            content="卷积神经网络是一种专门处理网格结构数据的深度学习模型。",
+            source="book-a",
+            page=5,
+            start=20,
+            end=45,
+            metadata={},
+        )
+        lexical.upsert([toc_chunk, body_chunk])
+        vector.upsert([toc_chunk, body_chunk])
+    finally:
+        lexical.close()
+        vector.close()
+
+    book = _manifest_book("book-a")
+
+    first_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    first_out = capsys.readouterr().out
+    second_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    second_out = capsys.readouterr().out
+
+    assert first_code == 0
+    assert second_code == 0
+    # 第一遍：目录 chunk 被标记并更新（更新 1 个）；第二遍：已一致（更新 0 个）。
+    assert "标记 1 / 更新 1 个 chunk" in first_out
+    assert "标记 1 / 更新 0 个 chunk" in second_out
+
+    # 词法库读回：metadata_json 已更新（chunk_class 正确，正文不误标）。
+    reopened_lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened_lexical.chunks_of_document("book-a")
+        by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        assert by_id["book-a:5:0:20"].metadata["chunk_class"] == "frontmatter"
+        assert "chunk_class" not in by_id["book-a:5:20:45"].metadata
+    finally:
+        reopened_lexical.close()
+
+    # 向量库读回：同一 chunk_id 的 metadata_json 已更新（向量 BLOB 未动）。
+    reopened_vector = SqliteVectorKnowledgeIndex(
+        vector_path, provider=HashEmbeddingProvider()
+    )
+    try:
+        hits = reopened_vector.search("Introduction", top_k=5)
+        toc_hit = next(
+            hit for hit in hits if hit.chunk.chunk_id == "book-a:5:0:20"
+        )
+        assert toc_hit.chunk.metadata["chunk_class"] == "frontmatter"
+    finally:
+        reopened_vector.close()
+
+
+def test_relabel_frontmatter_skips_blocked_books(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """阻塞书跳过不报错（与入库/verify 的 blocked 语义一致）。"""
+    lexical_path = tmp_path / "kb.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        lexical.upsert(
+            [
+                KnowledgeChunk(
+                    chunk_id="book-a:1:0:10",
+                    document_id="book-a",
+                    content="1 Introduction 1",
+                    source="book-a",
+                    page=1,
+                    start=0,
+                    end=10,
+                    metadata={},
+                )
+            ]
+        )
+    finally:
+        lexical.close()
+
+    blocked_book = _manifest_book("book-a", blocked="scanned-pdf-no-text-layer")
+    code = relabel_frontmatter(lexical_path, tmp_path / "missing.db", [blocked_book])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "阻塞" in out
+    # 被跳过的书不被触碰：metadata_json 未更新（chunk_class 仍未写入）。
+    reopened = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened.chunks_of_document("book-a")
+        assert "chunk_class" not in chunks[0].metadata
+    finally:
+        reopened.close()
+
+
+def test_relabel_frontmatter_removes_stale_mark(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """relabel 移除旧标分支：内容不再是目录但 metadata 残留旧标 → 键被移除。
+
+    review 补充：relabel 是「双向一致」比对——既补新标也清旧标；
+    旧标清理是幂等的（第二遍更新数为 0）。
+    """
+    lexical_path = tmp_path / "kb.db"
+    vector_path = tmp_path / "vector.db"
+    lexical = SqliteKnowledgeIndex(lexical_path)
+    vector = SqliteVectorKnowledgeIndex(vector_path, provider=HashEmbeddingProvider())
+    try:
+        stale_chunk = KnowledgeChunk(
+            chunk_id="book-b:8:0:30",
+            document_id="book-b",
+            content="卷积神经网络是一种专门处理网格结构数据的深度学习模型。",
+            source="book-b",
+            page=8,
+            start=0,
+            end=30,
+            metadata={"chunk_class": "frontmatter"},  # 旧标：内容实为正文
+        )
+        lexical.upsert([stale_chunk])
+        vector.upsert([stale_chunk])
+    finally:
+        lexical.close()
+        vector.close()
+
+    book = _manifest_book("book-b")
+
+    first_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    first_out = capsys.readouterr().out
+    second_code = relabel_frontmatter(lexical_path, vector_path, [book])
+    second_out = capsys.readouterr().out
+
+    assert first_code == 0
+    assert second_code == 0
+    # 第一遍：旧标被移除（标记 0、更新 1）；第二遍：已一致（更新 0）。
+    assert "标记 0 / 更新 1 个 chunk" in first_out
+    assert "标记 0 / 更新 0 个 chunk" in second_out
+
+    # 词法库读回：旧标已清除。
+    reopened_lexical = SqliteKnowledgeIndex(lexical_path)
+    try:
+        chunks = reopened_lexical.chunks_of_document("book-b")
+        assert "chunk_class" not in chunks[0].metadata
+    finally:
+        reopened_lexical.close()
+
+    # 向量库读回：同一 chunk 的 metadata 也已清除（BLOB 未动）。
+    reopened_vector = SqliteVectorKnowledgeIndex(
+        vector_path, provider=HashEmbeddingProvider()
+    )
+    try:
+        hits = reopened_vector.search("卷积神经网络", top_k=5)
+        assert "chunk_class" not in hits[0].chunk.metadata
+    finally:
+        reopened_vector.close()
+
+
+def test_main_relabel_frontmatter_flag(tmp_path: Path) -> None:
+    """CLI --relabel-frontmatter：独立分支，处理完即返回，不进入入库流程。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--books-dir",
+        str(books_dir),
+        "--db",
+        str(db_path),
+        # S3-T5：--vector-db 指向 tmp 路径，隔离真实工作区
+        # data/vector_knowledge.db——否则会探测到开发者本地的向量库。
+        "--vector-db",
+        str(tmp_path / "vector_knowledge.db"),
+    ]
+
+    # 空库上运行：不报错，正常退出（无已入库 chunk，全部跳过）。
+    assert main([*common, "--relabel-frontmatter"]) == 0
+    # 入库后运行：已入库 chunk 被重标注（CLI 分支不解析 PDF），同样正常退出。
+    assert main(common) == 0
+    assert main([*common, "--relabel-frontmatter"]) == 0

@@ -78,6 +78,7 @@ class ApiErrorCode(str, Enum):
     SESSION_ALREADY_EXISTS = "session_already_exists"
     SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
+    KNOWLEDGE_UNAVAILABLE = "knowledge_unavailable"
 
 
 class TaskPlanStatus(str, Enum):
@@ -122,6 +123,10 @@ class ChatRequest(ContractModel):
 
     session_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    # D7-T1:附件引用(契约扩展预留)——chat 路由当前忽略该字段(缺失
+    # 或携带均不影响现有行为),由 D7-T3 或后续 core 能力决定如何进入
+    # 模型上下文;留空列表与 None 等价。
+    attachments: list[Attachment] | None = None
 
     @field_validator("session_id", "message")
     @classmethod
@@ -139,6 +144,9 @@ class Message(ContractModel):
     content: str
     agent: AgentRole | None = None
     created_at: datetime | None = None
+    # D7-T3:附件引用(可选;历史消息/非附件消息为 None)。core 消息当前
+    # 无附件元数据,映射侧保持 None——契约预留,前端按字段渲染。
+    attachments: list[Attachment] | None = None
 
 
 class RunEvent(ContractModel):
@@ -154,6 +162,36 @@ class RunEvent(ContractModel):
     error_code: ErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
     degraded: bool | None = None
+
+
+class StreamEvent(ContractModel):
+    """SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
+
+    事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
+    的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
+    - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
+      成功与否、耗时等摘要,绝不含工具参数与结果正文;
+    - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
+      模型中间输出;
+    - message_end 事件的 content 是最终消息全文(与 POST /chat 的
+      ChatResponse.message.content 同源)。
+    error_code 复用 RunError 的联合类型:流式 error 事件需要携带
+    ApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。
+    """
+
+    event_type: StreamEventType
+    sequence: int = Field(ge=0)
+    session_id: str
+    agent: AgentRole | None = None
+    tool_name: str | None = None
+    success: bool | None = None
+    duration_ms: float | None = Field(default=None, ge=0)
+    error_code: ErrorCode | ApiErrorCode | None = None
+    plan_step_sequence: int | None = Field(default=None, ge=1)
+    content: str | None = None  # thinking 占位 / message_end 全文
+    message: Message | None = None  # message_end 的完整消息(可选)
+    citations: list[Citation] | None = None
+    current_agent: AgentRole | None = None
 
 
 class RunError(ContractModel):
@@ -187,24 +225,25 @@ class PendingHandoffResponse(ContractModel):
 
 
 class HandoffDecisionAction(str, Enum):
-    """Approval actions supported by the skeleton API."""
+    """Approval actions for one pending handoff interrupt."""
 
     CONFIRM = "confirm"
     REJECT = "reject"
+    MODIFY = "modify"
 
 
 class HandoffDecisionRequest(ContractModel):
-    """A confirmation or rejection for one pending handoff interrupt."""
+    """A confirmation, rejection, or modification for one pending handoff interrupt."""
 
     interrupt_id: str = Field(min_length=1)
     action: HandoffDecisionAction
     target_agent: WorkerAgentRole | None = Field(
         default=None,
-        description="Reserved for a future modification workflow.",
+        description="The modified target worker; only valid when action is modify.",
     )
     task_content: str | None = Field(
         default=None,
-        description="Reserved for a future modification workflow.",
+        description="The modified task content; only valid when action is modify.",
     )
 
     @field_validator("interrupt_id")
@@ -215,10 +254,19 @@ class HandoffDecisionRequest(ContractModel):
         return value
 
     @model_validator(mode="after")
-    def reject_modification_fields(self) -> HandoffDecisionRequest:
-        """Reserve modification fields without implementing that workflow yet."""
-        if self.target_agent is not None or self.task_content is not None:
-            raise ValueError("handoff modifications are not supported")
+    def action_matches_changes(self) -> HandoffDecisionRequest:
+        """Replicate the core HandoffApprovalDecision change rule (both branches).
+
+        - MODIFY must carry at least one of target_agent / task_content;
+        - confirm / reject must not carry either modification field.
+        Missing either branch would let invalid input reach the core
+        HandoffApprovalDecision constructor and surface as a 500.
+        """
+        has_changes = self.target_agent is not None or self.task_content is not None
+        if self.action is HandoffDecisionAction.MODIFY and not has_changes:
+            raise ValueError("modify requires target_agent or task_content")
+        if self.action is not HandoffDecisionAction.MODIFY and has_changes:
+            raise ValueError("only modify accepts target_agent or task_content")
         return self
 
 class Citation(ContractModel):
@@ -228,6 +276,101 @@ class Citation(ContractModel):
     source: str
     page: int | None = Field(default=None, ge=1)
     chunk_id: str
+
+
+class KnowledgeSearchRequest(ContractModel):
+    """知识库检索请求。
+
+    top_k 必须由 API 层校验(Field ge/le)拦截在 422,不得依赖 core
+    的 ValueError 运行时兜底(会变 500);query 的空白拦截与
+    ChatRequest.reject_blank_text 同构(core 对空白 query 抛
+    ValueError,同样要拦在 API 层)。
+    """
+
+    query: str = Field(min_length=1, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def reject_blank_query(cls, value: str) -> str:
+        """Reject whitespace-only queries before they reach the core service."""
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class SearchHitDto(ContractModel):
+    """检索命中的脱敏表示:chunk 摘要(截断)+ 逻辑 source 引用 + 分数。"""
+
+    summary: str
+    citation: Citation
+    score: float
+
+
+class KnowledgeSearchResponse(ContractModel):
+    """检索结果(空库返回空 hits,不报错)。"""
+
+    hits: list[SearchHitDto]
+
+
+class KnowledgeDocumentListEntry(ContractModel):
+    """知识库文档列表条目(只读元数据,不含内容)。
+
+    page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
+    能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+    """
+
+    document_id: str
+    source: str
+    page_count: int | None = None
+    chunk_count: int | None = None
+
+
+class KnowledgeDocumentUploadResponse(ContractModel):
+    """上传解析结果:文档已入库(幂等替换)后的元数据回执。"""
+
+    document_id: str
+    source: str
+    page_count: int | None = None
+    chunk_count: int | None = None
+
+
+class KnowledgeDocumentListResponse(ContractModel):
+    """文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。"""
+
+    documents: list[KnowledgeDocumentListEntry]
+
+
+class Attachment(ContractModel):
+    """聊天消息附件引用(D7-T1 契约扩展预留)。
+
+    - file_id / name / content_type / size 由上传回执(FILE-UPLOAD)填充;
+    - 骨架期 chat 路由忽略该字段不影响现有行为(见 ChatRequest 注释),由
+      D7-T3 或后续 core 能力决定如何进入模型上下文。
+    """
+
+    file_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=255)
+    content_type: str | None = None
+    size: int = Field(ge=0)
+
+
+class FileUploadResponse(ContractModel):
+    """文件上传回执(D7-T1):url 为受控下载的相对路径。
+
+    - file_id 是服务端生成的 uuid4().hex + 白名单后缀(落盘名),url 形如
+      /files/{file_id}——客户端凭 url 即可 GET 下载,url 不含原始文件名
+      (后者只作展示字段 name);
+    - content_type 由服务端按扩展名映射,不信任客户端伪造的类型;
+    - name 是原始文件名(仅展示用;落盘名是 uuid,见 api/files.py 的
+      防穿越设计)。
+    """
+
+    file_id: str
+    name: str
+    content_type: str | None
+    size: int
+    url: str
 
 
 class TaskPlanStep(ContractModel):
@@ -270,6 +413,46 @@ class ChatResponse(ContractModel):
     current_agent: AgentRole | None = None
 
 
+class FeedbackRating(str, Enum):
+    """用户反馈评分方向。"""
+
+    UP = "up"
+    DOWN = "down"
+
+
+class FeedbackRequest(ContractModel):
+    """用户反馈请求体(只收脱敏引用字段,不收消息全文)。"""
+
+    session_id: str = Field(max_length=200)
+    message_id: str | None = Field(default=None, max_length=200)
+    rating: FeedbackRating
+    comment: str | None = Field(default=None, max_length=500)
+    error_code: str | None = Field(default=None, max_length=100)
+
+
+class FeedbackResponse(ContractModel):
+    """反馈受理确认。"""
+
+    received: bool = True
+
+
+class StatsOverview(ContractModel):
+    """学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。
+
+    - agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /
+      teaching_assistant / learning_assistant / evaluator),口径与
+      api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;
+    - last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at
+      的最大值(langchain-core 的 BaseMessage 无 created_at 字段,
+      消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。
+    """
+
+    session_count: int
+    message_count: int
+    agent_answer_counts: dict[str, int]
+    last_activity_at: str | None
+
+
 CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     Session,
     CreateSessionRequest,
@@ -278,6 +461,7 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ChatRequest,
     Message,
     RunEvent,
+    StreamEvent,
     RunError,
     HandoffRequest,
     PendingHandoff,
@@ -288,6 +472,17 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     TaskPlan,
     TaskResult,
     ChatResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    StatsOverview,
+    KnowledgeSearchRequest,
+    SearchHitDto,
+    KnowledgeSearchResponse,
+    KnowledgeDocumentListEntry,
+    KnowledgeDocumentUploadResponse,
+    KnowledgeDocumentListResponse,
+    FileUploadResponse,
+    Attachment,
 )
 
 

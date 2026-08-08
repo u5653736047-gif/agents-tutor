@@ -32,16 +32,17 @@ from pydantic import BaseModel, Field, field_validator
 def _validate_logical_source(source: str) -> str:
     """Reject local filesystem locations at every public model boundary."""
     candidate = source.strip()
+    # 三重防护：空串、首尾带空白、含不可打印字符（换行等）一律拒绝。
     if not candidate or candidate != source or not candidate.isprintable():
         raise ValueError("source must be a logical identifier, not a filesystem path")
 
     windows_path = PureWindowsPath(candidate)
     posix_path = PurePosixPath(candidate)
     if (
-        windows_path.drive
-        or windows_path.root
-        or posix_path.is_absolute()
-        or candidate.casefold().startswith("file:")
+        windows_path.drive  # Windows 盘符（如 "C:"）
+        or windows_path.root  # Windows 根路径
+        or posix_path.is_absolute()  # Unix 绝对路径
+        or candidate.casefold().startswith("file:")  # file:// 前缀
     ):
         raise ValueError("source must be a logical identifier, not a filesystem path")
     return candidate
@@ -61,35 +62,37 @@ class _LogicalSourceModel(BaseModel):
 class KnowledgeDocument(_LogicalSourceModel):
     """A source document, or one page of a paged source."""
 
-    document_id: str
-    content: str
-    page: int | None = Field(default=None, ge=1)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    document_id: str  # 文档唯一 ID（默认由路径哈希派生，见 loaders）
+    content: str  # 全文内容（PDF 时为一页的文本）
+    page: int | None = Field(default=None, ge=1)  # 页码，仅 PDF 有（从 1 开始）；普通文件为 None
+    metadata: dict[str, Any] = Field(default_factory=dict)  # 领域字段（subject/difficulty 等）
 
 
 class KnowledgeChunk(_LogicalSourceModel):
     """A searchable slice with coordinates in its source document."""
 
-    chunk_id: str
-    document_id: str
-    content: str
-    page: int | None = Field(default=None, ge=1)
-    start: int = Field(ge=0)
-    end: int = Field(ge=0)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    chunk_id: str  # 分块唯一 ID：document_id:page:start:end（可按坐标回溯原文）
+    document_id: str  # 所属文档 ID
+    content: str  # 分块文本
+    page: int | None = Field(default=None, ge=1)  # 页码（非 PDF 文档为 None）
+    start: int = Field(ge=0)  # 在原文中的起始字符偏移（左闭右开）
+    end: int = Field(ge=0)  # 在原文中的结束字符偏移（左闭右开）
+    metadata: dict[str, Any] = Field(default_factory=dict)  # 文档 metadata 副本 + 分块追加字段
 
 
 class Citation(_LogicalSourceModel):
     """Minimal source information safe to expose with a search result."""
 
-    document_id: str
-    page: int | None = Field(default=None, ge=1)
-    chunk_id: str
+    document_id: str  # 引用的是哪篇文档
+    page: int | None = Field(default=None, ge=1)  # 引用所在页码（非 PDF 为 None）
+    chunk_id: str  # 引用精确到哪个分块（据此可回溯原文）
+    # Citation 是「引用凭证」：只携带文档/页码/分块定位信息，不含正文内容，
+    # 是搜索结果对外展示时的安全最小集（对比 SearchHit 携带完整 chunk）。
 
 
 class SearchHit(BaseModel):
     """A ranked chunk paired with its citation."""
 
-    chunk: KnowledgeChunk
-    citation: Citation
-    score: float = Field(ge=0)
+    chunk: KnowledgeChunk  # 命中的分块（含完整文本）
+    citation: Citation  # 配套引用凭证（对外展示定位信息）
+    score: float = Field(ge=0)  # 相关性得分（词法索引为命中查询词数）

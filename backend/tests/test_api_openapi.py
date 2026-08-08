@@ -87,7 +87,12 @@ def test_handoff_routes_expose_only_the_minimal_approval_contract() -> None:
         ]["$ref"]
         == "#/components/schemas/ErrorResponse"
     )
-    assert schemas["HandoffDecisionAction"]["enum"] == ["confirm", "reject"]
+    # D2-T4:审批修改工作流上线,HandoffDecisionAction 增加 modify
+    assert schemas["HandoffDecisionAction"]["enum"] == [
+        "confirm",
+        "reject",
+        "modify",
+    ]
     assert set(schemas["HandoffDecisionRequest"]["properties"]) == {
         "action",
         "interrupt_id",

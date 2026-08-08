@@ -41,6 +41,7 @@ class KnowledgeService:
         refiner: QueryRefiner | None = None,
         relevance_threshold: float | None = None,
         max_refine_rounds: int = 2,
+        suppress_frontmatter: bool = True,
     ) -> None:
         """初始化服务。
 
@@ -86,6 +87,12 @@ class KnowledgeService:
           须 ≥ 0 且 ≤ 10），仅 refiner 非 None 时生效。上限 10 是
           成本软上限：每轮重检 = 一次完整检索（未来 LLM 精化器还有
           模型调用），上限过高会让单次查询成本失控。
+        - suppress_frontmatter（H-T2）：默认 True 时，search /
+          adaptive_search 自动附加 {"chunk_class": "!frontmatter"}
+          排除过滤，抑制前言/目录类噪音 chunk（分类规则见
+          frontmatter.py；排除语义见 index.py 模块顶部契约注释）；
+          False 关闭。调用方显式传 metadata_filter 且含 chunk_class
+          键时尊重调用方，不合并（见 _apply_suppression）。
         """
         if chunking not in _CHUNKING_STRATEGIES:
             raise ValueError("chunking must be 'character' or 'semantic'")
@@ -109,10 +116,34 @@ class KnowledgeService:
         self._refiner = refiner
         self._relevance_threshold = relevance_threshold
         self._max_refine_rounds = max_refine_rounds
+        self._suppress_frontmatter = suppress_frontmatter
+
+    def _apply_suppression(
+        self, metadata_filter: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        """H-T2：把默认的 frontmatter 抑制合并进调用方的过滤条件。
+
+        规则（search 与 adaptive_search 共用本方法，词法/向量/混合
+        索引都经 service 收到同一份过滤条件，三路行为一致）：
+        - suppress_frontmatter=False → 原样返回，不附加任何条件；
+        - 未传过滤条件 → 返回 {"chunk_class": "!frontmatter"}；
+        - 调用方已传含 chunk_class 键的条件 → 原样返回（尊重调用方
+          的显式意图，如 {"chunk_class": "frontmatter"} 精确限定）；
+        - 否则在调用方条件上追加 chunk_class 排除（多键 AND 语义）。
+        """
+        if not self._suppress_frontmatter:
+            return metadata_filter
+        if metadata_filter is None:
+            return {"chunk_class": "!frontmatter"}
+        if "chunk_class" in metadata_filter:
+            return metadata_filter
+        return {**metadata_filter, "chunk_class": "!frontmatter"}
 
     def add_documents(self, documents: Iterable[KnowledgeDocument]) -> list[KnowledgeChunk]:
         """Replace the supplied documents, then return their stored chunks."""
         document_batch = list(documents)
+        # 批内坐标唯一性校验：同一 (document_id, page) 不允许重复出现，
+        # 保证「整文档替换」时每个坐标只对应一份内容。
         coordinates: set[tuple[str, int | None]] = set()
         for document in document_batch:
             coordinate = (document.document_id, document.page)
@@ -184,11 +215,22 @@ class KnowledgeService:
         - 没有任何匹配时返回空列表（不报错）；
         - 多路检索下过滤条件透传给每一个变体，被过滤的 chunk 不会
           进入任何变体、自然也不进合并结果（与单路语义一致）。
+
+        H-T2 前言/目录抑制（面向初学者）：构造时 suppress_frontmatter=
+        True（默认）时，本方法会自动附加 {"chunk_class": "!frontmatter"}
+        排除条件——前言/目录类噪音 chunk（分类见 frontmatter.py）
+        不会进入任何变体的候选，自然也不进合并结果；调用方显式传
+        含 chunk_class 键的过滤条件时尊重调用方，不合并。该抑制对
+        词法/向量/混合三路一致生效（search_knowledge 工具路径调用
+        本方法，自动获得该行为）。
         """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
+        # H-T2：入口校验后合并默认抑制——词法/向量/混合三路都经
+        # service 收到同一份过滤条件，行为一致（见 _apply_suppression）。
+        metadata_filter = self._apply_suppression(metadata_filter)
         return multi_query_search(
             self._index,
             query,
@@ -204,6 +246,9 @@ class KnowledgeService:
         top_k: int = 5,
         *,
         metadata_filter: dict[str, str] | None = None,
+        policy: RetrievalPolicy | None = None,
+        relevance_threshold: float | None = None,
+        refiner: QueryRefiner | None = None,
     ) -> AdaptiveSearchResult:
         """自适应检索（S4-T3）：必要性判断 → 检索 → 阈值判定 → 多轮重检。
 
@@ -228,24 +273,52 @@ class KnowledgeService:
            （rounds / refine_history / stopped_reason）里，由上层
            （工具/图）转成事件——检索层不依赖 core/events.py。
 
+        S4-T3 工具层注入（本任务的扩展）：policy / relevance_threshold
+        / refiner 三个参数允许调用方（如 create_search_knowledge_tool）
+        按次覆盖构造时配置——None 表示沿用构造时配置（默认，零回归），
+        非 None 表示本次调用改用注入值。为什么需要覆盖：工具装配方
+        （api 层）构造 service 时可能没有检索配置，工具自身却允许
+        装配方注入自适应配置（见 tools.py 注释）；没有这个覆盖口，
+        工具注入的配置就无法生效。校验与降级语义与构造时配置一致
+        （relevance_threshold > 0、上限校验在 retrieval.adaptive_search
+        内部兜底）。
+        边界（M-2）：None 恒表示「沿用构造时配置」，本方法不提供
+        「覆盖为空（显式关闭）」的通道——如需在工具层关闭构造时
+        已配置的 relevance_threshold / refiner（如临时退化为单轮
+        检索），请修改 service 构造配置或另建 service 实例，避免
+        None 语义歧义。
+
         返回：AdaptiveSearchResult（hits + RetrievalMetadata），hits
         的形态与 search 一致（分数、排序、citation 语义不变）。所有
         失败路径（policy / refiner 异常）都不抛错（降级语义详见
         retrieval.py 的 _safe_policy / _safe_refine）。
+
+        H-T2 前言/目录抑制：与 search 一致——suppress_frontmatter=
+        True（默认）时自动附加 {"chunk_class": "!frontmatter"} 排除
+        条件，每轮检索（含精化重检）都带同一份过滤条件；调用方显式
+        传含 chunk_class 键的条件时尊重调用方，不合并（见
+        _apply_suppression）。
         """
         if not query.strip():
             raise ValueError("query must not be empty")
         if not 1 <= top_k <= 10:
             raise ValueError("top_k must be between 1 and 10")
+        # H-T2：与 search 同一套默认抑制（三路一致，见 _apply_suppression）。
+        metadata_filter = self._apply_suppression(metadata_filter)
         return adaptive_search(
             self._index,
             query,
             top_k,
-            policy=self._policy,
+            # 覆盖语义：非 None 用调用方注入值，None 沿用构造时配置。
+            policy=policy if policy is not None else self._policy,
             rewriter=self._rewriter,
             reranker=self._reranker,
-            refiner=self._refiner,
-            relevance_threshold=self._relevance_threshold,
+            refiner=refiner if refiner is not None else self._refiner,
+            relevance_threshold=(
+                relevance_threshold
+                if relevance_threshold is not None
+                else self._relevance_threshold
+            ),
             max_refine_rounds=self._max_refine_rounds,
             metadata_filter=metadata_filter,
         )

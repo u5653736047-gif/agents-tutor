@@ -614,6 +614,18 @@
   strict（35 文件）干净；独立 review 无 Critical/Important，4 个
   Minor（正则漏判修正、成本上限、refiner 生效语义锁定、取舍注释）
   已处理并复审放行。
+  **事件接线已完成（2026-08-03，工作单 T3）**：工具层
+  `create_search_knowledge_tool` 支持可选 adaptive 装配（policy/
+  relevance_threshold/refiner 注入，默认不注入与现行为逐项一致零回归）；
+  `RetrievalMetadata` 摘要（rounds/threshold_met/stopped_reason/
+  hit_count/top_score/needed/need_reason，不含查询正文）经
+  `RETRIEVAL_DECISION` 事件（graph_builder._wrap 转换，knowledge 包
+  保持零依赖 events）随 checkpoint 持久化供评价审计；
+  threshold_met=False 时 Observation 明确提示「知识库检索未达相关性
+  阈值，知识库可能未覆盖该问题」。新增 15 个测试（多轮 refine 事件
+  轮数与上限、阈值未达标信号与事件、必要性 reason、负值兜底、脏数据
+  跳过、默认路径零回归），全量 627 通过；独立 review 无 Critical，
+  I-1 值域兜底与 2 个 Minor 已处理并复审放行。
 
 ---
 

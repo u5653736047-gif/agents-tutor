@@ -124,7 +124,7 @@ class HashEmbeddingProvider:
             vector = [0.0] * self.dimension
             for feature in _char_features(text):
                 bucket = zlib.crc32(feature.encode("utf-8")) % self.dimension
-                vector[bucket] += 1.0
+                vector[bucket] += 1.0  # 词频权重：特征出现几次，桶里累加几次
             vectors.append(vector)
         return vectors
 

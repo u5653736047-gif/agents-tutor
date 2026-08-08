@@ -50,6 +50,33 @@ npm install
 | `NEXT_PUBLIC_API_BASE_URL` | 可选，前端 API 地址；默认 `http://127.0.0.1:8000`。 |
 | `API_SESSION_STORE_PATH` | 可选，会话 SQLite 文件；默认根目录 `data/api_sessions.sqlite3`。 |
 | `API_CHECKPOINT_PATH` | 可选，图 checkpoint SQLite 文件；默认根目录 `data/api_checkpoints.sqlite3`。 |
+| `API_KNOWLEDGE_DB_PATH` | 可选，知识库词法 SQLite 文件；默认根目录 `data/knowledge.db`（由 ingest 脚本生成，永不降级的底线检索）。 |
+| `API_VECTOR_DB_PATH` | 可选，知识库向量 SQLite 文件；默认根目录 `data/vector_knowledge.db`；不可用（文件不存在 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断启动。 |
+| `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
+
+### 启用真实语义检索（可选）
+
+默认 `uv sync --extra dev` 不安装 fastembed，`auto` 模式会自动回退到
+零依赖的哈希向量（256 维字符特征替身，语义能力有限）。需要真实语义
+检索（fastembed + bge-small-zh-v1.5，512 维）时，在 `backend/` 下安装
+可选依赖并重建向量库：
+
+```powershell
+uv sync --extra embedding   # 或对已存在的环境：uv pip install fastembed
+uv run python scripts/ingest_books.py --force --vector --provider fastembed
+```
+
+注意：fastembed 的向量是 512 维，与哈希库的 256 维不同——重建前请先
+删除旧 `data/vector_knowledge.db`（或用新的 `--vector-db` 路径），
+`--force` 无法绕过维度守卫。
+
+语义检索是否真的在线，看启动日志（`知识检索模式=hybrid
+embedding_provider=FastEmbedProvider vector_dimension=512`）或
+`GET /healthz` 返回的 `retrieval` 字段：`mode` 为 `hybrid` /
+`lexical_only`，`embedding_provider` 为实际打开向量库的 provider 类名，
+`vector_dimension` 为其维度。`mode=hybrid` 且
+`embedding_provider=FastEmbedProvider` 即真实语义检索在线；否则是哈希
+替身或纯词法降级。诊断字段不含任何文件路径。
 
 然后在 Windows PowerShell 的仓库根目录运行一条命令：
 
@@ -64,6 +91,68 @@ npm install
 骨架期的手动验收路径是：在前端创建会话并提问，确认带角色徽章的回答；在 API
 文档中用同一 `demo-user` 和会话 ID 查询 / 提交 handoff 的 `confirm` 或 `reject`，
 再刷新前端验证历史，最后归档会话。审批卡片的完整前端交互属于后续细节清单。
+
+## 容器启动（Docker Compose）
+
+> ⚠️ **验收状态**：本小节由静态审查交付（开发环境无 Docker，未能执行
+> `docker compose up -d` 实测）。YAML/Dockerfile 经逐行人工校验，但
+> 首次使用请按下方启动步骤自行验证；若发现与描述不符，以实测为准
+> 并回报修正。
+
+在具备 Docker 的环境下，可用 Compose 一键拉起前后端，无需本机安装
+Python/Node。仓库根目录的 `docker-compose.yml` 编排两个服务：
+
+| 服务 | 镜像来源 | 对外端口 | 说明 |
+| --- | --- | --- | --- |
+| `api` | `backend/Dockerfile`（python:3.11-slim） | `8000` | FastAPI + uvicorn，已含 `[embedding]` 可选组（fastembed，语义检索开箱可用） |
+| `frontend` | `frontend/Dockerfile`（node:22-alpine） | `3000` | Next.js 生产构建（`next start`） |
+
+启动前先在仓库根目录配置 `.env`（复制 `.env.example` 并填入
+`DEEPSEEK_API_KEY`），然后执行：
+
+```bash
+docker compose up -d --build
+```
+
+浏览器打开 `http://localhost:3000`，API 文档在 `http://localhost:8000/docs`。
+停止与清理：
+
+```bash
+docker compose down      # 停止服务；data/ 数据卷保留
+docker compose down -v   # 停止并删除卷（连同 data/ 数据，慎用）
+```
+
+### 容器版环境变量
+
+与骨架联调一致：密钥与可选配置都来自根目录 `.env`，compose 只做 `${VAR}`
+占位透传，不写死任何密钥（`.env` 已被 Git 忽略）。
+
+| 变量 | 容器内行为 |
+| --- | --- |
+| `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` | 必填，从 `.env` 透传；`DEEPSEEK_API_KEY` 缺失时 `docker compose up` 直接报错 |
+| `API_SESSION_STORE_PATH` 等 5 个 `API_*_PATH` | 容器内固定指向挂载卷 `/app/data/...`。后端默认路径按宿主仓库根解析（`__file__.parents[3]`），容器里会落到不可写的根目录 `/`，必须显式指定；宿主 `.env` 里的 Windows 风格路径对容器无效 |
+| `API_KNOWLEDGE_EMBEDDING` | 可选，默认 `auto`；镜像已装 fastembed，`auto` 即真实语义检索 |
+| `NEXT_PUBLIC_API_BASE_URL` | 前端构建参数，默认 `http://localhost:8000`（见下方说明） |
+
+### 数据卷与前端 API 地址说明
+
+- **数据卷**：`api` 服务的 `./data:/app/data` 把 SQLite 会话、checkpoint、
+  知识库与反馈文件都保留在宿主机 `data/`，`docker compose down` 后数据
+  仍在；`data/knowledge.db` 等可直接复用宿主机现有产物，重建知识库用
+  宿主机脚本 `backend/scripts/ingest_books.py`。注意：若现有向量库维度与
+  容器内 fastembed 不匹配（如宿主是 256 维哈希库），检索会自动降级为纯
+  词法，不阻断启动。
+- **前端 API 地址**：`NEXT_PUBLIC_*` 由 Next.js 在构建时内联进浏览器产物，
+  运行时改环境变量无效，所以 compose 用 build args 传入
+  `http://localhost:8000`（宿主端口映射到 `api` 容器）。不能传 compose
+  内网服务名 `http://api:8000`——那是浏览器里 fetch 的目标地址，用户
+  浏览器解析不了 `api` 主机名；服务间调用（如 healthcheck）才用服务名。
+  已知限制：首页的连接状态徽标由**服务端组件** `app/page.tsx` 在容器内
+  fetch `/healthz` 得出，容器内 `localhost` 指向容器自身——因此容器部署
+  下首页徽标可能显示「后端暂不可用」，但浏览器端实际请求（对话/检索等）
+  仍走 `8000:8000` 映射正常可用。如需徽标准确，可设
+  `SERVER_API_BASE_URL=http://api:8000` 并让 `app/page.tsx` 使用它
+  （当前未实现，列为后续优化）。
 
 ## 验证
 
@@ -91,12 +180,16 @@ Graph 自动同步。归档只让默认会话列表隐藏该记录，不会删�
 
 ## 知识检索
 
-当前知识层使用轻量内存索引，无需学科文档或向量数据库即可测试。调用方加载或
-直接构造 `KnowledgeDocument`，交给 `KnowledgeService`，再通过
+知识层以 SQLite 词法索引为基础（默认 `data/knowledge.db`，由 ingest 脚本
+生成，永不降级的底线检索），按查询词与分块内容的命中情况打分排序。
+`--vector` 可选生成向量索引（默认 `data/vector_knowledge.db`），可用时默认
+检索路径为词法 + 向量混合：两路结果按 RRF 融合排序（S3-T5）；向量索引
+不可用（文件缺失 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断
+启动——相关环境变量见上文表格 `API_KNOWLEDGE_*`。调用方加载或直接构造
+`KnowledgeDocument`，交给 `KnowledgeService`，再通过
 `create_search_knowledge_tool()` 封装为 `search_knowledge` 工具。接入 Graph 时
 应使用 `tool_permissions` 显式授权助教、助学和评价角色；零命中只返回空结果，
-不会生成 Citation。内存索引不提供跨进程持久化，后续可按 `KnowledgeIndex`
-协议替换实现。同一 `document_id` 重导入会替换旧分块；同一 PDF 的多页应在
+不会生成 Citation。同一 `document_id` 重导入会替换旧分块；同一 PDF 的多页应在
 一次 `add_documents()` 调用中提交。
 
 核心架构说明见

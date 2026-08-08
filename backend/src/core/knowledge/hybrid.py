@@ -146,7 +146,7 @@ class HybridKnowledgeIndex:
         # RRF 融合：chunk_id → 融合分 = Σ 1/(k + 该路排名)（公式见模块注释）。
         fused: dict[str, float] = {}
         for hits in (lexical_hits, vector_hits):
-            for rank, hit in enumerate(hits, start=1):
+            for rank, hit in enumerate(hits, start=1):  # 排名从 1 起：第 1 名权重 1/(k+1) 最高
                 fused[hit.chunk.chunk_id] = (
                     fused.get(hit.chunk.chunk_id, 0.0) + 1.0 / (self._rrf_k + rank)
                 )

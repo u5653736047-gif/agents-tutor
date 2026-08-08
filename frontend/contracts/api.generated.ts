@@ -24,6 +24,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/chat/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Chat Stream
+         * @description SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。
+         *
+         *     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
+         *     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
+         *
+         *     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
+         *     sequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端
+         *     回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新
+         *     消息,启动新 run。
+         */
+        post: operations["chat_stream_chat_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/feedback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Feedback
+         * @description 记录一条用户反馈,返回受理确认。
+         *
+         *     只存脱敏引用字段:record 固定 7 个键,不含消息全文;user_id 为
+         *     None 时落 null(匿名反馈),与会话 API 的匿名语义一致。
+         */
+        post: operations["submit_feedback_feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload File
+         * @description 上传聊天附件(按用户隔离存储),返回受控下载回执。
+         *
+         *     - 扩展名白名单 / 大小上限 / 空文件都在 API 层拦截为 422(大小在
+         *       逐块读取时累计,不能信 Content-Length);
+         *     - 存储目录按 user_key 隔离(消毒后的 X-User-Id,None → anonymous);
+         *       落盘名是 uuid4().hex + 白名单后缀,原始文件名只作展示字段返回;
+         *     - 同步写盘走 run_in_threadpool,不阻塞事件循环;写盘失败(OSError
+         *       等)统一映射 500 internal_error,不泄底层细节。
+         */
+        post: operations["upload_file_files_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/files/{file_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Uploaded File
+         * @description 按受控下载路径提供已上传文件(用户隔离校验)。
+         *
+         *     - file_id 必须是安全段(见 _is_safe_segment),不匹配一律 404;
+         *     - 存储路径 {root}/{user_key}/{file_id}:user_key 由当前 X-User-Id
+         *       消毒得出(与上传同源)——他人目录下的 uuid 文件名不可枚举,
+         *       等价于文件不存在,统一 404(不返回 403,避免泄露目录存在性);
+         *     - media_type 按扩展名映射,与上传响应的 content_type 同源
+         *       (_UPLOAD_CONTENT_TYPES);底层读盘异常映射 500。
+         */
+        get: operations["get_uploaded_file_files__file_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -31,10 +136,111 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Healthz */
+        /**
+         * Healthz
+         * @description 存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+         *
+         *     - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
+         *       {"status": "ok"} 现状，不破坏既有探针语义与测试；
+         *     - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
+         *       vector_dimension），运维据此判断语义检索是否在线。诊断只含
+         *       这三个字段，绝不含任何文件路径。
+         */
         get: operations["healthz_healthz_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Documents
+         * @description 列出通过 API 上传的文档元数据。
+         *
+         *     core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
+         *     delete_document / search),因此 API 层维护进程内注册表
+         *     (_document_registry):只登记经 POST /knowledge/documents 上传的
+         *     文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
+         *     (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
+         *     app 生命周期,测试各 app 实例隔离)。
+         */
+        get: operations["list_documents_knowledge_documents_get"];
+        put?: never;
+        /**
+         * Upload Document
+         * @description 上传 txt/pdf 文档入库(幂等替换),返回文档元数据回执。
+         *
+         *     - 扩展名白名单 / 大小上限 / 空文件都在 API 层拦截为 422,不依赖
+         *       core 运行时异常(大小在逐块读取时累计,不能信 Content-Length);
+         *     - document_id = 上传文件名 stem,source = 上传文件名(逻辑标识,
+         *       不泄漏文件系统路径):重传同名文件 → 同一 document_id → core
+         *       替换语义,旧内容被新内容覆盖;
+         *     - loader 解析失败(空文件/无文本/损坏 PDF)映射 422 invalid_request
+         *       (内容不可解析属请求问题);入库内部异常映射 500 internal_error,
+         *       不泄底层细节。
+         */
+        post: operations["upload_document_knowledge_documents_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents/{document_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Document
+         * @description 删除文档(幂等:文档不存在也返回 204,不报 404)。
+         *
+         *     core 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),
+         *     且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法
+         *     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
+         *     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
+         *     404 区分。注册表同步移除该条目。
+         */
+        delete: operations["delete_document_knowledge_documents__document_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search Knowledge
+         * @description 检索知识库,返回命中的脱敏摘要与逻辑引用。
+         *
+         *     - 空库返回空 hits,不报错(与 core 语义一致);
+         *     - top_k 已被 Pydantic 拦截在 1-10,core 的 ValueError 兜底不会
+         *       触发(见 KnowledgeSearchRequest 注释);
+         *     - service.search 内部异常统一映射 500 internal_error,不泄底层
+         *       细节(与 api/feedback 的存储异常处理同构)。
+         */
+        post: operations["search_knowledge_knowledge_search_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -129,6 +335,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/stats/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stats Overview
+         * @description 返回当前用户的学习进度基础统计(只读聚合)。
+         */
+        get: operations["stats_overview_stats_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -144,12 +370,48 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found";
+        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
+        /**
+         * Attachment
+         * @description 聊天消息附件引用(D7-T1 契约扩展预留)。
+         *
+         *     - file_id / name / content_type / size 由上传回执(FILE-UPLOAD)填充;
+         *     - 骨架期 chat 路由忽略该字段不影响现有行为(见 ChatRequest 注释),由
+         *       D7-T3 或后续 core 能力决定如何进入模型上下文。
+         */
+        Attachment: {
+            /**
+             * Content Type
+             * @default null
+             */
+            content_type?: string | null;
+            /** File Id */
+            file_id: string;
+            /** Name */
+            name: string;
+            /** Size */
+            size: number;
+        };
+        /** Body_upload_document_knowledge_documents_post */
+        Body_upload_document_knowledge_documents_post: {
+            /** File */
+            file: string;
+        };
+        /** Body_upload_file_files_post */
+        Body_upload_file_files_post: {
+            /** File */
+            file: string;
+        };
         /**
          * ChatRequest
          * @description One synchronous user message for a session.
          */
         ChatRequest: {
+            /**
+             * Attachments
+             * @default null
+             */
+            attachments?: components["schemas"]["Attachment"][] | null;
             /** Message */
             message: string;
             /** Session Id */
@@ -236,27 +498,96 @@ export interface components {
             detail: components["schemas"]["ErrorDetail"];
         };
         /**
-         * HandoffDecisionAction
-         * @description Approval actions supported by the skeleton API.
+         * FeedbackRating
+         * @description 用户反馈评分方向。
          * @enum {string}
          */
-        HandoffDecisionAction: "confirm" | "reject";
+        FeedbackRating: "up" | "down";
+        /**
+         * FeedbackRequest
+         * @description 用户反馈请求体(只收脱敏引用字段,不收消息全文)。
+         */
+        FeedbackRequest: {
+            /**
+             * Comment
+             * @default null
+             */
+            comment?: string | null;
+            /**
+             * Error Code
+             * @default null
+             */
+            error_code?: string | null;
+            /**
+             * Message Id
+             * @default null
+             */
+            message_id?: string | null;
+            rating: components["schemas"]["FeedbackRating"];
+            /** Session Id */
+            session_id: string;
+        };
+        /**
+         * FeedbackResponse
+         * @description 反馈受理确认。
+         */
+        FeedbackResponse: {
+            /**
+             * Received
+             * @default true
+             */
+            received?: boolean;
+        };
+        /**
+         * FileUploadResponse
+         * @description 文件上传回执(D7-T1):url 为受控下载的相对路径。
+         *
+         *     - file_id 是服务端生成的 uuid4().hex + 白名单后缀(落盘名),url 形如
+         *       /files/{file_id}——客户端凭 url 即可 GET 下载,url 不含原始文件名
+         *       (后者只作展示字段 name);
+         *     - content_type 由服务端按扩展名映射,不信任客户端伪造的类型;
+         *     - name 是原始文件名(仅展示用;落盘名是 uuid,见 api/files.py 的
+         *       防穿越设计)。
+         */
+        FileUploadResponse: {
+            /** Content Type */
+            content_type: string | null;
+            /** File Id */
+            file_id: string;
+            /** Name */
+            name: string;
+            /** Size */
+            size: number;
+            /** Url */
+            url: string;
+        };
+        /** HTTPValidationError */
+        HTTPValidationError: {
+            /** Detail */
+            detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * HandoffDecisionAction
+         * @description Approval actions for one pending handoff interrupt.
+         * @enum {string}
+         */
+        HandoffDecisionAction: "confirm" | "reject" | "modify";
         /**
          * HandoffDecisionRequest
-         * @description A confirmation or rejection for one pending handoff interrupt.
+         * @description A confirmation, rejection, or modification for one pending handoff interrupt.
          */
         HandoffDecisionRequest: {
             action: components["schemas"]["HandoffDecisionAction"];
             /** Interrupt Id */
             interrupt_id: string;
             /**
-             * @description Reserved for a future modification workflow.
+             * @description The modified target worker; only valid when action is modify.
              * @default null
              */
             target_agent?: components["schemas"]["WorkerAgentRole"] | null;
             /**
              * Task Content
-             * @description Reserved for a future modification workflow.
+             * @description The modified task content; only valid when action is modify.
              * @default null
              */
             task_content?: string | null;
@@ -276,12 +607,94 @@ export interface components {
             task_content: string;
         };
         /**
+         * KnowledgeDocumentListEntry
+         * @description 知识库文档列表条目(只读元数据,不含内容)。
+         *
+         *     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
+         *     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+         */
+        KnowledgeDocumentListEntry: {
+            /**
+             * Chunk Count
+             * @default null
+             */
+            chunk_count?: number | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
+        };
+        /**
+         * KnowledgeDocumentListResponse
+         * @description 文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。
+         */
+        KnowledgeDocumentListResponse: {
+            /** Documents */
+            documents: components["schemas"]["KnowledgeDocumentListEntry"][];
+        };
+        /**
+         * KnowledgeDocumentUploadResponse
+         * @description 上传解析结果:文档已入库(幂等替换)后的元数据回执。
+         */
+        KnowledgeDocumentUploadResponse: {
+            /**
+             * Chunk Count
+             * @default null
+             */
+            chunk_count?: number | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
+        };
+        /**
+         * KnowledgeSearchRequest
+         * @description 知识库检索请求。
+         *
+         *     top_k 必须由 API 层校验(Field ge/le)拦截在 422,不得依赖 core
+         *     的 ValueError 运行时兜底(会变 500);query 的空白拦截与
+         *     ChatRequest.reject_blank_text 同构(core 对空白 query 抛
+         *     ValueError,同样要拦在 API 层)。
+         */
+        KnowledgeSearchRequest: {
+            /** Query */
+            query: string;
+            /**
+             * Top K
+             * @default 5
+             */
+            top_k?: number;
+        };
+        /**
+         * KnowledgeSearchResponse
+         * @description 检索结果(空库返回空 hits,不报错)。
+         */
+        KnowledgeSearchResponse: {
+            /** Hits */
+            hits: components["schemas"]["SearchHitDto"][];
+        };
+        /**
          * Message
          * @description A safe user or assistant message.
          */
         Message: {
             /** @default null */
             agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Attachments
+             * @default null
+             */
+            attachments?: components["schemas"]["Attachment"][] | null;
             /** Content */
             content: string;
             /**
@@ -372,6 +785,17 @@ export interface components {
             tool_name?: string | null;
         };
         /**
+         * SearchHitDto
+         * @description 检索命中的脱敏表示:chunk 摘要(截断)+ 逻辑 source 引用 + 分数。
+         */
+        SearchHitDto: {
+            citation: components["schemas"]["Citation"];
+            /** Score */
+            score: number;
+            /** Summary */
+            summary: string;
+        };
+        /**
          * Session
          * @description A session visible to its owner.
          */
@@ -387,6 +811,92 @@ export interface components {
             session_id: string;
             /** User Id */
             user_id: string | null;
+        };
+        /**
+         * StatsOverview
+         * @description 学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。
+         *
+         *     - agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /
+         *       teaching_assistant / learning_assistant / evaluator),口径与
+         *       api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;
+         *     - last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at
+         *       的最大值(langchain-core 的 BaseMessage 无 created_at 字段,
+         *       消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。
+         */
+        StatsOverview: {
+            /** Agent Answer Counts */
+            agent_answer_counts: {
+                [key: string]: number;
+            };
+            /** Last Activity At */
+            last_activity_at: string | null;
+            /** Message Count */
+            message_count: number;
+            /** Session Count */
+            session_count: number;
+        };
+        /**
+         * StreamEvent
+         * @description SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
+         *
+         *     事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
+         *     的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
+         *     - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
+         *       成功与否、耗时等摘要,绝不含工具参数与结果正文;
+         *     - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
+         *       模型中间输出;
+         *     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
+         *       ChatResponse.message.content 同源)。
+         *     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
+         *     ApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。
+         */
+        StreamEvent: {
+            /** @default null */
+            agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Citations
+             * @default null
+             */
+            citations?: components["schemas"]["Citation"][] | null;
+            /**
+             * Content
+             * @default null
+             */
+            content?: string | null;
+            /** @default null */
+            current_agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Duration Ms
+             * @default null
+             */
+            duration_ms?: number | null;
+            /**
+             * Error Code
+             * @default null
+             */
+            error_code?: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"] | null;
+            event_type: components["schemas"]["StreamEventType"];
+            /** @default null */
+            message?: components["schemas"]["Message"] | null;
+            /**
+             * Plan Step Sequence
+             * @default null
+             */
+            plan_step_sequence?: number | null;
+            /** Sequence */
+            sequence: number;
+            /** Session Id */
+            session_id: string;
+            /**
+             * Success
+             * @default null
+             */
+            success?: boolean | null;
+            /**
+             * Tool Name
+             * @default null
+             */
+            tool_name?: string | null;
         };
         /**
          * StreamEventType
@@ -439,6 +949,19 @@ export interface components {
             /** Success */
             success: boolean;
             target_agent: components["schemas"]["WorkerAgentRole"];
+        };
+        /** ValidationError */
+        ValidationError: {
+            /** Context */
+            ctx?: Record<string, never>;
+            /** Input */
+            input?: unknown;
+            /** Location */
+            loc: (string | number)[];
+            /** Message */
+            msg: string;
+            /** Error Type */
+            type: string;
         };
         /**
          * WorkerAgentRole
@@ -499,6 +1022,191 @@ export interface operations {
             };
         };
     };
+    chat_stream_chat_stream_post: {
+        parameters: {
+            query?: {
+                from_sequence?: number;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_feedback_feedback_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FeedbackRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FeedbackResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    upload_file_files_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_file_files_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileUploadResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_uploaded_file_files__file_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     healthz_healthz_get: {
         parameters: {
             query?: never;
@@ -515,8 +1223,204 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        [key: string]: string;
+                        [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    list_documents_knowledge_documents_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    upload_document_knowledge_documents_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_document_knowledge_documents_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentUploadResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    delete_document_knowledge_documents__document_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    search_knowledge_knowledge_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KnowledgeSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeSearchResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };
@@ -815,6 +1719,55 @@ export interface operations {
             };
             /** @description Unprocessable Entity */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    stats_overview_stats_overview_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatsOverview"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

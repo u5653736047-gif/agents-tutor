@@ -467,6 +467,78 @@ def test_service_search_accepts_metadata_filter() -> None:
     assert empty == []
 
 
+def _frontmatter_documents() -> list[KnowledgeDocument]:
+    """一份「目录页 + 正文页」文档对：目录页被启发式标为 frontmatter。"""
+    return [
+        KnowledgeDocument(
+            document_id="fm",
+            content="1 Introduction 1\n2 Fundamentals 15",
+            source="fm.txt",
+            page=5,
+        ),
+        KnowledgeDocument(
+            document_id="body",
+            content="support vector machine kernel",
+            source="body.txt",
+            page=100,
+        ),
+    ]
+
+
+def test_service_suppresses_frontmatter_by_default() -> None:
+    """H-T2 默认抑制：search 自动附加 chunk_class=!frontmatter 排除。"""
+    service = KnowledgeService(InMemoryKnowledgeIndex(), chunk_size=100, overlap=0)
+    service.add_documents(_frontmatter_documents())
+
+    hits = service.search("support vector machine kernel introduction", top_k=10)
+
+    # 目录页（fm）被默认排除，只剩正文页（body）。
+    assert [hit.chunk.document_id for hit in hits] == ["body"]
+
+
+def test_service_suppress_frontmatter_false_keeps_them() -> None:
+    """suppress_frontmatter=False：关闭默认抑制，frontmatter chunk 照常返回。"""
+    service = KnowledgeService(
+        InMemoryKnowledgeIndex(),
+        chunk_size=100,
+        overlap=0,
+        suppress_frontmatter=False,
+    )
+    service.add_documents(_frontmatter_documents())
+
+    hits = service.search("support vector machine kernel introduction", top_k=10)
+
+    # fm 词法 1 分（introduction），body 4 分 → 排序 body 在前。
+    assert [hit.chunk.document_id for hit in hits] == ["body", "fm"]
+
+
+def test_service_explicit_chunk_class_filter_wins_over_suppression() -> None:
+    """调用方显式传含 chunk_class 的过滤条件时，尊重调用方，不合并。"""
+    service = KnowledgeService(InMemoryKnowledgeIndex(), chunk_size=100, overlap=0)
+    service.add_documents(_frontmatter_documents())
+
+    hits = service.search(
+        "support vector machine kernel introduction",
+        top_k=10,
+        metadata_filter={"chunk_class": "frontmatter"},
+    )
+
+    # 显式精确限定 frontmatter：不被默认抑制覆盖，只剩目录页。
+    assert [hit.chunk.document_id for hit in hits] == ["fm"]
+
+
+def test_adaptive_search_suppresses_frontmatter() -> None:
+    """H-T2：adaptive_search 与 search 同一套默认抑制（三路一致）。"""
+    service = KnowledgeService(InMemoryKnowledgeIndex(), chunk_size=100, overlap=0)
+    service.add_documents(_frontmatter_documents())
+
+    result = service.adaptive_search(
+        "support vector machine kernel introduction", top_k=10
+    )
+
+    assert [hit.chunk.document_id for hit in result.hits] == ["body"]
+
+
 # ── 4. ingest 端到端：清单注入 + 规则提取合流 ────────────────────
 
 
@@ -519,3 +591,170 @@ def test_ingest_combines_injected_and_extracted_metadata(tmp_path: Path) -> None
         assert "支持向量机" in metadata["tags"]
     finally:
         index.close()
+
+
+# ── 5. H-T2 否定/排除语义（值以 ! 开头）──────────────────────────
+
+
+def _frontmatter_chunks() -> list[KnowledgeChunk]:
+    """带 chunk_class 的样本：一个 frontmatter + 一个普通正文 chunk。"""
+    return [
+        _chunk(
+            "fm1",
+            "frontmatter content",
+            source="ml-zhouzhihua",
+            metadata={"chunk_class": "frontmatter", "tags": ["frontmatter", "ml"]},
+        ),
+        _chunk(
+            "body1",
+            "support vector machine",
+            source="ml-zhouzhihua",
+            metadata={"chunk_class": "body", "tags": ["ml"]},
+        ),
+    ]
+
+
+def test_filter_excludes_value_with_bang_prefix(index: KnowledgeIndex) -> None:
+    """值以 ! 开头表示排除：chunk_class=frontmatter 的 chunk 被剔除。"""
+    index.upsert(_frontmatter_chunks())
+
+    hits = index.search(
+        "support vector machine frontmatter",
+        top_k=10,
+        metadata_filter={"chunk_class": "!frontmatter"},
+    )
+
+    assert [hit.chunk.chunk_id for hit in hits] == ["body1"]
+
+
+def test_filter_exclude_missing_key_passes(index: KnowledgeIndex) -> None:
+    """排除条件对「没有该键」的 chunk 通过（键不存在不匹配排除条件）。"""
+    index.upsert(
+        [
+            _chunk("plain", "support vector machine", source="ml-zhouzhihua"),
+            _chunk(
+                "fm",
+                "support vector kernel",
+                source="ml-zhouzhihua",
+                metadata={"chunk_class": "frontmatter"},
+            ),
+        ]
+    )
+
+    hits = index.search(
+        "support vector machine kernel",
+        top_k=10,
+        metadata_filter={"chunk_class": "!frontmatter"},
+    )
+
+    # plain 没有 chunk_class 键 → 不被排除；fm 命中排除值 → 被剔除。
+    assert [hit.chunk.chunk_id for hit in hits] == ["plain"]
+
+
+def test_filter_exclude_list_value(index: KnowledgeIndex) -> None:
+    """排除 + 列表值：列表任一元素等于排除值即被剔除；无关值通过。"""
+    index.upsert(
+        [
+            _chunk(
+                "tagged",
+                "support vector machine",
+                source="ml-zhouzhihua",
+                metadata={"tags": ["frontmatter", "ml"]},
+            ),
+            _chunk(
+                "plain",
+                "support vector",
+                source="dl-d2l",
+                metadata={"tags": ["ml"]},
+            ),
+        ]
+    )
+
+    excluded = index.search(
+        "support vector machine",
+        top_k=10,
+        metadata_filter={"tags": "!frontmatter"},
+    )
+    assert [hit.chunk.chunk_id for hit in excluded] == ["plain"]
+
+    # 两个 chunk 的 tags 都含 "ml" → 全部被排除 → 空列表（不报错）。
+    excluded_ml = index.search(
+        "support vector machine",
+        top_k=10,
+        metadata_filter={"tags": "!ml"},
+    )
+    assert excluded_ml == []
+
+    # 排除一个不存在的值：所有 chunk 都通过（普通语义不受影响）。
+    kept = index.search(
+        "support vector machine",
+        top_k=10,
+        metadata_filter={"tags": "!other"},
+    )
+    assert [hit.chunk.chunk_id for hit in kept] == ["tagged", "plain"]
+
+
+def test_filter_excludes_source_with_bang(index: KnowledgeIndex) -> None:
+    """!source：排除某本书（source 顶层字段），其余书保留。"""
+    index.upsert(_domain_chunks())
+
+    hits = index.search(
+        "support vector machine",
+        top_k=10,
+        metadata_filter={"source": "!ml-zhouzhihua"},
+    )
+
+    assert [hit.chunk.chunk_id for hit in hits] == ["c3"]
+
+
+def test_filter_plain_value_still_exact_match(index: KnowledgeIndex) -> None:
+    """普通值（不以 ! 开头）语义不变：chunk_class 精确匹配（肯定语义回归）。"""
+    index.upsert(_frontmatter_chunks())
+
+    hits = index.search(
+        "support vector machine frontmatter",
+        top_k=10,
+        metadata_filter={"chunk_class": "frontmatter"},
+    )
+
+    assert [hit.chunk.chunk_id for hit in hits] == ["fm1"]
+
+
+def test_filter_exclude_composes_with_other_keys(index: KnowledgeIndex) -> None:
+    """排除条件与其它键 AND 组合：同时满足才入选（多键语义不受影响）。
+
+    review 补充：排除语义不是独立开关，必须与既有的多键 AND 契约
+    正确组合——{"source": "algebra", "chunk_class": "!frontmatter"}
+    表示「algebra 这本书里排除 frontmatter」。
+    """
+    index.upsert(
+        [
+            _chunk(
+                "fm-algebra",
+                "support vector machine",
+                source="algebra",
+                metadata={"chunk_class": "frontmatter"},
+            ),
+            _chunk(
+                "body-algebra",
+                "support vector kernel",
+                source="algebra",
+            ),
+            _chunk(
+                "fm-ml",
+                "support vector",
+                source="ml-zhouzhihua",
+                metadata={"chunk_class": "frontmatter"},
+            ),
+        ]
+    )
+
+    hits = index.search(
+        "support vector machine kernel",
+        top_k=10,
+        metadata_filter={"source": "algebra", "chunk_class": "!frontmatter"},
+    )
+
+    # algebra 书中排除 frontmatter 后只剩 body-algebra；fm-ml 因 source
+    # 不匹配（AND）不入选——排除语义与既有多键 AND 契约正确组合。
+    assert [hit.chunk.chunk_id for hit in hits] == ["body-algebra"]

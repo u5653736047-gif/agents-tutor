@@ -27,13 +27,16 @@ def create_agent_nodes(
     tool_timeouts: Mapping[str, float] | None = None,
 ) -> dict[AgentRole, ReActAgentNode]:
     """共享模型、工具和循环配置，仅为每个角色替换 Prompt。"""
+    # 所有角色共享同一个工具执行器：同一份工具注册表与超时配置。
     tool_executor = ToolExecutor(
         tools,
         registry=registry,
         tool_timeout_seconds=tool_timeout_seconds,
         tool_timeouts=tool_timeouts,
     )
+    # 工具只绑定一次，四个 Agent 复用同一模型实例（省内存、行为一致）。
     prepared_model = _bind_tools(model, tool_executor.registry.list_tools())
+    # 按角色批量创建 4 个 Agent：共享模型/工具/循环配置，仅 Prompt（与可选的动态提示词）不同。
     return {
         role: ReActAgentNode(
             role=role,

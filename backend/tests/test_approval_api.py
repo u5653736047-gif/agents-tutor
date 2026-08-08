@@ -13,8 +13,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from api.app import create_app
 from core.events import EventType, RunEvent
+from core.knowledge.models import Citation as CoreCitation
 from core.sessions import SessionStore
 from core.state import (
+    REFERENCES_METADATA_KEY,
     AgentRole,
     HandoffApprovalAction,
     HandoffApprovalDecision,
@@ -300,6 +302,7 @@ def test_confirm_handoff_resumes_in_a_worker_and_returns_chat_response(tmp_path:
         "content": "continued answer",
         "agent": "teaching_assistant",
         "created_at": None,
+        "attachments": None,
     }
     assert [event["sequence"] for event in response.json()["events"]] == [1, 2]
     assert response.json()["pending_handoff"] is None
@@ -368,6 +371,273 @@ def test_approval_rejects_reserved_modification_fields(tmp_path: Path) -> None:
                     "interrupt_id": "interrupt-1",
                     "action": "confirm",
                     "task_content": "modified content",
+                },
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"error_code": "invalid_request", "message": "Request is invalid."}
+    }
+    assert graph.resume_inputs == []
+
+
+def test_confirm_handoff_response_carries_references_from_the_final_message(
+    tmp_path: Path,
+) -> None:
+    """审批确认路径复用 chat_response_for_state，同样填充 references。"""
+    previous_message = HumanMessage(content="original request")
+    answer = AIMessage(
+        content="continued answer",
+        additional_kwargs={
+            REFERENCES_METADATA_KEY: [
+                CoreCitation(
+                    document_id="algebra",
+                    source="algebra.txt",
+                    page=1,
+                    chunk_id="chunk-algebra-1",
+                ).model_dump(mode="json")
+            ]
+        },
+    )
+    previous_event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=0,
+        session_id="session-1",
+        agent="supervisor",
+    )
+    graph = ApprovalGraph(
+        {
+            "messages": [previous_message, answer],
+            "events": [
+                previous_event,
+                RunEvent(
+                    event_type=EventType.RUN_COMPLETED,
+                    sequence=1,
+                    session_id="session-1",
+                    success=True,
+                ),
+            ],
+            "current_agent": "teaching_assistant",
+            "run_error": None,
+        },
+        previous_state={"messages": [previous_message], "events": [previous_event]},
+        pending_handoff=_pending_handoff(),
+    )
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {"interrupt_id": "interrupt-1", "action": "confirm"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert response.json()["references"] == [
+        {
+            "document_id": "algebra",
+            "source": "algebra.txt",
+            "page": 1,
+            "chunk_id": "chunk-algebra-1",
+        }
+    ]
+
+
+# D2-T4:审批修改工作流(修改目标 Agent / 任务内容)————————————————
+def _modified_run_state(previous_message: HumanMessage) -> dict[str, Any]:
+    """modify 成功路径的替身 state(与 confirm 成功测试同构)。"""
+    return {
+        "messages": [previous_message, AIMessage(content="continued answer")],
+        "events": [
+            RunEvent(
+                event_type=EventType.AGENT_STARTED,
+                sequence=0,
+                session_id="session-1",
+                agent="supervisor",
+            ),
+            RunEvent(
+                event_type=EventType.RUN_COMPLETED,
+                sequence=1,
+                session_id="session-1",
+                success=True,
+            ),
+        ],
+        "current_agent": "learning_assistant",
+        "run_error": None,
+    }
+
+
+def test_decide_handoff_modify_target_agent_resumes_with_the_new_target(
+    tmp_path: Path,
+) -> None:
+    """D2-T4:modify 仅改目标 Agent 时,core 决策携带新目标与 action=modify。"""
+    previous_message = HumanMessage(content="original request")
+    previous_event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=0,
+        session_id="session-1",
+        agent="supervisor",
+    )
+    graph = ApprovalGraph(
+        _modified_run_state(previous_message),
+        previous_state={"messages": [previous_message], "events": [previous_event]},
+        pending_handoff=_pending_handoff(),
+    )
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {
+                    "interrupt_id": "interrupt-1",
+                    "action": "modify",
+                    "target_agent": "learning_assistant",
+                },
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert len(graph.resume_inputs) == 1
+    _, decision, user_id = graph.resume_inputs[0]
+    assert decision.action is HandoffApprovalAction.MODIFY
+    assert decision.target_agent == AgentRole.LEARNING_ASSISTANT
+    assert decision.task_content is None
+    assert user_id == "user-1"
+
+
+def test_decide_handoff_modify_task_content_resumes_with_the_new_content(
+    tmp_path: Path,
+) -> None:
+    """D2-T4:modify 仅改任务内容时,core 决策携带新内容。"""
+    previous_message = HumanMessage(content="original request")
+    previous_event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=0,
+        session_id="session-1",
+        agent="supervisor",
+    )
+    graph = ApprovalGraph(
+        _modified_run_state(previous_message),
+        previous_state={"messages": [previous_message], "events": [previous_event]},
+        pending_handoff=_pending_handoff(),
+    )
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {
+                    "interrupt_id": "interrupt-1",
+                    "action": "modify",
+                    "task_content": "rewrite the lesson plan",
+                },
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert len(graph.resume_inputs) == 1
+    _, decision, _ = graph.resume_inputs[0]
+    assert decision.action is HandoffApprovalAction.MODIFY
+    assert decision.target_agent is None
+    assert decision.task_content == "rewrite the lesson plan"
+
+
+def test_decide_handoff_modify_carries_both_fields_when_provided(
+    tmp_path: Path,
+) -> None:
+    """D2-T4:modify 同时携带目标与内容时,两个字段都透传给 core。"""
+    previous_message = HumanMessage(content="original request")
+    previous_event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=0,
+        session_id="session-1",
+        agent="supervisor",
+    )
+    graph = ApprovalGraph(
+        _modified_run_state(previous_message),
+        previous_state={"messages": [previous_message], "events": [previous_event]},
+        pending_handoff=_pending_handoff(),
+    )
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {
+                    "interrupt_id": "interrupt-1",
+                    "action": "modify",
+                    "target_agent": "learning_assistant",
+                    "task_content": "rewrite the lesson plan",
+                },
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert len(graph.resume_inputs) == 1
+    _, decision, _ = graph.resume_inputs[0]
+    assert decision.action is HandoffApprovalAction.MODIFY
+    assert decision.target_agent == AgentRole.LEARNING_ASSISTANT
+    assert decision.task_content == "rewrite the lesson plan"
+
+
+def test_decide_handoff_modify_without_changes_is_rejected(tmp_path: Path) -> None:
+    """D2-T4:modify 未携带任何修改字段 → 422(双分支第一半)。"""
+    graph = ApprovalGraph(pending_handoff=_pending_handoff())
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {"interrupt_id": "interrupt-1", "action": "modify"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"error_code": "invalid_request", "message": "Request is invalid."}
+    }
+    assert graph.resume_inputs == []
+
+
+def test_decide_handoff_confirm_with_modification_fields_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """D2-T4:confirm 携带修改字段 → 422(双分支第二半)。"""
+    graph = ApprovalGraph(pending_handoff=_pending_handoff())
+    app, store = _approval_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _submit_decision(
+                app,
+                "session-1",
+                {
+                    "interrupt_id": "interrupt-1",
+                    "action": "confirm",
+                    "target_agent": "learning_assistant",
                 },
             )
         )

@@ -284,6 +284,7 @@ def message_references(message: BaseMessage) -> list[Citation] | None:
     return citations
 
 
+# 可被分派执行任务的 Worker 角色子集（Supervisor 只调度、不执行）
 WorkerAgentRole = Literal[
     AgentRole.TEACHING_ASSISTANT,
     AgentRole.LEARNING_ASSISTANT,
@@ -330,6 +331,7 @@ class TaskContext(BaseModel):
     各子 Agent 读取自身相关的任务信息执行工作。
     """
 
+    # 12 位随机短 ID：任务唯一标识（短到方便展示，碰撞概率足够低）
     task_id: str = Field(default_factory=lambda: uuid4().hex[:12])
     # 注意与 state["intent"] 的约束差异是有意的：
     # - state["intent"] 是严格校验后的 Intent 枚举值字符串（每轮重置，

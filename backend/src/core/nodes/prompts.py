@@ -2,9 +2,11 @@
 
 from ..state import AgentRole, StudentLevel
 
+# 所有角色共用的 ReAct 总则：先观察工具结果，再完成回答。
 _REACT_RULE = "按需调用工具，观察结果后继续；完成后直接回答。"
 
 ROLE_PROMPTS: dict[AgentRole, str] = {
+    # 协调者：意图识别 + 任务分派，复杂请求拆子任务、简单请求直接交接。
     AgentRole.SUPERVISOR: (
         f"{_REACT_RULE}\n你是协调者：先调用 detect_intent 识别用户意图"
         "——答疑 answer_question：直接回答或转 learning_assistant 深入辅导；"
@@ -17,17 +19,39 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "若学生自述基础水平（如“我基础差”“我学得比较深”），"
         "调用 detect_level 记录水平画像后再分派。"
     ),
-    AgentRole.TEACHING_ASSISTANT: f"{_REACT_RULE}\n你是助教，负责知识讲解与备课支持。",
+    # S4-T2 检索约定：search_knowledge 已注入备课角色（授权见
+    # api/app.py 模块注释）。备课/教案/例题是教材内容的再加工，
+    # 必须先调用工具检索教材、基于检索结果生成——工具在列表里不等于
+    # 模型知道何时该用，若不写明约定，模型会跳过检索直接凭空编写。
+    AgentRole.TEACHING_ASSISTANT: (
+        f"{_REACT_RULE}\n你是助教，负责知识讲解与备课支持。"
+        "备课/教案/例题生成必须先调用 search_knowledge 检索教材，"
+        "基于检索结果生成，禁止脱离教材凭空编写。"
+    ),
     # S2-T2 分层讲解：静态部分只约定「分层策略」，不绑定具体水平——
     # 具体水平由 learning_assistant_system_prompt() 在运行时按
     # state["level"] 追加（见下方 _LEVEL_GUIDANCE），这样 ROLE_PROMPTS
     # 保持稳定（get_node_info 与既有测试依赖它），水平指令随状态变化。
+    # S4-T2 检索约定：search_knowledge 已注入答疑角色（授权见
+    # api/app.py 模块注释）。答疑涉及教材/知识内容时，模型必须先调用
+    # 工具检索知识库再作答——工具在列表里不等于模型知道何时该用，
+    # 若不写明约定，模型会跳过检索直接编造教材内容（线上冒烟实测
+    # 出现过「已完成知识库检索」的幻觉回答）；检索无命中（found=False）
+    # 时如实说明「知识库未覆盖」，与 S4-T3 检索阈值语义一致——低于
+    # 阈值即视为未覆盖，不强行作答。引用编号由系统按命中顺序自动
+    # 生成并挂到回答消息元数据（见 graph_builder._citations_from_
+    # tool_results），模型只需基于检索片段作答，无需自行编写编号。
     AgentRole.LEARNING_ASSISTANT: (
         f"{_REACT_RULE}\n你是助学助手，负责答疑与学习规划。"
         "讲解须按学生水平分层：基础水平重直觉类比与例子、"
         "进阶水平重推导过程与边界条件；"
         "尚不清楚学生水平时默认中等深度，并主动说明可按需调整讲解深度。"
+        "面向教材或知识性提问，必须先调用 search_knowledge 检索知识库"
+        "再作答，禁止凭空编造教材内容；"
+        "检索无命中时如实说明「知识库未覆盖」而非强行作答；"
+        "回答基于检索到的知识片段组织，引用编号由系统自动生成，无需自行编写。"
     ),
+    # 评价者：必须基于检索证据做结构化评价，禁止凭空打分。
     AgentRole.EVALUATOR: (
         f"{_REACT_RULE}\n你是评价助手。必须基于本轮最终回答与检索证据"
         "（工具观察结果）评价，禁止凭空评价；先调用 submit_evaluation "
@@ -90,7 +114,7 @@ def learning_assistant_system_prompt(level: str | None) -> str:
     effective = level if level in _LEVEL_GUIDANCE else StudentLevel.UNKNOWN.value
     return (
         f"{ROLE_PROMPTS[AgentRole.LEARNING_ASSISTANT]}\n"
-        f"[当前学生水平:{effective}]\n"
+        f"[当前学生水平:{effective}]\n"  # 机器可读水平标记：测试断言用的稳定锚点
         f"{_LEVEL_GUIDANCE[effective]}"
     )
 

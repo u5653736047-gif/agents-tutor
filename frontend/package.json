@@ -10,10 +10,13 @@
     "export:openapi": "cd .. && .\\backend\\.venv\\Scripts\\python.exe .\\scripts\\export_openapi.py",
     "generate:api-types": "openapi-typescript contracts/openapi.json --default-non-nullable=false -o contracts/api.generated.ts",
     "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
     "test:scaffold": "node --test tests/scaffold.test.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
+    "@types/katex": "^0.16.8",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
@@ -27,13 +30,21 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.9",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.16.47",
     "lucide-react": "^1.28.0",
     "next": "^16.2.12",
+    "next-themes": "^0.4.6",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "tailwind-merge": "^3.6.0",
     "zustand": "^5.0.14"
   }
