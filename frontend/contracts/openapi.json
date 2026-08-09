@@ -873,7 +873,7 @@
       },
       "RunEvent": {
         "additionalProperties": false,
-        "description": "A safe incremental event emitted during one run.",
+        "description": "A replayable process event emitted during one run.",
         "properties": {
           "agent": {
             "anyOf": [
@@ -885,6 +885,18 @@
               }
             ],
             "default": null
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content"
           },
           "degraded": {
             "anyOf": [
@@ -924,6 +936,66 @@
           },
           "event_type": {
             "$ref": "#/components/schemas/StreamEventType"
+          },
+          "input_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Summary"
+          },
+          "is_delta": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Delta"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message Id"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Summary"
+          },
+          "parent_tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Tool Call Id"
           },
           "plan_step_sequence": {
             "anyOf": [
@@ -966,6 +1038,18 @@
             ],
             "default": null,
             "title": "Success"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Call Id"
           },
           "tool_name": {
             "anyOf": [
@@ -1067,6 +1151,58 @@
         "title": "Session",
         "type": "object"
       },
+      "SessionProcess": {
+        "additionalProperties": false,
+        "description": "刷新或切回会话时用于重放协作过程的权威快照。",
+        "properties": {
+          "current_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "task_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskPlan"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "task_results": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TaskResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Results"
+          }
+        },
+        "title": "SessionProcess",
+        "type": "object"
+      },
       "StatsOverview": {
         "additionalProperties": false,
         "description": "学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。\n\n- agent_answer_counts 的键是 AgentRole 的字符串值(supervisor /\n  teaching_assistant / learning_assistant / evaluator),口径与\n  api/sessions._safe_agent 一致:识别不出角色的回答不计入任何键;\n- last_activity_at 为 ISO 时间戳,取当前用户所有会话 created_at\n  的最大值(langchain-core 的 BaseMessage 无 created_at 字段,\n  消息级时间不可用,见 api/stats.py 注释);无任何会话时为 None。",
@@ -1109,7 +1245,7 @@
       },
       "StreamEvent": {
         "additionalProperties": false,
-        "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」\n的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):\n- tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、\n  成功与否、耗时等摘要,绝不含工具参数与结果正文;\n- thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造\n  模型中间输出;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
+        "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n- tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;\n- thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
         "properties": {
           "agent": {
             "anyOf": [
@@ -1191,6 +1327,30 @@
           "event_type": {
             "$ref": "#/components/schemas/StreamEventType"
           },
+          "input_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Summary"
+          },
+          "is_delta": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Delta"
+          },
           "message": {
             "anyOf": [
               {
@@ -1213,6 +1373,30 @@
             ],
             "default": null,
             "title": "Message Id"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Summary"
+          },
+          "parent_tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Tool Call Id"
           },
           "plan_step_sequence": {
             "anyOf": [
@@ -1248,6 +1432,18 @@
             "default": null,
             "title": "Success"
           },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Call Id"
+          },
           "tool_name": {
             "anyOf": [
               {
@@ -1273,6 +1469,7 @@
         "description": "Public SSE protocol for token deltas and safe execution events.",
         "enum": [
           "thinking",
+          "reasoning",
           "tool_call",
           "tool_result",
           "message_delta",
@@ -2554,6 +2751,85 @@
           }
         },
         "summary": "Get Session History",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/process": {
+      "get": {
+        "description": "返回 checkpoint 中可回放的思考、工具与协作过程快照。",
+        "operationId": "get_session_process_sessions__session_id__process_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionProcess"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Get Session Process",
         "tags": [
           "sessions"
         ]

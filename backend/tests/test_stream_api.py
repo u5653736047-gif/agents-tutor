@@ -8,8 +8,8 @@ create_app() 不跑 lifespan,state 直接赋值即可),验证:
    done 收尾;
 2. run 异常 → error 事件(internal_error / session_busy),HTTP 仍 200;
 3. 会话忙 → 第二次请求立即返回 JSON session_busy(非 SSE 流);
-4. 工具事件(tool_call/tool_result)不含工具参数/结果正文;
-5. thinking 事件 content 为固定占位文本(非模型输出)。
+4. 工具事件(tool_call/tool_result)携带有界、脱敏的输入/输出摘要;
+5. provider 的 reasoning 字段作为独立增量事件流式输出。
 """
 
 from __future__ import annotations
@@ -178,13 +178,13 @@ class NativeTokenStreamingChatGraph(StreamingChatGraph):
             "custom",
             {"kind": "run_event", "event": started.model_dump(mode="json")},
         )
-        # provider 的原始 reasoning_content 不属于公开正文，必须被过滤。
+        # provider 显式返回的 reasoning_content 是独立过程通道，不混入正文。
         yield (
             "messages",
             (
                 AIMessageChunk(
                     content="",
-                    additional_kwargs={"reasoning_content": "private chain of thought"},
+                    additional_kwargs={"reasoning_content": "先识别问题，再组织解释"},
                     id="assistant-turn",
                 ),
                 {"agent_role": "supervisor"},
@@ -396,7 +396,7 @@ def test_stream_events_arrive_in_sequence_and_end_with_message_end_then_done(
 def test_native_stream_yields_text_delta_before_the_graph_finishes(
     tmp_path: Path,
 ) -> None:
-    """真实 token 增量先到；原始 reasoning_content 不进入公开 SSE。"""
+    """reasoning 与正文 token 都在图结束前到达，且互不混入。"""
     graph = NativeTokenStreamingChatGraph()
     store = SessionStore(tmp_path / "sessions.sqlite3")
     payload = ChatRequest(session_id="session-1", message="解释流式")
@@ -442,12 +442,21 @@ def test_native_stream_yields_text_delta_before_the_graph_finishes(
     assert graph.stream_thread_id != caller_thread
     assert [frame["event_type"] for frame in frames] == [
         "thinking",
+        "reasoning",
         "message_delta",
         "message_delta",
         "message_end",
         "done",
     ]
-    assert "private chain of thought" not in json.dumps(frames)
+    reasoning = next(frame for frame in frames if frame["event_type"] == "reasoning")
+    assert reasoning["content"] == "先识别问题，再组织解释"
+    assert reasoning["message_id"] == "assistant-turn"
+    assert reasoning["is_delta"] is True
+    assert all(
+        "先识别问题，再组织解释" not in (frame.get("content") or "")
+        for frame in frames
+        if frame["event_type"] in {"message_delta", "message_end"}
+    )
 
 
 def test_native_stream_exposes_checkpoint_run_error_instead_of_silent_done(
@@ -620,14 +629,10 @@ def test_stream_returns_session_busy_json_when_the_session_is_locked(
     assert first_frames[-1]["event_type"] == "done"
 
 
-def test_stream_tool_events_never_carry_tool_arguments_or_results(
+def test_stream_tool_events_carry_redacted_input_and_output_summaries(
     tmp_path: Path,
 ) -> None:
-    """tool_call/tool_result 事件只含摘要字段,绝不含参数/结果正文。
-
-    更强形式:所有 SSE 帧的键集合必须落在 StreamEvent 的公开字段内,
-    帧里出现 args/result/tool_input/output 等键即视为契约破坏。
-    """
+    """工具详情可展示，但只通过有界、脱敏的摘要字段公开。"""
     events = [
         RunEvent(
             event_type=EventType.TOOL_STARTED,
@@ -635,6 +640,8 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
             session_id="session-1",
             agent="learning_assistant",
             tool_name="search_knowledge",
+            tool_call_id="call-search-1",
+            input_summary='{"query":"反向传播","api_key":"[REDACTED]"}',
         ),
         RunEvent(
             event_type=EventType.TOOL_COMPLETED,
@@ -642,7 +649,9 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
             session_id="session-1",
             agent="learning_assistant",
             tool_name="search_knowledge",
+            tool_call_id="call-search-1",
             success=True,
+            output_summary='{"found":true,"hits":2}',
         ),
         RunEvent(
             event_type=EventType.AGENT_COMPLETED,
@@ -692,6 +701,11 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
         "message",
         "citations",
         "current_agent",
+        "tool_call_id",
+        "parent_tool_call_id",
+        "input_summary",
+        "output_summary",
+        "is_delta",
     }
     for frame in frames:
         assert set(frame).issubset(allowed_keys)
@@ -700,11 +714,13 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
     ]
     assert len(tool_frames) == 2
     for frame in tool_frames:
-        assert "args" not in frame
-        assert "result" not in frame
-        assert "tool_input" not in frame
-        assert "output" not in frame
         assert frame["tool_name"] == "search_knowledge"
+        assert frame["tool_call_id"] == "call-search-1"
+    assert tool_frames[0]["input_summary"] == (
+        '{"query":"反向传播","api_key":"[REDACTED]"}'
+    )
+    assert tool_frames[1]["output_summary"] == '{"found":true,"hits":2}'
+    assert "secret" not in json.dumps(tool_frames)
 
 
 def test_stream_disconnect_waits_for_run_then_releases_lock(

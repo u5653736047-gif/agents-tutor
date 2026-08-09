@@ -195,6 +195,14 @@ def test_tool_orchestration_waits_for_subagent_then_supervisor_integrates() -> N
         AgentRole.SUPERVISOR.value,
         AgentRole.SUPERVISOR.value,
     ]
+    parent_tool_call_id = state["events"][1].tool_call_id
+    assert parent_tool_call_id is not None
+    assert [event.parent_tool_call_id for event in state["events"][2:4]] == [
+        parent_tool_call_id,
+        parent_tool_call_id,
+    ]
+    assert state["events"][4].tool_call_id == parent_tool_call_id
+    assert state["events"][4].parent_tool_call_id is None
 
 
 def test_graph_stream_exposes_model_chunks_with_agent_metadata() -> None:

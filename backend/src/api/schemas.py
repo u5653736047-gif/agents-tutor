@@ -44,6 +44,7 @@ class StreamEventType(str, Enum):
     """Public SSE protocol for token deltas and safe execution events."""
 
     THINKING = "thinking"
+    REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     MESSAGE_DELTA = "message_delta"
@@ -155,13 +156,20 @@ class Message(ContractModel):
 
 
 class RunEvent(ContractModel):
-    """A safe incremental event emitted during one run."""
+    """A replayable process event emitted during one run."""
 
     event_type: StreamEventType
     sequence: int = Field(ge=0)
     session_id: str | None = None
     agent: AgentRole | None = None
     tool_name: str | None = None
+    tool_call_id: str | None = None
+    parent_tool_call_id: str | None = None
+    input_summary: str | None = None
+    output_summary: str | None = None
+    content: str | None = None
+    message_id: str | None = None
+    is_delta: bool | None = None
     success: bool | None = None
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | None = None
@@ -172,12 +180,8 @@ class RunEvent(ContractModel):
 class StreamEvent(ContractModel):
     """SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
 
-    事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
-    的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
-    - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
-      成功与否、耗时等摘要,绝不含工具参数与结果正文;
-    - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
-      模型中间输出;
+    - tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;
+    - thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;
     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
       ChatResponse.message.content 同源)。
     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
@@ -189,12 +193,17 @@ class StreamEvent(ContractModel):
     session_id: str
     agent: AgentRole | None = None
     tool_name: str | None = None
+    tool_call_id: str | None = None
+    parent_tool_call_id: str | None = None
+    input_summary: str | None = None
+    output_summary: str | None = None
     success: bool | None = None
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | ApiErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
     content: str | None = None  # thinking 摘要 / message_delta 增量 / message_end 全文
     message_id: str | None = None  # 同一模型消息的增量关联键
+    is_delta: bool | None = None  # reasoning/message 的增量与完整快照标记
     message: Message | None = None  # message_end 的完整消息(可选)
     citations: list[Citation] | None = None
     current_agent: AgentRole | None = None
@@ -419,6 +428,15 @@ class ChatResponse(ContractModel):
     current_agent: AgentRole | None = None
 
 
+class SessionProcess(ContractModel):
+    """刷新或切回会话时用于重放协作过程的权威快照。"""
+
+    events: list[RunEvent] = Field(default_factory=list)
+    task_plan: TaskPlan | None = None
+    task_results: list[TaskResult] | None = None
+    current_agent: AgentRole | None = None
+
+
 class FeedbackRating(str, Enum):
     """用户反馈评分方向。"""
 
@@ -478,6 +496,7 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     TaskPlan,
     TaskResult,
     ChatResponse,
+    SessionProcess,
     FeedbackRequest,
     FeedbackResponse,
     StatsOverview,

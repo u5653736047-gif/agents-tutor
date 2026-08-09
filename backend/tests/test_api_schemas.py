@@ -123,6 +123,7 @@ def test_chat_response_keeps_future_fields_optional() -> None:
 def test_stream_event_values_match_the_public_protocol() -> None:
     assert {event.value for event in StreamEventType} == {
         "thinking",
+        "reasoning",
         "tool_call",
         "tool_result",
         "message_delta",

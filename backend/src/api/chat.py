@@ -52,6 +52,7 @@ CHAT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 EVENT_TYPE_MAP = {
     EventType.AGENT_STARTED: StreamEventType.THINKING,
+    EventType.AGENT_REASONING: StreamEventType.REASONING,
     EventType.TOOL_STARTED: StreamEventType.TOOL_CALL,
     EventType.TOOL_COMPLETED: StreamEventType.TOOL_RESULT,
     EventType.AGENT_COMPLETED: StreamEventType.MESSAGE_END,
@@ -281,6 +282,13 @@ def _public_event(event: CoreRunEvent) -> RunEvent | None:
         session_id=event.session_id,
         agent=_public_agent(event.agent),
         tool_name=event.tool_name,
+        tool_call_id=event.tool_call_id,
+        parent_tool_call_id=event.parent_tool_call_id,
+        input_summary=event.input_summary,
+        output_summary=event.output_summary,
+        content=event.content,
+        message_id=event.message_id,
+        is_delta=(False if event.event_type is EventType.AGENT_REASONING else None),
         success=event.success,
         duration_ms=event.duration_ms,
         error_code=error_code,

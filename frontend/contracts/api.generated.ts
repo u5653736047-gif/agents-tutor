@@ -41,9 +41,9 @@ export interface paths {
          *     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
          *
          *     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
-         *     sequence;若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
-         *     权威 message_end + done,不启动新 run(消息补发);默认 0 表示发新
-         *     消息,启动新 run。
+         *     sequence；若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
+         *     权威 message_end + done；若仍是中间态则要求客户端继续等待，绝不
+         *     重跑。默认 0 表示发新消息并启动新 run。
          */
         post: operations["chat_stream_chat_stream_post"];
         delete?: never;
@@ -327,6 +327,26 @@ export interface paths {
          * @description Return only safe history fields for the current user's session.
          */
         get: operations["get_session_history_sessions__session_id__messages_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/process": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Session Process
+         * @description 返回 checkpoint 中可回放的思考、工具与协作过程快照。
+         */
+        get: operations["get_session_process_sessions__session_id__process_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -743,11 +763,16 @@ export interface components {
         };
         /**
          * RunEvent
-         * @description A safe incremental event emitted during one run.
+         * @description A replayable process event emitted during one run.
          */
         RunEvent: {
             /** @default null */
             agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Content
+             * @default null
+             */
+            content?: string | null;
             /**
              * Degraded
              * @default null
@@ -761,6 +786,31 @@ export interface components {
             /** @default null */
             error_code?: components["schemas"]["ErrorCode"] | null;
             event_type: components["schemas"]["StreamEventType"];
+            /**
+             * Input Summary
+             * @default null
+             */
+            input_summary?: string | null;
+            /**
+             * Is Delta
+             * @default null
+             */
+            is_delta?: boolean | null;
+            /**
+             * Message Id
+             * @default null
+             */
+            message_id?: string | null;
+            /**
+             * Output Summary
+             * @default null
+             */
+            output_summary?: string | null;
+            /**
+             * Parent Tool Call Id
+             * @default null
+             */
+            parent_tool_call_id?: string | null;
             /**
              * Plan Step Sequence
              * @default null
@@ -778,6 +828,11 @@ export interface components {
              * @default null
              */
             success?: boolean | null;
+            /**
+             * Tool Call Id
+             * @default null
+             */
+            tool_call_id?: string | null;
             /**
              * Tool Name
              * @default null
@@ -823,6 +878,23 @@ export interface components {
             user_id: string | null;
         };
         /**
+         * SessionProcess
+         * @description 刷新或切回会话时用于重放协作过程的权威快照。
+         */
+        SessionProcess: {
+            /** @default null */
+            current_agent?: components["schemas"]["AgentRole"] | null;
+            /** Events */
+            events?: components["schemas"]["RunEvent"][];
+            /** @default null */
+            task_plan?: components["schemas"]["TaskPlan"] | null;
+            /**
+             * Task Results
+             * @default null
+             */
+            task_results?: components["schemas"]["TaskResult"][] | null;
+        };
+        /**
          * StatsOverview
          * @description 学习进度基础统计(只读聚合,依赖既有 SessionStore/Graph 能力)。
          *
@@ -849,12 +921,8 @@ export interface components {
          * StreamEvent
          * @description SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
          *
-         *     事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
-         *     的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
-         *     - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
-         *       成功与否、耗时等摘要,绝不含工具参数与结果正文;
-         *     - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
-         *       模型中间输出;
+         *     - tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;
+         *     - thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;
          *     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
          *       ChatResponse.message.content 同源)。
          *     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
@@ -886,6 +954,16 @@ export interface components {
              */
             error_code?: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"] | null;
             event_type: components["schemas"]["StreamEventType"];
+            /**
+             * Input Summary
+             * @default null
+             */
+            input_summary?: string | null;
+            /**
+             * Is Delta
+             * @default null
+             */
+            is_delta?: boolean | null;
             /** @default null */
             message?: components["schemas"]["Message"] | null;
             /**
@@ -893,6 +971,16 @@ export interface components {
              * @default null
              */
             message_id?: string | null;
+            /**
+             * Output Summary
+             * @default null
+             */
+            output_summary?: string | null;
+            /**
+             * Parent Tool Call Id
+             * @default null
+             */
+            parent_tool_call_id?: string | null;
             /**
              * Plan Step Sequence
              * @default null
@@ -908,6 +996,11 @@ export interface components {
              */
             success?: boolean | null;
             /**
+             * Tool Call Id
+             * @default null
+             */
+            tool_call_id?: string | null;
+            /**
              * Tool Name
              * @default null
              */
@@ -918,7 +1011,7 @@ export interface components {
          * @description Public SSE protocol for token deltas and safe execution events.
          * @enum {string}
          */
-        StreamEventType: "thinking" | "tool_call" | "tool_result" | "message_delta" | "message_end" | "agent_switch" | "error" | "done";
+        StreamEventType: "thinking" | "reasoning" | "tool_call" | "tool_result" | "message_delta" | "message_end" | "agent_switch" | "error" | "done";
         /**
          * TaskPlan
          * @description A task plan reserved for future chat responses.
@@ -1712,6 +1805,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Message"][];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_session_process_sessions__session_id__process_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionProcess"];
                 };
             };
             /** @description Bad Request */

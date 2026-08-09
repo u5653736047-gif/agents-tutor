@@ -12,17 +12,28 @@ from httpx import ASGITransport, AsyncClient, Response
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from api.app import create_app
+from core.events import EventType, RunEvent
 from core.sessions import SessionStore
 
 
 class HistoryGraph:
     """提供会话历史的最小 Graph 替身。"""
 
-    def __init__(self, histories: Mapping[tuple[str, str | None], list[BaseMessage]]) -> None:
+    def __init__(
+        self,
+        histories: Mapping[tuple[str, str | None], list[BaseMessage]],
+        states: Mapping[tuple[str, str | None], dict[str, Any]] | None = None,
+    ) -> None:
         self._histories = histories
+        self._states = states or {}
 
     def get_history(self, session_id: str, user_id: str | None = None) -> list[BaseMessage]:
         return self._histories.get((session_id, user_id), [])
+
+    def get_state(
+        self, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any] | None:
+        return self._states.get((session_id, user_id))
 
 
 def _session_app(tmp_path: Path, graph: HistoryGraph | None = None) -> tuple[FastAPI, SessionStore]:
@@ -93,6 +104,9 @@ def test_sessions_are_isolated_and_unknown_sessions_return_404(tmp_path: Path) -
         denied_history = asyncio.run(
             _request(app, "GET", "/sessions/private/messages", headers=second_user)
         )
+        denied_process = asyncio.run(
+            _request(app, "GET", "/sessions/private/process", headers=second_user)
+        )
     finally:
         store.close()
 
@@ -100,8 +114,10 @@ def test_sessions_are_isolated_and_unknown_sessions_return_404(tmp_path: Path) -
     assert second_created.status_code == 201
     assert denied_archive.status_code == 404
     assert denied_history.status_code == 404
+    assert denied_process.status_code == 404
     assert denied_archive.json()["detail"]["error_code"] == "session_not_found"
     assert denied_history.json()["detail"]["error_code"] == "session_not_found"
+    assert denied_process.json()["detail"]["error_code"] == "session_not_found"
 
 
 def test_missing_user_header_uses_the_anonymous_session_scope(tmp_path: Path) -> None:
@@ -199,6 +215,86 @@ def test_history_projects_only_safe_user_and_assistant_messages(tmp_path: Path) 
     assert "secret-key" not in response.text
     assert "secret tool output" not in response.text
     assert "internal payload" not in response.text
+
+
+def test_process_history_replays_reasoning_and_redacted_tool_details(
+    tmp_path: Path,
+) -> None:
+    events = [
+        RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=1,
+            session_id="session-1",
+            agent="learning_assistant",
+        ),
+        RunEvent(
+            event_type=EventType.AGENT_REASONING,
+            sequence=2,
+            session_id="session-1",
+            agent="learning_assistant",
+            content="先检索定义，再用例子解释",
+            message_id="assistant-step-1",
+        ),
+        RunEvent(
+            event_type=EventType.TOOL_STARTED,
+            sequence=3,
+            session_id="session-1",
+            agent="learning_assistant",
+            tool_name="search_knowledge",
+            tool_call_id="call-search-1",
+            input_summary='{"query":"反向传播","api_key":"[REDACTED]"}',
+        ),
+        RunEvent(
+            event_type=EventType.TOOL_COMPLETED,
+            sequence=4,
+            session_id="session-1",
+            agent="learning_assistant",
+            tool_name="search_knowledge",
+            tool_call_id="call-search-1",
+            success=True,
+            output_summary='{"found":true,"hits":2}',
+        ),
+    ]
+    graph = HistoryGraph(
+        {},
+        {
+            ("session-1", "user-1"): {
+                "events": events,
+                "current_agent": "learning_assistant",
+                "task_plan": None,
+                "task_results": [],
+            }
+        },
+    )
+    app, store = _session_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _request(
+                app,
+                "GET",
+                "/sessions/session-1/process",
+                headers={"X-User-Id": "user-1"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["current_agent"] == "learning_assistant"
+    assert [event["event_type"] for event in payload["events"]] == [
+        "thinking",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+    ]
+    assert payload["events"][1]["content"] == "先检索定义，再用例子解释"
+    assert payload["events"][2]["input_summary"] == (
+        '{"query":"反向传播","api_key":"[REDACTED]"}'
+    )
+    assert payload["events"][3]["output_summary"] == '{"found":true,"hits":2}'
+    assert "sk-live-secret" not in response.text
 
 
 def test_history_prefers_agent_role_metadata_over_name(tmp_path: Path) -> None:

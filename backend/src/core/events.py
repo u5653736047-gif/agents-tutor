@@ -12,6 +12,8 @@ class EventType(StrEnum):
     AGENT_STARTED = "agent_started"
     # Agent 节点正常结束（agent=角色名）
     AGENT_COMPLETED = "agent_completed"
+    # 模型显式返回的 reasoning/thinking 字段（不是 API 伪造的阶段文案）
+    AGENT_REASONING = "agent_reasoning"
     # 工具开始执行（tool_name=工具名）
     TOOL_STARTED = "tool_started"
     # 工具执行结束（tool_name=工具名，success 标记成败）
@@ -70,12 +72,12 @@ class ErrorCode(StrEnum):
 
 
 class RunEvent(BaseModel):
-    """不携带内容、参数或密钥的运行事件。
+    """可持久化、可回放的运行事件。
 
-    安全设计：事件只记录「发生了什么」的轻量事实——类型、角色、工具名、
-    耗时、错误码等结构化摘要；消息正文、工具调用参数与密钥都不进事件，
-    完整内容留在 state 与 checkpoint 里按需读取，事件流因此可以安全地
-    回放、审计和透传给前端。
+    过程展示需要的模型 reasoning 与工具输入/输出只保存有界摘要；工具
+    凭据等敏感键在写入前脱敏。最终回答正文仍由 messages 通道持久化，
+    不在事件中复制。该形状借鉴 typed event stream：工具调用 ID 关联
+    action/observation，parent_tool_call_id 关联子代理事件。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -85,6 +87,12 @@ class RunEvent(BaseModel):
     session_id: str | None
     agent: str | None = None  # 相关 Agent 角色名
     tool_name: str | None = None  # 相关工具名
+    tool_call_id: str | None = None  # 关联工具开始与结束事件
+    parent_tool_call_id: str | None = None  # 子代理事件所属的父工具调用
+    input_summary: str | None = None  # 有界、脱敏的工具输入 JSON 摘要
+    output_summary: str | None = None  # 有界、脱敏的工具结果摘要
+    content: str | None = None  # provider 显式 reasoning 内容（有界）
+    message_id: str | None = None  # reasoning 所属模型消息 ID
     success: bool | None = None  # 成功/失败标记（工具与步骤事件）
     duration_ms: float | None = Field(default=None, ge=0)  # 执行耗时（毫秒）
     error_code: ErrorCode | None = None  # 失败时的错误分类

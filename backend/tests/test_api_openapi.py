@@ -18,9 +18,11 @@ def test_openapi_includes_the_bridge_contract_models() -> None:
         "ChatResponse",
         "Citation",
         "TaskPlanStep",
+        "SessionProcess",
     }.issubset(schemas)
     assert schemas["StreamEventType"]["enum"] == [
         "thinking",
+        "reasoning",
         "tool_call",
         "tool_result",
         "message_delta",

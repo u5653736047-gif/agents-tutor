@@ -12,11 +12,10 @@ D1-T3 断线重连与消息补发:客户端可在查询参数传 from_sequence
 SSE 重试响应，绝不把同一输入启动为新 run。只有 from_sequence=0
 才代表一条新用户消息并获准启动执行。
 
-事件安全红线(与 api/chat.py 同口径):
-- tool_call / tool_result 事件只含工具名、成功与否、耗时等摘要,
-  绝不含工具参数与结果正文(_public_event 的字段白名单保证);
-- thinking 事件的 content 是按 Agent 角色映射的安全阶段摘要，绝不暴露
-  或伪造模型的隐藏思维链;
+过程事件约定(与 api/chat.py 同口径):
+- tool_call / tool_result 携带 core 已有界、脱敏的输入/输出摘要;
+- thinking 是按 Agent 角色映射的阶段文案；reasoning 只转发 provider
+  显式返回的 reasoning/thinking 字段，不从普通正文推断或伪造;
 - message_end 的 content 是最终消息全文(与 POST /chat 的
   ChatResponse.message.content 同源)。
 """
@@ -91,33 +90,35 @@ def _session_store(request: Request) -> SessionStore:
 
 
 def _stream_event_from_run_event(event: RunEvent, session_id: str) -> StreamEvent:
-    """把公开 RunEvent 转成流式 StreamEvent(不新增任何工具细节)。
-
-    thinking 事件补按角色固定的阶段摘要，帮助用户理解当前在做什么；
-    这些文本不是模型隐藏推理，也不读取 provider reasoning 字段。
-    其余字段与 RunEvent 一一对应,content 保持 None。
-    """
+    """把可回放 RunEvent 一一映射成实时 StreamEvent。"""
+    content: str | None
     if event.event_type is StreamEventType.THINKING:
         # AgentRole 是 str 枚举,f-string 直接格式化会输出
         # "AgentRole.SUPERVISOR",取 .value 得到 "supervisor"。
         agent_name = event.agent.value if event.agent is not None else None
-        content = _AGENT_PROGRESS_SUMMARIES.get(
+        content = event.content or _AGENT_PROGRESS_SUMMARIES.get(
             agent_name or "",
             "正在处理当前任务",
         )
     else:
-        content = None
+        content = event.content
     return StreamEvent(
         event_type=event.event_type,
         sequence=event.sequence,
         session_id=event.session_id or session_id,
         agent=event.agent,
         tool_name=event.tool_name,
+        tool_call_id=event.tool_call_id,
+        parent_tool_call_id=event.parent_tool_call_id,
+        input_summary=event.input_summary,
+        output_summary=event.output_summary,
         success=event.success,
         duration_ms=event.duration_ms,
         error_code=event.error_code,
         plan_step_sequence=event.plan_step_sequence,
         content=content,
+        message_id=event.message_id,
+        is_delta=event.is_delta,
     )
 
 
@@ -207,7 +208,7 @@ async def _wait_for_run(background_task: asyncio.Task[Any]) -> None:
 
 
 def _text_delta(chunk: object) -> str:
-    """只提取公开文本块；reasoning/tool-call 块与附加字段一律忽略。"""
+    """只提取回答正文；reasoning 由独立通道处理。"""
     if not isinstance(chunk, AIMessageChunk):
         return ""
     content = chunk.content
@@ -227,6 +228,36 @@ def _text_delta(chunk: object) -> str:
         text = block.get("text")
         if isinstance(text, str):
             parts.append(text)
+    return "".join(parts)
+
+
+def _reasoning_delta(chunk: object) -> str:
+    """提取 provider 显式 reasoning/thinking 增量，不解析普通正文。"""
+    if not isinstance(chunk, AIMessageChunk):
+        return ""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = chunk.additional_kwargs.get(key)
+        if isinstance(value, str):
+            return value
+    if not isinstance(chunk.content, list):
+        return ""
+    parts: list[str] = []
+    for block in chunk.content:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") not in {
+            "reasoning",
+            "reasoning_content",
+            "reasoning_delta",
+            "thinking",
+            "thinking_delta",
+        }:
+            continue
+        for key in ("text", "reasoning_content", "reasoning", "thinking"):
+            value = block.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+                break
     return "".join(parts)
 
 
@@ -306,20 +337,39 @@ async def _native_stream_events(
             ):
                 continue
             mode, data = item
-            stream_event: StreamEvent | None = None
+            stream_events: list[StreamEvent] = []
             if mode == "messages" and isinstance(data, tuple) and len(data) == 2:
                 chunk, metadata = data
+                agent = _public_agent(_stream_agent(metadata))
+                message_id = getattr(chunk, "id", None)
+                public_message_id = message_id if isinstance(message_id, str) else None
+                reasoning_delta = _reasoning_delta(chunk)
+                if reasoning_delta:
+                    sequence += 1
+                    stream_events.append(
+                        StreamEvent(
+                            event_type=StreamEventType.REASONING,
+                            sequence=sequence,
+                            session_id=payload.session_id,
+                            agent=agent,
+                            content=reasoning_delta,
+                            message_id=public_message_id,
+                            is_delta=True,
+                        )
+                    )
                 delta = _text_delta(chunk)
                 if delta:
                     sequence += 1
-                    message_id = getattr(chunk, "id", None)
-                    stream_event = StreamEvent(
-                        event_type=StreamEventType.MESSAGE_DELTA,
-                        sequence=sequence,
-                        session_id=payload.session_id,
-                        agent=_public_agent(_stream_agent(metadata)),
-                        content=delta,
-                        message_id=(message_id if isinstance(message_id, str) else None),
+                    stream_events.append(
+                        StreamEvent(
+                            event_type=StreamEventType.MESSAGE_DELTA,
+                            sequence=sequence,
+                            session_id=payload.session_id,
+                            agent=agent,
+                            content=delta,
+                            message_id=public_message_id,
+                            is_delta=True,
+                        )
                     )
             elif mode == "custom" and isinstance(data, Mapping):
                 raw_event = data.get("event") if data.get("kind") == "run_event" else None
@@ -335,11 +385,13 @@ async def _native_stream_events(
                             StreamEventType.DONE,
                         }:
                             sequence += 1
-                            stream_event = _stream_event_from_run_event(
-                                public_event,
-                                payload.session_id,
-                            ).model_copy(update={"sequence": sequence})
-            if stream_event is not None:
+                            stream_events.append(
+                                _stream_event_from_run_event(
+                                    public_event,
+                                    payload.session_id,
+                                ).model_copy(update={"sequence": sequence})
+                            )
+            for stream_event in stream_events:
                 yield _sse_frame(stream_event)
                 if stream_event.event_type is StreamEventType.ERROR:
                     error_emitted = True

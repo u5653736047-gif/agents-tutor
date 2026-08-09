@@ -1730,7 +1730,12 @@ def _interleave_subagent_traces(
             and event.tool_name in subagent_tools
             and trace_index < len(traces)
         ):
-            combined.extend(traces[trace_index])
+            combined.extend(
+                child_event.model_copy(
+                    update={"parent_tool_call_id": event.tool_call_id}
+                )
+                for child_event in traces[trace_index]
+            )
             trace_index += 1
 
     previous_sequence = max(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from threading import Event
 
@@ -48,6 +49,12 @@ class FailingModel:
 def double(value: int) -> int:
     """返回输入数字的两倍。"""
     return value * 2
+
+
+@tool
+def echo_with_secret(query: str, api_key: str) -> dict[str, str]:
+    """返回查询与凭据，用来验证事件展示层会脱敏。"""
+    return {"query": query, "api_key": api_key, "status": "ok"}
 
 
 def tool_call(name: str, call_id: str = "call-1") -> dict[str, object]:
@@ -492,6 +499,12 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "session_id",
         "agent",
         "tool_name",
+        "tool_call_id",
+        "parent_tool_call_id",
+        "input_summary",
+        "output_summary",
+        "content",
+        "message_id",
         "success",
         "duration_ms",
         "error_code",
@@ -513,6 +526,80 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "retrieval_need_reason",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
+
+
+def test_react_agent_persists_reasoning_and_redacted_tool_details() -> None:
+    secret = "sk-never-show-this"
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                additional_kwargs={"reasoning_content": "先检索概念，再整理解释"},
+                id="assistant-step-1",
+                tool_calls=[
+                    {
+                        "name": "echo_with_secret",
+                        "args": {"query": "反向传播", "api_key": secret},
+                        "id": "call-secret-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="最终解释",
+                additional_kwargs={"reasoning_content": "结合工具结果形成答案"},
+                id="assistant-step-2",
+            ),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.LEARNING_ASSISTANT,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([echo_with_secret]),
+    )
+
+    result = agent.run(create_initial_state(session_id="session-1"))
+    events = result.updates["events"]
+
+    assert [event.event_type for event in events] == [
+        EventType.AGENT_STARTED,
+        EventType.AGENT_REASONING,
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.AGENT_REASONING,
+        EventType.AGENT_COMPLETED,
+    ]
+    reasoning_events = [
+        event for event in events if event.event_type is EventType.AGENT_REASONING
+    ]
+    assert [event.content for event in reasoning_events] == [
+        "先检索概念，再整理解释",
+        "结合工具结果形成答案",
+    ]
+    assert [event.message_id for event in reasoning_events] == [
+        "assistant-step-1",
+        "assistant-step-2",
+    ]
+
+    tool_started = next(
+        event for event in events if event.event_type is EventType.TOOL_STARTED
+    )
+    tool_completed = next(
+        event for event in events if event.event_type is EventType.TOOL_COMPLETED
+    )
+    assert tool_started.tool_call_id == "call-secret-1"
+    assert tool_completed.tool_call_id == "call-secret-1"
+    assert json.loads(tool_started.input_summary or "{}") == {
+        "api_key": "[REDACTED]",
+        "query": "反向传播",
+    }
+    assert json.loads(tool_completed.output_summary or "{}") == {
+        "api_key": "[REDACTED]",
+        "query": "反向传播",
+        "status": "ok",
+    }
+    assert secret not in "".join(event.model_dump_json() for event in events)
 
 
 def test_react_agent_replaces_unknown_tool_name_in_public_updates() -> None:

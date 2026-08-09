@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
@@ -17,6 +20,118 @@ from ..context import (
 from ..events import ErrorCode, EventType, RunError, RunEvent
 from ..state import AgentRole, AgentState, ToolResult
 from ..tools import ToolExecutor
+
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+_REASONING_BLOCK_TYPES = {
+    "reasoning",
+    "reasoning_content",
+    "reasoning_delta",
+    "thinking",
+    "thinking_delta",
+}
+_SECRET_KEY_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+)
+_REASONING_LIMIT = 8_000
+_TOOL_INPUT_LIMIT = 4_000
+_TOOL_OUTPUT_LIMIT = 8_000
+_TRUNCATION_MARKER = "…[truncated]"
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(api[_-]?key|authorization|cookie|password|secret|token)"
+    r"(\s*[:=]\s*)([^,\s;]+)"
+)
+_ACTIVE_PARENT_TOOL_CALL_ID: ContextVar[str | None] = ContextVar(
+    "active_parent_tool_call_id",
+    default=None,
+)
+
+
+def _truncate_display(text: str, limit: int) -> str:
+    """把过程正文限制在固定长度，避免 checkpoint/UI 被大结果撑爆。"""
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - len(_TRUNCATION_MARKER))]}{_TRUNCATION_MARKER}"
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return any(marker in normalized for marker in _SECRET_KEY_MARKERS)
+
+
+def _redact_value(value: object) -> object:
+    """递归脱敏结构化工具数据，同时保留普通参数供 UI 检查。"""
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]" if _is_secret_key(key) else _redact_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_redact_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _json_summary(value: object, limit: int) -> str:
+    return _truncate_display(
+        json.dumps(
+            _redact_value(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+        limit,
+    )
+
+
+def _tool_input_summary(value: object) -> str:
+    return _json_summary(value, _TOOL_INPUT_LIMIT)
+
+
+def _tool_output_summary(value: str) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        redacted = _SECRET_ASSIGNMENT.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+            value,
+        )
+        return _truncate_display(redacted, _TOOL_OUTPUT_LIMIT)
+    return _json_summary(parsed, _TOOL_OUTPUT_LIMIT)
+
+
+def _reasoning_content(message: AIMessage) -> str | None:
+    """读取 provider 显式 reasoning 字段；缺失时不合成、不伪造。"""
+    for key in _REASONING_KEYS:
+        value = message.additional_kwargs.get(key)
+        if isinstance(value, str) and value:
+            return _truncate_display(value, _REASONING_LIMIT)
+
+    if not isinstance(message.content, list):
+        return None
+    parts: list[str] = []
+    for block in message.content:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") not in _REASONING_BLOCK_TYPES:
+            continue
+        for key in ("text", "reasoning_content", "reasoning", "thinking"):
+            value = block.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+                break
+    if not parts:
+        return None
+    return _truncate_display("".join(parts), _REASONING_LIMIT)
 
 
 @dataclass(slots=True)
@@ -142,6 +257,10 @@ class ReActAgentNode:
             # 小工具：生成带自增序号的事件暂存，节点结束时统一写回状态。
             nonlocal sequence
             sequence += 1
+            values.setdefault(
+                "parent_tool_call_id",
+                _ACTIVE_PARENT_TOOL_CALL_ID.get(),
+            )
             event = RunEvent(
                 event_type=event_type,
                 sequence=sequence,
@@ -183,6 +302,13 @@ class ReActAgentNode:
                     iteration,
                     extra,
                     error,
+                )
+            reasoning = _reasoning_content(response)
+            if reasoning is not None:
+                emit(
+                    EventType.AGENT_REASONING,
+                    content=reasoning,
+                    message_id=(response.id if isinstance(response.id, str) else None),
                 )
             if not response.tool_calls:  # 没有工具请求 → 模型已给出最终回答，本轮结束
                 generated.append(response)
@@ -235,16 +361,29 @@ class ReActAgentNode:
 
             # 工具返回的 ToolMessage 会进入下一轮模型输入，形成 Observation。
             for public_name, tool_call in public_tool_calls:  # 逐个执行，异常已包装成失败结果
+                tool_call_id = tool_call.get("id")
                 emit(
                     EventType.TOOL_STARTED,
                     tool_name=public_name,
+                    tool_call_id=(
+                        str(tool_call_id) if tool_call_id is not None else None
+                    ),
+                    input_summary=_tool_input_summary(tool_call.get("args", {})),
                 )
-                execution = self.tool_executor.execute(tool_call, self.role)
+                parent_token = _ACTIVE_PARENT_TOOL_CALL_ID.set(
+                    str(tool_call_id) if tool_call_id is not None else None
+                )
+                try:
+                    execution = self.tool_executor.execute(tool_call, self.role)
+                finally:
+                    _ACTIVE_PARENT_TOOL_CALL_ID.reset(parent_token)
                 generated.append(execution.message)
                 tool_results.append(execution.result)
                 emit(
                     EventType.TOOL_COMPLETED,
                     tool_name=execution.result.tool_name,
+                    tool_call_id=execution.result.tool_call_id,
+                    output_summary=_tool_output_summary(execution.result.output),
                     success=execution.result.success,
                     duration_ms=execution.result.duration_ms,
                     error_code=execution.result.error_code,

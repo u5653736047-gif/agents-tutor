@@ -19,6 +19,7 @@ from api.schemas import (
     Message,
     MessageRole,
     Session,
+    SessionProcess,
 )
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionRecord, SessionStore
@@ -258,3 +259,40 @@ def get_session_history(
             "Session was not found.",
         )
     return _public_messages(_graph(request).get_history(session_id, user_id=user_id))
+
+
+@router.get(
+    "/{session_id}/process",
+    response_model=SessionProcess,
+    responses=LOOKUP_ERROR_RESPONSES,
+)
+def get_session_process(
+    session_id: str,
+    request: Request,
+    user_id: Annotated[str | None, Depends(current_user_id)],
+) -> SessionProcess:
+    """返回 checkpoint 中可回放的思考、工具与协作过程快照。"""
+    if _owned_session(_session_store(request), session_id, user_id) is None:
+        _raise_error(
+            status.HTTP_404_NOT_FOUND,
+            ApiErrorCode.SESSION_NOT_FOUND,
+            "Session was not found.",
+        )
+
+    # 延迟导入避免 chat.py -> sessions.py(current_user_id) 的模块环。
+    from api.chat import (
+        _public_agent,
+        _public_events,
+        _public_task_plan,
+        _public_task_results,
+    )
+
+    state = _graph(request).get_state(session_id, user_id=user_id)
+    if state is None:
+        return SessionProcess()
+    return SessionProcess(
+        events=_public_events(state.get("events", []), -1),
+        task_plan=_public_task_plan(state.get("task_plan")),
+        task_results=_public_task_results(state.get("task_results")),
+        current_agent=_public_agent(state.get("current_agent")),
+    )

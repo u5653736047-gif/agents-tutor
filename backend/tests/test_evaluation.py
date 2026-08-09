@@ -290,11 +290,11 @@ def test_evaluation_event_redacts_reason() -> None:
     assert result["evaluation"].reason == "回答包含学生作文细节……"
     eval_events = _evaluation_events(result)
     assert len(eval_events) == 1
-    # RunEvent 模型本身没有 reason/content 字段（事件协议无敏感正文），
-    # 只有 evaluation_verdict 摘要；用 model_dump 证明字段集合不含正文
+    # 通用 RunEvent 协议为推理回放保留 content 字段，但评价事件不得写入正文。
+    # 只有 evaluation_verdict 摘要可用于审计。
     dumped = eval_events[0].model_dump()
     assert "reason" not in dumped
-    assert "content" not in dumped
+    assert dumped["content"] is None
     assert dumped["evaluation_verdict"] == "fail"
 
 
