@@ -7,18 +7,16 @@
 轮询事件,但生产图不走该降级路径。
 
 D1-T3 断线重连与消息补发:客户端可在查询参数传 from_sequence
-(上次收到的最新公开 sequence)。若 checkpoint 中最近一轮已结束
-(最后事件是终态),本端点直接回放剩余事件并补发
-权威 message_end + done,不启动新 run(避免断线重试导致整轮重复执行);
-否则按正常路径启动新 run。core 事件序列随 checkpoint 跨轮累积，
-token 帧则只属于当前公开流；回放只对 from_sequence > 0 生效——正常发新消息时
-默认 from_sequence=0 必须启动新 run,否则会把上一轮误判为重连回放。
+(上次收到的最新公开 sequence)。正数游标只具有「续传」语义：最近
+一轮已结束时回放并补权威全文；仍在执行或状态不完整时返回一个空的
+SSE 重试响应，绝不把同一输入启动为新 run。只有 from_sequence=0
+才代表一条新用户消息并获准启动执行。
 
 事件安全红线(与 api/chat.py 同口径):
 - tool_call / tool_result 事件只含工具名、成功与否、耗时等摘要,
   绝不含工具参数与结果正文(_public_event 的字段白名单保证);
-- thinking 事件的 content 是固定占位文本(如 Agent 名),绝不伪造
-  模型中间输出;
+- thinking 事件的 content 是按 Agent 角色映射的安全阶段摘要，绝不暴露
+  或伪造模型的隐藏思维链;
 - message_end 的 content 是最终消息全文(与 POST /chat 的
   ChatResponse.message.content 同源)。
 """
@@ -76,6 +74,13 @@ _POLL_INTERVAL_SECONDS = 0.05
 # (": keepalive\n\n")防止中间代理因空闲断开;心跳不携带任何数据。
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 
+_AGENT_PROGRESS_SUMMARIES = {
+    "supervisor": "正在分析问题并规划协作",
+    "teaching_assistant": "正在设计教学与答疑方案",
+    "learning_assistant": "正在梳理知识点与讲解路径",
+    "evaluator": "正在检查答案与学习效果",
+}
+
 
 def _graph(request: Request) -> CollaborativeAgentGraph:
     return cast(CollaborativeAgentGraph, request.app.state.graph)
@@ -88,15 +93,17 @@ def _session_store(request: Request) -> SessionStore:
 def _stream_event_from_run_event(event: RunEvent, session_id: str) -> StreamEvent:
     """把公开 RunEvent 转成流式 StreamEvent(不新增任何工具细节)。
 
-    thinking 事件补固定占位文本(如「supervisor 开始处理」),绝不使用
-    模型中间输出;其余字段与 RunEvent 一一对应,content 保持 None。
+    thinking 事件补按角色固定的阶段摘要，帮助用户理解当前在做什么；
+    这些文本不是模型隐藏推理，也不读取 provider reasoning 字段。
+    其余字段与 RunEvent 一一对应,content 保持 None。
     """
     if event.event_type is StreamEventType.THINKING:
         # AgentRole 是 str 枚举,f-string 直接格式化会输出
         # "AgentRole.SUPERVISOR",取 .value 得到 "supervisor"。
         agent_name = event.agent.value if event.agent is not None else None
-        content = (
-            f"{agent_name} 开始处理" if agent_name is not None else "该 Agent 开始处理"
+        content = _AGENT_PROGRESS_SUMMARIES.get(
+            agent_name or "",
+            "正在处理当前任务",
         )
     else:
         content = None
@@ -419,8 +426,8 @@ async def _stream_events(
 
     from_sequence(D1-T3):客户端断线重连时传「上次收到的最新 sequence」。
     若 checkpoint 中最近一轮已结束,直接回放剩余事件并补权威全文
-    + done,不启动新 run;否则正常启动新 run(默认 0 表示发新消息,
-    必须启动新 run——回放仅对 from_sequence > 0 生效,见模块 docstring)。
+    + done；正数游标遇到中间态时不启动 run，让客户端稍后再次续传。
+    默认 0 才表示发新消息并启动新 run。
     """
     async with active_session_lock:
         await run_in_threadpool(
@@ -429,6 +436,7 @@ async def _stream_events(
             payload.session_id,
             user_id,
             payload.message,
+            from_sequence == 0,
         )
         # 只读一次 checkpoint:回放检查与正常路径的 previous_state 共用
         # 同一份状态,避免重复取(两者本就要求同一时刻的快照)。
@@ -505,6 +513,16 @@ async def _stream_events(
                     session_id=payload.session_id,
                 )
             )
+            return
+
+        if from_sequence > 0:
+            # fail closed：带游标的请求一定是断线续传。真实长任务可能因
+            # 客户端断开而仍在线程中运行，此时 checkpoint 只落了中间
+            # 事件；若继续走下方 graph.stream/run，会把同一用户任务再
+            # 执行一次。发一条 SSE 注释后结束（无 done），客户端会按
+            # 原游标退避续传；即使服务已重启留下孤儿中间态，也宁可显式
+            # 恢复失败，不能冒险重复有副作用的工具调用。
+            yield ": reconnect-pending\n\n"
             return
 
         previous_state = current_state
@@ -670,9 +688,9 @@ async def chat_stream(
     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
 
     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
-    sequence;若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
-    权威 message_end + done,不启动新 run(消息补发);默认 0 表示发新
-    消息,启动新 run。
+    sequence；若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
+    权威 message_end + done；若仍是中间态则要求客户端继续等待，绝不
+    重跑。默认 0 表示发新消息并启动新 run。
     """
     graph = _graph(request)
     session_store = _session_store(request)

@@ -93,17 +93,22 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     userId,
   } = options;
 
-  // 内部超时计时器与调用方 signal 合并:任一触发都中止 fetch 与读取循环
-  // (reader.read 在 signal abort 时拒绝)。超时按失败抛错;调用方主动取消
-  // (AbortController.abort)则静默返回——D1-T3 的重连依赖后者。
-  // 注意:计时器与监听必须覆盖「fetch + 读取」全程,不能在响应头返回后就
-  // 清理——否则后端挂起时前端无限挂起(review 修正)。
+  // timeoutMs 是「空闲看门狗」而不是整轮硬截止时间：多 Agent 一轮可能
+  // 合法运行数分钟，只要正文、过程事件或 keepalive 仍持续到达就不能
+  // 中止。每个网络 chunk 都会重新计时；真正连续静默 timeoutMs 才失败。
   const controller = new AbortController();
   let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const armInactivityTimeout = () => {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  };
+  armInactivityTimeout();
   const abortFromCaller = () => controller.abort();
   signal?.addEventListener("abort", abortFromCaller, { once: true });
 
@@ -196,6 +201,9 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       if (done) {
         break;
       }
+      // 注释心跳也属于有效网络活动；在解析 data 帧之前就重置，避免
+      // 长工具/子代理阶段因没有正文 token 被误判超时。
+      armInactivityTimeout();
       // stream: true 让 TextDecoder 保留跨 chunk 的半截多字节字符
       buffer += decoder.decode(value, { stream: true });
       let newlineIndex = buffer.indexOf("\n");
@@ -231,8 +239,10 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       status: null,
     });
   } finally {
-    // 计时器与监听在此统一清理:覆盖 fetch + 读取全程(review 修正)。
-    clearTimeout(timeout);
+    // 计时器与监听在此统一清理:覆盖 fetch + 读取全程。
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
     signal?.removeEventListener("abort", abortFromCaller);
   }
 }
@@ -306,7 +316,7 @@ export async function streamChatWithRetry(
         return;
       }
       if (attempt >= options.maxRetries) {
-        throw error; // 重试耗尽:原样抛出,由调用方决定降级策略
+        throw error; // 重试耗尽:原样抛出,由调用方展示并提供显式恢复入口
       }
       options.onRetry?.(attempt + 1, error);
       await delay(

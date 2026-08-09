@@ -56,7 +56,8 @@ type TaskResult = components["schemas"]["TaskResult"];
 type Citation = components["schemas"]["Citation"];
 
 // D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
-// streamChatWithRetry 的 maxRetries;耗尽后降级到同步通道。
+// streamChatWithRetry 的 maxRetries;耗尽后向用户报告连接错误，绝不
+// 自动改走同步通道重发同一条消息。
 const _STREAM_RETRY_LIMIT = 3;
 
 export type ChatStore = {
@@ -518,9 +519,16 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
 
+      // 同一 store 同时只允许一个发送动作。UI 禁用需要一次 React
+      // 重渲染才生效，双击/连续 Enter 仍可能在同一事件循环内进入两次；
+      // 这里用同步状态做最终闸门，避免启动两个后端 run。
+      if (get().isStreaming || get().isSending) {
+        return;
+      }
+
       // D7-T2:附件消息——stream-client 已扩展 attachments 透传(与同步
-      // 通道同契约),正常走流式主通道获得流式体验;重试耗尽降级到同步
-      // sendMessage 时同样携带附件(见降级分支)。
+      // 通道同契约),正常走流式主通道获得流式体验。网络状态不确定时
+      // 也不自动重发，避免同一条附件消息触发两个后端 run。
 
       // D1-T3:优先走带断线重连的通道(指数退避 + fromSequence 续传);
       // 未注入重试通道的旧 stub 退回底层 streamChat(D1-T1 行为不变)。
@@ -546,7 +554,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       // UX-20260807#1:乐观回显——与 sendMessage 同构,流式请求发起前
       // 先把用户消息追加进 messages(输入框立即清空后用户能看到自己
-      // 说了什么)。run 结束/失败/降级后权威历史整体替换 messages,
+      // 说了什么)。run 正常结束后权威历史整体替换 messages；连接失败
+      // 时保留乐观消息与已经收到的部分结果，
       // 乐观消息自然被覆盖,无需去重。
       const optimistic: Message = {
         agent: null,
@@ -557,6 +566,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       set((state) => ({
         isStreaming: true,
+        degradedNotice: null,
         requestError: null,
         runError: null,
         streamingAgent: null,
@@ -735,51 +745,15 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           return;
         }
         if (get().currentSessionId === sessionId) {
-          // UX-20260807#1:失败回滚——按对象引用移除本次追加的乐观消息
-          // (复用 sendMessage 的按引用查找模式)。降级分支随后走
-          // sendMessage,其内部会重新追加新的乐观消息,不会重复。
-          set((state) => {
-            const messages = [...state.messages];
-            let index = -1;
-            for (let i = messages.length - 1; i >= 0; i -= 1) {
-              if (messages[i] === optimistic) {
-                index = i;
-                break;
-              }
-            }
-            if (index !== -1) {
-              messages.splice(index, 1);
-            }
-            return { messages };
+          // 流式请求是否已经送达服务端在断线后不可判定，因此绝不能
+          // 自动切换 POST /chat 重发同一消息。保留乐观用户消息与已收到
+          // 的部分回答，让用户看得见发生了什么；仅标记连接失败。
+          set({
+            degradedNotice: null,
+            isStreaming: false,
+            requestError: asApiClientError(error),
+            streamingAgent: null,
           });
-          if (retryStream) {
-            // D1-T3 降级:重试通道耗尽(重试 + 续传均失败)后走同步通道
-            // 保证消息一致。sendMessage 内部「POST + 拉全量」以历史为
-            // 权威,流式残留先并入消息列表再拉全量,不闪失。
-            set({ isStreaming: false, requestError: asApiClientError(error) });
-            set({
-              degradedNotice: "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
-            });
-            const streamed = get().streamingMessage;
-            if (streamed) {
-              set((state) => ({
-                messages: [...state.messages, streamed],
-                streamingMessage: null,
-              }));
-            }
-            try {
-              // D7-T2:降级重发同样携带附件引用(与首次发送一致;当前
-              // 附件消息不会进入本分支——流式分流在上游,此处防御性
-              // 透传,待流式附件支持后自然衔接)。
-              await get().sendMessage(message, attachments);
-            } catch {
-              // sendMessage 内部已处理错误(requestError / 会话守卫),无需再处理
-            }
-          } else {
-            // 旧通道失败:保留已流式收到的内容(streamingMessage 不清空),
-            // 仅标记失败(D1-T1 行为)
-            set({ isStreaming: false, requestError: asApiClientError(error) });
-          }
         }
       } finally {
         // D4-T3:清理 controller 引用(按引用比对,只清自己的;流结束后

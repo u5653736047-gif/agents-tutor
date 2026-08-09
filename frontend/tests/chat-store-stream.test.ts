@@ -355,7 +355,7 @@ async function createRetryStreamStore(overrides: {
   });
 }
 
-test("streamSendMessage falls back to the sync channel after retries are exhausted", async () => {
+test("streamSendMessage never resends through the sync channel after retries are exhausted", async () => {
   const { ApiClientError } = await loadApiClient();
   const failure = new ApiClientError("流式通道重试耗尽。", { code: null, status: null });
   let sendChatCalls = 0;
@@ -371,17 +371,40 @@ test("streamSendMessage falls back to the sync channel after retries are exhaust
   });
 
   store.getState().selectSession(session.session_id);
-  await store.getState().streamSendMessage("会降级的请求");
+  await store.getState().streamSendMessage("不能自动重发的请求");
 
   const state = store.getState();
   assert.equal(state.isStreaming, false);
-  // 降级提示被设置,且同步通道确实被调用(sendMessage 拉全量后消息一致)。
-  assert.equal(
-    state.degradedNotice,
-    "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
+  assert.equal(sendChatCalls, 0, "a failed stream must not execute the same task again");
+  assert.equal(state.degradedNotice, null);
+  assert.equal(state.requestError, failure);
+  assert.deepEqual(
+    state.messages.map((message) => message.content),
+    ["不能自动重发的请求"],
   );
-  assert.equal(sendChatCalls, 1);
-  assert.deepEqual(state.messages, [assistantMessage]);
+});
+
+test("concurrent stream submissions start only one run", async () => {
+  let calls = 0;
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent }) => {
+      calls += 1;
+      await pending;
+      onEvent({ event_type: "done", sequence: 1, session_id: session.session_id });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const first = store.getState().streamSendMessage("只执行一次");
+  const second = store.getState().streamSendMessage("只执行一次");
+
+  assert.equal(calls, 1);
+  release?.();
+  await Promise.all([first, second]);
 });
 
 test("streamSendMessage finishes normally via the retry channel after internal recovery", async () => {

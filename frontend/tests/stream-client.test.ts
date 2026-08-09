@@ -247,6 +247,77 @@ test("a stalled stream rejects with a timeout error while reading", async () => 
   );
 });
 
+test("the timeout is an inactivity watchdog and resets on every stream chunk", async () => {
+  const { streamChat } = await loadStreamClient();
+  const received: Array<{ event_type: string }> = [];
+  const encoder = new TextEncoder();
+  const fetchImpl: typeof fetch = async (_url, init) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const timers = [
+          setTimeout(() => controller.enqueue(encoder.encode(": keepalive\n\n")), 10),
+          setTimeout(
+            () =>
+              controller.enqueue(
+                encoder.encode(
+                  frame(
+                    JSON.stringify({
+                      agent: "supervisor",
+                      event_type: "thinking",
+                      sequence: 1,
+                      session_id: "session-1",
+                    }),
+                  ),
+                ),
+              ),
+            25,
+          ),
+          setTimeout(() => controller.enqueue(encoder.encode(": keepalive\n\n")), 40),
+          setTimeout(() => {
+            controller.enqueue(
+              encoder.encode(
+                frame(
+                  JSON.stringify({
+                    event_type: "done",
+                    sequence: 2,
+                    session_id: "session-1",
+                  }),
+                ),
+              ),
+            );
+            controller.close();
+          }, 55),
+        ];
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            for (const timer of timers) clearTimeout(timer);
+            controller.error(new DOMException("aborted", "AbortError"));
+          },
+          { once: true },
+        );
+      },
+    });
+    return new Response(body, {
+      headers: { "Content-Type": "text/event-stream" },
+      status: 200,
+    });
+  };
+
+  // 整个请求持续 55ms，超过 30ms；但任意两次网络活动只间隔 15ms，
+  // 因此空闲看门狗不应中止健康流。
+  await streamChat({
+    ...streamOptions(fetchImpl),
+    onEvent: (event) => received.push(event),
+    timeoutMs: 30,
+  });
+
+  assert.deepEqual(
+    received.map((event) => event.event_type),
+    ["thinking", "done"],
+  );
+});
+
 test("a caller abort during the read phase resolves silently", async () => {
   const { streamChat } = await loadStreamClient();
   const caller = new AbortController();

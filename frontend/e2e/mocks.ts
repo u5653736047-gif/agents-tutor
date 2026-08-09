@@ -47,6 +47,8 @@ export type MockSession = {
   archived: boolean;
   created_at: string;
   session_id: string;
+  title?: string | null;
+  updated_at: string;
   user_id: string | null;
 };
 
@@ -76,21 +78,23 @@ let failStreaming = false;
 let sessionCounter = 0;
 
 export type InstallMocksOptions = {
-  // 用例 2:流式通道恒 500 → streamChatWithRetry 重试耗尽 → store 降级
-  // 同步 /chat,再由同步响应携带 pending_handoff 呈现审批卡片
+  // 流式通道恒 500，用于验证重试耗尽后不会自动同步重发。
   failStreaming?: boolean;
-  // 同步 /chat 与 GET /handoff 返回的待审批(用例 2 使用)
+  // 同步 /chat 与 GET /handoff 返回的待审批(独立接口用例使用)
   pendingHandoff?: MockPendingHandoff | null;
   // 预置会话与消息(用例 3 历史回溯 / 用例 4 归档)
   seedSessions?: MockSession[];
   seedMessages?: Record<string, MockMessage[]>;
 };
 
-export function mockSession(sessionId: string): MockSession {
+export function mockSession(sessionId: string, title: string | null = null): MockSession {
+  const now = new Date().toISOString();
   return {
     archived: false,
-    created_at: new Date().toISOString(),
+    created_at: now,
     session_id: sessionId,
+    title,
+    updated_at: now,
     user_id: "demo-user",
   };
 }
@@ -122,6 +126,10 @@ function appendHistory(
     created_at: assistantAt,
   });
   mockMessagesBySession.set(sessionId, history);
+  const session = mockSessions.find((item) => item.session_id === sessionId);
+  if (session) {
+    session.updated_at = assistantAt;
+  }
   return assistantAt;
 }
 
@@ -187,7 +195,7 @@ export async function installMocks(
   );
 
   // ── POST /chat/stream?from_sequence=N(SSE) ──
-  await page.route("**/chat/stream", async (route) => {
+  await page.route(/\/chat\/stream(?:\?.*)?$/, async (route) => {
     const fromSequence =
       new URL(route.request().url()).searchParams.get("from_sequence") ?? "0";
     const body = JSON.parse(route.request().postData() ?? "{}") as {
@@ -199,7 +207,7 @@ export async function installMocks(
 
     if (failStreaming) {
       // 用例 2:恒 500(ErrorResponse 形状,stream-client readErrorDetail
-      // 按 detail.error_code / detail.message 解析)→ 重试耗尽 → 降级同步
+      // 按 detail.error_code / detail.message 解析)→ 重试耗尽 → 显示错误
       await route.fulfill({
         status: 500,
         headers: jsonHeaders(),
@@ -228,13 +236,13 @@ export async function installMocks(
     const answer = mockAnswerFor(question);
     const assistantAt = appendHistory(sessionId, question, answer);
     const frames = [
-      // thinking:content 只放占位文本(Agent 名),与契约安全红线一致
+      // thinking:公开的是阶段摘要，不是 provider 隐藏推理原文。
       sseFrame({
         event_type: "thinking",
         sequence: 1,
         session_id: sessionId,
         agent: "supervisor",
-        content: "supervisor",
+        content: "正在分析问题并规划协作",
       }),
       // tool_call:摘要事件,不含工具参数
       sseFrame({
@@ -279,7 +287,7 @@ export async function installMocks(
     });
   });
 
-  // ── POST /chat(同步,降级路径与 API 直测使用) ──
+  // ── POST /chat(同步 API 的独立直测使用) ──
   await page.route("**/chat", async (route) => {
     const body = JSON.parse(route.request().postData() ?? "{}") as {
       message?: string;
@@ -382,6 +390,8 @@ export async function installMocks(
           archived: true,
           created_at: new Date().toISOString(),
           session_id: sessionId,
+          title: null,
+          updated_at: new Date().toISOString(),
           user_id: "demo-user",
         },
       ),
@@ -389,7 +399,7 @@ export async function installMocks(
   });
 
   // ── /sessions(GET 列表 + POST 创建) ──
-  await page.route("**/sessions", async (route) => {
+  await page.route(/\/sessions(?:\?.*)?$/, async (route) => {
     if (route.request().method() === "POST") {
       sessionCounter += 1;
       const session = mockSession(`mock-session-${sessionCounter}`);

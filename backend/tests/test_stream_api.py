@@ -388,8 +388,8 @@ def test_stream_events_arrive_in_sequence_and_end_with_message_end_then_done(
     assert message_end_frames[-1]["content"] == "评估完成"
     assert message_end_frames[-1]["message"]["content"] == "评估完成"
 
-    # thinking 事件 content 是固定占位文本(非模型输出)。
-    assert frames[0]["content"] == "supervisor 开始处理"
+    # thinking 是可审计的阶段摘要，不是模型隐藏推理原文。
+    assert frames[0]["content"] == "正在分析问题并规划协作"
     assert frames[0]["agent"] == "supervisor"
 
 
@@ -844,6 +844,7 @@ def test_stream_replays_remaining_events_when_round_finished(
         run_delay=0.0,
     )
     app, store = _chat_app(tmp_path, graph)
+    existing = store.create_session("session-1", user_id="user-1")
     try:
         frames = asyncio.run(
             _post_stream_from(
@@ -852,11 +853,13 @@ def test_stream_replays_remaining_events_when_round_finished(
                 from_sequence=3,
             )
         )
+        replayed = store.list_sessions(user_id="user-1")[0]
     finally:
         store.close()
 
     # 回放不启动 run(断线重连避免整轮重复执行)。
     assert graph.run_inputs == []
+    assert replayed.updated_at == existing.updated_at
 
     # 只回放 sequence > 3 的公开事件;AGENT_COMPLETED(message_end 映射)
     # 与 RUN_COMPLETED(done 映射)被跳过,随后补权威 message_end + done。
@@ -922,10 +925,16 @@ def test_stream_reconnect_with_token_sequence_above_checkpoint_does_not_rerun(
     assert frames[0]["content"] == "权威完整回答"
 
 
-def test_stream_from_sequence_ignored_when_round_not_finished(
+def test_stream_reconnect_never_reruns_when_round_not_finished(
     tmp_path: Path,
 ) -> None:
-    """重连时最近一轮未结束(最后事件非终态)→ from_sequence 被忽略,正常启动 run。"""
+    """重连时最近一轮未结束也不得重跑同一输入。
+
+    真实故障链路是：长任务仍在后台执行时浏览器断线，续传请求带正数
+    from_sequence 到达；此时 checkpoint 可能只落了中间事件。把它当成
+    新消息会让同一子代理任务执行两次。正数游标只表示续传，绝不具有
+    启动新 run 的权限；连接可无事件结束，由客户端稍后再次续传。
+    """
     final_events = [
         RunEvent(
             event_type=EventType.AGENT_STARTED,
@@ -974,16 +983,8 @@ def test_stream_from_sequence_ignored_when_round_not_finished(
     finally:
         store.close()
 
-    # 最后事件不是终态 → 回放条件不成立 → 启动新 run,事件按新 run 推送。
-    assert graph.run_inputs == [("请检索", "session-1", "user-1")]
-    assert [frame["event_type"] for frame in frames] == [
-        "thinking",
-        "tool_call",
-        "tool_result",
-        "message_end",
-        "done",
-    ]
-    assert [frame["sequence"] for frame in frames] == [3, 4, 5, 6, 7]
+    assert graph.run_inputs == []
+    assert frames == []
 
 
 def test_stream_from_sequence_zero_starts_new_run_when_round_finished(

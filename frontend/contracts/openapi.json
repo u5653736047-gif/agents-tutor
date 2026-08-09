@@ -1527,7 +1527,7 @@
     },
     "/chat/stream": {
       "post": {
-        "description": "SSE 原生流式聊天(token + 安全运行事件)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence;若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发\n权威 message_end + done,不启动新 run(消息补发);默认 0 表示发新\n消息,启动新 run。",
+        "description": "SSE 原生流式聊天(token + 安全运行事件)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence；若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发\n权威 message_end + done；若仍是中间态则要求客户端继续等待，绝不\n重跑。默认 0 表示发新消息并启动新 run。",
         "operationId": "chat_stream_chat_stream_post",
         "parameters": [
           {
