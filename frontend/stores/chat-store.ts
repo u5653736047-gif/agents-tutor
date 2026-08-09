@@ -1,6 +1,6 @@
 "use client";
 
-import { create } from "zustand";
+import { create, type StoreApi } from "zustand";
 
 import {
   ApiClientError,
@@ -12,7 +12,9 @@ import {
   type HandoffDecision,
   type Message,
   type PendingHandoffResponse,
+  type PendingToolApprovalResponse,
   type Session,
+  type ToolApprovalDecision,
 } from "../lib/api-client";
 import type { components } from "../contracts/api.generated";
 
@@ -22,10 +24,15 @@ type ChatStoreClient = Pick<
 > & {
   // 正式客户端会从 checkpoint 恢复过程；可选以兼容只关注消息的测试替身。
   getSessionProcess?: ApiClient["getSessionProcess"];
+  // 正式客户端可为当前会话追加只读授权目录；可选以兼容旧测试替身。
+  addWorkspaceRoot?: ApiClient["addWorkspaceRoot"];
   // D2-T3:审批接口——可选:既有测试注入的 stub 未实现,正式 apiClient
   // 一定实现;decideHandoff action 在未注入时直接跳过(与 streamChat 同模式)
   decideHandoff?: ApiClient["decideHandoff"];
   getPendingHandoff?: ApiClient["getPendingHandoff"];
+  decideToolApproval?: ApiClient["decideToolApproval"];
+  getPendingToolApproval?: ApiClient["getPendingToolApproval"];
+  streamToolApproval?: ApiClient["streamToolApproval"];
   // 可选:既有测试注入的 stub 未实现流式通道,正式 apiClient 一定实现
   streamChat?: ApiClient["streamChat"];
   // D1-T3:断线重连通道(指数退避重试 + fromSequence 续传)。store 优先
@@ -40,6 +47,9 @@ type ChatStoreClient = Pick<
 // NonNullable:响应字段可选(含 undefined),store 语义统一为 null
 // (所有写入点都用 ?? null 归一化)——否则组件 props 会收到 undefined。
 type PendingHandoff = NonNullable<PendingHandoffResponse["pending_handoff"]>;
+type PendingToolApproval = NonNullable<
+  PendingToolApprovalResponse["pending_tool_approval"]
+>;
 type RunError = ChatResponse["run_error"];
 type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
@@ -63,13 +73,14 @@ type Citation = components["schemas"]["Citation"];
 const _STREAM_RETRY_LIMIT = 3;
 
 export type ChatStore = {
+  addWorkspaceRoot(path: string): Promise<Session | null>;
   archiveSession(sessionId: string): Promise<void>;
   // D4-T3:停止生成——abort 当前流式请求(仅对流式通道生效,同步
   // 通道无取消能力);无活跃流时为 no-op。
   cancelStreaming(): void;
   clearConversationState(): void;
   clearRequestError(): void;
-  createSession(): Promise<Session | null>;
+  createSession(workspaceRoot?: string): Promise<Session | null>;
   currentAgent: AgentRole | null;
   currentSessionId: string | null;
   // D2-T3:审批决策——决定(确认/拒绝/修改)与状态字段
@@ -78,9 +89,11 @@ export type ChatStore = {
     action: "confirm" | "reject" | "modify",
     modifications?: HandoffModifications,
   ): Promise<void>;
+  decideToolApproval(action: "confirm" | "reject"): Promise<void>;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
   isDecidingHandoff: boolean;
+  isDecidingToolApproval: boolean;
   isLoadingMessages: boolean;
   isLoadingSessions: boolean;
   isSending: boolean;
@@ -89,6 +102,7 @@ export type ChatStore = {
   loadCurrentSessionMessages(): Promise<void>;
   messages: Message[];
   pendingHandoff: PendingHandoff | null;
+  pendingToolApproval: PendingToolApproval | null;
   // D3-T4:本轮回答的引用列表(null = 无引用,与后端「无引用不携带」
   // 契约一致;组件层零渲染降级)
   references: Citation[] | null;
@@ -126,12 +140,14 @@ function emptyConversationState() {
     degradedNotice: null as string | null,
     events: [] as (RunEvent | StreamEvent)[],
     isDecidingHandoff: false,
+    isDecidingToolApproval: false,
     isLoadingMessages: false,
     isSending: false,
     isStreaming: false,
     lastSentMessage: null,
     messages: [] as Message[],
     pendingHandoff: null,
+    pendingToolApproval: null,
     // D3-T4:引用随轮次清空(引用对应最后一轮回答,切会话/新建会话不残留)
     references: null,
     runError: null,
@@ -162,6 +178,7 @@ function applyChatResponse(
     currentAgent: response.current_agent ?? null,
     events: [...(response.events ?? [])],
     pendingHandoff: response.pending_handoff ?? null,
+    pendingToolApproval: response.pending_tool_approval ?? null,
     // D3-T4:响应缺失(undefined/null)统一归一为 null,store 语义与
     // 其它可选字段一致,组件层收到 null 时零渲染
     references: response.references ?? null,
@@ -169,6 +186,150 @@ function applyChatResponse(
     taskPlan: response.task_plan ?? null,
     taskResults: response.task_results ?? null,
   };
+}
+
+type ChatStoreSet = StoreApi<ChatStore>["setState"];
+type ChatStoreGet = StoreApi<ChatStore>["getState"];
+type StreamDispatchContext = { activeSupervisorMessageId: string | null };
+
+function dispatchStreamEvent(
+  set: ChatStoreSet,
+  get: ChatStoreGet,
+  sessionId: string,
+  event: StreamEvent,
+  context: StreamDispatchContext,
+) {
+  if (get().currentSessionId !== sessionId) {
+    return;
+  }
+  switch (event.event_type) {
+    case "thinking":
+      set((state) => ({
+        events: [...state.events, event],
+        streamingAgent: event.agent ?? null,
+      }));
+      break;
+    case "reasoning": {
+      const messageId =
+        event.message_id ?? `${event.agent ?? "agent"}-reasoning-${event.sequence}`;
+      const delta = event.content ?? "";
+      set((state) => {
+        const existingIndex = state.events.findIndex(
+          (item) =>
+            item.event_type === "reasoning" &&
+            "message_id" in item &&
+            item.message_id === messageId,
+        );
+        if (existingIndex < 0) {
+          return {
+            events: [...state.events, { ...event, message_id: messageId }],
+            streamingAgent: event.agent ?? null,
+          };
+        }
+        const events = [...state.events];
+        const existing = events[existingIndex];
+        const previousContent =
+          existing && "content" in existing ? (existing.content ?? "") : "";
+        events[existingIndex] = {
+          ...event,
+          content: event.is_delta === false ? delta : `${previousContent}${delta}`,
+          message_id: messageId,
+          sequence: existing?.sequence ?? event.sequence,
+        };
+        return { events, streamingAgent: event.agent ?? null };
+      });
+      break;
+    }
+    case "tool_call":
+    case "tool_result":
+    case "tool_output":
+      set((state) => ({ events: [...state.events, event] }));
+      break;
+    case "approval_required":
+      set({
+        pendingToolApproval: event.pending_tool_approval ?? null,
+        streamingAgent: event.agent ?? null,
+      });
+      break;
+    case "message_delta": {
+      const delta = event.content ?? "";
+      if (event.agent === "supervisor") {
+        const messageId = event.message_id ?? "supervisor";
+        const continuesCurrent = context.activeSupervisorMessageId === messageId;
+        context.activeSupervisorMessageId = messageId;
+        set((state) => ({
+          streamingAgent: "supervisor",
+          streamingMessage: {
+            agent: "supervisor",
+            content: `${continuesCurrent ? (state.streamingMessage?.content ?? "") : ""}${delta}`,
+            created_at: undefined,
+            role: "assistant",
+          },
+        }));
+        break;
+      }
+
+      set((state) => {
+        const messageId =
+          event.message_id ?? `${event.agent ?? "agent"}-${event.sequence}`;
+        const existingIndex = state.events.findIndex(
+          (item) =>
+            item.event_type === "message_delta" &&
+            "message_id" in item &&
+            item.message_id === messageId,
+        );
+        if (existingIndex < 0) {
+          return {
+            events: [...state.events, event],
+            streamingAgent: event.agent ?? null,
+          };
+        }
+        const events = [...state.events];
+        const existing = events[existingIndex];
+        const previousContent =
+          existing && "content" in existing ? (existing.content ?? "") : "";
+        events[existingIndex] = {
+          ...event,
+          content: `${previousContent}${delta}`,
+          message_id: messageId,
+        };
+        return { events, streamingAgent: event.agent ?? null };
+      });
+      break;
+    }
+    case "agent_switch":
+      set((state) => ({
+        currentAgent: event.agent ?? null,
+        events: [...state.events, event],
+        streamingAgent: event.agent ?? null,
+      }));
+      break;
+    case "message_end": {
+      const streamed: Message = event.message ?? {
+        agent: event.agent ?? undefined,
+        content: event.content ?? "",
+        created_at: undefined,
+        role: "assistant",
+      };
+      set({
+        streamingAgent: event.agent ?? null,
+        streamingMessage: streamed,
+        references: event.citations ?? null,
+      });
+      break;
+    }
+    case "error":
+      set({
+        runError: {
+          agent: event.agent ?? undefined,
+          error_code: event.error_code ?? "internal_error",
+          message: "The request could not be completed.",
+        },
+      });
+      break;
+    case "done":
+      break;
+  }
 }
 
 export function createChatStore(client: ChatStoreClient = apiClient) {
@@ -191,6 +352,25 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     requestError: null,
     sessions: [],
     showArchived: false,
+    addWorkspaceRoot: async (path) => {
+      const sessionId = get().currentSessionId;
+      if (!sessionId || !client.addWorkspaceRoot) {
+        return null;
+      }
+      set({ requestError: null });
+      try {
+        const session = await client.addWorkspaceRoot(sessionId, path);
+        set((state) => ({
+          sessions: state.sessions.map((item) =>
+            item.session_id === session.session_id ? session : item,
+          ),
+        }));
+        return session;
+      } catch (error) {
+        set({ requestError: asApiClientError(error) });
+        return null;
+      }
+    },
     archiveSession: async (sessionId) => {
       // D4-T3 review 修正:切会话时 abort 活跃流——旧流继续在后台
       // 跑完浪费算力,且「切走再切回」时旧流剩余事件会重新通过会话
@@ -224,12 +404,14 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     cancelStreaming: () => {
       activeStreamController?.abort();
     },
-    createSession: async () => {
+    createSession: async (workspaceRoot) => {
       // D4-T3 review 修正:新建会话同样中止旧流(见 archiveSession 注释)。
       activeStreamController?.abort();
       set({ requestError: null });
       try {
-        const session = await client.createSession();
+        const session = await client.createSession(
+          workspaceRoot === undefined ? {} : { workspace_root: workspaceRoot },
+        );
         set((state) => ({
           ...emptyConversationState(),
           currentSessionId: session.session_id,
@@ -253,9 +435,12 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       set({ isLoadingMessages: true, requestError: null });
       try {
+        const processSnapshot = client.getSessionProcess
+          ? client.getSessionProcess(sessionId).catch(() => null)
+          : Promise.resolve(null);
         const [messages, process] = await Promise.all([
           client.getSessionMessages(sessionId),
-          client.getSessionProcess?.(sessionId) ?? Promise.resolve(null),
+          processSnapshot,
         ]);
         if (get().currentSessionId === sessionId) {
           set({
@@ -265,6 +450,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
               ? {
                   currentAgent: process.current_agent ?? null,
                   events: [...(process.events ?? [])],
+                  pendingToolApproval: process.pending_tool_approval ?? null,
                   taskPlan: process.task_plan ?? null,
                   taskResults: process.task_results ?? null,
                 }
@@ -412,12 +598,121 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       }
     },
+    decideToolApproval: async (action: "confirm" | "reject") => {
+      const sessionId = get().currentSessionId;
+      const pending = get().pendingToolApproval;
+      const streamDecision = client.streamToolApproval;
+      const syncDecision = client.decideToolApproval;
+      if (
+        !sessionId ||
+        !pending ||
+        (!streamDecision && !syncDecision) ||
+        get().isDecidingToolApproval
+      ) {
+        return;
+      }
+
+      const decision: ToolApprovalDecision = {
+        action,
+        interrupt_id: pending.interrupt_id,
+      };
+      const dispatchContext: StreamDispatchContext = {
+        activeSupervisorMessageId: null,
+      };
+      set({
+        isDecidingToolApproval: true,
+        isStreaming: true,
+        requestError: null,
+        runError: null,
+        streamingAgent: pending.request.agent_role,
+        streamingMessage: null,
+      });
+
+      try {
+        if (streamDecision) {
+          await streamDecision({
+            decision,
+            onEvent: (event) =>
+              dispatchStreamEvent(
+                set,
+                get,
+                sessionId,
+                event,
+                dispatchContext,
+              ),
+            sessionId,
+          });
+        } else if (syncDecision) {
+          const response = await syncDecision(sessionId, decision);
+          if (get().currentSessionId === sessionId) {
+            set((state) => ({
+              ...applyChatResponse(state, response),
+              events: [...state.events, ...(response.events ?? [])],
+            }));
+          }
+        }
+
+        if (get().currentSessionId === sessionId) {
+          set((state) => ({
+            isDecidingToolApproval: false,
+            isStreaming: false,
+            messages: state.streamingMessage
+              ? [...state.messages, state.streamingMessage]
+              : state.messages,
+            pendingToolApproval:
+              state.pendingToolApproval?.interrupt_id === pending.interrupt_id
+                ? null
+                : state.pendingToolApproval,
+            streamingAgent: null,
+            streamingMessage: null,
+          }));
+          await get().loadCurrentSessionMessages();
+        }
+      } catch (error) {
+        if (get().currentSessionId === sessionId) {
+          const apiError = asApiClientError(error);
+          if (apiError.code === "tool_approval_not_pending") {
+            set({
+              isDecidingToolApproval: false,
+              isStreaming: false,
+              pendingToolApproval: null,
+            });
+            const refreshPending = client.getPendingToolApproval;
+            if (refreshPending) {
+              try {
+                const fresh = await refreshPending(sessionId);
+                if (get().currentSessionId === sessionId) {
+                  set({
+                    pendingToolApproval: fresh.pending_tool_approval ?? null,
+                  });
+                }
+              } catch {
+                // A stale approval stays cleared when the refresh also fails.
+              }
+            }
+          } else {
+            set({
+              isDecidingToolApproval: false,
+              isStreaming: false,
+              requestError: apiError,
+            });
+          }
+        }
+      } finally {
+        if (get().currentSessionId === sessionId) {
+          set({ isDecidingToolApproval: false, isStreaming: false });
+        }
+      }
+    },
     sendMessage: async (message, attachments) => {
       const sessionId = get().currentSessionId;
       if (!sessionId) {
         set({
           requestError: new ApiClientError("请先选择会话。", { code: null, status: null }),
         });
+        return;
+      }
+      if (get().pendingToolApproval) {
         return;
       }
 
@@ -534,6 +829,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         });
         return;
       }
+      if (get().pendingToolApproval) {
+        return;
+      }
 
       // 同一 store 同时只允许一个发送动作。UI 禁用需要一次 React
       // 重渲染才生效，双击/连续 Enter 仍可能在同一事件循环内进入两次；
@@ -595,146 +893,11 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         messages: [...state.messages, optimistic],
       }));
 
-      let activeSupervisorMessageId: string | null = null;
-      // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
-      const dispatch = (event: StreamEvent) => {
-        // 旧会话的流事件不回写新会话状态(与 sendMessage 的会话守卫一致)
-        if (get().currentSessionId !== sessionId) {
-          return;
-        }
-        switch (event.event_type) {
-          case "thinking":
-            // 安全思考摘要进入协作时间线；不进入回答正文。
-            set((state) => ({
-              events: [...state.events, event],
-              streamingAgent: event.agent ?? null,
-            }));
-            break;
-          case "reasoning": {
-            // reasoning token 按 message_id 聚合；checkpoint 的完整事件
-            // (is_delta=false)会替换临时增量，避免原生流 + custom 终态重复。
-            const messageId =
-              event.message_id ?? `${event.agent ?? "agent"}-reasoning-${event.sequence}`;
-            const delta = event.content ?? "";
-            set((state) => {
-              const existingIndex = state.events.findIndex(
-                (item) =>
-                  item.event_type === "reasoning" &&
-                  "message_id" in item &&
-                  item.message_id === messageId,
-              );
-              if (existingIndex < 0) {
-                return {
-                  events: [...state.events, { ...event, message_id: messageId }],
-                  streamingAgent: event.agent ?? null,
-                };
-              }
-              const events = [...state.events];
-              const existing = events[existingIndex];
-              const previousContent =
-                existing && "content" in existing ? (existing.content ?? "") : "";
-              events[existingIndex] = {
-                ...event,
-                content:
-                  event.is_delta === false ? delta : `${previousContent}${delta}`,
-                message_id: messageId,
-                sequence: existing?.sequence ?? event.sequence,
-              };
-              return { events, streamingAgent: event.agent ?? null };
-            });
-            break;
-          }
-          case "tool_call":
-          case "tool_result":
-            // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)
-            set((state) => ({ events: [...state.events, event] }));
-            break;
-          case "message_delta": {
-            const delta = event.content ?? "";
-            if (event.agent === "supervisor") {
-              const messageId = event.message_id ?? "supervisor";
-              const continuesCurrent = activeSupervisorMessageId === messageId;
-              activeSupervisorMessageId = messageId;
-              set((state) => ({
-                streamingAgent: "supervisor",
-                streamingMessage: {
-                  agent: "supervisor",
-                  content: `${continuesCurrent ? (state.streamingMessage?.content ?? "") : ""}${delta}`,
-                  created_at: undefined,
-                  role: "assistant",
-                },
-              }));
-              break;
-            }
-
-            // 子代理 token 不混入主回答气泡；按 message_id 合并为一条
-            // 阶段性结果，避免每个 token 生成一个时间线 DOM 节点。
-            set((state) => {
-              const messageId = event.message_id ?? `${event.agent ?? "agent"}-${event.sequence}`;
-              const existingIndex = state.events.findIndex(
-                (item) =>
-                  item.event_type === "message_delta" &&
-                  "message_id" in item &&
-                  item.message_id === messageId,
-              );
-              if (existingIndex < 0) {
-                return {
-                  events: [...state.events, event],
-                  streamingAgent: event.agent ?? null,
-                };
-              }
-              const events = [...state.events];
-              const existing = events[existingIndex];
-              const previousContent =
-                existing && "content" in existing ? (existing.content ?? "") : "";
-              events[existingIndex] = {
-                ...event,
-                content: `${previousContent}${delta}`,
-                message_id: messageId,
-              };
-              return { events, streamingAgent: event.agent ?? null };
-            });
-            break;
-          }
-          case "agent_switch":
-            // D2-T2:流式路径没有 ChatResponse,用最后一条 agent_switch
-            // 的目标 Agent 作为当前活跃 Agent(与面板内的兜底逻辑一致)。
-            set((state) => ({
-              currentAgent: event.agent ?? null,
-              events: [...state.events, event],
-              streamingAgent: event.agent ?? null,
-            }));
-            break;
-          case "message_end": {
-            const streamed: Message = event.message ?? {
-              agent: event.agent ?? undefined,
-              content: event.content ?? "",
-              created_at: undefined,
-              role: "assistant",
-            };
-            set({
-              streamingAgent: event.agent ?? null,
-              streamingMessage: streamed,
-              // D3-T5:流式主通道的引用由 message_end 事件携带(与
-              // POST /chat 的 references 同源);未携带时为 null。
-              references: event.citations ?? null,
-            });
-            break;
-          }
-          case "error":
-            set({
-              runError: {
-                agent: event.agent ?? undefined,
-                error_code: event.error_code ?? "internal_error",
-                message: "The request could not be completed.",
-              },
-            });
-            break;
-          case "done":
-            // done 无需处理,await 返回后统一收尾
-            break;
-        }
+      const dispatchContext: StreamDispatchContext = {
+        activeSupervisorMessageId: null,
       };
+      const dispatch = (event: StreamEvent) =>
+        dispatchStreamEvent(set, get, sessionId, event, dispatchContext);
 
       try {
         if (retryStream) {

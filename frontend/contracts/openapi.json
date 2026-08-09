@@ -1,6 +1,22 @@
 {
   "components": {
     "schemas": {
+      "AddWorkspaceRootRequest": {
+        "additionalProperties": false,
+        "description": "One user-authorized additional workspace directory.",
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "AddWorkspaceRootRequest",
+        "type": "object"
+      },
       "AgentRole": {
         "description": "Public collaborative-agent roles.",
         "enum": [
@@ -18,6 +34,7 @@
           "invalid_request",
           "internal_error",
           "handoff_not_pending",
+          "tool_approval_not_pending",
           "session_already_exists",
           "session_busy",
           "session_not_found",
@@ -177,6 +194,17 @@
             ],
             "default": null
           },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "references": {
             "anyOf": [
               {
@@ -202,6 +230,18 @@
               }
             ],
             "default": null
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "session_id": {
             "title": "Session Id",
@@ -293,6 +333,18 @@
             ],
             "default": null,
             "title": "Session Id"
+          },
+          "workspace_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Root"
           }
         },
         "title": "CreateSessionRequest",
@@ -306,6 +358,10 @@
           "tool_invalid_arguments",
           "tool_execution_failed",
           "tool_timeout",
+          "tool_no_progress",
+          "tool_budget_exceeded",
+          "tool_approval_rejected",
+          "tool_approval_queue_limit",
           "model_call_failed",
           "react_iteration_limit",
           "graph_handoff_limit",
@@ -833,6 +889,50 @@
         "title": "PendingHandoffResponse",
         "type": "object"
       },
+      "PendingToolApproval": {
+        "additionalProperties": false,
+        "description": "A tool invocation paused at a resumable graph gate.",
+        "properties": {
+          "interrupt_id": {
+            "title": "Interrupt Id",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ToolApprovalRequest"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "request"
+        ],
+        "title": "PendingToolApproval",
+        "type": "object"
+      },
+      "PendingToolApprovalResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "PendingToolApprovalResponse",
+        "type": "object"
+      },
       "RunError": {
         "additionalProperties": false,
         "description": "A stable, sanitized error response for a completed run.",
@@ -973,6 +1073,22 @@
             "default": null,
             "title": "Message Id"
           },
+          "output_stream": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Stream"
+          },
           "output_summary": {
             "anyOf": [
               {
@@ -1009,6 +1125,18 @@
             ],
             "default": null,
             "title": "Plan Step Sequence"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "sequence": {
             "minimum": 0,
@@ -1099,6 +1227,13 @@
         "additionalProperties": false,
         "description": "A session visible to its owner.",
         "properties": {
+          "additional_workspace_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Additional Workspace Roots",
+            "type": "array"
+          },
           "archived": {
             "title": "Archived",
             "type": "boolean"
@@ -1139,6 +1274,14 @@
               }
             ],
             "title": "User Id"
+          },
+          "workspace_access": {
+            "$ref": "#/components/schemas/WorkspaceAccess",
+            "default": "read_only"
+          },
+          "workspace_root": {
+            "title": "Workspace Root",
+            "type": "string"
           }
         },
         "required": [
@@ -1146,7 +1289,8 @@
           "user_id",
           "created_at",
           "updated_at",
-          "archived"
+          "archived",
+          "workspace_root"
         ],
         "title": "Session",
         "type": "object"
@@ -1172,6 +1316,29 @@
             },
             "title": "Events",
             "type": "array"
+          },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "task_plan": {
             "anyOf": [
@@ -1374,6 +1541,22 @@
             "default": null,
             "title": "Message Id"
           },
+          "output_stream": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Stream"
+          },
           "output_summary": {
             "anyOf": [
               {
@@ -1398,6 +1581,17 @@
             "default": null,
             "title": "Parent Tool Call Id"
           },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "plan_step_sequence": {
             "anyOf": [
               {
@@ -1410,6 +1604,18 @@
             ],
             "default": null,
             "title": "Plan Step Sequence"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "sequence": {
             "minimum": 0,
@@ -1472,6 +1678,8 @@
           "reasoning",
           "tool_call",
           "tool_result",
+          "tool_output",
+          "approval_required",
           "message_delta",
           "message_end",
           "agent_switch",
@@ -1594,6 +1802,63 @@
         "title": "TaskResult",
         "type": "object"
       },
+      "ToolApprovalDecisionAction": {
+        "enum": [
+          "confirm",
+          "reject"
+        ],
+        "title": "ToolApprovalDecisionAction",
+        "type": "string"
+      },
+      "ToolApprovalDecisionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ToolApprovalDecisionAction"
+          },
+          "interrupt_id": {
+            "minLength": 1,
+            "title": "Interrupt Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "action"
+        ],
+        "title": "ToolApprovalDecisionRequest",
+        "type": "object"
+      },
+      "ToolApprovalRequest": {
+        "additionalProperties": false,
+        "description": "The exact validated invocation shown to the user before execution.",
+        "properties": {
+          "agent_role": {
+            "$ref": "#/components/schemas/AgentRole"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_call_id",
+          "tool_name",
+          "agent_role",
+          "arguments"
+        ],
+        "title": "ToolApprovalRequest",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -1643,6 +1908,87 @@
         ],
         "title": "WorkerAgentRole",
         "type": "string"
+      },
+      "WorkspaceAccess": {
+        "description": "Access level granted to Agent filesystem tools for a session.",
+        "enum": [
+          "read_only"
+        ],
+        "title": "WorkspaceAccess",
+        "type": "string"
+      },
+      "WorkspaceDirectory": {
+        "additionalProperties": false,
+        "description": "One directory entry in the server-side workspace picker.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "path"
+        ],
+        "title": "WorkspaceDirectory",
+        "type": "object"
+      },
+      "WorkspaceDirectoryListing": {
+        "additionalProperties": false,
+        "description": "Directory picker state rooted in the server filesystem.",
+        "properties": {
+          "directories": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceDirectory"
+            },
+            "title": "Directories",
+            "type": "array"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "WorkspaceDirectoryListing",
+        "type": "object"
+      },
+      "WorkspacePath": {
+        "additionalProperties": false,
+        "description": "A canonical existing directory accepted by the server policy.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "name"
+        ],
+        "title": "WorkspacePath",
+        "type": "object"
       }
     }
   },
@@ -2835,6 +3181,348 @@
         ]
       }
     },
+    "/sessions/{session_id}/tool-approval": {
+      "get": {
+        "description": "Return the exact validated invocation currently awaiting consent.",
+        "operationId": "get_pending_tool_approval_sessions__session_id__tool_approval_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingToolApprovalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Get Pending Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      },
+      "post": {
+        "description": "Confirm or reject one exact invocation, then finish the graph turn.",
+        "operationId": "decide_tool_approval_sessions__session_id__tool_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolApprovalDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Decide Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      }
+    },
+    "/sessions/{session_id}/tool-approval/stream": {
+      "post": {
+        "description": "Resume one exact tool gate and stream terminal/model output as SSE.",
+        "operationId": "stream_tool_approval_sessions__session_id__tool_approval_stream_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolApprovalDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Stream Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      }
+    },
+    "/sessions/{session_id}/workspace-roots": {
+      "post": {
+        "description": "Authorize one additional directory for this session's file tools.",
+        "operationId": "add_workspace_root_sessions__session_id__workspace_roots_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddWorkspaceRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Add Workspace Root",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/stats/overview": {
       "get": {
         "description": "返回当前用户的学习进度基础统计(只读聚合)。",
@@ -2902,6 +3590,153 @@
         "summary": "Stats Overview",
         "tags": [
           "stats"
+        ]
+      }
+    },
+    "/workspaces/directories": {
+      "get": {
+        "description": "Browse immediate directories without exposing files or file contents.",
+        "operationId": "list_workspace_directories_workspaces_directories_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDirectoryListing"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "List Workspace Directories",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    },
+    "/workspaces/validate": {
+      "post": {
+        "description": "Resolve a typed path before the user creates or updates a session.",
+        "operationId": "validate_workspace_workspaces_validate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddWorkspaceRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspacePath"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Validate Workspace",
+        "tags": [
+          "workspaces"
         ]
       }
     }

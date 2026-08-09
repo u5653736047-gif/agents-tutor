@@ -157,6 +157,93 @@ test("the collaboration panel exposes model reasoning and detailed tool activity
   assert.doesNotMatch(markup, /sk-never-show/);
 });
 
+test("a tool call and its result render as one evolving activity row", async () => {
+  const { CollaborationPanel } = await loadCollaborationPanel();
+  const events = [
+    {
+      agent: "supervisor",
+      event_type: "tool_call",
+      input_summary: '{"operations":[{"kind":"glob","pattern":"**/*.py"}]}',
+      sequence: 3,
+      tool_call_id: "inspect-1",
+      tool_name: "inspect_workspace",
+    },
+    {
+      agent: "supervisor",
+      duration_ms: 18,
+      event_type: "tool_result",
+      output_summary: '{"results_returned":3}',
+      sequence: 4,
+      success: true,
+      tool_call_id: "inspect-1",
+      tool_name: "inspect_workspace",
+    },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(CollaborationPanel, { ...emptyProps, events }),
+  );
+
+  assert.equal((markup.match(/data-slot="tool-row"/g) ?? []).length, 1);
+  assert.match(markup, /data-tool-call-id="inspect-1"/);
+  assert.match(markup, /inspect_workspace/);
+  assert.match(markup, /执行成功/);
+  assert.match(markup, /工具输入/);
+  assert.match(markup, /工具输出/);
+  assert.match(markup, /耗时:18ms/);
+});
+
+test("terminal chunks stay attached to one shell activity in stream order", async () => {
+  const { CollaborationPanel } = await loadCollaborationPanel();
+  const events = [
+    {
+      agent: "supervisor",
+      event_type: "tool_call",
+      input_summary: '{"command":"echo first; echo warning"}',
+      sequence: 3,
+      tool_call_id: "shell-1",
+      tool_name: "shell",
+    },
+    {
+      agent: "supervisor",
+      content: "first\n",
+      event_type: "tool_output",
+      output_stream: "stdout",
+      sequence: 4,
+      tool_call_id: "shell-1",
+      tool_name: "shell",
+    },
+    {
+      agent: "supervisor",
+      content: "warning\n",
+      event_type: "tool_output",
+      output_stream: "stderr",
+      sequence: 5,
+      tool_call_id: "shell-1",
+      tool_name: "shell",
+    },
+    {
+      agent: "supervisor",
+      event_type: "tool_result",
+      output_summary: '{"exit_code":0,"ok":true}',
+      sequence: 6,
+      success: true,
+      tool_call_id: "shell-1",
+      tool_name: "shell",
+    },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(CollaborationPanel, { ...emptyProps, events }),
+  );
+
+  assert.equal((markup.match(/data-slot="tool-row"/g) ?? []).length, 1);
+  assert.equal((markup.match(/data-slot="terminal-output"/g) ?? []).length, 1);
+  assert.ok(markup.indexOf("first") < markup.indexOf("warning"));
+  assert.match(markup, /data-output-stream="stdout"/);
+  assert.match(markup, /data-output-stream="stderr"/);
+});
+
 test("the collaboration panel renders coalesced subagent output", async () => {
   const { CollaborationPanel } = await loadCollaborationPanel();
   const events = [

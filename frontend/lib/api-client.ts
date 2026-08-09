@@ -2,19 +2,28 @@ import type { components, paths } from "@/contracts/api.generated";
 import {
   streamChat as streamChatImpl,
   streamChatWithRetry as streamChatWithRetryImpl,
+  streamToolApproval as streamToolApprovalImpl,
   type StreamChatOptions,
   type StreamRetryOptions,
+  type StreamToolApprovalOptions,
 } from "./stream-client";
 
 export type ApiErrorCode = components["schemas"]["ApiErrorCode"];
 export type ChatRequest = components["schemas"]["ChatRequest"];
 export type ChatResponse = paths["/chat"]["post"]["responses"][200]["content"]["application/json"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
+export type WorkspaceDirectoryListing =
+  components["schemas"]["WorkspaceDirectoryListing"];
+export type WorkspacePath = components["schemas"]["WorkspacePath"];
 // D2-T4:审批决策放开为全字段契约(action/interrupt_id + modify 的
 // target_agent/task_content),由 store 按 action 构造合法组合。
 export type HandoffDecision = components["schemas"]["HandoffDecisionRequest"];
 export type Message = components["schemas"]["Message"];
 export type PendingHandoffResponse = components["schemas"]["PendingHandoffResponse"];
+export type PendingToolApprovalResponse =
+  components["schemas"]["PendingToolApprovalResponse"];
+export type ToolApprovalDecision =
+  components["schemas"]["ToolApprovalDecisionRequest"];
 export type Session = components["schemas"]["Session"];
 export type SessionProcess = components["schemas"]["SessionProcess"];
 // D6-T2:反馈评分方向与受理响应,直接取生成契约(单一数据源)
@@ -83,14 +92,22 @@ export class ApiClientError extends Error {
 }
 
 export type ApiClient = {
+  addWorkspaceRoot(sessionId: string, path: string): Promise<Session>;
   archiveSession(sessionId: string): Promise<Session>;
   createSession(payload?: CreateSessionRequest): Promise<Session>;
   decideHandoff(sessionId: string, decision: HandoffDecision): Promise<ChatResponse>;
+  decideToolApproval(
+    sessionId: string,
+    decision: ToolApprovalDecision,
+  ): Promise<ChatResponse>;
   getPendingHandoff(sessionId: string): Promise<PendingHandoffResponse>;
+  getPendingToolApproval(sessionId: string): Promise<PendingToolApprovalResponse>;
   getSessionMessages(sessionId: string): Promise<Message[]>;
   getSessionProcess(sessionId: string): Promise<SessionProcess>;
   listSessions(includeArchived?: boolean): Promise<Session[]>;
+  listWorkspaceDirectories(path?: string): Promise<WorkspaceDirectoryListing>;
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
+  validateWorkspace(path: string): Promise<WorkspacePath>;
   // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话接口解耦:错误与
   // 其它接口一样归一为 ApiClientError,由调用方(FeedbackButtons)
   // 决定呈现方式,不进入主流程错误状态。
@@ -129,6 +146,12 @@ export type ApiClient = {
   streamChatWithRetry(
     options: Omit<
       StreamChatOptions & StreamRetryOptions,
+      "baseUrl" | "fetchImpl" | "userId"
+    >,
+  ): Promise<void>;
+  streamToolApproval(
+    options: Omit<
+      StreamToolApprovalOptions,
       "baseUrl" | "fetchImpl" | "userId"
     >,
   ): Promise<void>;
@@ -247,6 +270,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   };
 
   return {
+    addWorkspaceRoot: (sessionId, path) =>
+      request<Session>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/workspace-roots`,
+        {
+          body: JSON.stringify({ path }),
+          method: "POST",
+        },
+      ),
     archiveSession: (sessionId) =>
       request<Session>(config, `/sessions/${encodeURIComponent(sessionId)}/archive`, {
         method: "POST",
@@ -261,10 +293,24 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         body: JSON.stringify(decision),
         method: "POST",
       }),
+    decideToolApproval: (sessionId, decision) =>
+      request<ChatResponse>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/tool-approval`,
+        {
+          body: JSON.stringify(decision),
+          method: "POST",
+        },
+      ),
     getPendingHandoff: (sessionId) =>
       request<PendingHandoffResponse>(
         config,
         `/sessions/${encodeURIComponent(sessionId)}/handoff`,
+      ),
+    getPendingToolApproval: (sessionId) =>
+      request<PendingToolApprovalResponse>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/tool-approval`,
       ),
     getSessionMessages: (sessionId) =>
       request<Message[]>(config, `/sessions/${encodeURIComponent(sessionId)}/messages`),
@@ -275,9 +321,21 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         config,
         includeArchived ? "/sessions?include_archived=true" : "/sessions",
       ),
+    listWorkspaceDirectories: (path) =>
+      request<WorkspaceDirectoryListing>(
+        config,
+        path === undefined
+          ? "/workspaces/directories"
+          : `/workspaces/directories?path=${encodeURIComponent(path)}`,
+      ),
     sendChat: (payload) =>
       request<ChatResponse>(config, "/chat", {
         body: JSON.stringify(payload),
+        method: "POST",
+      }),
+    validateWorkspace: (path) =>
+      request<WorkspacePath>(config, "/workspaces/validate", {
+        body: JSON.stringify({ path }),
         method: "POST",
       }),
     // D6-T2:反馈接口——只发契约 FeedbackRequest 的脱敏字段(不含消息
@@ -367,6 +425,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // 断线重连(指数退避 + fromSequence 续传,实现见 stream-client)。
     streamChatWithRetry: (options) =>
       streamChatWithRetryImpl({
+        baseUrl: config.baseUrl,
+        fetchImpl: config.fetchImpl,
+        timeoutMs: config.timeoutMs,
+        userId: config.userId,
+        ...options,
+      }),
+    streamToolApproval: (options) =>
+      streamToolApprovalImpl({
         baseUrl: config.baseUrl,
         fetchImpl: config.fetchImpl,
         timeoutMs: config.timeoutMs,

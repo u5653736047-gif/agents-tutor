@@ -50,9 +50,65 @@ test("the API client preserves an optional generated session ID", async () => {
     },
   });
 
-  await client.createSession({ session_id: "session/1" });
+  await client.createSession({
+    session_id: "session/1",
+    workspace_root: "D:\\Projects\\course",
+  });
 
-  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { session_id: "session/1" });
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    session_id: "session/1",
+    workspace_root: "D:\\Projects\\course",
+  });
+});
+
+test("the API client validates, browses, and adds workspace directories", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null; method: string; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({
+        body: init?.body ? String(init.body) : null,
+        method: init?.method ?? "GET",
+        url: String(input),
+      });
+      if (String(input).includes("/directories")) {
+        return Response.json({
+          directories: [],
+          parent: "D:\\Projects",
+          path: "D:\\Projects\\course",
+        });
+      }
+      if (String(input).includes("/validate")) {
+        return Response.json({ name: "course", path: "D:\\Projects\\course" });
+      }
+      return Response.json({
+        additional_workspace_roots: ["D:\\Shared"],
+        archived: false,
+        created_at: "2026-08-03T00:00:00Z",
+        session_id: "session/1",
+        updated_at: "2026-08-03T00:00:00Z",
+        user_id: "demo-user",
+        workspace_access: "read_only",
+        workspace_root: "D:\\Projects\\course",
+      });
+    },
+  });
+
+  await client.validateWorkspace("D:\\Projects\\course");
+  await client.listWorkspaceDirectories("D:\\Projects\\course");
+  await client.addWorkspaceRoot("session/1", "D:\\Shared");
+
+  assert.equal(requests[0]?.url, "https://api.example/workspaces/validate");
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    path: "D:\\Projects\\course",
+  });
+  assert.equal(
+    requests[1]?.url,
+    "https://api.example/workspaces/directories?path=D%3A%5CProjects%5Ccourse",
+  );
+  assert.equal(requests[2]?.url, "https://api.example/sessions/session%2F1/workspace-roots");
+  assert.deepEqual(JSON.parse(requests[2]?.body ?? "{}"), { path: "D:\\Shared" });
 });
 
 test("the API client loads a replayable session process snapshot", async () => {
@@ -152,6 +208,36 @@ test("the handoff client only serializes supported decision fields", async () =>
   assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
     action: "confirm",
     interrupt_id: "interrupt-1",
+  });
+});
+
+test("the tool approval client keeps the exact interrupt and encoded session path", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null; method?: string; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({
+        body: init?.body == null ? null : String(init.body),
+        method: init?.method,
+        url: String(input),
+      });
+      return Response.json({ events: [], session_id: "session/1" });
+    },
+  });
+
+  await client.decideToolApproval("session/1", {
+    action: "reject",
+    interrupt_id: "interrupt-shell-1",
+  });
+
+  assert.deepEqual(requests[0], {
+    body: JSON.stringify({
+      action: "reject",
+      interrupt_id: "interrupt-shell-1",
+    }),
+    method: "POST",
+    url: "https://api.example/sessions/session%2F1/tool-approval",
   });
 });
 

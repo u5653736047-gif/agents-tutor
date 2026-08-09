@@ -251,6 +251,12 @@ test.describe("真实 DeepSeek 冒烟(手动)", () => {
     const input = page.getByLabel("输入消息");
     await expect(input).toBeVisible();
     await input.fill("用一句话介绍反向传播");
+    const processRefreshed = page.waitForResponse(
+      (response) =>
+        response.request().method() === "GET" &&
+        /\/sessions\/[^/]+\/process$/.test(new URL(response.url()).pathname),
+      { timeout: 120_000 },
+    );
     await input.press("Enter");
     // 运行事件应先让执行过程面板出现，证明真实后端而非仅 mock 能把
     // 思考摘要、工具/子代理生命周期推到页面。
@@ -261,5 +267,7 @@ test.describe("真实 DeepSeek 冒烟(手动)", () => {
     await expect(
       page.locator('[data-message-role="assistant"]').last(),
     ).toBeVisible({ timeout: 120_000 });
+    expect((await processRefreshed).status()).toBe(200);
+    await expect(page.locator('[data-slot="sidebar-request-error"]')).toHaveCount(0);
   });
 });

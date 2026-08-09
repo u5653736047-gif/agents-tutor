@@ -355,6 +355,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sessions/{session_id}/tool-approval": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Pending Tool Approval
+         * @description Return the exact validated invocation currently awaiting consent.
+         */
+        get: operations["get_pending_tool_approval_sessions__session_id__tool_approval_get"];
+        put?: never;
+        /**
+         * Decide Tool Approval
+         * @description Confirm or reject one exact invocation, then finish the graph turn.
+         */
+        post: operations["decide_tool_approval_sessions__session_id__tool_approval_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/tool-approval/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stream Tool Approval
+         * @description Resume one exact tool gate and stream terminal/model output as SSE.
+         */
+        post: operations["stream_tool_approval_sessions__session_id__tool_approval_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/workspace-roots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Workspace Root
+         * @description Authorize one additional directory for this session's file tools.
+         */
+        post: operations["add_workspace_root_sessions__session_id__workspace_roots_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/stats/overview": {
         parameters: {
             query?: never;
@@ -375,10 +439,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/directories": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Workspace Directories
+         * @description Browse immediate directories without exposing files or file contents.
+         */
+        get: operations["list_workspace_directories_workspaces_directories_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate Workspace
+         * @description Resolve a typed path before the user creates or updates a session.
+         */
+        post: operations["validate_workspace_workspaces_validate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AddWorkspaceRootRequest
+         * @description One user-authorized additional workspace directory.
+         */
+        AddWorkspaceRootRequest: {
+            /** Path */
+            path: string;
+        };
         /**
          * AgentRole
          * @description Public collaborative-agent roles.
@@ -390,7 +502,7 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
+        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "tool_approval_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
         /**
          * Attachment
          * @description 聊天消息附件引用(D7-T1 契约扩展预留)。
@@ -450,6 +562,8 @@ export interface components {
             message?: components["schemas"]["Message"] | null;
             /** @default null */
             pending_handoff?: components["schemas"]["PendingHandoff"] | null;
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
             /**
              * References
              * @default null
@@ -457,6 +571,11 @@ export interface components {
             references?: components["schemas"]["Citation"][] | null;
             /** @default null */
             run_error?: components["schemas"]["RunError"] | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Session Id */
             session_id: string;
             /** @default null */
@@ -494,13 +613,18 @@ export interface components {
              * @default null
              */
             session_id?: string | null;
+            /**
+             * Workspace Root
+             * @default null
+             */
+            workspace_root?: string | null;
         };
         /**
          * ErrorCode
          * @description Stable API error codes aligned with the current Core classification.
          * @enum {string}
          */
-        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "agent_output_invalid";
+        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "tool_no_progress" | "tool_budget_exceeded" | "tool_approval_rejected" | "tool_approval_queue_limit" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "agent_output_invalid";
         /**
          * ErrorDetail
          * @description A sanitized stable API error.
@@ -750,6 +874,22 @@ export interface components {
             session_id: string;
         };
         /**
+         * PendingToolApproval
+         * @description A tool invocation paused at a resumable graph gate.
+         */
+        PendingToolApproval: {
+            /** Interrupt Id */
+            interrupt_id: string;
+            request: components["schemas"]["ToolApprovalRequest"];
+        };
+        /** PendingToolApprovalResponse */
+        PendingToolApprovalResponse: {
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
+            /** Session Id */
+            session_id: string;
+        };
+        /**
          * RunError
          * @description A stable, sanitized error response for a completed run.
          */
@@ -802,6 +942,11 @@ export interface components {
              */
             message_id?: string | null;
             /**
+             * Output Stream
+             * @default null
+             */
+            output_stream?: ("stdout" | "stderr") | null;
+            /**
              * Output Summary
              * @default null
              */
@@ -816,6 +961,11 @@ export interface components {
              * @default null
              */
             plan_step_sequence?: number | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Sequence */
             sequence: number;
             /**
@@ -855,6 +1005,8 @@ export interface components {
          * @description A session visible to its owner.
          */
         Session: {
+            /** Additional Workspace Roots */
+            additional_workspace_roots?: string[];
             /** Archived */
             archived: boolean;
             /**
@@ -876,6 +1028,10 @@ export interface components {
             updated_at: string;
             /** User Id */
             user_id: string | null;
+            /** @default read_only */
+            workspace_access?: components["schemas"]["WorkspaceAccess"];
+            /** Workspace Root */
+            workspace_root: string;
         };
         /**
          * SessionProcess
@@ -886,6 +1042,13 @@ export interface components {
             current_agent?: components["schemas"]["AgentRole"] | null;
             /** Events */
             events?: components["schemas"]["RunEvent"][];
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** @default null */
             task_plan?: components["schemas"]["TaskPlan"] | null;
             /**
@@ -972,6 +1135,11 @@ export interface components {
              */
             message_id?: string | null;
             /**
+             * Output Stream
+             * @default null
+             */
+            output_stream?: ("stdout" | "stderr") | null;
+            /**
              * Output Summary
              * @default null
              */
@@ -981,11 +1149,18 @@ export interface components {
              * @default null
              */
             parent_tool_call_id?: string | null;
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
             /**
              * Plan Step Sequence
              * @default null
              */
             plan_step_sequence?: number | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Sequence */
             sequence: number;
             /** Session Id */
@@ -1011,7 +1186,7 @@ export interface components {
          * @description Public SSE protocol for token deltas and safe execution events.
          * @enum {string}
          */
-        StreamEventType: "thinking" | "reasoning" | "tool_call" | "tool_result" | "message_delta" | "message_end" | "agent_switch" | "error" | "done";
+        StreamEventType: "thinking" | "reasoning" | "tool_call" | "tool_result" | "tool_output" | "approval_required" | "message_delta" | "message_end" | "agent_switch" | "error" | "done";
         /**
          * TaskPlan
          * @description A task plan reserved for future chat responses.
@@ -1058,6 +1233,32 @@ export interface components {
             success: boolean;
             target_agent: components["schemas"]["WorkerAgentRole"];
         };
+        /**
+         * ToolApprovalDecisionAction
+         * @enum {string}
+         */
+        ToolApprovalDecisionAction: "confirm" | "reject";
+        /** ToolApprovalDecisionRequest */
+        ToolApprovalDecisionRequest: {
+            action: components["schemas"]["ToolApprovalDecisionAction"];
+            /** Interrupt Id */
+            interrupt_id: string;
+        };
+        /**
+         * ToolApprovalRequest
+         * @description The exact validated invocation shown to the user before execution.
+         */
+        ToolApprovalRequest: {
+            agent_role: components["schemas"]["AgentRole"];
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Tool Call Id */
+            tool_call_id: string;
+            /** Tool Name */
+            tool_name: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -1077,6 +1278,44 @@ export interface components {
          * @enum {string}
          */
         WorkerAgentRole: "teaching_assistant" | "learning_assistant" | "evaluator";
+        /**
+         * WorkspaceAccess
+         * @description Access level granted to Agent filesystem tools for a session.
+         * @enum {string}
+         */
+        WorkspaceAccess: "read_only";
+        /**
+         * WorkspaceDirectory
+         * @description One directory entry in the server-side workspace picker.
+         */
+        WorkspaceDirectory: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+        };
+        /**
+         * WorkspaceDirectoryListing
+         * @description Directory picker state rooted in the server filesystem.
+         */
+        WorkspaceDirectoryListing: {
+            /** Directories */
+            directories?: components["schemas"]["WorkspaceDirectory"][];
+            /** Parent */
+            parent?: string | null;
+            /** Path */
+            path: string;
+        };
+        /**
+         * WorkspacePath
+         * @description A canonical existing directory accepted by the server policy.
+         */
+        WorkspacePath: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -1887,6 +2126,222 @@ export interface operations {
             };
         };
     };
+    get_pending_tool_approval_sessions__session_id__tool_approval_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingToolApprovalResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    decide_tool_approval_sessions__session_id__tool_approval_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToolApprovalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    stream_tool_approval_sessions__session_id__tool_approval_stream_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToolApprovalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    add_workspace_root_sessions__session_id__workspace_roots_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddWorkspaceRootRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Session"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     stats_overview_stats_overview_get: {
         parameters: {
             query?: never;
@@ -1927,6 +2382,92 @@ export interface operations {
             };
             /** @description Internal Server Error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_workspace_directories_workspaces_directories_get: {
+        parameters: {
+            query?: {
+                path?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDirectoryListing"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    validate_workspace_workspaces_validate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddWorkspaceRootRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspacePath"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -201,6 +201,97 @@ test("message deltas grow the supervisor bubble and coalesce subagent output", a
   assert.equal("content" in workerMessages[0]! ? workerMessages[0].content : null, "子任务");
 });
 
+test("tool approval streams terminal output and continues the same turn", async () => {
+  const { createChatStore } = await loadChatStore();
+  let receivedDecision: unknown = null;
+  const store = createChatStore({
+    archiveSession: async () => session as never,
+    createSession: async () => session as never,
+    getSessionMessages: async () => [
+      {
+        agent: "supervisor",
+        content: "检查完成",
+        role: "assistant",
+      },
+    ],
+    listSessions: async () => [session as never],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+    streamToolApproval: async ({ decision, onEvent }) => {
+      receivedDecision = decision;
+      onEvent({
+        agent: "supervisor",
+        content: "first\n",
+        event_type: "tool_output",
+        output_stream: "stdout",
+        sequence: 2,
+        session_id: session.session_id,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      });
+      onEvent({
+        agent: "supervisor",
+        event_type: "tool_result",
+        output_summary: '{"exit_code":0,"ok":true}',
+        sequence: 3,
+        session_id: session.session_id,
+        success: true,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "检查完成",
+        event_type: "message_end",
+        sequence: 4,
+        session_id: session.session_id,
+      });
+      onEvent({
+        event_type: "done",
+        sequence: 5,
+        session_id: session.session_id,
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({
+    events: [
+      {
+        agent: "supervisor",
+        event_type: "tool_call",
+        input_summary: '{"command":"echo first"}',
+        sequence: 1,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      },
+    ],
+    pendingToolApproval: {
+      interrupt_id: "interrupt-shell-1",
+      request: {
+        agent_role: "supervisor",
+        arguments: { command: "echo first", cwd: "." },
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      },
+    },
+  });
+
+  await store.getState().decideToolApproval("confirm");
+
+  assert.deepEqual(receivedDecision, {
+    action: "confirm",
+    interrupt_id: "interrupt-shell-1",
+  });
+  assert.deepEqual(
+    store.getState().events.map((item) => item.event_type),
+    ["tool_call", "tool_output", "tool_result"],
+  );
+  assert.equal(store.getState().pendingToolApproval, null);
+  assert.equal(store.getState().isDecidingToolApproval, false);
+  assert.equal(store.getState().isStreaming, false);
+  assert.equal(store.getState().messages[0]?.content, "检查完成");
+});
+
 test("reasoning deltas coalesce and a persisted full event replaces the partial trace", async () => {
   const store = await createStreamStore({
     getSessionMessages: async () => [assistantMessage],

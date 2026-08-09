@@ -5,6 +5,7 @@ import {
   BookOpen,
   CircleCheck,
   CircleX,
+  FolderPlus,
   Menu,
   Moon,
   Sparkles,
@@ -25,6 +26,7 @@ import {
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
+import { WorkspaceDialog, type WorkspaceDialogMode } from "@/components/workspace-dialog";
 import { apiBaseUrl } from "@/lib/api-base-url";
 import { isOnboardingSeen, markOnboardingSeen, subscribeOnboarding } from "@/lib/onboarding";
 import {
@@ -51,10 +53,13 @@ type AppShellProps = {
 };
 
 export function AppShell({ apiConnected }: AppShellProps) {
+  const addWorkspaceRoot = useChatStore((state) => state.addWorkspaceRoot);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   const createSession = useChatStore((state) => state.createSession);
   const sessions = useChatStore((state) => state.sessions);
   const streamSendMessage = useChatStore((state) => state.streamSendMessage);
+  const [workspaceDialogMode, setWorkspaceDialogMode] =
+    useState<WorkspaceDialogMode | null>(null);
 
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -75,6 +80,20 @@ export function AppShell({ apiConnected }: AppShellProps) {
   const currentSessionTitle = currentSessionId
     ? currentSession?.title?.trim() || "未命名会话"
     : "开始新的学习";
+  const recentWorkspaceRoots = Array.from(
+    new Set(
+      sessions
+        .map((session) => session.workspace_root)
+        .filter((root): root is string => Boolean(root)),
+    ),
+  );
+
+  const confirmWorkspace = async (path: string) => {
+    if (workspaceDialogMode === "add") {
+      return (await addWorkspaceRoot(path)) !== null;
+    }
+    return (await createSession(path)) !== null;
+  };
 
   const handleResizePointerDown = (
     event: ReactPointerEvent<HTMLDivElement>,
@@ -254,6 +273,7 @@ export function AppShell({ apiConnected }: AppShellProps) {
       <div className="relative hidden min-w-0 md:block" data-slot="desktop-sidebar">
         <SessionSidebar
           collapsed={sidebarCollapsed}
+          onCreateSession={() => setWorkspaceDialogMode("create")}
           onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
         />
         {!sidebarCollapsed ? (
@@ -308,7 +328,14 @@ export function AppShell({ apiConnected }: AppShellProps) {
           >
             {/* D4-T5:选中会话后自动收起抽屉(方案 A:容器可选回调)。
                 D5-T5:走 closeDrawer,焦点归还汉堡按钮。 */}
-            <SessionSidebar onClose={closeDrawer} onSessionSelected={closeDrawer} />
+            <SessionSidebar
+              onClose={closeDrawer}
+              onCreateSession={() => {
+                closeDrawer();
+                setWorkspaceDialogMode("create");
+              }}
+              onSessionSelected={closeDrawer}
+            />
           </div>
         </>
       ) : null}
@@ -339,6 +366,18 @@ export function AppShell({ apiConnected }: AppShellProps) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {currentSession?.workspace_root ? (
+              <button
+                aria-label="添加工作空间授权目录"
+                className="hidden max-w-64 items-center gap-2 rounded-lg border border-border/70 bg-background/60 px-3 py-1.5 text-caption text-muted-foreground transition-colors hover:border-primary/35 hover:text-foreground xl:flex"
+                onClick={() => setWorkspaceDialogMode("add")}
+                title={`${currentSession.workspace_root} · 添加授权目录`}
+                type="button"
+              >
+                <FolderPlus aria-hidden className="size-4 shrink-0 text-primary" />
+                <span className="truncate">{currentSession.workspace_root}</span>
+              </button>
+            ) : null}
             {/* D6-T4:知识库检索测试入口(教师端)——独立页面 /knowledge,
                 不经过主会话 store;小链接样式与顶栏辅助文案一致 */}
             <Link
@@ -458,6 +497,16 @@ export function AppShell({ apiConnected }: AppShellProps) {
           </div>
         )}
       </section>
+      {workspaceDialogMode ? (
+        <WorkspaceDialog
+          key={workspaceDialogMode}
+          mode={workspaceDialogMode}
+          onClose={() => setWorkspaceDialogMode(null)}
+          onConfirm={confirmWorkspace}
+          open
+          recentRoots={recentWorkspaceRoots}
+        />
+      ) : null}
     </main>
   );
 }

@@ -75,6 +75,7 @@ const toolActivityLabels: Record<string, string> = {
   detect_level: "判断学习阶段",
   search_knowledge: "检索课程知识库",
   submit_evaluation: "提交学习评估",
+  shell: "运行终端命令",
 };
 
 function toolActivityLabel(toolName: string): string {
@@ -164,10 +165,39 @@ function EventTimeline({
 }) {
   // 传入顺序不保证有序,先按 sequence 升序排好再渲染
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
+  // 工具开始/结束是同一活动的两个状态，不应在时间线中占两行。
+  // 以稳定的 tool_call_id 配对；缺少 ID 的旧事件继续独立展示。
+  const toolCallIds = new Set(
+    sorted
+      .filter((event) => event.event_type === "tool_call" && event.tool_call_id)
+      .map((event) => event.tool_call_id as string),
+  );
+  const toolResultsById = new Map(
+    sorted
+      .filter((event) => event.event_type === "tool_result" && event.tool_call_id)
+      .map((event) => [event.tool_call_id as string, event] as const),
+  );
+  const toolOutputsById = new Map<string, (RunEvent | StreamEvent)[]>();
+  for (const event of sorted) {
+    if (event.event_type !== "tool_output" || !event.tool_call_id) {
+      continue;
+    }
+    const outputs = toolOutputsById.get(event.tool_call_id) ?? [];
+    outputs.push(event);
+    toolOutputsById.set(event.tool_call_id, outputs);
+  }
 
   return (
     <ol className="space-y-1 px-4 py-3" data-slot="event-timeline">
       {sorted.map((event) => {
+        if (
+          (event.event_type === "tool_result" ||
+            event.event_type === "tool_output") &&
+          event.tool_call_id &&
+          toolCallIds.has(event.tool_call_id)
+        ) {
+          return null;
+        }
         // 与当前活跃 Agent 相同的事件条目加高亮(加粗 + 前景色)
         const isActive = event.agent != null && event.agent === activeAgent;
         const activeProps = {
@@ -224,9 +254,26 @@ function EventTimeline({
           case "tool_call":
           case "tool_result": {
             // 工具详情使用原生 details：输入/输出是后端生成的有界脱敏摘要。
-            const toolName = event.tool_name ?? "未知工具";
+            // 有 call id 时把调用与结果合并为一张会随流更新的活动卡片。
+            const callEvent = event.event_type === "tool_call" ? event : null;
+            const resultEvent =
+              event.event_type === "tool_result"
+                ? event
+                : event.tool_call_id
+                  ? (toolResultsById.get(event.tool_call_id) ?? null)
+                  : null;
+            const toolName = callEvent?.tool_name ?? resultEvent?.tool_name ?? "未知工具";
             const label = toolActivityLabel(toolName);
-            const succeeded = event.success;
+            const succeeded = resultEvent?.success;
+            const toolCallId = callEvent?.tool_call_id ?? resultEvent?.tool_call_id ?? undefined;
+            const inputSummary = callEvent?.input_summary ?? resultEvent?.input_summary;
+            const outputSummary = resultEvent?.output_summary ?? callEvent?.output_summary;
+            const planStepSequence =
+              callEvent?.plan_step_sequence ?? resultEvent?.plan_step_sequence;
+            const durationMs = resultEvent?.duration_ms ?? callEvent?.duration_ms;
+            const terminalOutputs = toolCallId
+              ? (toolOutputsById.get(toolCallId) ?? [])
+              : [];
 
             return (
               <li
@@ -234,9 +281,10 @@ function EventTimeline({
                   parentToolCallId && "ml-4 border-l border-border pl-3",
                 )}
                 data-parent-tool-call-id={parentToolCallId}
-                key={`${event.event_type}-${event.tool_call_id ?? event.sequence}`}
+                data-tool-call-id={toolCallId}
+                key={`tool-${toolCallId ?? event.sequence}`}
               >
-                <details {...activeProps}>
+                <details open={toolName === "shell" ? true : undefined} {...activeProps}>
                   <summary
                     className={cn(
                       "flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1 text-caption",
@@ -245,15 +293,18 @@ function EventTimeline({
                     data-slot="tool-row"
                   >
                     <span aria-hidden>
-                      {event.event_type === "tool_call"
-                        ? "🔧"
-                        : succeeded === true
-                          ? "✅"
-                          : succeeded === false
-                            ? "❌"
-                            : "🔧"}
+                      {succeeded === true ? "✅" : succeeded === false ? "❌" : "🔧"}
                     </span>
                     <span className="truncate">{label}</span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {resultEvent
+                        ? succeeded === true
+                          ? "已完成"
+                          : succeeded === false
+                            ? "失败"
+                            : "已结束"
+                        : "运行中"}
+                    </span>
                     <span className="ml-auto shrink-0">详情</span>
                   </summary>
 
@@ -261,27 +312,51 @@ function EventTimeline({
                     className="ml-2 space-y-2 border-l border-border py-1 pl-3 text-caption text-muted-foreground"
                     data-slot="tool-details"
                   >
-                    {event.input_summary ? (
+                    {inputSummary ? (
                       <div>
                         <p className="font-medium text-foreground/80">工具输入</p>
                         <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
-                          {event.input_summary}
+                          {inputSummary}
                         </pre>
                       </div>
                     ) : null}
-                    {event.output_summary ? (
+                    {outputSummary ? (
                       <div>
                         <p className="font-medium text-foreground/80">工具输出</p>
                         <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
-                          {event.output_summary}
+                          {outputSummary}
                         </pre>
                       </div>
                     ) : null}
-                    {event.plan_step_sequence != null ? (
-                      <p>所属计划步骤:{event.plan_step_sequence}</p>
+                    {terminalOutputs.length > 0 ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">
+                          终端输出
+                        </p>
+                        <pre
+                          className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-neutral-950 p-2 font-mono text-[11px] text-neutral-100"
+                          data-slot="terminal-output"
+                        >
+                          {terminalOutputs.map((output) => (
+                            <span
+                              className={cn(
+                                output.output_stream === "stderr" &&
+                                  "text-red-300",
+                              )}
+                              data-output-stream={output.output_stream ?? "stdout"}
+                              key={`terminal-${output.sequence}`}
+                            >
+                              {eventContent(output)}
+                            </span>
+                          ))}
+                        </pre>
+                      </div>
                     ) : null}
-                    {event.duration_ms != null ? <p>耗时:{event.duration_ms}ms</p> : null}
-                    {event.event_type === "tool_result" && succeeded != null ? (
+                    {planStepSequence != null ? (
+                      <p>所属计划步骤:{planStepSequence}</p>
+                    ) : null}
+                    {durationMs != null ? <p>耗时:{durationMs}ms</p> : null}
+                    {resultEvent && succeeded != null ? (
                       <p>{succeeded ? "执行成功" : "执行失败"}</p>
                     ) : null}
                   </div>
@@ -332,6 +407,7 @@ function EventTimeline({
             );
           }
           case "message_end":
+          case "tool_output":
           case "done":
           case "error":
             // 终态事件:由消息流与 runError 呈现,这里忽略

@@ -471,15 +471,26 @@ export function ChatInput() {
   const cancelStreaming = useChatStore((state) => state.cancelStreaming);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
+  const isDecidingToolApproval = useChatStore(
+    (state) => state.isDecidingToolApproval,
+  );
+  const pendingToolApproval = useChatStore(
+    (state) => state.pendingToolApproval,
+  );
   const streamSendMessage = useChatStore((state) => state.streamSendMessage);
   const [value, setValue] = useState("");
+  const isBlocked =
+    isSending ||
+    isStreaming ||
+    isDecidingToolApproval ||
+    pendingToolApproval !== null;
 
   const handleSubmit = () => {
     const message = normalizeMessage(value);
     // 流式期间同样锁定输入(与发送中一致):并发重复提交会互相覆盖
     // 流状态(review 修正——sendMessage 时期只有 isSending,切换流式后
     // 必须同时看 isStreaming)。
-    if (!message || isSending || isStreaming) {
+    if (!message || isBlocked) {
       return;
     }
 
@@ -492,7 +503,7 @@ export function ChatInput() {
   // attachments 透传,与同步通道同契约;重试耗尽才降级同步,见
   // streamSendMessage 内注释),文本清空与无附件路径一致。
   const handleSubmitWithAttachments = (message: string, attachments: AttachmentInput[]) => {
-    if (isSending || isStreaming) {
+    if (isBlocked) {
       return;
     }
     setValue("");
@@ -501,8 +512,8 @@ export function ChatInput() {
 
   return (
     <ChatInputContent
-      isSending={isSending || isStreaming}
-      isStreaming={isStreaming}
+      isSending={isBlocked}
+      isStreaming={isStreaming && !isDecidingToolApproval}
       onChange={setValue}
       onStop={cancelStreaming}
       onSubmit={handleSubmit}

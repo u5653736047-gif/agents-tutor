@@ -9,22 +9,30 @@ export type StreamEvent = components["schemas"]["StreamEvent"];
 
 export type StreamEventCallback = (event: StreamEvent) => void;
 
-export interface StreamChatOptions {
+interface EventStreamOptions {
   baseUrl: string;
   userId: string;
+  onEvent: StreamEventCallback;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export interface StreamChatOptions extends EventStreamOptions {
   sessionId: string;
   message: string;
   // D7-T2:附件引用列表(契约 ChatRequest.attachments)——流式通道与同步
   // 通道同契约,有附件时一并提交;缺省 undefined 不落 body 字段。
   // 类型直接引用生成契约,store→stream 间字段零漂移(review nit)。
   attachments?: components["schemas"]["Attachment"][];
-  onEvent: StreamEventCallback;
-  signal?: AbortSignal;
-  fetchImpl?: typeof fetch;
-  timeoutMs?: number;
   // D1-T3:断线重连续传起点——上次成功收到的最新事件 sequence。
   // 服务端据此回放剩余事件 + done,不重复执行整轮;默认 0 表示新消息。
   fromSequence?: number;
+}
+
+export interface StreamToolApprovalOptions extends EventStreamOptions {
+  sessionId: string;
+  decision: components["schemas"]["ToolApprovalDecisionRequest"];
 }
 
 // D1-T3 重连参数:指数退避 + 重试上限。重试期间携带递增的
@@ -79,15 +87,15 @@ async function readErrorDetail(response: Response): Promise<{
   return { code: null, message: "请求失败，请稍后重试。" };
 }
 
-export async function streamChat(options: StreamChatOptions): Promise<void> {
+async function streamEvents(
+  options: EventStreamOptions,
+  path: string,
+  body: unknown,
+): Promise<void> {
   const {
-    attachments,
     baseUrl,
     fetchImpl = fetch,
-    fromSequence = 0,
-    message,
     onEvent,
-    sessionId,
     signal,
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     userId,
@@ -117,16 +125,9 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     let response: Response;
     try {
       response = await fetchImpl(
-        `${baseUrl}/chat/stream?from_sequence=${fromSequence}`,
+        `${baseUrl}${path}`,
         {
-          body: JSON.stringify({
-            message,
-            session_id: sessionId,
-            // D7-T2:流式通道同契约透传附件(见 StreamChatOptions.attachments);
-            // 条件展开:缺省不落字段,与既有请求体逐字节一致(既有测试
-            // 零回归)。
-            ...(attachments && attachments.length > 0 ? { attachments } : {}),
-          }),
+          body: JSON.stringify(body),
           headers: {
             "Content-Type": "application/json",
             "X-User-Id": userId,
@@ -245,6 +246,34 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     }
     signal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+export async function streamChat(options: StreamChatOptions): Promise<void> {
+  const {
+    attachments,
+    fromSequence = 0,
+    message,
+    sessionId,
+  } = options;
+  await streamEvents(
+    options,
+    `/chat/stream?from_sequence=${fromSequence}`,
+    {
+      message,
+      session_id: sessionId,
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    },
+  );
+}
+
+export async function streamToolApproval(
+  options: StreamToolApprovalOptions,
+): Promise<void> {
+  await streamEvents(
+    options,
+    `/sessions/${encodeURIComponent(options.sessionId)}/tool-approval/stream`,
+    options.decision,
+  );
 }
 
 // D1-T3:可中断的退避等待。signal abort 时立即返回(不抛错)——调用方

@@ -1,7 +1,7 @@
 // 错误码 → 用户友好文案的映射(纯函数,无依赖)。
 // 覆盖三类输入:
-//   1. core ErrorCode(后端 RunError.error_code 可能值,共 12 个);
-//   2. ApiErrorCode(前端 ApiClientError.code 可能值,共 6 个);
+//   1. core ErrorCode(后端 RunError.error_code 可能值);
+//   2. ApiErrorCode(前端 ApiClientError.code 可能值);
 //   3. null / undefined(网络失败、超时等请求层错误)与未知字符串兜底。
 export type ErrorMessagePreset = {
   /** 简短标题,如「会话正忙」 */
@@ -25,6 +25,8 @@ export function errorMessageFor(
       };
     case "handoff_not_pending":
       return { title: "审批已处理", detail: "该审批已被处理或已过期。" };
+    case "tool_approval_not_pending":
+      return { title: "命令审批已失效", detail: "该命令审批已被处理或已过期。" };
     case "session_not_found":
       return {
         title: "会话不存在",
@@ -52,6 +54,14 @@ export function errorMessageFor(
       return { title: "工具未授权", detail: "当前没有调用该工具的权限。" };
     case "tool_invalid_arguments":
       return { title: "工具参数无效", detail: "工具调用参数不合法,请调整后重试。" };
+    case "tool_no_progress":
+      return { title: "工具调用无进展", detail: "相同工具调用被重复请求,本轮已停止。" };
+    case "tool_budget_exceeded":
+      return { title: "工具调用过多", detail: "本轮工具调用已达到安全上限。" };
+    case "tool_approval_rejected":
+      return { title: "命令已拒绝", detail: "命令未执行,Agent 将据此继续处理。" };
+    case "tool_approval_queue_limit":
+      return { title: "待审批命令过多", detail: "一次只能审批一条命令。" };
     case "react_iteration_limit":
     case "graph_handoff_limit":
     case "graph_switch_limit":

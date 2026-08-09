@@ -247,6 +247,58 @@ test("a stalled stream rejects with a timeout error while reading", async () => 
   );
 });
 
+test("tool approval uses the dedicated endpoint and streams terminal events", async () => {
+  const { streamToolApproval } = await loadStreamClient();
+  const received: Array<{ event_type: string; content?: string | null }> = [];
+  let requestedUrl = "";
+  let requestedBody = "";
+
+  await streamToolApproval({
+    baseUrl: "https://api.example",
+    decision: { action: "confirm", interrupt_id: "interrupt-1" },
+    fetchImpl: async (input, init) => {
+      requestedUrl = String(input);
+      requestedBody = String(init?.body);
+      return sseResponse([
+        frame(
+          JSON.stringify({
+            content: "first\n",
+            event_type: "tool_output",
+            output_stream: "stdout",
+            sequence: 1,
+            session_id: "session/1",
+            tool_call_id: "shell-1",
+          }),
+        ),
+        frame(
+          JSON.stringify({
+            event_type: "done",
+            sequence: 2,
+            session_id: "session/1",
+          }),
+        ),
+      ]);
+    },
+    onEvent: (event) => received.push(event),
+    sessionId: "session/1",
+    userId: "demo-user",
+  });
+
+  assert.equal(
+    requestedUrl,
+    "https://api.example/sessions/session%2F1/tool-approval/stream",
+  );
+  assert.deepEqual(JSON.parse(requestedBody), {
+    action: "confirm",
+    interrupt_id: "interrupt-1",
+  });
+  assert.deepEqual(
+    received.map((event) => event.event_type),
+    ["tool_output", "done"],
+  );
+  assert.equal(received[0]?.content, "first\n");
+});
+
 test("the timeout is an inactivity watchdog and resets on every stream chunk", async () => {
   const { streamChat } = await loadStreamClient();
   const received: Array<{ event_type: string }> = [];

@@ -427,6 +427,7 @@ export function SessionSidebarContent({
 type SessionSidebarProps = {
   collapsed?: boolean;
   onClose?: () => void;
+  onCreateSession?: () => void;
   onSessionSelected?: () => void;
   onToggleCollapsed?: () => void;
 };
@@ -434,6 +435,7 @@ type SessionSidebarProps = {
 export function SessionSidebar({
   collapsed = false,
   onClose,
+  onCreateSession,
   onSessionSelected,
   onToggleCollapsed,
 }: SessionSidebarProps = {}) {
@@ -466,11 +468,13 @@ export function SessionSidebar({
     onSessionSelected?.();
   };
 
+  const handleCreateSession = onCreateSession ?? (() => void createSession());
+
   return (
     <SessionSidebarContent
       archiveSession={archiveSession}
       collapsed={collapsed}
-      createSession={createSession}
+      createSession={handleCreateSession}
       currentSessionId={currentSessionId}
       isLoadingSessions={isLoadingSessions}
       loadCurrentSessionMessages={loadCurrentSessionMessages}

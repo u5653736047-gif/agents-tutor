@@ -14,6 +14,7 @@ import {
 } from "@/components/collaboration-panel";
 import { FeedbackButtons } from "@/components/feedback-buttons";
 import { HandoffCard } from "@/components/handoff-card";
+import { TerminalApprovalCard } from "@/components/terminal-approval-card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { AgentRole } from "@/lib/agent-roles";
@@ -508,7 +509,11 @@ export function ConversationPanel() {
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
   const decideHandoff = useChatStore((state) => state.decideHandoff);
+  const decideToolApproval = useChatStore((state) => state.decideToolApproval);
   const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
+  const isDecidingToolApproval = useChatStore(
+    (state) => state.isDecidingToolApproval,
+  );
   // UX-20260807#2:拉历史加载态——此前无组件订阅(「死状态」),切换会话
   // 期间消息区空白;现在驱动 ConversationContent 的加载骨架。
   const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);
@@ -518,6 +523,9 @@ export function ConversationPanel() {
   const lastSentMessage = useChatStore((state) => state.lastSentMessage);
   const messages = useChatStore((state) => state.messages);
   const pendingHandoff = useChatStore((state) => state.pendingHandoff);
+  const pendingToolApproval = useChatStore(
+    (state) => state.pendingToolApproval,
+  );
   // D3-T4:本轮回答的引用列表(store 从 ChatResponse.references 归一),
   // null 时 CitationList 零渲染,无引用轮次不显示任何东西
   const references = useChatStore((state) => state.references);
@@ -587,11 +595,13 @@ export function ConversationPanel() {
     }
   }, [
     isDecidingHandoff,
+    isDecidingToolApproval,
     isSending,
     isStreaming,
     events,
     messages,
     pendingHandoff,
+    pendingToolApproval,
     references,
     runError,
     streamingAgent,
@@ -672,6 +682,17 @@ export function ConversationPanel() {
               void decideHandoff(action, modifications)
             }
             pending={pendingHandoff}
+          />
+          <TerminalApprovalCard
+            errorMessage={
+              requestError?.code === "session_busy" ||
+              requestError?.code === "tool_approval_not_pending"
+                ? requestError.message
+                : null
+            }
+            isDeciding={isDecidingToolApproval}
+            onDecide={(action) => void decideToolApproval(action)}
+            pending={pendingToolApproval}
           />
           {/* D3-T4:引用卡片——消息列表尾部(审批卡片之后),引用对应
               最后一轮回答,跟随该轮回答一起展示;store
