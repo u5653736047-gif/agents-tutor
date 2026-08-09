@@ -201,6 +201,61 @@ test("message deltas grow the supervisor bubble and coalesce subagent output", a
   assert.equal("content" in workerMessages[0]! ? workerMessages[0].content : null, "子任务");
 });
 
+test("reasoning deltas coalesce and a persisted full event replaces the partial trace", async () => {
+  const store = await createStreamStore({
+    getSessionMessages: async () => [assistantMessage],
+    streamChat: async ({ onEvent }) => {
+      onEvent({
+        agent: "learning_assistant",
+        content: "先识别",
+        event_type: "reasoning",
+        is_delta: true,
+        message_id: "reasoning-step-1",
+        sequence: 1,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "链式法则",
+        event_type: "reasoning",
+        is_delta: true,
+        message_id: "reasoning-step-1",
+        sequence: 2,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "先识别链式法则，再组织讲解",
+        event_type: "reasoning",
+        is_delta: false,
+        message_id: "reasoning-step-1",
+        sequence: 3,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "完成",
+        event_type: "message_end",
+        sequence: 4,
+        session_id: "session-1",
+      });
+      onEvent({ event_type: "done", sequence: 5, session_id: "session-1" });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("解释链式法则");
+
+  const reasoningEvents = store
+    .getState()
+    .events.filter((event) => event.event_type === "reasoning");
+  assert.equal(reasoningEvents.length, 1);
+  assert.equal(
+    "content" in reasoningEvents[0]! ? reasoningEvents[0].content : null,
+    "先识别链式法则，再组织讲解",
+  );
+});
+
 test("an error event sets runError and the stream still finishes cleanly", async () => {
   const store = await createStreamStore({
     streamChat: async ({ onEvent }) => {

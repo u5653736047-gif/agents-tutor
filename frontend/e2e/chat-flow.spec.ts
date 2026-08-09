@@ -67,6 +67,19 @@ test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染
   await expect(processPanel).toBeVisible();
   await expect(processPanel).toContainText("执行过程");
   await expect(processPanel).toContainText("检索课程知识库");
+  const reasoningBlock = processPanel.locator('[data-slot="reasoning-block"]');
+  await expect(reasoningBlock).toBeVisible();
+  await reasoningBlock.locator("summary").click();
+  await expect(reasoningBlock).toContainText("先识别问题目标");
+  const toolRows = processPanel.locator('[data-slot="tool-row"]');
+  await toolRows.first().click();
+  await expect(processPanel.locator('[data-slot="tool-details"]').first()).toContainText(
+    question,
+  );
+  await toolRows.last().click();
+  await expect(processPanel.locator('[data-slot="tool-details"]').last()).toContainText(
+    '"hits":2',
+  );
 
   // message_end 后完整回答渲染(气泡并入消息列表,权威历史覆盖)
   await expect(page.locator('[data-message-role="assistant"]').last()).toContainText(
@@ -105,8 +118,9 @@ test("流式重试耗尽后不通过同步接口重复执行任务", async ({ pa
   expect(syncChatRequests).toBe(0);
 });
 
-test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
+test("切换并刷新后历史回溯:消息与协作过程仍可渲染", async ({ page }) => {
   const session = mockSession("mock-session-history");
+  const otherSession = mockSession("mock-session-other");
   const messages = [
     {
       role: "user" as const,
@@ -120,9 +134,40 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
       created_at: "2026-01-01T10:00:01.000Z",
     },
   ];
+  const processEvents = [
+    {
+      event_type: "reasoning",
+      sequence: 1,
+      session_id: session.session_id,
+      agent: "supervisor",
+      content: "先检查梯度经过每一层时的连乘效应。",
+      is_delta: false,
+      message_id: "history-reasoning-1",
+    },
+    {
+      event_type: "tool_call",
+      sequence: 2,
+      session_id: session.session_id,
+      agent: "supervisor",
+      tool_name: "search_knowledge",
+      tool_call_id: "history-tool-1",
+      input_summary: '{"query":"梯度消失"}',
+    },
+    {
+      event_type: "tool_result",
+      sequence: 3,
+      session_id: session.session_id,
+      agent: "supervisor",
+      tool_name: "search_knowledge",
+      tool_call_id: "history-tool-1",
+      output_summary: '{"hits":2}',
+      success: true,
+    },
+  ];
   await installMocks(page, {
-    seedSessions: [session],
+    seedSessions: [session, otherSession],
     seedMessages: { [session.session_id]: messages },
+    seedProcess: { [session.session_id]: processEvents },
   });
 
   await page.goto("/");
@@ -136,8 +181,22 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
   await expect(page.locator('[data-message-role="assistant"]')).toContainText(
     "历史回答:梯度消失",
   );
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+  await expect(page.locator('[data-slot="tool-details"]').first()).toContainText(
+    "梯度消失",
+  );
 
-  // 刷新页面(内存状态清空)→ 重新从 mock 列表拉取 → 再点会话 → 消息仍在
+  // 切到另一会话再切回，必须从后端快照恢复协作过程。
+  await page.getByTitle(otherSession.session_id).click();
+  await expect(page.locator('[data-slot="reasoning-block"]')).toHaveCount(0);
+  await page.getByTitle(session.session_id).click();
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+
+  // 刷新页面(内存状态清空)→ 重新从 mock 拉取 → 消息与协作过程仍在。
   await page.reload();
   const sessionButtonAfterReload = page.getByTitle(session.session_id);
   await expect(sessionButtonAfterReload).toBeVisible();
@@ -147,6 +206,12 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
   );
   await expect(page.locator('[data-message-role="assistant"]')).toContainText(
     "历史回答:梯度消失",
+  );
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+  await expect(page.locator('[data-slot="tool-details"]').last()).toContainText(
+    '"hits":2',
   );
 });
 

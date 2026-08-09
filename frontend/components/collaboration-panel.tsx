@@ -43,8 +43,8 @@ const planStatusPresentation: Record<
   failed: { label: "失败", className: "border-destructive/30 bg-destructive/10 text-destructive" },
 };
 
-// content 字段只在 StreamEvent 上存在(thinking 的占位文本),
-// 用 in 操作符收窄联合类型后安全读取,RunEvent 返回 null。
+// RunEvent 与 StreamEvent 都可携带 reasoning / delta 内容；兼容旧契约
+// 数据时仍用 in 操作符宽容读取。
 function eventContent(event: RunEvent | StreamEvent): string | null {
   return "content" in event ? (event.content ?? null) : null;
 }
@@ -164,19 +164,16 @@ function EventTimeline({
 }) {
   // 传入顺序不保证有序,先按 sequence 升序排好再渲染
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
-  // 工具行展开状态:记录展开行在排序数组中的索引(而非 sequence)——
-  // sequence 每轮 run 从 1 起,跨 run 复用会撞号导致旧行意外展开
-  // (review 修正);索引在当次渲染的排序数组中稳定。
-  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
 
   return (
     <ol className="space-y-1 px-4 py-3" data-slot="event-timeline">
-      {sorted.map((event, sortedIndex) => {
+      {sorted.map((event) => {
         // 与当前活跃 Agent 相同的事件条目加高亮(加粗 + 前景色)
         const isActive = event.agent != null && event.agent === activeAgent;
         const activeProps = {
           "data-active": isActive ? "true" : undefined,
         };
+        const parentToolCallId = event.parent_tool_call_id ?? undefined;
 
         switch (event.event_type) {
           case "thinking": {
@@ -187,6 +184,7 @@ function EventTimeline({
                   "flex items-center gap-2 text-caption",
                   isActive ? "font-medium text-foreground" : "text-muted-foreground",
                 )}
+                data-parent-tool-call-id={parentToolCallId}
                 key={`thinking-${event.sequence}`}
                 {...activeProps}
               >
@@ -195,45 +193,90 @@ function EventTimeline({
               </li>
             );
           }
+          case "reasoning": {
+            const content = eventContent(event);
+            if (!content) {
+              return null;
+            }
+            return (
+              <li
+                className={cn(
+                  parentToolCallId && "ml-4 border-l border-border pl-3",
+                )}
+                data-parent-tool-call-id={parentToolCallId}
+                data-slot="reasoning-block"
+                key={`reasoning-${event.message_id ?? event.sequence}`}
+                {...activeProps}
+              >
+                <details open={event.is_delta === true}>
+                  <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-caption text-muted-foreground">
+                    <span aria-hidden>✨</span>
+                    {event.agent ? <AgentBadge agent={event.agent} /> : null}
+                    <span>{event.is_delta === true ? "模型思考中…" : "模型思考"}</span>
+                  </summary>
+                  <div className="ml-2 border-l-2 border-border pl-3 text-caption text-muted-foreground">
+                    <p className="whitespace-pre-wrap break-words">{content}</p>
+                  </div>
+                </details>
+              </li>
+            );
+          }
           case "tool_call":
           case "tool_result": {
-            // 工具行:只含工具名与成功与否等摘要,绝无参数/结果正文(安全红线)。
-            // 点击展开可看耗时与所属计划步骤;success 为 null 时不显示状态。
+            // 工具详情使用原生 details：输入/输出是后端生成的有界脱敏摘要。
             const toolName = event.tool_name ?? "未知工具";
             const label = toolActivityLabel(toolName);
             const succeeded = event.success;
-            const isExpanded = expandedIndex === sortedIndex;
 
             return (
-              <li key={`${event.event_type}-${event.sequence}`}>
-                <button
-                  aria-expanded={isExpanded}
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-caption",
-                    isActive ? "font-medium text-foreground" : "text-muted-foreground",
-                  )}
-                  data-slot="tool-row"
-                  type="button"
-                  onClick={() =>
-                    setExpandedIndex(isExpanded ? null : sortedIndex)
-                  }
-                  {...activeProps}
-                >
-                  <span aria-hidden>
-                    {event.event_type === "tool_call"
-                      ? "🔧"
-                      : succeeded === true
-                        ? "✅"
-                        : succeeded === false
-                          ? "❌"
-                          : "🔧"}
-                  </span>
-                  <span className="truncate">{label}</span>
-                  <span className="ml-auto shrink-0">{isExpanded ? "收起" : "详情"}</span>
-                </button>
+              <li
+                className={cn(
+                  parentToolCallId && "ml-4 border-l border-border pl-3",
+                )}
+                data-parent-tool-call-id={parentToolCallId}
+                key={`${event.event_type}-${event.tool_call_id ?? event.sequence}`}
+              >
+                <details {...activeProps}>
+                  <summary
+                    className={cn(
+                      "flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1 text-caption",
+                      isActive ? "font-medium text-foreground" : "text-muted-foreground",
+                    )}
+                    data-slot="tool-row"
+                  >
+                    <span aria-hidden>
+                      {event.event_type === "tool_call"
+                        ? "🔧"
+                        : succeeded === true
+                          ? "✅"
+                          : succeeded === false
+                            ? "❌"
+                            : "🔧"}
+                    </span>
+                    <span className="truncate">{label}</span>
+                    <span className="ml-auto shrink-0">详情</span>
+                  </summary>
 
-                {isExpanded ? (
-                  <div className="ml-2 border-l border-border pl-3 text-caption text-muted-foreground">
+                  <div
+                    className="ml-2 space-y-2 border-l border-border py-1 pl-3 text-caption text-muted-foreground"
+                    data-slot="tool-details"
+                  >
+                    {event.input_summary ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">工具输入</p>
+                        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
+                          {event.input_summary}
+                        </pre>
+                      </div>
+                    ) : null}
+                    {event.output_summary ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">工具输出</p>
+                        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
+                          {event.output_summary}
+                        </pre>
+                      </div>
+                    ) : null}
                     {event.plan_step_sequence != null ? (
                       <p>所属计划步骤:{event.plan_step_sequence}</p>
                     ) : null}
@@ -242,7 +285,7 @@ function EventTimeline({
                       <p>{succeeded ? "执行成功" : "执行失败"}</p>
                     ) : null}
                   </div>
-                ) : null}
+                </details>
               </li>
             );
           }

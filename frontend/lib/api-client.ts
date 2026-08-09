@@ -16,6 +16,7 @@ export type HandoffDecision = components["schemas"]["HandoffDecisionRequest"];
 export type Message = components["schemas"]["Message"];
 export type PendingHandoffResponse = components["schemas"]["PendingHandoffResponse"];
 export type Session = components["schemas"]["Session"];
+export type SessionProcess = components["schemas"]["SessionProcess"];
 // D6-T2:反馈评分方向与受理响应,直接取生成契约(单一数据源)
 export type FeedbackRating = components["schemas"]["FeedbackRating"];
 export type FeedbackResponse = components["schemas"]["FeedbackResponse"];
@@ -87,6 +88,7 @@ export type ApiClient = {
   decideHandoff(sessionId: string, decision: HandoffDecision): Promise<ChatResponse>;
   getPendingHandoff(sessionId: string): Promise<PendingHandoffResponse>;
   getSessionMessages(sessionId: string): Promise<Message[]>;
+  getSessionProcess(sessionId: string): Promise<SessionProcess>;
   listSessions(includeArchived?: boolean): Promise<Session[]>;
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
   // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话接口解耦:错误与
@@ -266,6 +268,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       ),
     getSessionMessages: (sessionId) =>
       request<Message[]>(config, `/sessions/${encodeURIComponent(sessionId)}/messages`),
+    getSessionProcess: (sessionId) =>
+      request<SessionProcess>(config, `/sessions/${encodeURIComponent(sessionId)}/process`),
     listSessions: (includeArchived = false) =>
       request<Session[]>(
         config,

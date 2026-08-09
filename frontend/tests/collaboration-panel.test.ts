@@ -36,7 +36,7 @@ test("the collaboration panel shows a placeholder when there is no plan or event
   assert.doesNotMatch(markup, /data-slot="event-timeline"/);
 });
 
-test("the collaboration panel renders events in sequence order with tool summaries only", async () => {
+test("the collaboration panel renders events in sequence order with expandable tool details", async () => {
   const { CollaborationPanel } = await loadCollaborationPanel();
 
   // 故意乱序传入:验证按 sequence 升序渲染
@@ -62,13 +62,13 @@ test("the collaboration panel renders events in sequence order with tool summari
   assert.ok(toolCallAt < toolResultAt, "tool_call 应排在 tool_result 前");
   assert.ok(toolResultAt < switchAt, "tool_result 应排在 agent_switch 前");
 
-  // 工具行摘要:只含工具名,绝无参数/结果正文
+  // 工具行摘要保持紧凑，详情作为原生 details 内容随 DOM 提供。
   assert.match(markup, /data-slot="tool-row"/);
+  assert.match(markup, /data-slot="tool-details"/);
   assert.match(markup, /search_notes/);
   assert.doesNotMatch(markup, /参数/);
   assert.doesNotMatch(markup, /结果正文/);
-  // 工具行默认收起:展开详情(所属计划步骤/耗时)不渲染
-  assert.doesNotMatch(markup, /所属计划步骤/);
+  assert.match(markup, /所属计划步骤:1/);
   assert.doesNotMatch(markup, /耗时/);
 
   // agent_switch 提示行出现,终态事件(done)被忽略
@@ -101,6 +101,60 @@ test("the collaboration panel gives known agent tools readable activity labels",
   assert.match(markup, /调用助学助手/);
   assert.match(markup, /检索课程知识库/);
   assert.doesNotMatch(markup, /ask_learning_assistant/);
+});
+
+test("the collaboration panel exposes model reasoning and detailed tool activity", async () => {
+  const { CollaborationPanel } = await loadCollaborationPanel();
+  const events = [
+    {
+      agent: "learning_assistant",
+      content: "先区分前向传播与反向传播，再解释链式法则。",
+      event_type: "reasoning",
+      message_id: "reasoning-step-1",
+      sequence: 2,
+    },
+    {
+      agent: "learning_assistant",
+      event_type: "tool_call",
+      input_summary: '{"query":"反向传播","api_key":"[REDACTED]"}',
+      sequence: 3,
+      tool_call_id: "call-search-1",
+      tool_name: "search_knowledge",
+    },
+    {
+      agent: "learning_assistant",
+      event_type: "tool_result",
+      output_summary: '{"found":true,"hits":2}',
+      sequence: 4,
+      success: true,
+      tool_call_id: "call-search-1",
+      tool_name: "search_knowledge",
+    },
+    {
+      agent: "evaluator",
+      content: "核对讲解是否覆盖梯度方向。",
+      event_type: "reasoning",
+      message_id: "reasoning-child-1",
+      parent_tool_call_id: "call-search-1",
+      sequence: 5,
+    },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(CollaborationPanel, { ...emptyProps, events }),
+  );
+
+  assert.match(markup, /data-slot="reasoning-block"/);
+  assert.match(markup, /模型思考/);
+  assert.match(markup, /先区分前向传播与反向传播/);
+  assert.match(markup, /data-slot="tool-details"/);
+  assert.match(markup, /工具输入/);
+  assert.match(markup, /反向传播/);
+  assert.match(markup, /工具输出/);
+  assert.match(markup, /&quot;hits&quot;:2/);
+  assert.match(markup, /data-parent-tool-call-id="call-search-1"/);
+  assert.match(markup, /核对讲解是否覆盖梯度方向/);
+  assert.doesNotMatch(markup, /sk-never-show/);
 });
 
 test("the collaboration panel renders coalesced subagent output", async () => {

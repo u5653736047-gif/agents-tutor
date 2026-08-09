@@ -121,6 +121,54 @@ test("switching sessions clears a pending send from the previous session", async
   assert.equal(store.getState().requestError, null);
 });
 
+test("switching away and back restores the persisted collaboration process", async () => {
+  const { createChatStore } = await loadChatStore();
+  const replayedEvent = {
+    agent: "learning_assistant" as const,
+    content: "先识别链式法则，再说明梯度回传",
+    event_type: "reasoning" as const,
+    message_id: "assistant-step-1",
+    sequence: 2,
+    session_id: "session-1",
+  };
+  const toolEvent = {
+    agent: "learning_assistant" as const,
+    event_type: "tool_call" as const,
+    input_summary: '{"query":"反向传播"}',
+    sequence: 3,
+    session_id: "session-1",
+    tool_call_id: "call-search-1",
+    tool_name: "search_knowledge",
+  };
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async (sessionId) =>
+      sessionId === "session-1" ? [userMessage, assistantMessage] : [],
+    getSessionProcess: async (sessionId) => ({
+      current_agent: sessionId === "session-1" ? "learning_assistant" : null,
+      events: sessionId === "session-1" ? [replayedEvent, toolEvent] : [],
+      task_plan: null,
+      task_results: null,
+    }),
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  store.getState().selectSession("session-1");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, [replayedEvent, toolEvent]);
+
+  store.getState().selectSession("session-2");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, []);
+
+  store.getState().selectSession("session-1");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, [replayedEvent, toolEvent]);
+  assert.equal(store.getState().currentAgent, "learning_assistant");
+});
+
 // D4-T2:乐观更新与失败回滚 ——————————————————————————————
 test("sendMessage optimistically shows the user message then replaces with the authoritative history", async () => {
   const { createChatStore } = await loadChatStore();

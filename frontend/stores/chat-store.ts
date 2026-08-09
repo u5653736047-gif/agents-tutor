@@ -20,6 +20,8 @@ type ChatStoreClient = Pick<
   ApiClient,
   "archiveSession" | "createSession" | "getSessionMessages" | "listSessions" | "sendChat"
 > & {
+  // 正式客户端会从 checkpoint 恢复过程；可选以兼容只关注消息的测试替身。
+  getSessionProcess?: ApiClient["getSessionProcess"];
   // D2-T3:审批接口——可选:既有测试注入的 stub 未实现,正式 apiClient
   // 一定实现;decideHandoff action 在未注入时直接跳过(与 streamChat 同模式)
   decideHandoff?: ApiClient["decideHandoff"];
@@ -251,9 +253,23 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       set({ isLoadingMessages: true, requestError: null });
       try {
-        const messages = await client.getSessionMessages(sessionId);
+        const [messages, process] = await Promise.all([
+          client.getSessionMessages(sessionId),
+          client.getSessionProcess?.(sessionId) ?? Promise.resolve(null),
+        ]);
         if (get().currentSessionId === sessionId) {
-          set({ isLoadingMessages: false, messages });
+          set({
+            isLoadingMessages: false,
+            messages,
+            ...(process
+              ? {
+                  currentAgent: process.current_agent ?? null,
+                  events: [...(process.events ?? [])],
+                  taskPlan: process.task_plan ?? null,
+                  taskResults: process.task_results ?? null,
+                }
+              : {}),
+          });
         }
       } catch (error) {
         if (get().currentSessionId === sessionId) {
@@ -594,6 +610,40 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
               streamingAgent: event.agent ?? null,
             }));
             break;
+          case "reasoning": {
+            // reasoning token 按 message_id 聚合；checkpoint 的完整事件
+            // (is_delta=false)会替换临时增量，避免原生流 + custom 终态重复。
+            const messageId =
+              event.message_id ?? `${event.agent ?? "agent"}-reasoning-${event.sequence}`;
+            const delta = event.content ?? "";
+            set((state) => {
+              const existingIndex = state.events.findIndex(
+                (item) =>
+                  item.event_type === "reasoning" &&
+                  "message_id" in item &&
+                  item.message_id === messageId,
+              );
+              if (existingIndex < 0) {
+                return {
+                  events: [...state.events, { ...event, message_id: messageId }],
+                  streamingAgent: event.agent ?? null,
+                };
+              }
+              const events = [...state.events];
+              const existing = events[existingIndex];
+              const previousContent =
+                existing && "content" in existing ? (existing.content ?? "") : "";
+              events[existingIndex] = {
+                ...event,
+                content:
+                  event.is_delta === false ? delta : `${previousContent}${delta}`,
+                message_id: messageId,
+                sequence: existing?.sequence ?? event.sequence,
+              };
+              return { events, streamingAgent: event.agent ?? null };
+            });
+            break;
+          }
           case "tool_call":
           case "tool_result":
             // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)

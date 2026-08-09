@@ -12,6 +12,7 @@
 //   GET  /sessions[?include_archived] → Session[](listSessions)
 //   GET  /sessions/{id}/messages      → Message[] 数组(直接返回数组,
 //                                       没有外层对象——以 api-client 为准)
+//   GET  /sessions/{id}/process       → SessionProcess(checkpoint 回放快照)
 //   POST /chat                        → ChatResponse(sendChat)
 //   POST /chat/stream?from_sequence=N → SSE 帧序列(stream-client 逐行解析)
 //   POST /sessions/{id}/handoff       → ChatResponse(decideHandoff)
@@ -73,6 +74,7 @@ export type MockPendingHandoff = {
 // 重置,配合 playwright.config 的 fullyParallel: false 保证用例隔离。
 let mockSessions: MockSession[] = [];
 const mockMessagesBySession = new Map<string, MockMessage[]>();
+const mockProcessBySession = new Map<string, Record<string, unknown>[]>();
 let mockPendingHandoff: MockPendingHandoff | null = null;
 let failStreaming = false;
 let sessionCounter = 0;
@@ -85,6 +87,7 @@ export type InstallMocksOptions = {
   // 预置会话与消息(用例 3 历史回溯 / 用例 4 归档)
   seedSessions?: MockSession[];
   seedMessages?: Record<string, MockMessage[]>;
+  seedProcess?: Record<string, Record<string, unknown>[]>;
 };
 
 export function mockSession(sessionId: string, title: string | null = null): MockSession {
@@ -161,6 +164,10 @@ export async function installMocks(
   for (const [sessionId, messages] of Object.entries(options.seedMessages ?? {})) {
     mockMessagesBySession.set(sessionId, [...messages]);
   }
+  mockProcessBySession.clear();
+  for (const [sessionId, events] of Object.entries(options.seedProcess ?? {})) {
+    mockProcessBySession.set(sessionId, [...events]);
+  }
   mockPendingHandoff = options.pendingHandoff ?? null;
   failStreaming = options.failStreaming ?? false;
   // review nit:会话计数一并重置,避免跨用例 id 递增(不影响正确性,
@@ -223,7 +230,7 @@ export async function installMocks(
       await route.fulfill({
         status: 200,
         headers: { "content-type": "text/event-stream" },
-        body: sseFrame({ event_type: "done", sequence: 5, session_id: sessionId }),
+        body: sseFrame({ event_type: "done", sequence: 6, session_id: sessionId }),
       });
       return;
     }
@@ -235,39 +242,53 @@ export async function installMocks(
     // 出现」,同时顺带覆盖 D1-T3 断线重连续传路径。
     const answer = mockAnswerFor(question);
     const assistantAt = appendHistory(sessionId, question, answer);
-    const frames = [
-      // thinking:公开的是阶段摘要，不是 provider 隐藏推理原文。
-      sseFrame({
+    const processEvents = [
+      {
         event_type: "thinking",
         sequence: 1,
         session_id: sessionId,
         agent: "supervisor",
         content: "正在分析问题并规划协作",
-      }),
-      // tool_call:摘要事件,不含工具参数
-      sseFrame({
-        event_type: "tool_call",
+      },
+      {
+        event_type: "reasoning",
         sequence: 2,
         session_id: sessionId,
         agent: "supervisor",
-        tool_name: "search_knowledge",
-        success: null,
-      }),
-      // tool_result:摘要事件 + 耗时
-      sseFrame({
-        event_type: "tool_result",
+        content: "先识别问题目标，再选择合适的知识检索路径。",
+        is_delta: false,
+        message_id: "mock-reasoning-1",
+      },
+      {
+        event_type: "tool_call",
         sequence: 3,
         session_id: sessionId,
         agent: "supervisor",
         tool_name: "search_knowledge",
+        tool_call_id: "mock-tool-1",
+        input_summary: JSON.stringify({ query: question }),
+        success: null,
+      },
+      {
+        event_type: "tool_result",
+        sequence: 4,
+        session_id: sessionId,
+        agent: "supervisor",
+        tool_name: "search_knowledge",
+        tool_call_id: "mock-tool-1",
+        output_summary: JSON.stringify({ found: true, hits: 2 }),
         success: true,
         duration_ms: 12,
-      }),
+      },
+    ];
+    mockProcessBySession.set(sessionId, processEvents);
+    const frames = [
+      ...processEvents.map((event) => sseFrame(event)),
       // message_end:content 为最终消息全文,message 与 getSessionMessages
       // 返回的历史消息同构(chat-store 优先取 event.message)
       sseFrame({
         event_type: "message_end",
-        sequence: 4,
+        sequence: 5,
         session_id: sessionId,
         agent: "supervisor",
         content: answer,
@@ -335,6 +356,21 @@ export async function installMocks(
       status: 200,
       headers: jsonHeaders(),
       body: JSON.stringify(mockMessagesBySession.get(sessionId) ?? []),
+    });
+  });
+
+  // ── GET /sessions/{id}/process → SessionProcess(checkpoint 快照) ──
+  await page.route("**/sessions/*/process", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        current_agent: "supervisor",
+        events: mockProcessBySession.get(sessionId) ?? [],
+        task_plan: null,
+        task_results: null,
+      }),
     });
   });
 

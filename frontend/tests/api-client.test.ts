@@ -55,6 +55,38 @@ test("the API client preserves an optional generated session ID", async () => {
   assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { session_id: "session/1" });
 });
 
+test("the API client loads a replayable session process snapshot", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: string[] = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input) => {
+      requests.push(String(input));
+      return Response.json({
+        current_agent: "learning_assistant",
+        events: [
+          {
+            agent: "learning_assistant",
+            content: "先检索再解释",
+            event_type: "reasoning",
+            message_id: "assistant-step-1",
+            sequence: 2,
+            session_id: "session/1",
+          },
+        ],
+        task_plan: null,
+        task_results: null,
+      });
+    },
+  });
+
+  const process = await client.getSessionProcess("session/1");
+
+  assert.equal(requests[0], "https://api.example/sessions/session%2F1/process");
+  assert.equal(process.events[0]?.event_type, "reasoning");
+  assert.equal(process.current_agent, "learning_assistant");
+});
+
 test("the API client exposes non-success responses as one error shape", async () => {
   const { ApiClientError, createApiClient } = await loadApiClient();
   const client = createApiClient({
