@@ -12,6 +12,8 @@
 - “思考”仅展示可审计的执行摘要，不公开模型原始推理文本或工具参数/结果正文
 - 兼容原有 `handoff` / 人工审批编排模式（非生产默认）
 - 工具名称唯一校验、角色权限和结构化错误
+- 每会话可选择主工作区并追加授权根目录；只读文件工具支持相对路径与已授权绝对路径，含路径逃逸、链接越界与敏感文件防护
+- `inspect_workspace` 可把多项只读检查合并为一次工具调用；Supervisor 还可提出一条复合 Shell 命令，经用户逐次审批后实时回显 stdout/stderr
 - 安全运行事件以及 handoff、Agent 切换上限
 - 可选 SQLite 持久化，按 `user_id + session_id` 逻辑分区
 - 可选模型上下文裁剪，checkpoint 仍保留完整历史
@@ -56,6 +58,8 @@ npm install
 | `API_KNOWLEDGE_DB_PATH` | 可选，知识库词法 SQLite 文件；默认根目录 `data/knowledge.db`（由 ingest 脚本生成，永不降级的底线检索）。 |
 | `API_VECTOR_DB_PATH` | 可选，知识库向量 SQLite 文件；默认根目录 `data/vector_knowledge.db`；不可用（文件不存在 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断启动。 |
 | `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
+| `API_WORKSPACE_ROOT` | 可选，新会话的默认主工作区；启动脚本默认绑定当前仓库根。用户可在创建会话时选择其他目录。 |
+| `API_WORKSPACE_ALLOWED_ROOTS` | 可选，部署侧允许用户选择的目录边界；多个根用系统 PATH 分隔符分隔（Windows `;`、Linux/macOS `:`）。未设置时本地模式允许明确选择任意现有目录；生产部署建议必设。 |
 
 ### 启用真实语义检索（可选）
 
@@ -93,6 +97,9 @@ embedding_provider=FastEmbedProvider vector_dimension=512`）或
 
 手动验收路径：在前端创建会话并提问，确认 Supervisor 的主回答按 token 增量出现；
 需要专业 Agent 时，Supervisor 会在同一轮内等待其完成并整合结果，不提前结束会话。
+可在新建会话时输入或浏览服务器上的工作区，也可为当前会话追加授权根；文件工具既可使用
+相对路径，也可使用这些根目录内的绝对路径。遇到适合终端处理的任务时，页面应先展示完整
+命令、工作目录与超时，批准后在同一工具卡片内逐段显示 stdout/stderr，随后继续生成最终回答。
 最后切换或刷新页面验证权威全文仍在历史中，再归档会话。模型或编排失败时，对话区应
 显示稳定错误提示，不能只结束加载状态而没有回答。
 
@@ -136,6 +143,7 @@ docker compose down -v   # 停止并删除卷（连同 data/ 数据，慎用）
 | `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` | 必填，从 `.env` 透传；`DEEPSEEK_API_KEY` 缺失时 `docker compose up` 直接报错 |
 | `API_SESSION_STORE_PATH` 等 5 个 `API_*_PATH` | 容器内固定指向挂载卷 `/app/data/...`。后端默认路径按宿主仓库根解析（`__file__.parents[3]`），容器里会落到不可写的根目录 `/`，必须显式指定；宿主 `.env` 里的 Windows 风格路径对容器无效 |
 | `API_KNOWLEDGE_EMBEDDING` | 可选，默认 `auto`；镜像已装 fastembed，`auto` 即真实语义检索 |
+| `API_WORKSPACE_ROOT` / `API_WORKSPACE_ALLOWED_ROOTS` | 均固定为容器内 `/workspace`；选择器只能授权该挂载内目录。宿主其他目录必须先显式挂载，不能直接用宿主绝对路径。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 前端构建参数，默认 `http://localhost:8000`（见下方说明） |
 
 ### 数据卷与前端 API 地址说明
@@ -146,6 +154,13 @@ docker compose down -v   # 停止并删除卷（连同 data/ 数据，慎用）
   宿主机脚本 `backend/scripts/ingest_books.py`。注意：若现有向量库维度与
   容器内 fastembed 不匹配（如宿主是 256 维哈希库），检索会自动降级为纯
   词法，不阻断启动。
+- **Agent 工作区**：宿主仓库通过 `./:/workspace:ro` 只读挂载。文件工具包括
+  `workspace_info`、`list_files`、`glob_files`、`grep_files`、`read_file` 与
+  `inspect_workspace`，可使用相对路径或已授权的容器内绝对路径。Supervisor 可提出
+  支持管道/顺序语句的前台 Shell 命令，但每次都必须由用户核对完整命令并批准；终端
+  输出会实时归入同一工具卡片。Shell 以 API 服务账号权限运行，工作目录授权不是操作
+  系统级命令沙箱；容器中的 `/workspace` 只读挂载可防止其修改仓库，但命令仍可能访问
+  服务账号可访问的其他容器资源，因此只应批准可信命令。
 - **前端 API 地址**：`NEXT_PUBLIC_*` 由 Next.js 在构建时内联进浏览器产物，
   运行时改环境变量无效，所以 compose 用 build args 传入
   `http://localhost:8000`（宿主端口映射到 `api` 容器）。不能传 compose
