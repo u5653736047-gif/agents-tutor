@@ -49,11 +49,38 @@ test("the conversation panel keeps an end anchor for automatic scrolling", () =>
   assert.match(panel, /data-slot="conversation-end"/);
 });
 
-test("the conversation page keeps transient collaboration telemetry out of the chat", () => {
+test("the conversation page renders the collaboration process for the active turn", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      collaboration: {
+        currentAgent: "learning_assistant",
+        events: [
+          {
+            agent: "learning_assistant",
+            content: "正在梳理知识点",
+            event_type: "thinking",
+            sequence: 1,
+            session_id: "session-1",
+          },
+        ],
+        taskPlan: null,
+        taskResults: null,
+      },
+      isSending: false,
+      isStreaming: true,
+      messages: [{ agent: null, content: "请讲解", role: "user" }],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: null,
+    }),
+  );
   const panel = readFileSync(panelPath, "utf8");
 
-  assert.doesNotMatch(panel, /import \{ CollaborationPanel \}/);
-  assert.doesNotMatch(panel, /<CollaborationPanel/);
+  assert.match(markup, /data-slot="collaboration-panel"/);
+  assert.match(markup, /正在梳理知识点/);
+  assert.match(panel, /state\.events/);
+  assert.match(panel, /state\.taskPlan/);
 });
 
 // D2-T5:错误降级 UX——runError 分类渲染与重试按钮 ———————————————————
@@ -630,4 +657,35 @@ test("attachment rendering lives inside MessageRow so both render paths share it
   assert.match(panel, /getFileUrl\(attachment\.file_id\)/);
   // 仅用户消息渲染(守卫在 role 分支内)
   assert.match(panel, /isUser \? \(/);
+});
+
+test("message bubbles use a softer hierarchy for user and assistant content", async () => {
+  const { MessageRow } = await loadConversationPanel();
+  const userMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: { agent: null, content: "用户问题", role: "user" },
+    }),
+  );
+  const assistantMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 1,
+      message: { agent: "supervisor", content: "助手回答", role: "assistant" },
+    }),
+  );
+
+  assert.match(userMarkup, /rounded-2xl/);
+  assert.match(userMarkup, /rounded-br-md/);
+  assert.match(assistantMarkup, /rounded-2xl/);
+  assert.match(assistantMarkup, /bg-card\/80/);
+  assert.match(assistantMarkup, /shadow-sm/);
+});
+
+test("the conversation uses a wider reading rail and a soft composer transition", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  assert.match(panel, /max-w-4xl/);
+  assert.match(panel, /data-slot="chat-input-area"/);
+  assert.match(panel, /bg-gradient-to-t/);
+  assert.doesNotMatch(panel, /className="border-t border-border px-8 py-4"/);
 });

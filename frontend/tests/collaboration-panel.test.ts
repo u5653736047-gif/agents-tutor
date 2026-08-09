@@ -77,6 +77,32 @@ test("the collaboration panel renders events in sequence order with tool summari
   assert.doesNotMatch(markup, /done/);
 });
 
+test("the collaboration panel gives known agent tools readable activity labels", async () => {
+  const { CollaborationPanel } = await loadCollaborationPanel();
+  const events = [
+    {
+      agent: "supervisor",
+      event_type: "tool_call",
+      sequence: 1,
+      tool_name: "ask_learning_assistant",
+    },
+    {
+      agent: "learning_assistant",
+      event_type: "tool_call",
+      sequence: 2,
+      tool_name: "search_knowledge",
+    },
+  ];
+
+  const markup = renderToStaticMarkup(
+    createElement(CollaborationPanel, { ...emptyProps, events }),
+  );
+
+  assert.match(markup, /调用助学助手/);
+  assert.match(markup, /检索课程知识库/);
+  assert.doesNotMatch(markup, /ask_learning_assistant/);
+});
+
 test("the collaboration panel renders coalesced subagent output", async () => {
   const { CollaborationPanel } = await loadCollaborationPanel();
   const events = [

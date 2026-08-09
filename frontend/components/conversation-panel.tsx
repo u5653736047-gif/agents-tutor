@@ -8,6 +8,10 @@ import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
+import {
+  CollaborationPanel,
+  type CollaborationPanelProps,
+} from "@/components/collaboration-panel";
 import { FeedbackButtons } from "@/components/feedback-buttons";
 import { HandoffCard } from "@/components/handoff-card";
 import { Button } from "@/components/ui/button";
@@ -188,8 +192,8 @@ export function MessageRow({
       <div
         className={
           isUser
-            ? "max-w-[80%] rounded-lg bg-primary px-4 py-3 text-body text-primary-foreground"
-            : "max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground"
+            ? "max-w-[85%] rounded-2xl rounded-br-md bg-primary px-4 py-3 text-body text-primary-foreground shadow-sm md:max-w-[75%]"
+            : "max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 text-body text-foreground shadow-sm md:max-w-[85%]"
         }
       >
         {!isUser ? <AssistantBadge agent={message.agent} /> : null}
@@ -235,6 +239,7 @@ export function MessageRow({
 }
 
 type ConversationContentProps = {
+  collaboration?: CollaborationPanelProps;
   // UX-20260807#2:切换会话拉历史期间(isLoadingMessages && 无消息)渲染
   // 加载骨架,区分「正在加载」与「会话是空的」。可选:既有调用不传时
   // 零渲染,行为不变。
@@ -261,6 +266,7 @@ type ConversationContentProps = {
 };
 
 export function ConversationContent({
+  collaboration,
   isLoadingMessages = false,
   isSending,
   isStreaming,
@@ -306,7 +312,7 @@ export function ConversationContent({
               data-slot="history-skeleton"
               key={index}
             >
-              <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+              <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
                 <div className="flex items-center gap-2">
                   <Skeleton className="size-5 rounded-full" />
                   <Skeleton className="h-4 w-16" />
@@ -337,6 +343,13 @@ export function ConversationContent({
           ))
         : null}
 
+      {/* 当前轮执行轨迹与回答属于同一个视觉单元：在历史/用户消息后、
+          流式回答前展示。只在已有过程数据时挂载，普通闲置会话不占位。 */}
+      {collaboration &&
+      (collaboration.events.length > 0 || collaboration.taskPlan !== null) ? (
+        <CollaborationPanel {...collaboration} />
+      ) : null}
+
       {/* 流式气泡:isStreaming 期间渲染,或异常中断后保留已收到内容时继续展示 */}
       {isStreaming || streamingMessage ? (
         <article
@@ -346,7 +359,7 @@ export function ConversationContent({
           data-message-role="assistant"
           data-slot="streaming-message"
         >
-          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 text-body text-foreground shadow-sm md:max-w-[85%]">
             <AssistantBadge agent={streamingAgent} />
             <div className="mt-2">
               <AssistantMarkdown content={streamingMessage?.content ?? ""} />
@@ -474,7 +487,7 @@ export function ConversationContent({
           className="flex justify-start"
           data-slot="message-skeleton"
         >
-          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
             <div className="flex items-center gap-2">
               <Skeleton className="size-5 rounded-full" />
               <Skeleton className="h-4 w-16" />
@@ -491,6 +504,7 @@ export function ConversationContent({
 }
 
 export function ConversationPanel() {
+  const currentAgent = useChatStore((state) => state.currentAgent);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
   const decideHandoff = useChatStore((state) => state.decideHandoff);
@@ -500,6 +514,7 @@ export function ConversationPanel() {
   const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
+  const events = useChatStore((state) => state.events);
   const lastSentMessage = useChatStore((state) => state.lastSentMessage);
   const messages = useChatStore((state) => state.messages);
   const pendingHandoff = useChatStore((state) => state.pendingHandoff);
@@ -511,6 +526,8 @@ export function ConversationPanel() {
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
+  const taskPlan = useChatStore((state) => state.taskPlan);
+  const taskResults = useChatStore((state) => state.taskResults);
   // D6-T2:反馈提交 action——与主对话流程解耦(不写 requestError),
   // 失败由 FeedbackButtons 组件内错误行呈现
   const submitFeedback = useChatStore((state) => state.submitFeedback);
@@ -572,12 +589,15 @@ export function ConversationPanel() {
     isDecidingHandoff,
     isSending,
     isStreaming,
+    events,
     messages,
     pendingHandoff,
     references,
     runError,
     streamingAgent,
     streamingMessage,
+    taskPlan,
+    taskResults,
   ]);
 
   return (
@@ -594,7 +614,7 @@ export function ConversationPanel() {
         onScroll={handleScroll}
         ref={parentRef}
       >
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
           {/* D4-T8:虚拟化前 spacer——把首行推到估算位置(首帧未测量
               时为 0,随测量/滚动更新) */}
           {isVirtualized && virtualItems.length > 0 ? (
@@ -620,6 +640,7 @@ export function ConversationPanel() {
               })
             : null}
           <ConversationContent
+            collaboration={{ currentAgent, events, taskPlan, taskResults }}
             feedbackSessionId={currentSessionId ?? undefined}
             isLoadingMessages={isLoadingMessages}
             isSending={isSending}
@@ -671,8 +692,11 @@ export function ConversationPanel() {
           <div data-slot="conversation-end" ref={endRef} />
         </div>
       </div>
-      <div className="border-t border-border px-8 py-4" data-slot="chat-input-area">
-        <div className="mx-auto w-full max-w-3xl">
+      <div
+        className="bg-gradient-to-t from-background via-background to-transparent px-4 pb-4 pt-6 md:px-8"
+        data-slot="chat-input-area"
+      >
+        <div className="mx-auto w-full max-w-4xl">
           <ChatInput />
         </div>
       </div>

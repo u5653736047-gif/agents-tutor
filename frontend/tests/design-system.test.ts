@@ -128,3 +128,15 @@ test("globals.css 含 prefers-reduced-motion 全局关闭守卫", () => {
   assert.match(globals, /transition-duration: 0\.01ms !important/);
   assert.match(globals, /scroll-behavior: auto !important/);
 });
+
+test("暗色画布保持柔和层级而不是近黑背景与突兀卡片", () => {
+  const darkBlock = globals.match(/\.dark \{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const background = Number(
+    darkBlock.match(/--background:\s*oklch\(([\d.]+)/)?.[1],
+  );
+  const card = Number(darkBlock.match(/--card:\s*oklch\(([\d.]+)/)?.[1]);
+
+  assert.ok(background >= 0.16, "暗色画布过黑，长时间阅读压抑");
+  assert.ok(card > background, "卡片必须高于画布形成层级");
+  assert.ok(card - background <= 0.06, "卡片与画布反差过大，界面会碎片化");
+});

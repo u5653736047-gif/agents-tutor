@@ -81,9 +81,10 @@
   /* UX-20260807#4:暗色背景/边框色相对齐品牌蓝 hue 262.88(原 285.x
      紫灰),与亮色同一品牌冷蓝温;含 --input 与 --muted-foreground,
      保持「暗色 input 与 border 同值」不变量。 */
-  --background: oklch(0.141 0.005 262.88);
+  /* 画布抬离近黑色，降低大面积空白处的压迫感；卡片仍保留一档层级。 */
+  --background: oklch(0.165 0.012 262.88);
   --foreground: oklch(0.985 0 0);
-  --card: oklch(0.21 0.006 262.88);
+  --card: oklch(0.21 0.012 262.88);
   --card-foreground: oklch(0.985 0 0);
   --primary: var(--brand);
   --primary-foreground: oklch(0.985 0.002 247.84);

@@ -309,7 +309,7 @@ test("filterSessions also matches session titles case-insensitively", async () =
   );
 });
 
-test("the sidebar renders the session title and falls back to session_id", async () => {
+test("the sidebar renders the session title and a readable legacy fallback", async () => {
   const { SessionSidebarContent } = await loadSessionSidebar();
 
   const markup = renderToStaticMarkup(
@@ -325,7 +325,7 @@ test("the sidebar renders the session title and falls back to session_id", async
       sessions: [
         // 有标题:正文展示标题,完整 session_id 收进悬浮提示(title 属性)
         { archived: false, created_at: "2025-01-01T00:00:00Z", session_id: "titled-session-id", user_id: null, title: "机器学习学习路径" },
-        // 无标题(存量老会话,契约为 null):正文回退 session_id
+        // 无标题(存量老会话,契约为 null):正文显示可读占位 + 短 ID
         { archived: false, created_at: "2025-01-02T00:00:00Z", session_id: "legacy-session-id", user_id: null, title: null },
       ],
       showArchived: false,
@@ -336,5 +336,33 @@ test("the sidebar renders the session title and falls back to session_id", async
   assert.match(markup, /title="titled-session-id"/);
   // 有标题时正文不再把 session_id 当展示文本
   assert.doesNotMatch(markup, />titled-session-id</);
-  assert.match(markup, />legacy-session-id</);
+  assert.match(markup, />未命名会话</);
+  assert.match(markup, /legacy-s/);
+  assert.doesNotMatch(markup, />legacy-session-id</);
+});
+
+test("the sidebar renders a compact rail when collapsed", async () => {
+  const { SessionSidebarContent } = await loadSessionSidebar();
+
+  const markup = renderToStaticMarkup(
+    createElement(SessionSidebarContent, {
+      archiveSession: () => undefined,
+      collapsed: true,
+      createSession: () => undefined,
+      currentSessionId: null,
+      isLoadingSessions: false,
+      loadCurrentSessionMessages: () => undefined,
+      onToggleArchived: () => undefined,
+      onToggleCollapsed: () => undefined,
+      requestError: null,
+      selectSession: () => undefined,
+      sessions: [],
+      showArchived: false,
+    }),
+  );
+
+  assert.match(markup, /data-slot="sidebar-collapsed"/);
+  assert.match(markup, /aria-label="展开会话侧栏"/);
+  assert.match(markup, /aria-label="新建会话"/);
+  assert.doesNotMatch(markup, /data-slot="session-search"/);
 });

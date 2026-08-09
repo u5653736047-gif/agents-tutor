@@ -66,6 +66,21 @@ function summarize(text: string | null | undefined, maxLength = 40): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
 }
 
+const toolActivityLabels: Record<string, string> = {
+  ask_evaluator: "调用评估助手",
+  ask_learning_assistant: "调用助学助手",
+  ask_teaching_assistant: "调用助教助手",
+  create_task_plan: "制定协作计划",
+  detect_intent: "识别学习意图",
+  detect_level: "判断学习阶段",
+  search_knowledge: "检索课程知识库",
+  submit_evaluation: "提交学习评估",
+};
+
+function toolActivityLabel(toolName: string): string {
+  return toolActivityLabels[toolName] ?? toolName;
+}
+
 // 计划步骤条:横向步骤列表,current_step_index 高亮,结果打勾/打叉
 function PlanSteps({
   taskPlan,
@@ -185,6 +200,7 @@ function EventTimeline({
             // 工具行:只含工具名与成功与否等摘要,绝无参数/结果正文(安全红线)。
             // 点击展开可看耗时与所属计划步骤;success 为 null 时不显示状态。
             const toolName = event.tool_name ?? "未知工具";
+            const label = toolActivityLabel(toolName);
             const succeeded = event.success;
             const isExpanded = expandedIndex === sortedIndex;
 
@@ -212,7 +228,7 @@ function EventTimeline({
                           ? "❌"
                           : "🔧"}
                   </span>
-                  <span className="truncate">{toolName}</span>
+                  <span className="truncate">{label}</span>
                   <span className="ml-auto shrink-0">{isExpanded ? "收起" : "详情"}</span>
                 </button>
 
@@ -310,7 +326,12 @@ export function CollaborationPanel({
           expanded && "border-b border-border",
         )}
       >
-        <h3 className="text-caption font-medium text-foreground">协作过程</h3>
+        <div>
+          <h3 className="text-caption font-medium text-foreground">执行过程</h3>
+          <p className="text-[11px] text-muted-foreground">
+            思考摘要 · 工具调用 · 子代理
+          </p>
+        </div>
         <button
           aria-expanded={expanded}
           className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-muted-foreground hover:bg-muted hover:text-foreground"

@@ -44,10 +44,10 @@ type ChatInputContentProps = {
   value: string;
 };
 
-// D4-T3:输入区自适应高度的夹取边界。最小基线 96px(约 3 行文本 +
-// 上下 padding,与旧 rows={3} + min-h-24 视觉一致);上限 192px
+// 输入区自适应高度的夹取边界。最小基线 64px（约 2 行文本），保留
+// 足够输入空间但不再让空编辑器长期占据大块视口；上限 192px
 // (8 行 × 24px,text-body 行高),超限由组件滚动。
-export const MIN_TEXTAREA_HEIGHT = 96;
+export const MIN_TEXTAREA_HEIGHT = 64;
 export const MAX_TEXTAREA_HEIGHT = 192;
 
 // D4-T3:自适应高度夹取纯函数——scrollHeight(内容高度)夹在最小
@@ -243,7 +243,7 @@ export function ChatInputContent({
 
   return (
     <form
-      className="flex items-end gap-3"
+      className="flex items-end gap-2 rounded-2xl border border-border/80 bg-card p-2 shadow-sm"
       data-slot="chat-input"
       onSubmit={(event) => {
         event.preventDefault();
@@ -385,7 +385,7 @@ export function ChatInputContent({
             挂载后高度由 resizeTextarea 接管。 */}
         <textarea
           aria-label="输入消息"
-          className="min-h-24 max-h-48 w-full resize-none overflow-y-auto rounded-lg border border-input bg-background px-3 py-2 text-body text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted"
+          className="min-h-16 max-h-48 w-full resize-none overflow-y-auto rounded-xl border-0 bg-transparent px-2 py-2 text-body text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:cursor-not-allowed disabled:bg-muted/40"
           disabled={isSending}
           onChange={(event) => {
             onChange(event.target.value);
@@ -438,7 +438,7 @@ export function ChatInputContent({
             }
           }}
           placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-          rows={3}
+          rows={2}
           ref={textareaRef}
           value={value}
         />
