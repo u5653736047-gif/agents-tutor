@@ -30,6 +30,7 @@ def test_contract_models_represent_a_minimal_chat_response() -> None:
         session_id="session-1",
         user_id=None,
         created_at=datetime(2026, 8, 3, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 3, tzinfo=UTC),
         archived=False,
     )
     message = Message(

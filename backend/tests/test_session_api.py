@@ -357,5 +357,7 @@ def test_session_response_carries_nullable_title(tmp_path: Path) -> None:
         store.close()
 
     assert created.status_code == 201
+    assert "updated_at" in created.json()
+    assert created.json()["updated_at"] == created.json()["created_at"]
     assert created.json()["title"] is None
     assert [session["title"] for session in listed.json()] == ["什么是注意力机制"]

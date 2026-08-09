@@ -814,6 +814,11 @@ export interface components {
              * @default null
              */
             title?: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
             /** User Id */
             user_id: string | null;
         };

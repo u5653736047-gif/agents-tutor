@@ -17,13 +17,35 @@ def test_session_store_creates_and_lists_immutable_records(tmp_path: Path) -> No
         first = store.create_session("session-1", user_id="user-1")
         second = store.create_session("session-2", user_id="user-1")
 
-        assert store.list_sessions(user_id="user-1") == [first, second]
+        assert store.list_sessions(user_id="user-1") == [second, first]
 
     assert first.session_id == "session-1"
     assert first.user_id == "user-1"
+    assert first.updated_at == first.created_at
     assert first.archived is False
     with pytest.raises(FrozenInstanceError):
         first.archived = True  # type: ignore[misc]
+
+
+def test_session_store_orders_by_recent_activity_and_can_touch_a_session(
+    tmp_path: Path,
+) -> None:
+    with SessionStore(tmp_path / "sessions.sqlite") as store:
+        first = store.create_session("first", user_id="user-1")
+        store.create_session("second", user_id="user-1")
+
+        assert [record.session_id for record in store.list_sessions(user_id="user-1")] == [
+            "second",
+            "first",
+        ]
+
+        touch_session = getattr(store, "touch_session", None)
+        assert callable(touch_session)
+        assert touch_session("first", user_id="user-1") is True
+
+        records = store.list_sessions(user_id="user-1")
+        assert [record.session_id for record in records] == ["first", "second"]
+        assert records[0].updated_at > first.updated_at
 
 
 def test_session_store_archives_without_deleting_metadata(tmp_path: Path) -> None:
@@ -38,8 +60,8 @@ def test_session_store_archives_without_deleting_metadata(tmp_path: Path) -> Non
 
         all_sessions = store.list_sessions(user_id="user-1", include_archived=True)
 
-    assert [record.session_id for record in all_sessions] == ["active", "archived"]
-    assert [record.archived for record in all_sessions] == [False, True]
+    assert [record.session_id for record in all_sessions] == ["archived", "active"]
+    assert [record.archived for record in all_sessions] == [True, False]
 
 
 @pytest.mark.parametrize("session_id", ["", "   "])
@@ -77,7 +99,8 @@ def test_session_store_supports_one_instance_across_threads(tmp_path: Path) -> N
 
         assert store.list_sessions(user_id="user-1") == sorted(
             records,
-            key=lambda record: (record.created_at, record.session_id),
+            key=lambda record: (record.updated_at, record.created_at, record.session_id),
+            reverse=True,
         )
 
 
@@ -120,6 +143,7 @@ def test_session_store_isolates_users_and_persists_after_reopen(tmp_path: Path) 
                 session_id=first_user.session_id,
                 user_id=first_user.user_id,
                 created_at=first_user.created_at,
+                updated_at=first_user.updated_at,
                 archived=True,
             )
         ]
@@ -235,6 +259,7 @@ def test_session_store_migrates_legacy_database_without_title_column(tmp_path: P
         records = store.list_sessions(user_id="user-1")
         assert [record.session_id for record in records] == ["legacy-session"]
         assert [record.title for record in records] == [None]
+        assert records[0].updated_at == records[0].created_at
         # 迁移后的库可正常补标题
         assert (
             store.set_title_if_absent("legacy-session", "旧会话标题", user_id="user-1") is True

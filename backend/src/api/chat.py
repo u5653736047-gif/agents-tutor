@@ -339,7 +339,11 @@ def _ensure_session(session_store: SessionStore, session_id: str, user_id: str |
 
 
 def _ensure_session_with_title(
-    session_store: SessionStore, session_id: str, user_id: str | None, message: str
+    session_store: SessionStore,
+    session_id: str,
+    user_id: str | None,
+    message: str,
+    touch_activity: bool = True,
 ) -> None:
     """Ensure the session exists, then title it from its first user message.
 
@@ -351,6 +355,8 @@ def _ensure_session_with_title(
     title = derive_session_title(message)
     if title is not None:
         session_store.set_title_if_absent(session_id, title, user_id=user_id)
+    if touch_activity:
+        session_store.touch_session(session_id, user_id=user_id)
 
 
 async def pending_handoff_for_session(

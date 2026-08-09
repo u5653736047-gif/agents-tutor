@@ -1040,6 +1040,11 @@
             "default": null,
             "title": "Title"
           },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
           "user_id": {
             "anyOf": [
               {
@@ -1056,6 +1061,7 @@
           "session_id",
           "user_id",
           "created_at",
+          "updated_at",
           "archived"
         ],
         "title": "Session",

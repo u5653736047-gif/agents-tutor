@@ -97,6 +97,7 @@ class Session(ContractModel):
     session_id: str
     user_id: str | None
     created_at: datetime
+    updated_at: datetime
     archived: bool
     # 侧栏标题：首条用户消息提炼（只写一次）；存量老会话为 None，
     # 前端按 session_id 回退展示。

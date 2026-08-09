@@ -783,6 +783,7 @@ def test_chat_titles_session_from_first_message_only(tmp_path: Path) -> None:
                 {"session_id": "session-1", "message": "  什么是\n  注意力机制?  "},
             )
         )
+        first_activity = store.list_sessions(user_id="user-1")[0].updated_at
         second = asyncio.run(
             _post_chat(app, {"session_id": "session-1", "message": "后续消息不改标题"})
         )
@@ -793,3 +794,4 @@ def test_chat_titles_session_from_first_message_only(tmp_path: Path) -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert [record.title for record in records] == ["什么是 注意力机制?"]
+    assert records[0].updated_at > first_activity

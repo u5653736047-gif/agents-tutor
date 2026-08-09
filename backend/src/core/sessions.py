@@ -22,6 +22,7 @@ class SessionRecord:
     session_id: str
     user_id: str | None
     created_at: datetime
+    updated_at: datetime
     archived: bool = False
     # 侧栏展示标题（首条用户消息提炼，只写一次）；老数据为 None，
     # 前端回退显示 session_id。
@@ -46,6 +47,7 @@ class SessionStore:
                         user_id TEXT,
                         session_id TEXT NOT NULL,
                         created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
                         archived INTEGER NOT NULL DEFAULT 0,
                         title TEXT,
                         PRIMARY KEY (user_key, session_id)
@@ -54,11 +56,17 @@ class SessionStore:
                 )
                 # 增量迁移：老库（title 列加入前建的表）走 CREATE TABLE IF NOT
                 # EXISTS 是空操作，必须单独 ALTER 补列；新库已含该列，跳过。
-                if "title" not in {
+                columns = {
                     str(row["name"])
                     for row in connection.execute("PRAGMA table_info(sessions)")
-                }:
+                }
+                if "title" not in columns:
                     connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+                if "updated_at" not in columns:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL"
+                    )
         except BaseException:
             connection.close()
             raise
@@ -73,23 +81,28 @@ class SessionStore:
         """Create and return a session metadata record."""
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
+        now = datetime.now(UTC)
         record = SessionRecord(
             session_id=session_id,
             user_id=user_id,
-            created_at=datetime.now(UTC),
+            created_at=now,
+            updated_at=now,
         )
         try:
             with self._lock, self._connection:
                 self._connection.execute(
                     """
-                    INSERT INTO sessions (user_key, user_id, session_id, created_at, archived)
-                    VALUES (?, ?, ?, ?, 0)
+                    INSERT INTO sessions (
+                        user_key, user_id, session_id, created_at, updated_at, archived
+                    )
+                    VALUES (?, ?, ?, ?, ?, 0)
                     """,
                     (
                         self._user_key(user_id),
                         user_id,
                         session_id,
                         record.created_at.isoformat(),
+                        record.updated_at.isoformat(),
                     ),
                 )
         # 主键冲突 = 同用户重复创建同一会话，转成业务错误抛出
@@ -110,9 +123,9 @@ class SessionStore:
         *,
         include_archived: bool = False,
     ) -> list[SessionRecord]:
-        """List one user's sessions in creation order."""
+        """List one user's sessions by most recent conversation activity."""
         query = """
-            SELECT session_id, user_id, created_at, archived, title
+            SELECT session_id, user_id, created_at, updated_at, archived, title
             FROM sessions
             WHERE user_key = ?
         """
@@ -120,7 +133,7 @@ class SessionStore:
         # 默认只列未归档会话：归档只影响列表可见性，数据不删除
         if not include_archived:
             query += " AND archived = 0"
-        query += " ORDER BY created_at, session_id"
+        query += " ORDER BY updated_at DESC, created_at DESC, session_id DESC"
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
         return [self._record_from_row(row) for row in rows]
@@ -142,6 +155,23 @@ class SessionStore:
                     """,
                     (self._user_key(user_id), session_id),
                 )
+            return cursor.rowcount > 0
+
+    def touch_session(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> bool:
+        """Record fresh conversation activity and report whether a row changed."""
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?
+                WHERE user_key = ? AND session_id = ?
+                """,
+                (datetime.now(UTC).isoformat(), self._user_key(user_id), session_id),
+            )
             return cursor.rowcount > 0
 
     def set_title_if_absent(
@@ -198,6 +228,7 @@ class SessionStore:
             session_id=str(row["session_id"]),
             user_id=cast(str | None, row["user_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
             archived=bool(row["archived"]),
             title=cast(str | None, row["title"]),
         )
