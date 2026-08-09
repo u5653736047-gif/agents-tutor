@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,14 +14,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 import core.graph_builder as graph_builder_module
 from core.events import ErrorCode, EventType, RunError
+from core.filesystem import WorkspaceFileSystem
 from core.graph_builder import CollaborativeAgentGraph
 from core.nodes.react_agent import ReActAgentNode
 from core.state import (
     AgentRole,
     HandoffApprovalAction,
     HandoffApprovalDecision,
+    ToolApprovalAction,
+    ToolApprovalDecision,
     create_initial_state,
 )
+from core.tools.shell_tool import create_shell_tool
 
 
 @tool
@@ -97,6 +102,76 @@ def subagent_response(
             }
         ],
     )
+
+
+def shell_response(command: str = "echo approved") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "shell",
+                "args": {
+                    "command": command,
+                    "cwd": ".",
+                    "description": "verify the project",
+                    "timeout_seconds": 10,
+                },
+                "id": "shell-call-1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def test_shell_approval_pauses_without_replaying_the_model(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = ScriptedModel(
+        [
+            shell_response(),
+            AIMessage(content="命令完成，继续整合回答。"),
+        ]
+    )
+    shell = create_shell_tool(WorkspaceFileSystem(workspace))
+    graph = CollaborativeAgentGraph(
+        model=model,
+        tools=[shell],
+        tool_permissions={"shell": {AgentRole.SUPERVISOR}},
+        checkpointer=InMemorySaver(),
+        orchestration_mode="tool",
+    )
+    session_id = "shell-approval"
+
+    paused = graph.run(
+        "检查项目",
+        session_id,
+        workspace_root=str(workspace),
+    )
+    pending = graph.get_pending_tool_approval(session_id)
+
+    assert len(model.calls) == 1
+    assert paused["pending_tool_approval"] is not None
+    assert pending is not None
+    assert pending.request.tool_call_id == "shell-call-1"
+    assert pending.request.arguments["command"] == "echo approved"
+
+    result = graph.resume_tool_approval(
+        session_id,
+        ToolApprovalDecision(
+            interrupt_id=pending.interrupt_id,
+            action=ToolApprovalAction.CONFIRM,
+        ),
+    )
+
+    assert len(model.calls) == 2
+    assert result["pending_tool_approval"] is None
+    assert result["messages"][-1].content == "命令完成，继续整合回答。"
+    assert sum(
+        event.event_type is EventType.TOOL_COMPLETED
+        and event.tool_call_id == "shell-call-1"
+        for event in result["events"]
+    ) == 1
+    assert any("approved" in str(message.content) for message in model.calls[1])
 
 
 def test_interrupt_identifier_supports_langgraph_0_4_shape() -> None:

@@ -27,6 +27,9 @@ from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
 from api.sessions import router as session_router
 from api.stats import router as stats_router
 from api.stream import router as stream_router
+from api.tool_approvals import router as tool_approval_router
+from api.workspaces import router as workspace_router
+from core.filesystem import WorkspaceFileSystem
 from core.graph_builder import CollaborativeAgentGraph
 from core.knowledge.embedding import (
     EmbeddingProvider,
@@ -46,6 +49,11 @@ from core.nodes.react_agent import ChatModel
 from core.persistence import open_sqlite_checkpointer
 from core.sessions import SessionStore
 from core.state import AgentRole
+from core.tools import (
+    MAX_SHELL_TIMEOUT_SECONDS,
+    create_read_only_file_tools,
+    create_shell_tool,
+)
 
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -77,11 +85,34 @@ DEFAULT_CHECKPOINT_PATH = str(_REPO_ROOT / "data" / "api_checkpoints.sqlite3")
 DEFAULT_KNOWLEDGE_DB_PATH = str(_REPO_ROOT / "data" / "knowledge.db")
 DEFAULT_VECTOR_DB_PATH = str(_REPO_ROOT / "data" / "vector_knowledge.db")
 DEFAULT_EMBEDDING_MODE = "auto"
+# 未显式配置时只开放进程工作目录，绝不通过源码层级推导到磁盘根目录。
+# 本地启动脚本会显式设为仓库根；容器显式设为只读挂载的 /workspace。
+DEFAULT_WORKSPACE_ROOT = str(Path.cwd().resolve())
 # ── search_knowledge 工具的角色授权声明（理由见模块注释）──────────
 _KNOWLEDGE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
     "search_knowledge": frozenset(
         {AgentRole.LEARNING_ASSISTANT, AgentRole.TEACHING_ASSISTANT}
     ),
+}
+_READ_ONLY_FILE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
+    tool_name: frozenset(
+        {
+            AgentRole.SUPERVISOR,
+            AgentRole.TEACHING_ASSISTANT,
+            AgentRole.LEARNING_ASSISTANT,
+        }
+    )
+    for tool_name in (
+        "workspace_info",
+        "list_files",
+        "glob_files",
+        "grep_files",
+        "read_file",
+        "inspect_workspace",
+    )
+}
+_SHELL_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
+    "shell": frozenset({AgentRole.SUPERVISOR}),
 }
 REQUEST_LOGGER = logging.getLogger("api.request")
 _LOGGER = logging.getLogger("api.app")
@@ -240,9 +271,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     checkpoint_path = Path(os.getenv("API_CHECKPOINT_PATH", DEFAULT_CHECKPOINT_PATH))
     knowledge_db = Path(os.getenv("API_KNOWLEDGE_DB_PATH", DEFAULT_KNOWLEDGE_DB_PATH))
     vector_db = Path(os.getenv("API_VECTOR_DB_PATH", DEFAULT_VECTOR_DB_PATH))
+    workspace_root = Path(os.getenv("API_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT))
+    raw_allowed_workspace_roots = os.getenv("API_WORKSPACE_ALLOWED_ROOTS")
+    allowed_workspace_roots = (
+        [
+            Path(value.strip())
+            for value in raw_allowed_workspace_roots.split(os.pathsep)
+            if value.strip()
+        ]
+        if raw_allowed_workspace_roots
+        else None
+    )
+    workspace_filesystem = WorkspaceFileSystem(workspace_root)
+    read_only_file_tools = create_read_only_file_tools(workspace_filesystem)
+    shell_tool = create_shell_tool(workspace_filesystem)
 
     with open_sqlite_checkpointer(checkpoint_path) as checkpointer:
-        session_store = SessionStore(session_store_path)
+        session_store = SessionStore(
+            session_store_path,
+            default_workspace_root=workspace_root,
+            allowed_workspace_roots=allowed_workspace_roots,
+        )
         # 装配知识检索链路（工作单 T2）：词法 → 向量（可选）→ 混合 →
         # 服务 → 工具；向量不可用自动降级词法，不阻断启动（详见
         # create_knowledge_search_stack 注释）。词法库打不开会在此
@@ -278,8 +327,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # 内容的两个 Worker（理由见模块底部 _KNOWLEDGE_TOOL_PERMISSIONS
                 # 的注释）；graph_builder 会校验权限声明完整（缺工具或
                 # 权限为 None 会抛 ValueError）。
-                tools=[knowledge_stack.tool],
-                tool_permissions=_KNOWLEDGE_TOOL_PERMISSIONS,
+                tools=[knowledge_stack.tool, *read_only_file_tools, shell_tool],
+                tool_permissions={
+                    **_KNOWLEDGE_TOOL_PERMISSIONS,
+                    **_READ_ONLY_FILE_TOOL_PERMISSIONS,
+                    **_SHELL_TOOL_PERMISSIONS,
+                },
+                # Shell enforces its own user-selected timeout (max 120s).
+                # Keep the generic executor deadline slightly above it so the
+                # shell can terminate its process tree and return diagnostics.
+                tool_timeouts={"shell": MAX_SHELL_TIMEOUT_SECONDS + 5},
             )
             app.state.session_store = session_store
             # D6-T3:检索服务挂到 app.state,供 /knowledge/search 路由
@@ -314,11 +371,13 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(stream_router)
     app.include_router(approval_router)
+    app.include_router(tool_approval_router)
     app.include_router(session_router)
     app.include_router(stats_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
     app.include_router(files_router)
+    app.include_router(workspace_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Annotated, Any, cast
@@ -22,6 +23,7 @@ from api.schemas import (
     Message,
     MessageRole,
     PendingHandoff,
+    PendingToolApproval,
     RunError,
     RunEvent,
     StreamEventType,
@@ -29,6 +31,7 @@ from api.schemas import (
     TaskPlanStatus,
     TaskPlanStep,
     TaskResult,
+    ToolApprovalRequest,
     WorkerAgentRole,
 )
 from api.schemas import (
@@ -39,8 +42,9 @@ from core.events import EventType
 from core.events import RunError as CoreRunError
 from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
-from core.sessions import SessionStore, derive_session_title
+from core.sessions import SessionRecord, SessionStore, derive_session_title
 from core.state import AgentState, PendingHandoffApproval
+from core.state import PendingToolApproval as CorePendingToolApproval
 from core.state import TaskPlan as CoreTaskPlan
 from core.state import TaskStepResult as CoreTaskStepResult
 from core.state import message_references as core_message_references
@@ -55,6 +59,7 @@ EVENT_TYPE_MAP = {
     EventType.AGENT_REASONING: StreamEventType.REASONING,
     EventType.TOOL_STARTED: StreamEventType.TOOL_CALL,
     EventType.TOOL_COMPLETED: StreamEventType.TOOL_RESULT,
+    EventType.TOOL_OUTPUT: StreamEventType.TOOL_OUTPUT,
     EventType.AGENT_COMPLETED: StreamEventType.MESSAGE_END,
     EventType.AGENT_SWITCHED: StreamEventType.AGENT_SWITCH,
     EventType.RUN_FAILED: StreamEventType.ERROR,
@@ -280,6 +285,7 @@ def _public_event(event: CoreRunEvent) -> RunEvent | None:
         event_type=event_type,
         sequence=event.sequence,
         session_id=event.session_id,
+        run_id=event.run_id,
         agent=_public_agent(event.agent),
         tool_name=event.tool_name,
         tool_call_id=event.tool_call_id,
@@ -287,6 +293,7 @@ def _public_event(event: CoreRunEvent) -> RunEvent | None:
         input_summary=event.input_summary,
         output_summary=event.output_summary,
         content=event.content,
+        output_stream=event.output_stream,
         message_id=event.message_id,
         is_delta=(False if event.event_type is EventType.AGENT_REASONING else None),
         success=event.success,
@@ -352,7 +359,7 @@ def _ensure_session_with_title(
     user_id: str | None,
     message: str,
     touch_activity: bool = True,
-) -> None:
+) -> SessionRecord:
     """Ensure the session exists, then title it from its first user message.
 
     侧栏列表不再只显示 session_id:标题取首条用户消息的压缩截断,
@@ -365,13 +372,81 @@ def _ensure_session_with_title(
         session_store.set_title_if_absent(session_id, title, user_id=user_id)
     if touch_activity:
         session_store.touch_session(session_id, user_id=user_id)
+    record = session_store.get_session(session_id, user_id=user_id)
+    if record is None:
+        raise RuntimeError("session disappeared after creation")
+    return record
+
+
+def _workspace_call_kwargs(
+    method: object,
+    session: SessionRecord,
+) -> dict[str, object]:
+    """Pass workspace capability only to graph implementations that support it."""
+    if not callable(method):
+        return {}
+    parameters = inspect.signature(method).parameters
+    kwargs: dict[str, object] = {}
+    if "workspace_root" in parameters:
+        kwargs["workspace_root"] = session.workspace_root
+    if "additional_workspace_roots" in parameters:
+        kwargs["additional_workspace_roots"] = session.additional_workspace_roots
+    return kwargs
+
+
+def _run_graph_turn(
+    graph: CollaborativeAgentGraph,
+    message: str,
+    session_id: str,
+    user_id: str | None,
+    session: SessionRecord,
+) -> AgentState:
+    return graph.run(
+        message,
+        session_id,
+        user_id,
+        **_workspace_call_kwargs(graph.run, session),
+    )
+
+
+def _public_pending_tool_approval(
+    pending: object,
+) -> PendingToolApproval | None:
+    if not isinstance(pending, CorePendingToolApproval):
+        return None
+    return PendingToolApproval(
+        interrupt_id=pending.interrupt_id,
+        request=ToolApprovalRequest(
+            tool_call_id=pending.request.tool_call_id,
+            tool_name=pending.request.tool_name,
+            agent_role=AgentRole(pending.request.agent_role.value),
+            arguments=pending.request.arguments,
+        ),
+    )
 
 
 async def pending_handoff_for_session(
     graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
 ) -> PendingHandoff | None:
-    pending = await run_in_threadpool(graph.get_pending_handoff, session_id, user_id)
+    pending_method = getattr(graph, "get_pending_handoff", None)
+    if not callable(pending_method):
+        return None
+    pending = await run_in_threadpool(pending_method, session_id, user_id)
     return _public_pending_handoff(pending)
+
+
+async def pending_tool_approval_for_session(
+    graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
+) -> PendingToolApproval | None:
+    pending_method = getattr(graph, "get_pending_tool_approval", None)
+    if not callable(pending_method):
+        return None
+    pending = await run_in_threadpool(
+        pending_method,
+        session_id,
+        user_id,
+    )
+    return _public_pending_tool_approval(pending)
 
 
 def session_busy_response(session_id: str, message: str) -> ChatResponse:
@@ -395,6 +470,7 @@ async def chat_response_for_state(
     previous_count = _previous_message_count(previous_state)
     return ChatResponse(
         session_id=session_id,
+        run_id=state.get("run_id"),
         message=_final_assistant_message(state, previous_count),
         references=_response_references(state, previous_count),
         task_plan=_public_task_plan(state.get("task_plan")),
@@ -402,6 +478,11 @@ async def chat_response_for_state(
         events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
         run_error=_public_run_error(state.get("run_error")),
         pending_handoff=await pending_handoff_for_session(graph, session_id, user_id),
+        pending_tool_approval=await pending_tool_approval_for_session(
+            graph,
+            session_id,
+            user_id,
+        ),
         current_agent=_public_agent(state.get("current_agent")),
     )
 
@@ -423,7 +504,7 @@ async def chat(
         )
 
     async with active_session_lock:
-        await run_in_threadpool(
+        session = await run_in_threadpool(
             _ensure_session_with_title,
             session_store,
             payload.session_id,
@@ -435,14 +516,28 @@ async def chat(
         )
         try:
             state = await run_in_threadpool(
-                graph.run, payload.message, payload.session_id, user_id
+                _run_graph_turn,
+                graph,
+                payload.message,
+                payload.session_id,
+                user_id,
+                session,
             )
         except RuntimeError as error:
             pending_handoff = await pending_handoff_for_session(
                 graph, payload.session_id, user_id
             )
-            if pending_handoff is not None or str(error).startswith(
-                PENDING_RESUME_ERROR_PREFIX
+            pending_tool_approval = await pending_tool_approval_for_session(
+                graph,
+                payload.session_id,
+                user_id,
+            )
+            if (
+                pending_handoff is not None
+                or pending_tool_approval is not None
+                or str(error).startswith(
+                    PENDING_RESUME_ERROR_PREFIX
+                )
             ):
                 return ChatResponse(
                     session_id=payload.session_id,
@@ -451,6 +546,7 @@ async def chat(
                         message="The session is waiting for a pending operation.",
                     ),
                     pending_handoff=pending_handoff,
+                    pending_tool_approval=pending_tool_approval,
                 )
             return ChatResponse(
                 session_id=payload.session_id,

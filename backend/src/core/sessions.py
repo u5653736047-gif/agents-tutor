@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,12 +29,33 @@ class SessionRecord:
     # 侧栏展示标题（首条用户消息提炼，只写一次）；老数据为 None，
     # 前端回退显示 session_id。
     title: str | None = None
+    # 主工作区与额外授权目录均保存规范化绝对路径。None 只用于兼容
+    # 手工构造的旧 SessionRecord；SessionStore 返回的记录始终有主目录。
+    workspace_root: str | None = None
+    additional_workspace_roots: tuple[str, ...] = ()
 
 
 class SessionStore:
     """Persist session metadata separately from graph checkpoints."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        default_workspace_root: str | Path | None = None,
+        allowed_workspace_roots: Sequence[str | Path] | None = None,
+    ) -> None:
+        self._default_workspace_root = self._canonical_directory(
+            Path.cwd() if default_workspace_root is None else default_workspace_root
+        )
+        self._allowed_workspace_roots = (
+            None
+            if allowed_workspace_roots is None
+            else tuple(
+                self._canonical_directory(root) for root in allowed_workspace_roots
+            )
+        )
+        self._assert_workspace_allowed(self._default_workspace_root)
         database_path = Path(path)
         database_path.parent.mkdir(parents=True, exist_ok=True)
         # 所有连接访问均由实例锁串行化，因此允许跨线程复用。
@@ -50,6 +73,8 @@ class SessionStore:
                         updated_at TEXT NOT NULL,
                         archived INTEGER NOT NULL DEFAULT 0,
                         title TEXT,
+                        workspace_root TEXT NOT NULL,
+                        additional_workspace_roots TEXT NOT NULL DEFAULT '[]',
                         PRIMARY KEY (user_key, session_id)
                     )
                     """
@@ -67,6 +92,18 @@ class SessionStore:
                     connection.execute(
                         "UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL"
                     )
+                if "workspace_root" not in columns:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN workspace_root TEXT")
+                if "additional_workspace_roots" not in columns:
+                    connection.execute(
+                        "ALTER TABLE sessions ADD COLUMN additional_workspace_roots "
+                        "TEXT NOT NULL DEFAULT '[]'"
+                    )
+                connection.execute(
+                    "UPDATE sessions SET workspace_root = ? "
+                    "WHERE workspace_root IS NULL OR TRIM(workspace_root) = ''",
+                    (str(self._default_workspace_root),),
+                )
         except BaseException:
             connection.close()
             raise
@@ -77,25 +114,30 @@ class SessionStore:
         self,
         session_id: str,
         user_id: str | None = None,
+        *,
+        workspace_root: str | Path | None = None,
     ) -> SessionRecord:
         """Create and return a session metadata record."""
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
+        resolved_workspace = self.resolve_workspace_root(workspace_root)
         now = datetime.now(UTC)
         record = SessionRecord(
             session_id=session_id,
             user_id=user_id,
             created_at=now,
             updated_at=now,
+            workspace_root=resolved_workspace,
         )
         try:
             with self._lock, self._connection:
                 self._connection.execute(
                     """
                     INSERT INTO sessions (
-                        user_key, user_id, session_id, created_at, updated_at, archived
+                        user_key, user_id, session_id, created_at, updated_at, archived,
+                        workspace_root, additional_workspace_roots
                     )
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, '[]')
                     """,
                     (
                         self._user_key(user_id),
@@ -103,6 +145,7 @@ class SessionStore:
                         session_id,
                         record.created_at.isoformat(),
                         record.updated_at.isoformat(),
+                        resolved_workspace,
                     ),
                 )
         # 主键冲突 = 同用户重复创建同一会话，转成业务错误抛出
@@ -125,7 +168,8 @@ class SessionStore:
     ) -> list[SessionRecord]:
         """List one user's sessions by most recent conversation activity."""
         query = """
-            SELECT session_id, user_id, created_at, updated_at, archived, title
+            SELECT session_id, user_id, created_at, updated_at, archived, title,
+                   workspace_root, additional_workspace_roots
             FROM sessions
             WHERE user_key = ?
         """
@@ -137,6 +181,113 @@ class SessionStore:
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
         return [self._record_from_row(row) for row in rows]
+
+    def get_session(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> SessionRecord | None:
+        """Return one owned session without scanning the user's full history."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT session_id, user_id, created_at, updated_at, archived, title,
+                       workspace_root, additional_workspace_roots
+                FROM sessions
+                WHERE user_key = ? AND session_id = ?
+                """,
+                (self._user_key(user_id), session_id),
+            ).fetchone()
+        return None if row is None else self._record_from_row(row)
+
+    def add_workspace_root(
+        self,
+        session_id: str,
+        path: str | Path,
+        user_id: str | None = None,
+    ) -> SessionRecord | None:
+        """Authorize one additional directory for an existing owned session."""
+        resolved = self.resolve_workspace_root(path)
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT session_id, user_id, created_at, updated_at, archived, title,
+                       workspace_root, additional_workspace_roots
+                FROM sessions
+                WHERE user_key = ? AND session_id = ?
+                """,
+                (self._user_key(user_id), session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._record_from_row(row)
+            roots = list(record.additional_workspace_roots)
+            if resolved != record.workspace_root and resolved not in roots:
+                roots.append(resolved)
+                self._connection.execute(
+                    """
+                    UPDATE sessions
+                    SET additional_workspace_roots = ?, updated_at = ?
+                    WHERE user_key = ? AND session_id = ?
+                    """,
+                    (
+                        json.dumps(roots, ensure_ascii=False),
+                        datetime.now(UTC).isoformat(),
+                        self._user_key(user_id),
+                        session_id,
+                    ),
+                )
+        return self.get_session(session_id, user_id=user_id)
+
+    @property
+    def default_workspace_root(self) -> str:
+        return str(self._default_workspace_root)
+
+    def resolve_workspace_root(self, path: str | Path | None = None) -> str:
+        """Canonicalize and authorize a user-selected workspace directory."""
+        candidate = (
+            self._default_workspace_root
+            if path is None
+            else self._canonical_directory(path)
+        )
+        self._assert_workspace_allowed(candidate)
+        return str(candidate)
+
+    def list_workspace_directories(
+        self,
+        path: str | Path | None = None,
+        *,
+        max_results: int = 200,
+    ) -> dict[str, object]:
+        """List child directories for the local workspace selection dialog."""
+        if not 1 <= max_results <= 500:
+            raise ValueError("max_results must be between 1 and 500")
+        current = Path(self.resolve_workspace_root(path))
+        parent: str | None = None
+        if current.parent != current:
+            try:
+                parent = self.resolve_workspace_root(current.parent)
+            except ValueError:
+                parent = None
+
+        directories: list[dict[str, str]] = []
+        try:
+            children = sorted(current.iterdir(), key=lambda item: item.name.casefold())
+        except OSError as error:
+            raise ValueError("workspace directory cannot be browsed") from error
+        for child in children:
+            if len(directories) >= max_results:
+                break
+            try:
+                resolved = self.resolve_workspace_root(child)
+            except ValueError:
+                continue
+            directories.append({"name": child.name, "path": resolved})
+        return {
+            "path": str(current),
+            "parent": parent,
+            "directories": directories,
+        }
 
     def archive_session(
         self,
@@ -224,6 +375,14 @@ class SessionStore:
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> SessionRecord:
+        raw_additional = row["additional_workspace_roots"]
+        try:
+            parsed_additional = json.loads(str(raw_additional or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_additional = []
+        additional = tuple(
+            value for value in parsed_additional if isinstance(value, str) and value
+        )
         return SessionRecord(
             session_id=str(row["session_id"]),
             user_id=cast(str | None, row["user_id"]),
@@ -231,7 +390,30 @@ class SessionStore:
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             archived=bool(row["archived"]),
             title=cast(str | None, row["title"]),
+            workspace_root=cast(str | None, row["workspace_root"]),
+            additional_workspace_roots=additional,
         )
+
+    @staticmethod
+    def _canonical_directory(path: str | Path) -> Path:
+        candidate = Path(path).expanduser()
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("workspace root must be an existing directory") from error
+        if not resolved.is_dir():
+            raise ValueError("workspace root must be an existing directory")
+        return resolved
+
+    def _assert_workspace_allowed(self, candidate: Path) -> None:
+        if self._allowed_workspace_roots is None:
+            return
+        if any(
+            candidate == allowed or candidate.is_relative_to(allowed)
+            for allowed in self._allowed_workspace_roots
+        ):
+            return
+        raise ValueError("workspace root is not allowed by server policy")
 
 
 SESSION_TITLE_MAX_LENGTH = 30

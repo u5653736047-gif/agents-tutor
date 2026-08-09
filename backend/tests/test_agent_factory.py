@@ -8,7 +8,11 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 
 from core.nodes.factory import create_agent_nodes
-from core.nodes.prompts import ROLE_PROMPTS, learning_assistant_system_prompt
+from core.nodes.prompts import (
+    ROLE_PROMPTS,
+    TOOL_ORCHESTRATION_SUPERVISOR_PROMPT,
+    learning_assistant_system_prompt,
+)
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole
 from core.tools import ToolRegistry
@@ -68,9 +72,10 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     # 调用时机），上限再放宽到 500；其余角色提示词仍远低于此。
     # S4-T2：learning_assistant / teaching_assistant 新增检索约定
     # （search_knowledge 先检索再作答/生成，见
-    # test_worker_prompts_define_retrieval_contract），当前最长仍为
-    # Supervisor（约 412 字符），learning_assistant 约 224，均低于 500。
-    assert max(map(len, ROLE_PROMPTS.values())) <= 500
+    # test_worker_prompts_define_retrieval_contract）。文件工作区契约还会为
+    # 三个有只读权限的角色追加约 120 字符；最长角色卡仍限制在 600 内，
+    # 防止后续规则无边界膨胀。
+    assert max(map(len, ROLE_PROMPTS.values())) <= 600
     assert model.bind_count == 1
 
 
@@ -79,15 +84,14 @@ def test_learning_assistant_dynamic_prompt_length_is_bounded() -> None:
 
     ROLE_PROMPTS 长度上限只覆盖静态角色卡；动态水平段按 state["level"]
     每轮追加（见 prompts.learning_assistant_system_prompt），这里锁
-    「叠加后」的总长——现状最长约 290 字符（basic 档：静态角色卡 224
-    + 水平锚点与换行 16 + basic 指导词 50），上限取 340 留 50 字符
-    余量，防止未来指导词膨胀撑爆上下文预算。
+    「叠加后」的总长。加入只读工作区契约后现状最长不足 430 字符，
+    上限取 470 留出少量余量，防止未来指导词膨胀撑爆上下文预算。
     """
     lengths = [
         len(learning_assistant_system_prompt(level))
         for level in (None, "basic", "advanced")
     ]
-    assert max(lengths) <= 340
+    assert max(lengths) <= 470
 
 
 def test_worker_prompts_define_retrieval_contract() -> None:
@@ -108,6 +112,25 @@ def test_worker_prompts_define_retrieval_contract() -> None:
     assert "search_knowledge" in teaching
     assert "检索" in teaching
     assert "凭空编写" in teaching  # 备课禁止脱离教材凭空编写
+
+
+def test_workspace_enabled_prompts_require_grounded_workspace_inspection() -> None:
+    """工作区问题必须核验真实文件能力，不能被解释成抽象工作方式。"""
+    workspace_prompts = (
+        ROLE_PROMPTS[AgentRole.SUPERVISOR],
+        ROLE_PROMPTS[AgentRole.TEACHING_ASSISTANT],
+        ROLE_PROMPTS[AgentRole.LEARNING_ASSISTANT],
+        TOOL_ORCHESTRATION_SUPERVISOR_PROMPT,
+    )
+
+    for prompt in workspace_prompts:
+        assert "workspace_info" in prompt
+        assert "工作区" in prompt
+        assert "绝对路径" in prompt
+        assert "已授权" in prompt
+        assert "不得猜测" in prompt
+
+    assert "workspace_info" not in ROLE_PROMPTS[AgentRole.EVALUATOR]
 
 
 def test_factory_accepts_and_shares_registry() -> None:

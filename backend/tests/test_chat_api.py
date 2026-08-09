@@ -85,6 +85,26 @@ class BlockingChatGraph(ChatGraph):
         return super().run(user_input, session_id, user_id)
 
 
+class WorkspaceAwareChatGraph(ChatGraph):
+    """Capture the workspace capability forwarded by the HTTP session layer."""
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        super().__init__(state)
+        self.workspace_calls: list[tuple[str | None, tuple[str, ...]]] = []
+
+    def run(
+        self,
+        user_input: str,
+        session_id: str,
+        user_id: str | None = None,
+        *,
+        workspace_root: str | None = None,
+        additional_workspace_roots: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        self.workspace_calls.append((workspace_root, tuple(additional_workspace_roots)))
+        return super().run(user_input, session_id, user_id)
+
+
 def _chat_app(tmp_path: Path, graph: ChatGraph) -> tuple[FastAPI, SessionStore]:
     app = create_app()
     store = SessionStore(tmp_path / "sessions.sqlite3")
@@ -159,6 +179,40 @@ def test_chat_creates_missing_session_runs_in_worker_and_returns_event_delta(tmp
     }
     assert response.json()["current_agent"] == "evaluator"
     assert [session.session_id for session in sessions] == ["session-1"]
+
+
+def test_chat_runs_with_the_workspace_authorized_for_its_session(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    graph = WorkspaceAwareChatGraph(
+        {
+            "messages": [HumanMessage(content="分析"), AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    store.create_session(
+        "session-1",
+        user_id="user-1",
+        workspace_root=primary,
+    )
+    store.add_workspace_root("session-1", shared, user_id="user-1")
+    try:
+        response = asyncio.run(
+            _post_chat(app, {"session_id": "session-1", "message": "分析"})
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert graph.workspace_calls == [
+        (str(primary.resolve()), (str(shared.resolve()),))
+    ]
 
 
 def test_chat_returns_run_errors_as_a_successful_contract_response(tmp_path: Path) -> None:

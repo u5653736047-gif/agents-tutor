@@ -319,6 +319,13 @@ class HandoffApprovalAction(StrEnum):
     MODIFY = "modify"
 
 
+class ToolApprovalAction(StrEnum):
+    """Human decision for one exact approval-gated tool call."""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
 # ─────────────────────────────────────────────
 # Pydantic 子模型（嵌套结构）
 # ─────────────────────────────────────────────
@@ -511,6 +518,49 @@ class PendingHandoffApproval(BaseModel):
     request: HandoffApprovalRequest
 
 
+class ToolApprovalRequest(BaseModel):
+    """An exact validated tool call waiting at a resumable graph gate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    agent_role: AgentRole
+    arguments: dict[str, Any]
+
+    @field_validator("tool_call_id", "tool_name")
+    @classmethod
+    def identifiers_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("identifier must not be blank")
+        return value
+
+
+class ToolApprovalDecision(BaseModel):
+    """A stale-safe decision for one pending approval-gated tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interrupt_id: str = Field(min_length=1)
+    action: ToolApprovalAction
+
+    @field_validator("interrupt_id")
+    @classmethod
+    def interrupt_id_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("interrupt_id must not be blank")
+        return value
+
+
+class PendingToolApproval(BaseModel):
+    """Public core view of a tool gate and its exact proposed invocation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interrupt_id: str = Field(min_length=1)
+    request: ToolApprovalRequest
+
+
 class ToolResult(BaseModel):
     """单次工具调用的结构化结果.
 
@@ -696,6 +746,10 @@ class AgentState(TypedDict, total=False):
     # Supervisor 已提出、尚未由人工确认的分派；checkpoint 是唯一事实来源。
     pending_handoff: Annotated[HandoffApprovalRequest | None, _replace]
 
+    # 已通过工具 schema 校验、等待用户确认的精确调用。工具调用消息先
+    # 持久化，再进入独立 gate，恢复时不会重放产生调用的模型请求。
+    pending_tool_approval: Annotated[ToolApprovalRequest | None, _replace]
+
     # --- 意图识别（S2-T1） ---
     # Supervisor 本轮识别出的用户意图（Intent 枚举的 value 字符串）；
     # last-write-wins，由 detect_intent 工具结果经 _wrap 校验后写入，
@@ -824,6 +878,11 @@ class AgentState(TypedDict, total=False):
     # --- 会话元信息 ---
     session_id: Annotated[str | None, _replace]
     user_id: Annotated[str | None, _replace]
+    # 当前用户消息对应的运行标识。每次 run/stream 生成新值，事件据此分轮；
+    # 旧 checkpoint 没有该字段时按 None 兼容读取。
+    run_id: Annotated[str | None, _replace]
+    workspace_root: Annotated[str | None, _replace]
+    additional_workspace_roots: Annotated[list[str], _replace]
 
     events: Annotated[list[RunEvent], operator.add]
     run_error: Annotated[RunError | None, _replace]
@@ -844,6 +903,9 @@ def create_initial_state(
     *,
     session_id: str | None = None,
     user_id: str | None = None,
+    run_id: str | None = None,
+    workspace_root: str | None = None,
+    additional_workspace_roots: Sequence[str] = (),
 ) -> AgentState:
     """创建空白初始状态，用于启动一次新的图执行.
 
@@ -859,6 +921,7 @@ def create_initial_state(
         current_agent=None,
         next_agent=None,
         pending_handoff=None,
+        pending_tool_approval=None,
         intent=None,
         # S2-T2 学生水平画像：初始为 None（「尚未识别任何水平」），
         # 跨轮保留、不随新轮重置；读取侧按 StudentLevel.UNKNOWN 归一。
@@ -875,6 +938,9 @@ def create_initial_state(
         tool_results=[],
         session_id=session_id,
         user_id=user_id,
+        run_id=run_id,
+        workspace_root=workspace_root,
+        additional_workspace_roots=list(additional_workspace_roots),
         events=[],
         run_error=None,
         handoff_count=0,

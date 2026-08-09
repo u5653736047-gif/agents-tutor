@@ -17,6 +17,18 @@ def test_run_event_allows_session_id_none() -> None:
     assert event.session_id is None
 
 
+def test_run_event_carries_a_stable_run_id_for_turn_grouping() -> None:
+    event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=1,
+        session_id="session-1",
+        run_id="run-1",
+        agent="supervisor",
+    )
+
+    assert event.run_id == "run-1"
+
+
 def test_run_event_serializes_replayable_process_fields() -> None:
     event = RunEvent(
         event_type=EventType.TOOL_COMPLETED,
@@ -33,6 +45,7 @@ def test_run_event_serializes_replayable_process_fields() -> None:
         "event_type",
         "sequence",
         "session_id",
+        "run_id",
         "agent",
         "tool_name",
         "tool_call_id",
@@ -40,6 +53,7 @@ def test_run_event_serializes_replayable_process_fields() -> None:
         "input_summary",
         "output_summary",
         "content",
+        "output_stream",
         "message_id",
         "success",
         "duration_ms",

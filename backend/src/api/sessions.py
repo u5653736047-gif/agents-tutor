@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from api.schemas import (
+    AddWorkspaceRootRequest,
     AgentRole,
     ApiErrorCode,
     CreateSessionRequest,
@@ -21,6 +22,8 @@ from api.schemas import (
     Session,
     SessionProcess,
 )
+from core.events import EventType
+from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionRecord, SessionStore
 from core.state import message_agent_role
@@ -69,6 +72,8 @@ def _graph(request: Request) -> CollaborativeAgentGraph:
 
 
 def _session_response(record: SessionRecord) -> Session:
+    if record.workspace_root is None:
+        raise RuntimeError("persisted session is missing its workspace root")
     return Session(
         session_id=record.session_id,
         user_id=record.user_id,
@@ -76,20 +81,15 @@ def _session_response(record: SessionRecord) -> Session:
         updated_at=record.updated_at,
         archived=record.archived,
         title=record.title,
+        workspace_root=record.workspace_root,
+        additional_workspace_roots=list(record.additional_workspace_roots),
     )
 
 
 def _owned_session(
     session_store: SessionStore, session_id: str, user_id: str | None
 ) -> SessionRecord | None:
-    return next(
-        (
-            record
-            for record in session_store.list_sessions(user_id=user_id, include_archived=True)
-            if record.session_id == session_id
-        ),
-        None,
-    )
+    return session_store.get_session(session_id, user_id=user_id)
 
 
 def _safe_agent(message: BaseMessage) -> AgentRole | None:
@@ -165,6 +165,34 @@ def _public_messages(messages: Iterable[BaseMessage]) -> list[Message]:
     return [public_message for message in messages if (public_message := _public_message(message))]
 
 
+def _latest_run_events(state: Mapping[str, Any]) -> list[object]:
+    """Return one execution turn, with a boundary fallback for legacy checkpoints."""
+    events = list(state.get("events", []))
+    run_id = state.get("run_id")
+    if isinstance(run_id, str) and run_id:
+        return [
+            event
+            for event in events
+            if isinstance(event, CoreRunEvent) and event.run_id == run_id
+        ]
+
+    # 旧 checkpoint 没有 run_id。用终态事件切出最后一轮，避免升级后首次
+    # 刷新仍把多轮执行记录混在一起；没有终态边界时保留全部以避免丢数据。
+    terminal_indexes = [
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, CoreRunEvent)
+        and event.event_type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}
+    ]
+    if not terminal_indexes:
+        return events
+    if terminal_indexes[-1] == len(events) - 1:
+        boundary = terminal_indexes[-2] if len(terminal_indexes) > 1 else -1
+    else:
+        boundary = terminal_indexes[-1]
+    return events[boundary + 1 :]
+
+
 @router.post(
     "",
     response_model=Session,
@@ -184,13 +212,61 @@ def create_session(
             ApiErrorCode.INVALID_REQUEST,
             "Request is invalid.",
         )
+    session_store = _session_store(request)
+    requested_workspace = payload.workspace_root if payload is not None else None
     try:
-        record = _session_store(request).create_session(session_id, user_id=user_id)
+        workspace_root = session_store.resolve_workspace_root(requested_workspace)
+    except ValueError:
+        _raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            ApiErrorCode.INVALID_REQUEST,
+            "Workspace directory is invalid or not allowed.",
+        )
+    try:
+        record = session_store.create_session(
+            session_id,
+            user_id=user_id,
+            workspace_root=workspace_root,
+        )
     except ValueError:
         _raise_error(
             status.HTTP_409_CONFLICT,
             ApiErrorCode.SESSION_ALREADY_EXISTS,
             "Session already exists.",
+        )
+    return _session_response(record)
+
+
+@router.post(
+    "/{session_id}/workspace-roots",
+    response_model=Session,
+    responses=LOOKUP_ERROR_RESPONSES,
+)
+def add_workspace_root(
+    session_id: str,
+    payload: AddWorkspaceRootRequest,
+    request: Request,
+    user_id: Annotated[str | None, Depends(current_user_id)],
+) -> Session:
+    """Authorize one additional directory for this session's file tools."""
+    session_store = _session_store(request)
+    try:
+        record = session_store.add_workspace_root(
+            session_id,
+            payload.path,
+            user_id=user_id,
+        )
+    except ValueError:
+        _raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            ApiErrorCode.INVALID_REQUEST,
+            "Workspace directory is invalid or not allowed.",
+        )
+    if record is None:
+        _raise_error(
+            status.HTTP_404_NOT_FOUND,
+            ApiErrorCode.SESSION_NOT_FOUND,
+            "Session was not found.",
         )
     return _session_response(record)
 
@@ -283,16 +359,26 @@ def get_session_process(
     from api.chat import (
         _public_agent,
         _public_events,
+        _public_pending_tool_approval,
         _public_task_plan,
         _public_task_results,
     )
 
-    state = _graph(request).get_state(session_id, user_id=user_id)
+    graph = _graph(request)
+    state = graph.get_state(session_id, user_id=user_id)
     if state is None:
         return SessionProcess()
+    pending_method = getattr(graph, "get_pending_tool_approval", None)
+    pending_tool_approval = (
+        _public_pending_tool_approval(pending_method(session_id, user_id))
+        if callable(pending_method)
+        else None
+    )
     return SessionProcess(
-        events=_public_events(state.get("events", []), -1),
+        run_id=state.get("run_id"),
+        events=_public_events(_latest_run_events(state), -1),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),
         current_agent=_public_agent(state.get("current_agent")),
+        pending_tool_approval=pending_tool_approval,
     )

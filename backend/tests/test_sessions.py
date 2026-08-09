@@ -27,6 +27,116 @@ def test_session_store_creates_and_lists_immutable_records(tmp_path: Path) -> No
         first.archived = True  # type: ignore[misc]
 
 
+def test_session_store_persists_an_independent_workspace_per_session(
+    tmp_path: Path,
+) -> None:
+    first_workspace = tmp_path / "project-a"
+    second_workspace = tmp_path / "project-b"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    database_path = tmp_path / "sessions.sqlite"
+
+    with SessionStore(database_path, default_workspace_root=first_workspace) as store:
+        first = store.create_session("first", user_id="user-1")
+        second = store.create_session(
+            "second",
+            user_id="user-1",
+            workspace_root=second_workspace,
+        )
+
+    assert first.workspace_root == str(first_workspace.resolve())
+    assert second.workspace_root == str(second_workspace.resolve())
+    assert first.additional_workspace_roots == ()
+
+    with SessionStore(database_path, default_workspace_root=first_workspace) as reopened:
+        records = {record.session_id: record for record in reopened.list_sessions("user-1")}
+
+    assert records["first"].workspace_root == str(first_workspace.resolve())
+    assert records["second"].workspace_root == str(second_workspace.resolve())
+
+
+def test_session_store_adds_and_deduplicates_authorized_workspace_roots(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    database_path = tmp_path / "sessions.sqlite"
+
+    with SessionStore(database_path, default_workspace_root=primary) as store:
+        store.create_session("session-1", user_id="user-1")
+        updated = store.add_workspace_root("session-1", shared, user_id="user-1")
+        duplicate = store.add_workspace_root("session-1", shared, user_id="user-1")
+
+    assert updated is not None
+    assert duplicate is not None
+    assert updated.additional_workspace_roots == (str(shared.resolve()),)
+    assert duplicate.additional_workspace_roots == (str(shared.resolve()),)
+
+    with SessionStore(database_path, default_workspace_root=primary) as reopened:
+        persisted = reopened.get_session("session-1", user_id="user-1")
+
+    assert persisted is not None
+    assert persisted.additional_workspace_roots == (str(shared.resolve()),)
+
+
+def test_session_store_enforces_configured_workspace_allowlist(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    nested = allowed / "course"
+    outside = tmp_path / "outside"
+    nested.mkdir(parents=True)
+    outside.mkdir()
+
+    with SessionStore(
+        tmp_path / "sessions.sqlite",
+        default_workspace_root=allowed,
+        allowed_workspace_roots=[allowed],
+    ) as store:
+        accepted = store.create_session(
+            "accepted",
+            user_id="user-1",
+            workspace_root=nested,
+        )
+        with pytest.raises(ValueError, match="not allowed"):
+            store.create_session(
+                "rejected",
+                user_id="user-1",
+                workspace_root=outside,
+            )
+
+    assert accepted.workspace_root == str(nested.resolve())
+
+
+def test_session_store_lists_workspace_directories_without_escaping_policy(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    alpha = allowed / "alpha"
+    beta = allowed / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir()
+    (allowed / "file.txt").write_text("not a directory", encoding="utf-8")
+
+    with SessionStore(
+        tmp_path / "sessions.sqlite",
+        default_workspace_root=allowed,
+        allowed_workspace_roots=[allowed],
+    ) as store:
+        listing = store.list_workspace_directories()
+        nested_listing = store.list_workspace_directories(alpha)
+
+    assert listing == {
+        "path": str(allowed.resolve()),
+        "parent": None,
+        "directories": [
+            {"name": "alpha", "path": str(alpha.resolve())},
+            {"name": "beta", "path": str(beta.resolve())},
+        ],
+    }
+    assert nested_listing["parent"] == str(allowed.resolve())
+
+
 def test_session_store_orders_by_recent_activity_and_can_touch_a_session(
     tmp_path: Path,
 ) -> None:
@@ -143,9 +253,10 @@ def test_session_store_isolates_users_and_persists_after_reopen(tmp_path: Path) 
                 session_id=first_user.session_id,
                 user_id=first_user.user_id,
                 created_at=first_user.created_at,
-                updated_at=first_user.updated_at,
-                archived=True,
-            )
+                    updated_at=first_user.updated_at,
+                    archived=True,
+                    workspace_root=first_user.workspace_root,
+                )
         ]
         assert reopened.list_sessions(user_id="user-2") == [second_user]
 

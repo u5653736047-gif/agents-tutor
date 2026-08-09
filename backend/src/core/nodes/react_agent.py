@@ -18,8 +18,9 @@ from ..context import (
     trim_message_history,
 )
 from ..events import ErrorCode, EventType, RunError, RunEvent
-from ..state import AgentRole, AgentState, ToolResult
-from ..tools import ToolExecutor
+from ..filesystem import workspace_scope
+from ..state import AgentRole, AgentState, ToolApprovalRequest, ToolResult
+from ..tools import PreparedToolApproval, ToolExecution, ToolExecutor
 
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 _REASONING_BLOCK_TYPES = {
@@ -95,7 +96,7 @@ def _tool_input_summary(value: object) -> str:
     return _json_summary(value, _TOOL_INPUT_LIMIT)
 
 
-def _tool_output_summary(value: str) -> str | None:
+def tool_output_summary(value: str) -> str | None:
     if not value:
         return None
     try:
@@ -167,6 +168,7 @@ class ReActAgentNode:
         model: ChatModel,
         tool_executor: ToolExecutor | None = None,
         max_iterations: int = 5,
+        max_tool_calls: int = 20,
         max_context_messages: int | None = None,
         max_context_tokens: int | None = None,
         context_token_counter: MessageTokenCounter | None = None,
@@ -179,6 +181,8 @@ class ReActAgentNode:
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
+        if max_tool_calls <= 0:
+            raise ValueError("max_tool_calls must be positive")
         if max_context_messages is not None and max_context_messages < 3:
             raise ValueError("max_context_messages must be at least 3")
         if max_context_tokens is not None and max_context_tokens <= 0:
@@ -188,6 +192,7 @@ class ReActAgentNode:
         self.model = model
         self.tool_executor = tool_executor or ToolExecutor()
         self.max_iterations = max_iterations
+        self.max_tool_calls = max_tool_calls
         self.max_context_messages = max_context_messages
         self.max_context_tokens = max_context_tokens
         self.context_token_counter = context_token_counter
@@ -200,6 +205,9 @@ class ReActAgentNode:
         extra = dict(state.get("extra", {}))
         generated: list[BaseMessage] = []
         tool_results: list[ToolResult] = []
+        seen_tool_calls: set[tuple[str, str]] = set()
+        tool_call_count = 0
+        pending_tool_approval: ToolApprovalRequest | None = None
         events: list[RunEvent] = []
         sequence = max(  # 从历史事件续接序号，保证全会话事件递增
             (event.sequence for event in state.get("events", [])),
@@ -265,6 +273,7 @@ class ReActAgentNode:
                 event_type=event_type,
                 sequence=sequence,
                 session_id=session_id,
+                run_id=state.get("run_id"),
                 agent=self.role.value,
                 **values,
             )
@@ -373,20 +382,90 @@ class ReActAgentNode:
                 parent_token = _ACTIVE_PARENT_TOOL_CALL_ID.set(
                     str(tool_call_id) if tool_call_id is not None else None
                 )
+                execution: ToolExecution | None = None
                 try:
-                    execution = self.tool_executor.execute(tool_call, self.role)
+                    fingerprint = (
+                        public_name,
+                        json.dumps(
+                            tool_call.get("args", {}),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                    )
+                    if tool_call_count >= self.max_tool_calls:
+                        execution = self.tool_executor.reject(
+                            tool_call,
+                            self.role,
+                            ErrorCode.TOOL_BUDGET_EXCEEDED,
+                        )
+                    elif fingerprint in seen_tool_calls:
+                        tool_call_count += 1
+                        execution = self.tool_executor.reject(
+                            tool_call,
+                            self.role,
+                            ErrorCode.TOOL_NO_PROGRESS,
+                        )
+                    else:
+                        tool_call_count += 1
+                        seen_tool_calls.add(fingerprint)
+                        if self.tool_executor.requires_approval(tool_call):
+                            prepared = self.tool_executor.prepare_approval(
+                                tool_call,
+                                self.role,
+                            )
+                            if isinstance(prepared, PreparedToolApproval):
+                                if pending_tool_approval is None:
+                                    pending_tool_approval = ToolApprovalRequest(
+                                        tool_call_id=prepared.tool_call_id,
+                                        tool_name=prepared.tool_name,
+                                        agent_role=self.role,
+                                        arguments=prepared.arguments,
+                                    )
+                                else:
+                                    execution = self.tool_executor.reject(
+                                        tool_call,
+                                        self.role,
+                                        ErrorCode.TOOL_APPROVAL_QUEUE_LIMIT,
+                                    )
+                            else:
+                                execution = prepared
+                        else:
+                            with workspace_scope(
+                                state.get("workspace_root"),
+                                additional_roots=state.get(
+                                    "additional_workspace_roots",
+                                    [],
+                                ),
+                            ):
+                                execution = self.tool_executor.execute(tool_call, self.role)
                 finally:
                     _ACTIVE_PARENT_TOOL_CALL_ID.reset(parent_token)
+                if execution is None:
+                    # Exact call is now persisted and routed to an approval gate.
+                    # Its ToolMessage is appended only after the gate is resumed.
+                    continue
                 generated.append(execution.message)
                 tool_results.append(execution.result)
                 emit(
                     EventType.TOOL_COMPLETED,
                     tool_name=execution.result.tool_name,
                     tool_call_id=execution.result.tool_call_id,
-                    output_summary=_tool_output_summary(execution.result.output),
+                    output_summary=tool_output_summary(execution.result.output),
                     success=execution.result.success,
                     duration_ms=execution.result.duration_ms,
                     error_code=execution.result.error_code,
+                )
+
+            if pending_tool_approval is not None:
+                return self._result(
+                    generated,
+                    tool_results,
+                    events,
+                    iteration,
+                    extra,
+                    pending_tool_approval=pending_tool_approval,
                 )
 
         # 兜底：轮数用尽仍未给出最终回答，按迭代上限错误结束。
@@ -418,6 +497,7 @@ class ReActAgentNode:
         iterations: int,
         extra: dict[str, Any],
         error: RunError | None = None,
+        pending_tool_approval: ToolApprovalRequest | None = None,
     ) -> ReActResult:
         """统一整理写回 AgentState 的数据。"""
         updates: dict[str, Any] = {
@@ -427,9 +507,15 @@ class ReActAgentNode:
             "events": events,
             "extra": extra,
         }
+        if pending_tool_approval is not None:
+            updates["pending_tool_approval"] = pending_tool_approval
         return ReActResult(
             updates=updates,
             messages=messages,
             error=error,
-            metadata={"iterations": iterations, "role": self.role.value},
+            metadata={
+                "iterations": iterations,
+                "role": self.role.value,
+                "paused_for_tool_approval": pending_tool_approval is not None,
+            },
         )

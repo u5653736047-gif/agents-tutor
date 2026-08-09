@@ -84,6 +84,106 @@ def test_session_routes_create_list_and_archive_for_one_user(tmp_path: Path) -> 
     assert all_sessions.json() == [archived.json()]
 
 
+def test_session_api_selects_and_persists_an_absolute_workspace(tmp_path: Path) -> None:
+    app, store = _session_app(tmp_path)
+    workspace = tmp_path / "selected-project"
+    workspace.mkdir()
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/sessions",
+                headers=headers,
+                json={
+                    "session_id": "session-workspace",
+                    "workspace_root": str(workspace),
+                },
+            )
+        )
+        listed = asyncio.run(_request(app, "GET", "/sessions", headers=headers))
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert created.json()["workspace_root"] == str(workspace.resolve())
+    assert created.json()["additional_workspace_roots"] == []
+    assert created.json()["workspace_access"] == "read_only"
+    assert listed.json()[0]["workspace_root"] == str(workspace.resolve())
+
+
+def test_session_api_adds_an_authorized_workspace_directory(tmp_path: Path) -> None:
+    app, store = _session_app(tmp_path)
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/sessions",
+                headers=headers,
+                json={"session_id": "session-1", "workspace_root": str(primary)},
+            )
+        )
+        updated = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/sessions/session-1/workspace-roots",
+                headers=headers,
+                json={"path": str(shared)},
+            )
+        )
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert updated.status_code == 200
+    assert updated.json()["workspace_root"] == str(primary.resolve())
+    assert updated.json()["additional_workspace_roots"] == [str(shared.resolve())]
+
+
+def test_workspace_api_validates_and_browses_server_directories(tmp_path: Path) -> None:
+    app, store = _session_app(tmp_path)
+    workspace = tmp_path / "workspace"
+    child = workspace / "child"
+    child.mkdir(parents=True)
+    try:
+        validated = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/workspaces/validate",
+                json={"path": str(workspace)},
+            )
+        )
+        browsed = asyncio.run(
+            _request(
+                app,
+                "GET",
+                f"/workspaces/directories?path={workspace}",
+            )
+        )
+    finally:
+        store.close()
+
+    assert validated.status_code == 200
+    assert validated.json() == {
+        "path": str(workspace.resolve()),
+        "name": "workspace",
+    }
+    assert browsed.status_code == 200
+    assert browsed.json()["path"] == str(workspace.resolve())
+    assert browsed.json()["directories"] == [
+        {"name": "child", "path": str(child.resolve())}
+    ]
+
+
 def test_sessions_are_isolated_and_unknown_sessions_return_404(tmp_path: Path) -> None:
     app, store = _session_app(tmp_path)
     first_user = {"X-User-Id": "user-1"}
@@ -295,6 +395,70 @@ def test_process_history_replays_reasoning_and_redacted_tool_details(
     )
     assert payload["events"][3]["output_summary"] == '{"found":true,"hits":2}'
     assert "sk-live-secret" not in response.text
+
+
+def test_process_history_returns_only_the_latest_tagged_run(tmp_path: Path) -> None:
+    events = [
+        RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=1,
+            session_id="session-1",
+            run_id="run-1",
+            agent="supervisor",
+        ),
+        RunEvent(
+            event_type=EventType.RUN_COMPLETED,
+            sequence=2,
+            session_id="session-1",
+            run_id="run-1",
+        ),
+        RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=3,
+            session_id="session-1",
+            run_id="run-2",
+            agent="learning_assistant",
+        ),
+        RunEvent(
+            event_type=EventType.AGENT_REASONING,
+            sequence=4,
+            session_id="session-1",
+            run_id="run-2",
+            agent="learning_assistant",
+            content="只展示本轮",
+        ),
+    ]
+    graph = HistoryGraph(
+        {},
+        {
+            ("session-1", "user-1"): {
+                "run_id": "run-2",
+                "events": events,
+                "current_agent": "learning_assistant",
+                "task_plan": None,
+                "task_results": [],
+            }
+        },
+    )
+    app, store = _session_app(tmp_path, graph)
+    store.create_session("session-1", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _request(
+                app,
+                "GET",
+                "/sessions/session-1/process",
+                headers={"X-User-Id": "user-1"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == "run-2"
+    assert [event["sequence"] for event in payload["events"]] == [3, 4]
+    assert {event["run_id"] for event in payload["events"]} == {"run-2"}
 
 
 def test_history_prefers_agent_role_metadata_over_name(tmp_path: Path) -> None:

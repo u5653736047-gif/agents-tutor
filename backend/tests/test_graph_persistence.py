@@ -204,6 +204,52 @@ def test_each_persisted_turn_resets_transient_run_state() -> None:
     )
 
 
+def test_each_persisted_turn_has_a_distinct_run_id_and_tags_its_events() -> None:
+    graph = CollaborativeAgentGraph(
+        model=ScriptedModel(
+            [AIMessage(content="first answer"), AIMessage(content="second answer")]
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    first = graph.run("first turn", session_id="run-session", user_id="user-1")
+    first_run_id = first["run_id"]
+    first_event_count = len(first["events"])
+    second = graph.run("second turn", session_id="run-session", user_id="user-1")
+    second_run_id = second["run_id"]
+
+    assert isinstance(first_run_id, str) and first_run_id
+    assert isinstance(second_run_id, str) and second_run_id
+    assert first_run_id != second_run_id
+    assert {event.run_id for event in second["events"][:first_event_count]} == {
+        first_run_id
+    }
+    assert {event.run_id for event in second["events"][first_event_count:]} == {
+        second_run_id
+    }
+
+
+def test_new_run_state_carries_the_session_workspace_capability(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    graph = CollaborativeAgentGraph(
+        model=ScriptedModel([AIMessage(content="answer")]),
+    )
+
+    result = graph.run(
+        "question",
+        session_id="workspace-session",
+        user_id="user-1",
+        workspace_root=str(primary),
+        additional_workspace_roots=[str(shared)],
+    )
+
+    assert result["workspace_root"] == str(primary)
+    assert result["additional_workspace_roots"] == [str(shared)]
+
+
 def test_new_turn_preserves_persistent_task_fields() -> None:
     graph = CollaborativeAgentGraph(
         model=ScriptedModel(

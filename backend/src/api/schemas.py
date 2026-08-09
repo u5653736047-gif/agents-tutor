@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import models_json_schema
@@ -47,6 +47,8 @@ class StreamEventType(str, Enum):
     REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    TOOL_OUTPUT = "tool_output"
+    APPROVAL_REQUIRED = "approval_required"
     MESSAGE_DELTA = "message_delta"
     MESSAGE_END = "message_end"
     AGENT_SWITCH = "agent_switch"
@@ -62,6 +64,10 @@ class ErrorCode(str, Enum):
     TOOL_INVALID_ARGUMENTS = "tool_invalid_arguments"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     TOOL_TIMEOUT = "tool_timeout"
+    TOOL_NO_PROGRESS = "tool_no_progress"
+    TOOL_BUDGET_EXCEEDED = "tool_budget_exceeded"
+    TOOL_APPROVAL_REJECTED = "tool_approval_rejected"
+    TOOL_APPROVAL_QUEUE_LIMIT = "tool_approval_queue_limit"
     MODEL_CALL_FAILED = "model_call_failed"
     REACT_ITERATION_LIMIT = "react_iteration_limit"
     GRAPH_HANDOFF_LIMIT = "graph_handoff_limit"
@@ -77,6 +83,7 @@ class ApiErrorCode(str, Enum):
     INVALID_REQUEST = "invalid_request"
     INTERNAL_ERROR = "internal_error"
     HANDOFF_NOT_PENDING = "handoff_not_pending"
+    TOOL_APPROVAL_NOT_PENDING = "tool_approval_not_pending"
     SESSION_ALREADY_EXISTS = "session_already_exists"
     SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
@@ -92,6 +99,12 @@ class TaskPlanStatus(str, Enum):
     FAILED = "failed"
 
 
+class WorkspaceAccess(str, Enum):
+    """Access level granted to Agent filesystem tools for a session."""
+
+    READ_ONLY = "read_only"
+
+
 class Session(ContractModel):
     """A session visible to its owner."""
 
@@ -103,12 +116,58 @@ class Session(ContractModel):
     # 侧栏标题：首条用户消息提炼（只写一次）；存量老会话为 None，
     # 前端按 session_id 回退展示。
     title: str | None = None
+    workspace_root: str
+    additional_workspace_roots: list[str] = Field(default_factory=list)
+    workspace_access: WorkspaceAccess = WorkspaceAccess.READ_ONLY
 
 
 class CreateSessionRequest(ContractModel):
     """Optional client-selected ID for a new session."""
 
     session_id: str | None = None
+    workspace_root: str | None = None
+
+    @field_validator("workspace_root")
+    @classmethod
+    def reject_blank_workspace_root(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("workspace_root must not be blank")
+        return value
+
+
+class AddWorkspaceRootRequest(ContractModel):
+    """One user-authorized additional workspace directory."""
+
+    path: str = Field(min_length=1)
+
+    @field_validator("path")
+    @classmethod
+    def reject_blank_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path must not be blank")
+        return value
+
+
+class WorkspacePath(ContractModel):
+    """A canonical existing directory accepted by the server policy."""
+
+    path: str
+    name: str
+
+
+class WorkspaceDirectory(ContractModel):
+    """One directory entry in the server-side workspace picker."""
+
+    name: str
+    path: str
+
+
+class WorkspaceDirectoryListing(ContractModel):
+    """Directory picker state rooted in the server filesystem."""
+
+    path: str
+    parent: str | None = None
+    directories: list[WorkspaceDirectory] = Field(default_factory=list)
 
 
 class ErrorDetail(ContractModel):
@@ -155,12 +214,51 @@ class Message(ContractModel):
     attachments: list[Attachment] | None = None
 
 
+class ToolApprovalRequest(ContractModel):
+    """The exact validated invocation shown to the user before execution."""
+
+    tool_call_id: str
+    tool_name: str
+    agent_role: AgentRole
+    arguments: dict[str, Any]
+
+
+class PendingToolApproval(ContractModel):
+    """A tool invocation paused at a resumable graph gate."""
+
+    interrupt_id: str
+    request: ToolApprovalRequest
+
+
+class PendingToolApprovalResponse(ContractModel):
+    session_id: str
+    pending_tool_approval: PendingToolApproval | None = None
+
+
+class ToolApprovalDecisionAction(str, Enum):
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+class ToolApprovalDecisionRequest(ContractModel):
+    interrupt_id: str = Field(min_length=1)
+    action: ToolApprovalDecisionAction
+
+    @field_validator("interrupt_id")
+    @classmethod
+    def reject_blank_interrupt_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
 class RunEvent(ContractModel):
     """A replayable process event emitted during one run."""
 
     event_type: StreamEventType
     sequence: int = Field(ge=0)
     session_id: str | None = None
+    run_id: str | None = None
     agent: AgentRole | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None
@@ -168,6 +266,7 @@ class RunEvent(ContractModel):
     input_summary: str | None = None
     output_summary: str | None = None
     content: str | None = None
+    output_stream: Literal["stdout", "stderr"] | None = None
     message_id: str | None = None
     is_delta: bool | None = None
     success: bool | None = None
@@ -191,6 +290,7 @@ class StreamEvent(ContractModel):
     event_type: StreamEventType
     sequence: int = Field(ge=0)
     session_id: str
+    run_id: str | None = None
     agent: AgentRole | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None
@@ -202,11 +302,13 @@ class StreamEvent(ContractModel):
     error_code: ErrorCode | ApiErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
     content: str | None = None  # thinking 摘要 / message_delta 增量 / message_end 全文
+    output_stream: Literal["stdout", "stderr"] | None = None
     message_id: str | None = None  # 同一模型消息的增量关联键
     is_delta: bool | None = None  # reasoning/message 的增量与完整快照标记
     message: Message | None = None  # message_end 的完整消息(可选)
     citations: list[Citation] | None = None
     current_agent: AgentRole | None = None
+    pending_tool_approval: PendingToolApproval | None = None
 
 
 class RunError(ContractModel):
@@ -418,10 +520,12 @@ class ChatResponse(ContractModel):
     """The synchronous response contract shared by chat and approval routes."""
 
     session_id: str
+    run_id: str | None = None
     message: Message | None = None
     events: list[RunEvent] = Field(default_factory=list)
     run_error: RunError | None = None
     pending_handoff: PendingHandoff | None = None
+    pending_tool_approval: PendingToolApproval | None = None
     references: list[Citation] | None = None
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
@@ -431,10 +535,12 @@ class ChatResponse(ContractModel):
 class SessionProcess(ContractModel):
     """刷新或切回会话时用于重放协作过程的权威快照。"""
 
+    run_id: str | None = None
     events: list[RunEvent] = Field(default_factory=list)
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
     current_agent: AgentRole | None = None
+    pending_tool_approval: PendingToolApproval | None = None
 
 
 class FeedbackRating(str, Enum):
@@ -484,6 +590,10 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ErrorResponse,
     ChatRequest,
     Message,
+    ToolApprovalRequest,
+    PendingToolApproval,
+    PendingToolApprovalResponse,
+    ToolApprovalDecisionRequest,
     RunEvent,
     StreamEvent,
     RunError,

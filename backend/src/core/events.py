@@ -1,6 +1,7 @@
 """安全、精简的运行事件模型。"""
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +19,8 @@ class EventType(StrEnum):
     TOOL_STARTED = "tool_started"
     # 工具执行结束（tool_name=工具名，success 标记成败）
     TOOL_COMPLETED = "tool_completed"
+    # 审批后前台进程产生的增量输出；按 tool_call_id 归入同一终端卡片。
+    TOOL_OUTPUT = "tool_output"
     # 控制权从当前 Agent 切换到下一个
     AGENT_SWITCHED = "agent_switched"
     # S2-T1 意图识别：Supervisor 完成本轮意图分类后发出（agent=supervisor，
@@ -59,6 +62,10 @@ class ErrorCode(StrEnum):
     TOOL_INVALID_ARGUMENTS = "tool_invalid_arguments"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     TOOL_TIMEOUT = "tool_timeout"
+    TOOL_NO_PROGRESS = "tool_no_progress"
+    TOOL_BUDGET_EXCEEDED = "tool_budget_exceeded"
+    TOOL_APPROVAL_REJECTED = "tool_approval_rejected"
+    TOOL_APPROVAL_QUEUE_LIMIT = "tool_approval_queue_limit"
     # 模型调用与 ReAct 循环错误
     MODEL_CALL_FAILED = "model_call_failed"
     REACT_ITERATION_LIMIT = "react_iteration_limit"
@@ -85,6 +92,9 @@ class RunEvent(BaseModel):
     event_type: EventType
     sequence: int = Field(ge=0)  # 运行内递增序号，保证事件流有序
     session_id: str | None
+    # 一次用户消息触发的完整执行轮次。允许 None 以兼容旧 checkpoint；
+    # 新运行必须由 graph_builder 写入非空值。
+    run_id: str | None = None
     agent: str | None = None  # 相关 Agent 角色名
     tool_name: str | None = None  # 相关工具名
     tool_call_id: str | None = None  # 关联工具开始与结束事件
@@ -92,6 +102,7 @@ class RunEvent(BaseModel):
     input_summary: str | None = None  # 有界、脱敏的工具输入 JSON 摘要
     output_summary: str | None = None  # 有界、脱敏的工具结果摘要
     content: str | None = None  # provider 显式 reasoning 内容（有界）
+    output_stream: Literal["stdout", "stderr"] | None = None
     message_id: str | None = None  # reasoning 所属模型消息 ID
     success: bool | None = None  # 成功/失败标记（工具与步骤事件）
     duration_ms: float | None = Field(default=None, ge=0)  # 执行耗时（毫秒）

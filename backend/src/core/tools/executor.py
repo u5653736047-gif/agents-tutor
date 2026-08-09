@@ -30,6 +30,10 @@ _SAFE_ERRORS = {
     ErrorCode.TOOL_INVALID_ARGUMENTS: "工具参数无效",
     ErrorCode.TOOL_EXECUTION_FAILED: "工具执行失败",
     ErrorCode.TOOL_TIMEOUT: "工具执行超时",
+    ErrorCode.TOOL_NO_PROGRESS: "相同工具参数已执行过，请使用已有结果继续回答",
+    ErrorCode.TOOL_BUDGET_EXCEEDED: "本轮工具调用预算已用尽，请基于已有结果回答",
+    ErrorCode.TOOL_APPROVAL_REJECTED: "用户拒绝了该工具调用，请勿执行并继续安全回答",
+    ErrorCode.TOOL_APPROVAL_QUEUE_LIMIT: "一次只能等待一个工具审批，请合并命令后重试",
 }
 
 
@@ -39,6 +43,15 @@ class ToolExecution:
 
     message: ToolMessage
     result: ToolResult
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedToolApproval:
+    """A schema-validated exact call safe to persist before approval."""
+
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
 
 
 class ToolExecutor:
@@ -97,6 +110,49 @@ class ToolExecutor:
         requested_name = str(tool_call.get("name") or "")
         tool = self.registry.get(requested_name)  # 只认注册过的名字，模型伪造的名称统一归为 unknown
         return tool.name if tool is not None else UNKNOWN_TOOL_NAME
+
+    def requires_approval(self, tool_call: Mapping[str, Any]) -> bool:
+        """Return whether the registered tool is marked as approval-gated."""
+        tool = self.registry.get(str(tool_call.get("name") or ""))
+        extras = None if tool is None else getattr(tool, "extras", None)
+        return isinstance(extras, Mapping) and extras.get("requires_approval") is True
+
+    def prepare_approval(
+        self,
+        tool_call: Mapping[str, Any],
+        agent_role: AgentRole,
+    ) -> PreparedToolApproval | ToolExecution:
+        """Validate existence, authorization and schema without invoking a tool."""
+        call_id = str(tool_call.get("id") or "unknown")
+        requested_name = str(tool_call.get("name") or "")
+        tool = self.registry.get(requested_name)
+        args = tool_call.get("args", {})
+        error_code: ErrorCode | None = None
+        validated_arguments: dict[str, Any] | None = None
+        if tool is None:
+            error_code = ErrorCode.TOOL_UNKNOWN
+        elif not self.registry.is_authorized(requested_name, agent_role):
+            error_code = ErrorCode.TOOL_UNAUTHORIZED
+        elif not isinstance(args, Mapping):
+            error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
+        else:
+            try:
+                input_schema = cast(type[BaseModel], tool.get_input_schema())
+                validated = input_schema.model_validate(dict(args))
+                validated_arguments = validated.model_dump(mode="python")
+            except ValidationError:
+                error_code = ErrorCode.TOOL_INVALID_ARGUMENTS
+            except Exception:  # noqa: BLE001 - schema boundary exposes stable errors
+                error_code = ErrorCode.TOOL_EXECUTION_FAILED
+        if error_code is not None:
+            return self.reject(tool_call, agent_role, error_code)
+        if tool is None or validated_arguments is None:
+            raise RuntimeError("approval preparation produced no validated tool")
+        return PreparedToolApproval(
+            tool_call_id=call_id,
+            tool_name=tool.name,
+            arguments=validated_arguments,
+        )
 
     def execute(
         self,
@@ -158,14 +214,29 @@ class ToolExecutor:
                         future.cancel()
                         error_code = ErrorCode.TOOL_TIMEOUT
                     else:
-                        output = _to_text(future.result())  # 成功：输出统一转文本
-                        success = True
+                        raw_output = future.result()
+                        output = _to_text(raw_output)  # 成功：输出统一转文本
+                        extras = getattr(tool, "extras", None)
+                        reports_status = (
+                            isinstance(extras, Mapping)
+                            and extras.get("status_from_ok") is True
+                        )
+                        if (
+                            reports_status
+                            and isinstance(raw_output, Mapping)
+                            and raw_output.get("ok") is False
+                        ):
+                            error_code = ErrorCode.TOOL_EXECUTION_FAILED
+                        else:
+                            success = True
                 except Exception:  # noqa: BLE001 - 工具边界只公开稳定错误分类
                     error_code = ErrorCode.TOOL_EXECUTION_FAILED
 
         error = None if error_code is None else _SAFE_ERRORS[error_code]  # 只暴露稳定的错误分类提示
         duration_ms = (perf_counter() - started_at) * 1000  # 记录耗时，供系统侧统计
-        content = output if success else f"错误：{error}"  # 失败时喂给模型的是错误文案
+        # 某些工具（如 shell）会在结构化失败结果中携带有界 stdout/
+        # stderr；此时把结果本身交给模型，避免只剩泛化错误而无法诊断。
+        content = output if output else (output if success else f"错误：{error}")
         result = ToolResult(  # 结构化记录：留给系统分析用
             tool_call_id=call_id,
             tool_name=tool_name,
@@ -182,6 +253,37 @@ class ToolExecutor:
             name=tool_name,
         )
         return ToolExecution(message=message, result=result)
+
+    def reject(
+        self,
+        tool_call: Mapping[str, Any],
+        agent_role: AgentRole,
+        error_code: ErrorCode,
+    ) -> ToolExecution:
+        """Return a safe observation for a policy-blocked call without executing it."""
+        if error_code not in _SAFE_ERRORS:
+            raise ValueError("unsupported tool rejection error code")
+        call_id = str(tool_call.get("id") or "unknown")
+        tool_name = self.public_tool_name(tool_call)
+        error = _SAFE_ERRORS[error_code]
+        result = ToolResult(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            agent_role=agent_role,
+            success=False,
+            output="",
+            error=error,
+            error_code=error_code,
+            duration_ms=0.0,
+        )
+        return ToolExecution(
+            message=ToolMessage(
+                content=f"错误：{error}",
+                tool_call_id=call_id,
+                name=tool_name,
+            ),
+            result=result,
+        )
 
 
 def _validate_timeout(value: float, field_name: str) -> float:

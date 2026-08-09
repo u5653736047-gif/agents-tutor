@@ -7,6 +7,7 @@ from collections.abc import Collection, Hashable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from threading import RLock
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from langchain_core.messages import (
     AIMessage,
@@ -17,6 +18,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot, interrupt
@@ -30,10 +32,11 @@ from pydantic import (
 
 from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
+from .filesystem import workspace_scope
 from .knowledge.models import Citation
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
-from .nodes.react_agent import ChatModel
+from .nodes.react_agent import ChatModel, tool_output_summary
 from .state import (
     REFERENCES_METADATA_KEY,
     AgentRole,
@@ -45,6 +48,7 @@ from .state import (
     HandoffApprovalRequest,
     Intent,
     PendingHandoffApproval,
+    PendingToolApproval,
     ReferenceVerification,
     StudentLevel,
     TaskContext,
@@ -52,6 +56,9 @@ from .state import (
     TaskPlanStatus,
     TaskPlanStep,
     TaskStepResult,
+    ToolApprovalAction,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
     ToolResult,
     create_initial_state,
     message_references,
@@ -59,11 +66,13 @@ from .state import (
     with_references,
 )
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
+from .tools.shell_tool import approved_shell_execution, shell_output_scope
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 OrchestrationMode = Literal["handoff", "tool"]
 CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState]
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
+_TOOL_APPROVAL_NODE = "tool_approval"
 _TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
 _TASK_RESULTS_MARKER = "[TASK_RESULTS]"
 _SUBAGENT_TOOL_NAMES: dict[AgentRole, str] = {
@@ -247,6 +256,7 @@ class CollaborativeAgentGraph:
         model: ChatModel,
         tools: Sequence[BaseTool] = (),
         max_iterations: int = 5,
+        max_tool_calls: int = 20,
         max_context_messages: int | None = None,
         max_context_tokens: int | None = None,
         context_token_counter: MessageTokenCounter | None = None,
@@ -260,6 +270,15 @@ class CollaborativeAgentGraph:
         orchestration_mode: OrchestrationMode = "handoff",
     ) -> None:
         # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
+        approval_tool_names = frozenset(
+            business_tool.name
+            for business_tool in tools
+            if isinstance(
+                extras := getattr(business_tool, "extras", None),
+                Mapping,
+            )
+            and extras.get("requires_approval") is True
+        )
         if max_handoffs <= 0:
             raise ValueError("max_handoffs must be positive")
         if max_agent_switches <= 0:
@@ -268,6 +287,8 @@ class CollaborativeAgentGraph:
             raise ValueError(
                 "interrupt_before_handoff requires a configured checkpointer"
             )
+        if approval_tool_names and checkpointer is None:
+            raise ValueError("approval-gated tools require a configured checkpointer")
         if orchestration_mode not in {"handoff", "tool"}:
             raise ValueError("orchestration_mode must be 'handoff' or 'tool'")
         if orchestration_mode == "tool" and interrupt_before_handoff:
@@ -335,6 +356,7 @@ class CollaborativeAgentGraph:
                 allowed_roles=permissions.get(business_tool.name),
             )
         self.registry = registry
+        self._approval_tool_names = approval_tool_names
         self.max_handoffs = max_handoffs
         self.max_agent_switches = max_agent_switches
         self.checkpointer = checkpointer
@@ -352,6 +374,7 @@ class CollaborativeAgentGraph:
             model=model,
             registry=registry,
             max_iterations=max_iterations,
+            max_tool_calls=max_tool_calls,
             max_context_messages=max_context_messages,
             max_context_tokens=max_context_tokens,
             context_token_counter=context_token_counter,
@@ -397,6 +420,13 @@ class CollaborativeAgentGraph:
         child_state = create_initial_state(
             session_id=None if parent is None else parent.get("session_id"),
             user_id=None if parent is None else parent.get("user_id"),
+            run_id=None if parent is None else parent.get("run_id"),
+            workspace_root=None if parent is None else parent.get("workspace_root"),
+            additional_workspace_roots=(
+                []
+                if parent is None
+                else parent.get("additional_workspace_roots", [])
+            ),
         )
         child_state["messages"] = [HumanMessage(content=task)]
         if parent is not None:
@@ -447,6 +477,8 @@ class CollaborativeAgentGraph:
         }
         if self.interrupt_before_handoff:
             routes[_HANDOFF_APPROVAL_NODE] = _HANDOFF_APPROVAL_NODE
+        if self._approval_tool_names:
+            routes[_TOOL_APPROVAL_NODE] = _TOOL_APPROVAL_NODE
 
         for role, agent in self.agents.items():
             graph.add_node(role.value, self._wrap(agent))
@@ -463,6 +495,14 @@ class CollaborativeAgentGraph:
             graph.add_node(_HANDOFF_APPROVAL_NODE, self._approve_handoff)
             graph.add_conditional_edges(
                 _HANDOFF_APPROVAL_NODE,
+                self._route,
+                routes,
+            )
+
+        if self._approval_tool_names:
+            graph.add_node(_TOOL_APPROVAL_NODE, self._approve_tool)
+            graph.add_conditional_edges(
+                _TOOL_APPROVAL_NODE,
                 self._route,
                 routes,
             )
@@ -509,6 +549,7 @@ class CollaborativeAgentGraph:
                                 event_type=EventType.RUN_FAILED,
                                 sequence=sequence + 1,
                                 session_id=state.get("session_id"),
+                                run_id=state.get("run_id"),
                                 agent=agent.role.value,
                                 success=False,
                                 error_code=error.error_code,
@@ -535,6 +576,7 @@ class CollaborativeAgentGraph:
                             event_type=EventType.RUN_FAILED,
                             sequence=sequence + 1,
                             session_id=state.get("session_id"),
+                            run_id=state.get("run_id"),
                             agent=agent.role.value,
                             success=False,
                             error_code=preflight_error.error_code,
@@ -572,6 +614,7 @@ class CollaborativeAgentGraph:
                                 event_type=EventType.TASK_RESULTS_AGGREGATED,
                                 sequence=sequence + 1,
                                 session_id=state.get("session_id"),
+                                run_id=state.get("run_id"),
                                 agent=agent.role.value,
                                 success=False,
                                 error_code=error.error_code,
@@ -580,6 +623,7 @@ class CollaborativeAgentGraph:
                                 event_type=EventType.RUN_FAILED,
                                 sequence=sequence + 2,
                                 session_id=state.get("session_id"),
+                                run_id=state.get("run_id"),
                                 agent=agent.role.value,
                                 success=False,
                                 error_code=error.error_code,
@@ -646,6 +690,14 @@ class CollaborativeAgentGraph:
                 else message
                 for message in cast(list[BaseMessage], updates.get("messages", []))
             ]
+            if updates.get("pending_tool_approval") is not None:
+                # The AI tool-call message is now checkpointed.  Route to a
+                # separate interrupt node before any terminal-answer or handoff
+                # interpretation; resuming that gate cannot replay this model call.
+                updates["next_agent"] = None
+                updates["pending_handoff"] = None
+                updates["run_error"] = None
+                return cast(AgentState, updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             # ── S2-T4 结构化引用：把本轮检索命中挂到终端回答 ──
             # 注入时机：与角色元数据同一闸口（_wrap 是消息写入持久化历史
@@ -786,6 +838,7 @@ class CollaborativeAgentGraph:
                         event_type=event_type,
                         sequence=sequence,
                         session_id=state.get("session_id"),
+                        run_id=state.get("run_id"),
                         agent=event_agent,
                         success=success,
                         error_code=error_code,
@@ -1289,6 +1342,7 @@ class CollaborativeAgentGraph:
                             event_type=EventType.RUN_FAILED,
                             sequence=sequence + 1,
                             session_id=state.get("session_id"),
+                            run_id=state.get("run_id"),
                             agent=AgentRole.SUPERVISOR.value,
                             success=False,
                             error_code=limit_error.error_code,
@@ -1322,11 +1376,103 @@ class CollaborativeAgentGraph:
                     event_type=EventType.AGENT_SWITCHED,
                     sequence=sequence + 1,
                     session_id=state.get("session_id"),
+                    run_id=state.get("run_id"),
                     agent=step.target_agent.value,
                     success=True,
                 )
             ]
         return cast(AgentState, updates)
+
+    def _approve_tool(self, state: AgentState) -> AgentState:
+        """Pause before an exact side-effecting call, then execute only that call.
+
+        The model-produced AIMessage is persisted by ``_wrap`` before routing
+        here.  LangGraph may replay this gate while resolving ``interrupt()``,
+        but the model node itself is never replayed.
+        """
+        raw_pending = state.get("pending_tool_approval")
+        if raw_pending is None:
+            raise RuntimeError("tool approval node requires a pending request")
+        pending = ToolApprovalRequest.model_validate(raw_pending)
+        raw_decision = interrupt(pending.model_dump(mode="json"))
+        decision = ToolApprovalDecision.model_validate(raw_decision)
+        executor = self.agents[pending.agent_role].tool_executor
+        tool_call: dict[str, object] = {
+            "id": pending.tool_call_id,
+            "name": pending.tool_name,
+            "args": pending.arguments,
+            "type": "tool_call",
+        }
+        sequence = max(
+            (event.sequence for event in state.get("events", [])),
+            default=-1,
+        )
+        emitted: list[RunEvent] = []
+        try:
+            stream_writer = get_stream_writer()
+        except RuntimeError:
+            stream_writer = lambda _value: None
+
+        def emit(event_type: EventType, **values: Any) -> None:
+            nonlocal sequence
+            sequence += 1
+            event = RunEvent(
+                event_type=event_type,
+                sequence=sequence,
+                session_id=state.get("session_id"),
+                run_id=state.get("run_id"),
+                agent=pending.agent_role.value,
+                tool_name=pending.tool_name,
+                tool_call_id=pending.tool_call_id,
+                **values,
+            )
+            emitted.append(event)
+            stream_writer(
+                {"kind": "run_event", "event": event.model_dump(mode="json")}
+            )
+
+        if decision.action is ToolApprovalAction.REJECT:
+            execution = executor.reject(
+                tool_call,
+                pending.agent_role,
+                ErrorCode.TOOL_APPROVAL_REJECTED,
+            )
+        else:
+            def forward_output(channel: str, text: str) -> None:
+                emit(
+                    EventType.TOOL_OUTPUT,
+                    content=text,
+                    output_stream=cast(Literal["stdout", "stderr"], channel),
+                )
+
+            with (
+                workspace_scope(
+                    state.get("workspace_root"),
+                    additional_roots=state.get("additional_workspace_roots", []),
+                ),
+                approved_shell_execution(),
+                shell_output_scope(forward_output),
+            ):
+                execution = executor.execute(tool_call, pending.agent_role)
+
+        emit(
+            EventType.TOOL_COMPLETED,
+            output_summary=tool_output_summary(execution.result.output),
+            success=execution.result.success,
+            duration_ms=execution.result.duration_ms,
+            error_code=execution.result.error_code,
+        )
+        return cast(
+            AgentState,
+            {
+                "messages": [execution.message],
+                "tool_results": [execution.result],
+                "events": emitted,
+                "next_agent": pending.agent_role.value,
+                "pending_tool_approval": None,
+                "run_error": None,
+            },
+        )
 
     def _approve_handoff(self, state: AgentState) -> AgentState:
         """暂停并提交分派决定；恢复时仅重放这个无外部副作用的 gate。"""
@@ -1356,6 +1502,7 @@ class CollaborativeAgentGraph:
                         event_type=EventType.RUN_COMPLETED,
                         sequence=sequence + 1,
                         session_id=state.get("session_id"),
+                        run_id=state.get("run_id"),
                         agent=AgentRole.SUPERVISOR.value,
                         success=True,
                     )
@@ -1402,6 +1549,7 @@ class CollaborativeAgentGraph:
                         event_type=EventType.RUN_FAILED,
                         sequence=sequence + 1,
                         session_id=state.get("session_id"),
+                        run_id=state.get("run_id"),
                         agent=AgentRole.SUPERVISOR.value,
                         success=False,
                         error_code=limit_error.error_code,
@@ -1428,6 +1576,7 @@ class CollaborativeAgentGraph:
                     event_type=EventType.AGENT_SWITCHED,
                     sequence=sequence + 1,
                     session_id=state.get("session_id"),
+                    run_id=state.get("run_id"),
                     agent=target.value,
                     success=True,
                 )
@@ -1463,6 +1612,8 @@ class CollaborativeAgentGraph:
         """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
         if state.get("run_error") is not None:
             return "end"  # 已判死：终止
+        if state.get("pending_tool_approval") is not None:
+            return _TOOL_APPROVAL_NODE
         if state.get("pending_handoff") is not None:
             return _HANDOFF_APPROVAL_NODE  # 有审批请求：先去人工确认 gate
         next_agent = state.get("next_agent")
@@ -1481,15 +1632,23 @@ class CollaborativeAgentGraph:
         session_id: str,
         user_id: str | None,
         persisted_values: Mapping[str, Any] | None = None,
+        run_id: str | None = None,
+        workspace_root: str | None = None,
+        additional_workspace_roots: Sequence[str] = (),
     ) -> AgentState:
         """为 invoke/stream 共用地构造本轮输入，避免两条入口语义漂移。"""
+        active_run_id = run_id or str(uuid4())
         if persisted_values:
             return cast(
                 AgentState,
                 {
                     "messages": [HumanMessage(content=user_input)],
+                    "run_id": active_run_id,
+                    "workspace_root": workspace_root,
+                    "additional_workspace_roots": list(additional_workspace_roots),
                     "next_agent": None,
                     "pending_handoff": None,
+                    "pending_tool_approval": None,
                     "intent": None,
                     "evaluation": None,
                     "reference_verification": None,
@@ -1500,7 +1659,13 @@ class CollaborativeAgentGraph:
                     "agent_switch_count": 0,
                 },
             )
-        state = create_initial_state(session_id=session_id, user_id=user_id)
+        state = create_initial_state(
+            session_id=session_id,
+            user_id=user_id,
+            run_id=active_run_id,
+            workspace_root=workspace_root,
+            additional_workspace_roots=additional_workspace_roots,
+        )
         state["messages"] = [HumanMessage(content=user_input)]
         return state
 
@@ -1509,13 +1674,23 @@ class CollaborativeAgentGraph:
         user_input: str,
         session_id: str = "demo",
         user_id: str | None = None,
+        run_id: str | None = None,
+        workspace_root: str | None = None,
+        additional_workspace_roots: Sequence[str] = (),
     ) -> Iterator[tuple[str, Any]]:
         """直接转发 LangGraph messages/custom 流，供 API 实时消费。"""
         self._user_key(user_id)
         self._session_key(session_id)
         app = self.build()
         if self.checkpointer is None:
-            state = self._new_run_state(user_input, session_id, user_id)
+            state = self._new_run_state(
+                user_input,
+                session_id,
+                user_id,
+                run_id=run_id,
+                workspace_root=workspace_root,
+                additional_workspace_roots=additional_workspace_roots,
+            )
             yield from cast(
                 Iterator[tuple[str, Any]],
                 app.stream(state, stream_mode=["messages", "custom"]),
@@ -1527,7 +1702,14 @@ class CollaborativeAgentGraph:
             snapshot = app.get_state(config)
             if snapshot.next:
                 resume_method = (
-                    "resume_handoff()" if snapshot.interrupts else "resume()"
+                    "resume_tool_approval()"
+                    if cast(AgentState, snapshot.values).get(
+                        "pending_tool_approval"
+                    )
+                    is not None
+                    else "resume_handoff()"
+                    if snapshot.interrupts
+                    else "resume()"
                 )
                 raise RuntimeError(
                     f"存在待恢复执行，请先调用 {resume_method}"
@@ -1537,6 +1719,9 @@ class CollaborativeAgentGraph:
                 session_id,
                 user_id,
                 cast(Mapping[str, Any], snapshot.values),
+                run_id=run_id,
+                workspace_root=workspace_root,
+                additional_workspace_roots=additional_workspace_roots,
             )
             yield from cast(
                 Iterator[tuple[str, Any]],
@@ -1552,13 +1737,23 @@ class CollaborativeAgentGraph:
         user_input: str,
         session_id: str = "demo",
         user_id: str | None = None,
+        run_id: str | None = None,
+        workspace_root: str | None = None,
+        additional_workspace_roots: Sequence[str] = (),
     ) -> AgentState:
         """从一条用户消息启动协作图。"""
         self._user_key(user_id)
         self._session_key(session_id)
         app = self.build()
         if self.checkpointer is None:
-            state = self._new_run_state(user_input, session_id, user_id)
+            state = self._new_run_state(
+                user_input,
+                session_id,
+                user_id,
+                run_id=run_id,
+                workspace_root=workspace_root,
+                additional_workspace_roots=additional_workspace_roots,
+            )
             return cast(AgentState, app.invoke(state))
 
         config = self._thread_config(session_id, user_id)
@@ -1566,7 +1761,14 @@ class CollaborativeAgentGraph:
             snapshot = app.get_state(config)
             if snapshot.next:
                 resume_method = (
-                    "resume_handoff()" if snapshot.interrupts else "resume()"
+                    "resume_tool_approval()"
+                    if cast(AgentState, snapshot.values).get(
+                        "pending_tool_approval"
+                    )
+                    is not None
+                    else "resume_handoff()"
+                    if snapshot.interrupts
+                    else "resume()"
                 )
                 raise RuntimeError(
                     f"存在待恢复执行，请先调用 {resume_method}"
@@ -1576,6 +1778,9 @@ class CollaborativeAgentGraph:
                 session_id,
                 user_id,
                 cast(Mapping[str, Any], snapshot.values),
+                run_id=run_id,
+                workspace_root=workspace_root,
+                additional_workspace_roots=additional_workspace_roots,
             )
             return cast(AgentState, app.invoke(state, config=config))
 
@@ -1595,6 +1800,12 @@ class CollaborativeAgentGraph:
                 raise ValueError("当前会话没有待恢复执行")
             # next 同时表示普通 pending 与动态 interrupt；仅后者要求人工决定。
             if snapshot.interrupts:
+                if cast(AgentState, snapshot.values).get(
+                    "pending_tool_approval"
+                ) is not None:
+                    raise ValueError(
+                        "当前会话等待人工工具决策，请调用 resume_tool_approval()"
+                    )
                 raise ValueError(
                     "当前会话等待人工 handoff 决策，请调用 resume_handoff()"
                 )
@@ -1627,6 +1838,78 @@ class CollaborativeAgentGraph:
                 }
             )
             return cast(AgentState, app.invoke(command, config=config))
+
+    def resume_tool_approval(
+        self,
+        session_id: str,
+        decision: ToolApprovalDecision,
+        user_id: str | None = None,
+    ) -> AgentState:
+        """Resume one exact approval-gated tool call and finish the graph."""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError("resume_tool_approval requires a configured checkpointer")
+        app = self.build()
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            pending = _pending_tool_approval_from_snapshot(snapshot)
+            if not snapshot.next or pending is None:
+                raise ValueError("当前会话没有待人工确认的工具断点")
+            if decision.interrupt_id != pending.interrupt_id:
+                raise ValueError("interrupt_id 与当前工具断点不匹配")
+            command: Command[str] = Command(
+                resume={
+                    pending.interrupt_id: decision.model_dump(mode="json"),
+                }
+            )
+            return cast(AgentState, app.invoke(command, config=config))
+
+    def stream_tool_approval(
+        self,
+        session_id: str,
+        decision: ToolApprovalDecision,
+        user_id: str | None = None,
+    ) -> Iterator[tuple[str, Any]]:
+        """Resume a tool gate while exposing model, terminal and run events."""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError("stream_tool_approval requires a configured checkpointer")
+        app = self.build()
+        with self._persistence_lock:
+            snapshot = app.get_state(config)
+            pending = _pending_tool_approval_from_snapshot(snapshot)
+            if not snapshot.next or pending is None:
+                raise ValueError("当前会话没有待人工确认的工具断点")
+            if decision.interrupt_id != pending.interrupt_id:
+                raise ValueError("interrupt_id 与当前工具断点不匹配")
+            command: Command[str] = Command(
+                resume={
+                    pending.interrupt_id: decision.model_dump(mode="json"),
+                }
+            )
+            yield from cast(
+                Iterator[tuple[str, Any]],
+                app.stream(
+                    command,
+                    config=config,
+                    stream_mode=["messages", "custom"],
+                ),
+            )
+
+    def get_pending_tool_approval(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> PendingToolApproval | None:
+        """Return the exact pending tool call and its current interrupt ID."""
+        config = self._thread_config(session_id, user_id)
+        if self.checkpointer is None:
+            raise ValueError(
+                "get_pending_tool_approval requires a configured checkpointer"
+            )
+        app = self.build()
+        with self._persistence_lock:
+            return _pending_tool_approval_from_snapshot(app.get_state(config))
 
     def get_pending_handoff(
         self,
@@ -1748,6 +2031,7 @@ def _interleave_subagent_traces(
             update={
                 "sequence": previous_sequence + index + 1,
                 "session_id": session_id,
+                "run_id": state.get("run_id"),
             }
         )
         for index, event in enumerate(combined)
@@ -2453,6 +2737,22 @@ def _interrupt_identifier(pending_interrupt: object) -> str:
     if not isinstance(identifier, str) or not identifier:
         raise RuntimeError("LangGraph interrupt 缺少稳定标识")
     return identifier
+
+
+def _pending_tool_approval_from_snapshot(
+    snapshot: StateSnapshot,
+) -> PendingToolApproval | None:
+    """Combine a checkpointed exact call with its dynamic interrupt ID."""
+    values = cast(AgentState, snapshot.values)
+    pending = values.get("pending_tool_approval")
+    if pending is None:
+        return None
+    if len(snapshot.interrupts) != 1:
+        raise RuntimeError("待确认工具调用必须对应且仅对应一个 interrupt")
+    return PendingToolApproval(
+        interrupt_id=_interrupt_identifier(snapshot.interrupts[0]),
+        request=ToolApprovalRequest.model_validate(pending),
+    )
 
 
 def _pending_handoff_from_snapshot(

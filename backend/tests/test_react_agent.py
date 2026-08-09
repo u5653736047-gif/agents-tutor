@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -18,9 +19,11 @@ from langchain_core.tools import tool
 
 import core.nodes.react_agent as react_agent_module
 from core.events import ErrorCode, EventType, RunError, RunEvent
+from core.filesystem import WorkspaceFileSystem
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole, create_initial_state
 from core.tools.executor import ToolExecutor
+from core.tools.file_tools import create_read_only_file_tools
 
 MODEL_ERROR_SECRET = "secret=/srv/private/model-token"
 UNKNOWN_TOOL_NAME = "unknown_tool"
@@ -497,14 +500,16 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "event_type",
         "sequence",
         "session_id",
+        "run_id",
         "agent",
         "tool_name",
         "tool_call_id",
         "parent_tool_call_id",
         "input_summary",
         "output_summary",
-        "content",
-        "message_id",
+            "content",
+            "output_stream",
+            "message_id",
         "success",
         "duration_ms",
         "error_code",
@@ -738,6 +743,97 @@ def test_react_agent_stops_at_iteration_limit() -> None:
         result.updates["events"][-1].error_code
         is ErrorCode.REACT_ITERATION_LIMIT
     )
+
+
+def test_react_agent_blocks_an_identical_tool_call_after_no_progress() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("double", "call-1")]),
+            AIMessage(content="", tool_calls=[tool_call("double", "call-2")]),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+    )
+
+    result = agent.run(create_initial_state())
+
+    assert [item.success for item in result.updates["tool_results"]] == [True, False]
+    assert result.updates["tool_results"][1].error_code is ErrorCode.TOOL_NO_PROGRESS
+
+
+def test_react_agent_enforces_a_separate_tool_call_budget() -> None:
+    calls = [
+        {
+            "name": "double",
+            "args": {"value": value},
+            "id": f"call-{value}",
+            "type": "tool_call",
+        }
+        for value in (1, 2, 3)
+    ]
+    model = ScriptedModel(
+        [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+        max_tool_calls=2,
+    )
+
+    result = agent.run(create_initial_state())
+
+    assert [item.success for item in result.updates["tool_results"]] == [
+        True,
+        True,
+        False,
+    ]
+    assert result.updates["tool_results"][2].error_code is ErrorCode.TOOL_BUDGET_EXCEEDED
+
+
+def test_react_agent_uses_the_workspace_bound_to_its_state(tmp_path: Path) -> None:
+    default = tmp_path / "default"
+    selected = tmp_path / "selected"
+    default.mkdir()
+    selected.mkdir()
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_info",
+                        "args": {},
+                        "id": "workspace-info-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor(
+            create_read_only_file_tools(WorkspaceFileSystem(default))
+        ),
+    )
+    state = create_initial_state(session_id="session-1")
+    state["workspace_root"] = str(selected.resolve())
+    state["additional_workspace_roots"] = []
+
+    result = agent.run(state)
+
+    workspace_result = json.loads(result.updates["tool_results"][0].output)
+    assert workspace_result["root"] == str(selected.resolve())
 
 
 def test_react_agent_returns_model_error() -> None:

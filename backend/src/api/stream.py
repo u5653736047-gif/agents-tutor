@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Annotated, Any, cast
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -46,6 +48,10 @@ from api.chat import (
     _public_events,
     _public_run_error,
     _response_references,
+    _run_graph_turn,
+    _workspace_call_kwargs,
+    pending_handoff_for_session,
+    pending_tool_approval_for_session,
     session_busy_response,
     session_lock,
 )
@@ -60,8 +66,8 @@ from api.sessions import current_user_id
 from core.events import EventType
 from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
-from core.sessions import SessionStore
-from core.state import AgentState
+from core.sessions import SessionRecord, SessionStore
+from core.state import AgentState, ToolApprovalDecision
 
 router = APIRouter(tags=["chat"])
 _LOGGER = logging.getLogger("api.stream")
@@ -106,6 +112,7 @@ def _stream_event_from_run_event(event: RunEvent, session_id: str) -> StreamEven
         event_type=event.event_type,
         sequence=event.sequence,
         session_id=event.session_id or session_id,
+        run_id=event.run_id,
         agent=event.agent,
         tool_name=event.tool_name,
         tool_call_id=event.tool_call_id,
@@ -117,6 +124,7 @@ def _stream_event_from_run_event(event: RunEvent, session_id: str) -> StreamEven
         error_code=event.error_code,
         plan_step_sequence=event.plan_step_sequence,
         content=content,
+        output_stream=event.output_stream,
         message_id=event.message_id,
         is_delta=event.is_delta,
     )
@@ -141,6 +149,7 @@ def _state_error_event(
         event_type=StreamEventType.ERROR,
         sequence=sequence,
         session_id=session_id,
+        run_id=state.get("run_id"),
         agent=run_error.agent,
         error_code=run_error.error_code,
     )
@@ -152,6 +161,7 @@ async def _error_event_for(
     sequence: int,
     error: Exception,
     user_id: str | None,
+    run_id: str | None = None,
 ) -> StreamEvent:
     """把后台 run 的异常映射为脱敏 error 事件(与 POST /chat 分类一致)。
 
@@ -160,18 +170,29 @@ async def _error_event_for(
     - 其余异常 → internal_error。异常正文绝不进入事件(脱敏)。
     """
     if isinstance(error, RuntimeError):
-        pending = await run_in_threadpool(graph.get_pending_handoff, session_id, user_id)
-        if pending is not None or str(error).startswith(PENDING_RESUME_ERROR_PREFIX):
+        pending = await pending_handoff_for_session(graph, session_id, user_id)
+        pending_tool = await pending_tool_approval_for_session(
+            graph,
+            session_id,
+            user_id,
+        )
+        if (
+            pending is not None
+            or pending_tool is not None
+            or str(error).startswith(PENDING_RESUME_ERROR_PREFIX)
+        ):
             return StreamEvent(
                 event_type=StreamEventType.ERROR,
                 sequence=sequence,
                 session_id=session_id,
+                run_id=run_id,
                 error_code=ApiErrorCode.SESSION_BUSY,
             )
     return StreamEvent(
         event_type=StreamEventType.ERROR,
         sequence=sequence,
         session_id=session_id,
+        run_id=run_id,
         error_code=ApiErrorCode.INTERNAL_ERROR,
     )
 
@@ -267,6 +288,81 @@ def _stream_agent(metadata: object) -> object:
     return metadata.get("agent_role") or metadata.get("langgraph_node")
 
 
+def _stream_events_from_item(
+    item: object,
+    *,
+    session_id: str,
+    run_id: str | None,
+    sequence: int,
+) -> tuple[int, list[StreamEvent]]:
+    """Translate one LangGraph messages/custom item into ordered public events."""
+    if not (
+        isinstance(item, tuple)
+        and len(item) == 2
+        and isinstance(item[0], str)
+    ):
+        return sequence, []
+
+    mode, data = item
+    stream_events: list[StreamEvent] = []
+    if mode == "messages" and isinstance(data, tuple) and len(data) == 2:
+        chunk, metadata = data
+        agent = _public_agent(_stream_agent(metadata))
+        message_id = getattr(chunk, "id", None)
+        public_message_id = message_id if isinstance(message_id, str) else None
+        reasoning_delta = _reasoning_delta(chunk)
+        if reasoning_delta:
+            sequence += 1
+            stream_events.append(
+                StreamEvent(
+                    event_type=StreamEventType.REASONING,
+                    sequence=sequence,
+                    session_id=session_id,
+                    run_id=run_id,
+                    agent=agent,
+                    content=reasoning_delta,
+                    message_id=public_message_id,
+                    is_delta=True,
+                )
+            )
+        delta = _text_delta(chunk)
+        if delta:
+            sequence += 1
+            stream_events.append(
+                StreamEvent(
+                    event_type=StreamEventType.MESSAGE_DELTA,
+                    sequence=sequence,
+                    session_id=session_id,
+                    run_id=run_id,
+                    agent=agent,
+                    content=delta,
+                    message_id=public_message_id,
+                    is_delta=True,
+                )
+            )
+    elif mode == "custom" and isinstance(data, Mapping):
+        raw_event = data.get("event") if data.get("kind") == "run_event" else None
+        if isinstance(raw_event, Mapping):
+            try:
+                core_event = CoreRunEvent.model_validate(raw_event)
+            except (TypeError, ValueError):
+                core_event = None
+            if core_event is not None:
+                public_event = _public_event(core_event)
+                if public_event is not None and public_event.event_type not in {
+                    StreamEventType.MESSAGE_END,
+                    StreamEventType.DONE,
+                }:
+                    sequence += 1
+                    stream_events.append(
+                        _stream_event_from_run_event(
+                            public_event,
+                            session_id,
+                        ).model_copy(update={"sequence": sequence})
+                    )
+    return sequence, stream_events
+
+
 async def _native_stream_events(
     graph: CollaborativeAgentGraph,
     payload: ChatRequest,
@@ -274,18 +370,26 @@ async def _native_stream_events(
     user_id: str | None,
     previous_state: AgentState | None,
     from_sequence: int,
+    session: SessionRecord,
 ) -> AsyncIterator[str]:
     """把 LangGraph messages/custom 原生流桥接为 SSE，不轮询 checkpoint。"""
+    run_id = str(uuid4())
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
     def pump() -> None:
         try:
-            for item in graph.stream(
+            stream_method = graph.stream
+            stream_kwargs = _workspace_call_kwargs(stream_method, session)
+            if "run_id" in inspect.signature(stream_method).parameters:
+                stream_kwargs["run_id"] = run_id
+            stream_items = stream_method(
                 payload.message,
                 payload.session_id,
                 user_id,
-            ):
+                **stream_kwargs,
+            )
+            for item in stream_items:
                 loop.call_soon_threadsafe(queue.put_nowait, ("item", item))
         except Exception as error:  # noqa: BLE001 - 稳定错误映射在异步边界完成
             loop.call_soon_threadsafe(queue.put_nowait, ("error", error))
@@ -325,72 +429,18 @@ async def _native_stream_events(
                         sequence,
                         cast(Exception, item),
                         user_id,
+                        run_id,
                     )
                 )
                 return
             if item_type == "end":
                 break
-            if not (
-                isinstance(item, tuple)
-                and len(item) == 2
-                and isinstance(item[0], str)
-            ):
-                continue
-            mode, data = item
-            stream_events: list[StreamEvent] = []
-            if mode == "messages" and isinstance(data, tuple) and len(data) == 2:
-                chunk, metadata = data
-                agent = _public_agent(_stream_agent(metadata))
-                message_id = getattr(chunk, "id", None)
-                public_message_id = message_id if isinstance(message_id, str) else None
-                reasoning_delta = _reasoning_delta(chunk)
-                if reasoning_delta:
-                    sequence += 1
-                    stream_events.append(
-                        StreamEvent(
-                            event_type=StreamEventType.REASONING,
-                            sequence=sequence,
-                            session_id=payload.session_id,
-                            agent=agent,
-                            content=reasoning_delta,
-                            message_id=public_message_id,
-                            is_delta=True,
-                        )
-                    )
-                delta = _text_delta(chunk)
-                if delta:
-                    sequence += 1
-                    stream_events.append(
-                        StreamEvent(
-                            event_type=StreamEventType.MESSAGE_DELTA,
-                            sequence=sequence,
-                            session_id=payload.session_id,
-                            agent=agent,
-                            content=delta,
-                            message_id=public_message_id,
-                            is_delta=True,
-                        )
-                    )
-            elif mode == "custom" and isinstance(data, Mapping):
-                raw_event = data.get("event") if data.get("kind") == "run_event" else None
-                if isinstance(raw_event, Mapping):
-                    try:
-                        core_event = CoreRunEvent.model_validate(raw_event)
-                    except (TypeError, ValueError):
-                        core_event = None
-                    if core_event is not None:
-                        public_event = _public_event(core_event)
-                        if public_event is not None and public_event.event_type not in {
-                            StreamEventType.MESSAGE_END,
-                            StreamEventType.DONE,
-                        }:
-                            sequence += 1
-                            stream_events.append(
-                                _stream_event_from_run_event(
-                                    public_event,
-                                    payload.session_id,
-                                ).model_copy(update={"sequence": sequence})
-                            )
+            sequence, stream_events = _stream_events_from_item(
+                item,
+                session_id=payload.session_id,
+                run_id=run_id,
+                sequence=sequence,
+            )
             for stream_event in stream_events:
                 yield _sse_frame(stream_event)
                 if stream_event.event_type is StreamEventType.ERROR:
@@ -410,6 +460,7 @@ async def _native_stream_events(
                     event_type=StreamEventType.ERROR,
                     sequence=sequence,
                     session_id=payload.session_id,
+                    run_id=run_id,
                     error_code=ApiErrorCode.INTERNAL_ERROR,
                 )
             )
@@ -419,10 +470,29 @@ async def _native_stream_events(
             sequence + 1,
             payload.session_id,
         )
+        pending_tool_approval = await pending_tool_approval_for_session(
+            graph,
+            payload.session_id,
+            user_id,
+        )
         if state_error is not None:
             if not error_emitted:
                 sequence += 1
                 yield _sse_frame(state_error)
+        elif pending_tool_approval is not None and not error_emitted:
+            sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.APPROVAL_REQUIRED,
+                    sequence=sequence,
+                    session_id=payload.session_id,
+                    run_id=state.get("run_id") or run_id,
+                    agent=pending_tool_approval.request.agent_role,
+                    tool_name=pending_tool_approval.request.tool_name,
+                    tool_call_id=pending_tool_approval.request.tool_call_id,
+                    pending_tool_approval=pending_tool_approval,
+                )
+            )
         elif not error_emitted:
             final_message = _final_assistant_message(state, previous_count)
             if final_message is None:
@@ -432,6 +502,7 @@ async def _native_stream_events(
                         event_type=StreamEventType.ERROR,
                         sequence=sequence,
                         session_id=payload.session_id,
+                        run_id=run_id,
                         agent=_public_agent(state.get("current_agent")),
                         error_code=ApiErrorCode.INTERNAL_ERROR,
                     )
@@ -443,6 +514,7 @@ async def _native_stream_events(
                         event_type=StreamEventType.MESSAGE_END,
                         sequence=sequence,
                         session_id=payload.session_id,
+                        run_id=run_id,
                         agent=_public_agent(state.get("current_agent")),
                         content=final_message.content,
                         message=final_message,
@@ -455,6 +527,163 @@ async def _native_stream_events(
                 event_type=StreamEventType.DONE,
                 sequence=sequence,
                 session_id=payload.session_id,
+                run_id=run_id,
+            )
+        )
+    finally:
+        if not pump_task.done():
+            await _wait_for_run(pump_task)
+
+
+async def tool_approval_stream_events(
+    graph: CollaborativeAgentGraph,
+    session_id: str,
+    decision: ToolApprovalDecision,
+    request: Request,
+    user_id: str | None,
+    previous_state: AgentState | None,
+) -> AsyncIterator[str]:
+    """Resume a tool gate and bridge terminal/model deltas to public SSE."""
+    run_id = None if previous_state is None else previous_state.get("run_id")
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    def pump() -> None:
+        try:
+            for item in graph.stream_tool_approval(
+                session_id,
+                decision,
+                user_id,
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, ("item", item))
+        except Exception as error:  # noqa: BLE001 - mapped at the API boundary
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", error))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+
+    pump_task = asyncio.create_task(run_in_threadpool(pump))
+    sequence = _previous_sequence(previous_state)
+    previous_count = _previous_message_count(previous_state)
+    last_send_at = time.monotonic()
+    error_emitted = False
+    try:
+        while True:
+            try:
+                item_type, item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_POLL_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                if await request.is_disconnected():
+                    await _wait_for_run(pump_task)
+                    return
+                if time.monotonic() - last_send_at > _KEEPALIVE_INTERVAL_SECONDS:
+                    yield ": keepalive\n\n"
+                    last_send_at = time.monotonic()
+                continue
+
+            if item_type == "error":
+                sequence += 1
+                yield _sse_frame(
+                    await _error_event_for(
+                        graph,
+                        session_id,
+                        sequence,
+                        cast(Exception, item),
+                        user_id,
+                        run_id,
+                    )
+                )
+                return
+            if item_type == "end":
+                break
+
+            sequence, stream_events = _stream_events_from_item(
+                item,
+                session_id=session_id,
+                run_id=run_id,
+                sequence=sequence,
+            )
+            for stream_event in stream_events:
+                yield _sse_frame(stream_event)
+                if stream_event.event_type is StreamEventType.ERROR:
+                    error_emitted = True
+                last_send_at = time.monotonic()
+
+        await pump_task
+        state = await run_in_threadpool(graph.get_state, session_id, user_id)
+        if state is None:
+            sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.ERROR,
+                    sequence=sequence,
+                    session_id=session_id,
+                    run_id=run_id,
+                    error_code=ApiErrorCode.INTERNAL_ERROR,
+                )
+            )
+            return
+
+        state_error = _state_error_event(state, sequence + 1, session_id)
+        pending_tool_approval = await pending_tool_approval_for_session(
+            graph,
+            session_id,
+            user_id,
+        )
+        if state_error is not None:
+            if not error_emitted:
+                sequence += 1
+                yield _sse_frame(state_error)
+        elif pending_tool_approval is not None and not error_emitted:
+            sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.APPROVAL_REQUIRED,
+                    sequence=sequence,
+                    session_id=session_id,
+                    run_id=state.get("run_id") or run_id,
+                    agent=pending_tool_approval.request.agent_role,
+                    tool_name=pending_tool_approval.request.tool_name,
+                    tool_call_id=pending_tool_approval.request.tool_call_id,
+                    pending_tool_approval=pending_tool_approval,
+                )
+            )
+        elif not error_emitted:
+            final_message = _final_assistant_message(state, previous_count)
+            sequence += 1
+            if final_message is None:
+                yield _sse_frame(
+                    StreamEvent(
+                        event_type=StreamEventType.ERROR,
+                        sequence=sequence,
+                        session_id=session_id,
+                        run_id=state.get("run_id") or run_id,
+                        agent=_public_agent(state.get("current_agent")),
+                        error_code=ApiErrorCode.INTERNAL_ERROR,
+                    )
+                )
+            else:
+                yield _sse_frame(
+                    StreamEvent(
+                        event_type=StreamEventType.MESSAGE_END,
+                        sequence=sequence,
+                        session_id=session_id,
+                        run_id=state.get("run_id") or run_id,
+                        agent=_public_agent(state.get("current_agent")),
+                        content=final_message.content,
+                        message=final_message,
+                        citations=_response_references(state, previous_count),
+                    )
+                )
+
+        sequence += 1
+        yield _sse_frame(
+            StreamEvent(
+                event_type=StreamEventType.DONE,
+                sequence=sequence,
+                session_id=session_id,
+                run_id=state.get("run_id") or run_id,
             )
         )
     finally:
@@ -482,7 +711,7 @@ async def _stream_events(
     默认 0 才表示发新消息并启动新 run。
     """
     async with active_session_lock:
-        await run_in_threadpool(
+        session = await run_in_threadpool(
             _ensure_session_with_title,
             session_store,
             payload.session_id,
@@ -499,6 +728,43 @@ async def _stream_events(
             [] if current_state is None else current_state.get("events", [])
         )
         last_event = events[-1] if events else None
+        pending_tool_approval = await pending_tool_approval_for_session(
+            graph,
+            payload.session_id,
+            user_id,
+        )
+        if from_sequence > 0 and pending_tool_approval is not None:
+            replay_sequence = max(
+                from_sequence,
+                _previous_sequence(current_state),
+            )
+            replay_sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.APPROVAL_REQUIRED,
+                    sequence=replay_sequence,
+                    session_id=payload.session_id,
+                    run_id=(
+                        None if current_state is None else current_state.get("run_id")
+                    ),
+                    agent=pending_tool_approval.request.agent_role,
+                    tool_name=pending_tool_approval.request.tool_name,
+                    tool_call_id=pending_tool_approval.request.tool_call_id,
+                    pending_tool_approval=pending_tool_approval,
+                )
+            )
+            replay_sequence += 1
+            yield _sse_frame(
+                StreamEvent(
+                    event_type=StreamEventType.DONE,
+                    sequence=replay_sequence,
+                    session_id=payload.session_id,
+                    run_id=(
+                        None if current_state is None else current_state.get("run_id")
+                    ),
+                )
+            )
+            return
         if (
             from_sequence > 0
             and current_state is not None
@@ -541,6 +807,7 @@ async def _stream_events(
                             event_type=StreamEventType.ERROR,
                             sequence=replay_sequence,
                             session_id=payload.session_id,
+                            run_id=current_state.get("run_id"),
                             agent=_public_agent(current_state.get("current_agent")),
                             error_code=ApiErrorCode.INTERNAL_ERROR,
                         )
@@ -551,6 +818,7 @@ async def _stream_events(
                             event_type=StreamEventType.MESSAGE_END,
                             sequence=replay_sequence,
                             session_id=payload.session_id,
+                            run_id=current_state.get("run_id"),
                             agent=_public_agent(current_state.get("current_agent")),
                             content=final_message.content,
                             message=final_message,
@@ -563,6 +831,7 @@ async def _stream_events(
                     event_type=StreamEventType.DONE,
                     sequence=replay_sequence,
                     session_id=payload.session_id,
+                    run_id=current_state.get("run_id"),
                 )
             )
             return
@@ -590,6 +859,7 @@ async def _stream_events(
                 user_id,
                 previous_state,
                 from_sequence,
+                session,
             ):
                 yield frame
             return
@@ -597,7 +867,14 @@ async def _stream_events(
         last_sequence = _previous_sequence(previous_state)
         previous_count = _previous_message_count(previous_state)
         background_task = asyncio.create_task(
-            run_in_threadpool(graph.run, payload.message, payload.session_id, user_id)
+            run_in_threadpool(
+                _run_graph_turn,
+                graph,
+                payload.message,
+                payload.session_id,
+                user_id,
+                session,
+            )
         )
         last_send_at = time.monotonic()
         error_emitted = False
@@ -663,6 +940,7 @@ async def _stream_events(
                                 last_sequence,
                                 error,
                                 user_id,
+                                None,
                             )
                         )
                         return
@@ -672,10 +950,31 @@ async def _stream_events(
                         last_sequence + 1,
                         payload.session_id,
                     )
+                    pending_tool_approval = await pending_tool_approval_for_session(
+                        graph,
+                        payload.session_id,
+                        user_id,
+                    )
                     if state_error is not None:
                         if not error_emitted:
                             last_sequence += 1
                             yield _sse_frame(state_error)
+                    elif pending_tool_approval is not None and not error_emitted:
+                        last_sequence += 1
+                        yield _sse_frame(
+                            StreamEvent(
+                                event_type=StreamEventType.APPROVAL_REQUIRED,
+                                sequence=last_sequence,
+                                session_id=payload.session_id,
+                                run_id=state.get("run_id"),
+                                agent=pending_tool_approval.request.agent_role,
+                                tool_name=pending_tool_approval.request.tool_name,
+                                tool_call_id=(
+                                    pending_tool_approval.request.tool_call_id
+                                ),
+                                pending_tool_approval=pending_tool_approval,
+                            )
+                        )
                     elif not error_emitted:
                         final_message = _final_assistant_message(state, previous_count)
                         last_sequence += 1
@@ -685,6 +984,7 @@ async def _stream_events(
                                     event_type=StreamEventType.ERROR,
                                     sequence=last_sequence,
                                     session_id=payload.session_id,
+                                    run_id=state.get("run_id"),
                                     agent=_public_agent(state.get("current_agent")),
                                     error_code=ApiErrorCode.INTERNAL_ERROR,
                                 )
@@ -695,6 +995,7 @@ async def _stream_events(
                                     event_type=StreamEventType.MESSAGE_END,
                                     sequence=last_sequence,
                                     session_id=payload.session_id,
+                                    run_id=state.get("run_id"),
                                     agent=_public_agent(state.get("current_agent")),
                                     content=final_message.content,
                                     message=final_message,
@@ -715,6 +1016,7 @@ async def _stream_events(
                             event_type=StreamEventType.DONE,
                             sequence=last_sequence,
                             session_id=payload.session_id,
+                            run_id=state.get("run_id"),
                         )
                     )
                     return

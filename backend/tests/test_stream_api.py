@@ -30,6 +30,7 @@ from api.schemas import ChatRequest
 from api.stream import _stream_events
 from core.events import ErrorCode, EventType, RunError, RunEvent
 from core.sessions import SessionStore
+from core.state import AgentRole, PendingToolApproval, ToolApprovalRequest
 
 # ── 图替身:与 test_chat_api.ChatGraph 同构,但 get_state 返回
 #    「当前可见」状态(中间态 → 最终态),模拟 checkpoint 逐步落盘 ──
@@ -238,6 +239,40 @@ class NativeTerminalStateChatGraph(StreamingChatGraph):
             {"kind": "run_event", "event": started.model_dump(mode="json")},
         )
         self._visible_state = self._final_state
+
+
+class NativePendingToolChatGraph(NativeTerminalStateChatGraph):
+    def __init__(self) -> None:
+        super().__init__(
+            {
+                "run_id": "run-shell-1",
+                "messages": [HumanMessage(content="inspect")],
+                "events": [],
+                "current_agent": "supervisor",
+                "pending_tool_approval": {
+                    "tool_call_id": "shell-1",
+                    "tool_name": "shell",
+                    "agent_role": "supervisor",
+                    "arguments": {"command": "git status", "cwd": "."},
+                },
+            }
+        )
+        self.pending = PendingToolApproval(
+            interrupt_id="interrupt-shell-1",
+            request=ToolApprovalRequest(
+                tool_call_id="shell-1",
+                tool_name="shell",
+                agent_role=AgentRole.SUPERVISOR,
+                arguments={"command": "git status", "cwd": "."},
+            ),
+        )
+
+    def get_pending_tool_approval(
+        self,
+        _session_id: str,
+        _user_id: str | None = None,
+    ) -> PendingToolApproval | None:
+        return self.pending if self.run_started.is_set() else None
 
 
 def _chat_app(tmp_path: Path, graph: StreamingChatGraph) -> tuple[FastAPI, SessionStore]:
@@ -688,9 +723,10 @@ def test_stream_tool_events_carry_redacted_input_and_output_summaries(
 
     allowed_keys = {
         "event_type",
-        "sequence",
-        "session_id",
-        "agent",
+            "sequence",
+            "session_id",
+            "run_id",
+            "agent",
         "tool_name",
         "success",
         "duration_ms",
@@ -704,9 +740,11 @@ def test_stream_tool_events_carry_redacted_input_and_output_summaries(
         "tool_call_id",
         "parent_tool_call_id",
         "input_summary",
-        "output_summary",
-        "is_delta",
-    }
+            "output_summary",
+            "output_stream",
+            "is_delta",
+            "pending_tool_approval",
+        }
     for frame in frames:
         assert set(frame).issubset(allowed_keys)
     tool_frames = [
@@ -892,7 +930,32 @@ def test_stream_replays_remaining_events_when_round_finished(
     assert [frame["sequence"] for frame in frames] == [4, 7, 8]
     assert all(frame["sequence"] > 3 for frame in frames)
     assert frames[-1]["event_type"] == "done"
-    assert frames[-1]["sequence"] == 8
+
+
+def test_native_stream_pauses_with_an_exact_tool_approval_instead_of_an_error(
+    tmp_path: Path,
+) -> None:
+    graph = NativePendingToolChatGraph()
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream(
+                app,
+                {"session_id": "session-1", "message": "inspect"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert [frame["event_type"] for frame in frames] == [
+        "thinking",
+        "approval_required",
+        "done",
+    ]
+    approval = frames[1]["pending_tool_approval"]
+    assert approval["interrupt_id"] == "interrupt-shell-1"
+    assert approval["request"]["arguments"]["command"] == "git status"
+    assert all(frame["event_type"] != "error" for frame in frames)
 
 
 def test_stream_reconnect_with_token_sequence_above_checkpoint_does_not_rerun(
