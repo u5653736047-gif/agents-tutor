@@ -155,6 +155,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/knowledge/chunks/{chunk_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Chunk
+         * @description 按 chunk_id 取回分块原文(I2 查看原文)。
+         *
+         *     - 未命中(不存在 / 空白 / 超长 chunk_id):404 chunk_not_found——
+         *       chunk_id 是引用凭证,引用指向不存在的分块属「资源不存在」,
+         *       与检索「空结果不报错」语义刻意不同(检索是查询,这里是定位);
+         *     - content 上限 CHUNK_CONTENT_MAX_LENGTH 截断(防撑爆响应体);
+         *     - 只暴露 chunk 文本 + 逻辑引用,不暴露文件路径(models 层
+         *       _validate_logical_source 保证)。
+         */
+        get: operations["get_chunk_knowledge_chunks__chunk_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/knowledge/documents": {
         parameters: {
             query?: never;
@@ -164,14 +191,13 @@ export interface paths {
         };
         /**
          * List Documents
-         * @description 列出通过 API 上传的文档元数据。
+         * @description 列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。
          *
-         *     core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
-         *     delete_document / search),因此 API 层维护进程内注册表
-         *     (_document_registry):只登记经 POST /knowledge/documents 上传的
-         *     文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
-         *     (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
-         *     app 生命周期,测试各 app 实例隔离)。
+         *     I1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库
+         *     的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API
+         *     可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表
+         *     (app.state.knowledge_documents)只作为「未落库条目」的防御性兜底
+         *     合并(理论上不触发,保留以兼容极端时序)。
          */
         get: operations["list_documents_knowledge_documents_get"];
         put?: never;
@@ -216,6 +242,68 @@ export interface paths {
          *     404 区分。注册表同步移除该条目。
          */
         delete: operations["delete_document_knowledge_documents__document_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents/{document_id}/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Document Chunks
+         * @description 列出某文档的分块(I2 浏览):分页,只带定位信息与摘要。
+         *
+         *     - offset 从 0 起、limit 默认 20;limit 由 FastAPI Query 参数拦截
+         *       越界(offset>=0、1<=limit<=CHUNK_LIST_PAGE_SIZE_MAX,422),不
+         *       依赖 core 校验;
+         *     - chunks_of_document 按 (start, chunk_id) 排序(与 ingest 顺序一致),
+         *       分页截取稳定;
+         *     - 条目只带摘要(SUMMARY_MAX_LENGTH 截断),完整原文经
+         *       GET /knowledge/chunks/{chunk_id} 获取——列表页先看摘要、点开
+         *       再看全文;
+         *     - 文档不存在:空 items(分页在空集合上就是空),不报 404——与
+         *       删除端点「不存在幂等」同一哲学(见 delete_document 注释);
+         *     - 用服务层的 chunk 能力做「索引未实现 chunk 的兜底」:若索引
+         *       未实现 chunk(getter 缺失),列表仍可用 chunks_of_document 逻辑?
+         *       ——不:本端点直接依赖 chunks_of_document(索引实现本身),与
+         *       chunk 单条端点无关。分页在 Python 侧完成(全部取出后切片),
+         *       数据量(单文档最多数千 chunk)可接受。
+         */
+        get: operations["list_document_chunks_knowledge_documents__document_id__chunks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Knowledge Overview
+         * @description 知识库总览(I1):语料统计 + 每篇文档元数据,一次请求覆盖教师端。
+         *
+         *     - 无 catalog 装配(部署问题):503 knowledge_unavailable(与检索
+         *       端点同一稳定错误码);
+         *     - 空库(从未入库):stats 全 0、documents 空列表,不报错(与
+         *       「空库检索返回空」语义一致);
+         *     - 只读聚合,不触发 embedding 模型加载(数据全部来自词法库)。
+         */
+        get: operations["knowledge_overview_knowledge_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -587,6 +675,64 @@ export interface components {
             task_results?: components["schemas"]["TaskResult"][] | null;
         };
         /**
+         * ChunkDetailResponse
+         * @description 单个分块原文(I2 查看原文):内容 + 配套引用凭证。
+         *
+         *     content 上限 8KB(后端截断,防撑爆响应,见 api/knowledge.py 的
+         *     CHUNK_CONTENT_MAX_LENGTH);citation 与检索命中的 Citation 同构
+         *     (document_id / source / page / chunk_id),可直接用于「查看原文」
+         *     跳转与引用展示。
+         */
+        ChunkDetailResponse: {
+            citation: components["schemas"]["Citation"];
+            /** Content */
+            content: string;
+        };
+        /**
+         * ChunkListEntry
+         * @description 分块列表条目(I2 浏览):不带全文,只带定位信息与摘要。
+         *
+         *     summary 由 chunk 内容截断生成(与检索命中同口径,上限
+         *     SUMMARY_MAX_LENGTH);完整原文经 GET /knowledge/chunks/{chunk_id}
+         *     单独获取——列表页先看摘要,点开再看全文。
+         */
+        ChunkListEntry: {
+            /** Chunk Id */
+            chunk_id: string;
+            /**
+             * End
+             * @default 0
+             */
+            end?: number;
+            /**
+             * Page
+             * @default null
+             */
+            page?: number | null;
+            /**
+             * Start
+             * @default 0
+             */
+            start?: number;
+            /** Summary */
+            summary: string;
+        };
+        /**
+         * ChunkListResponse
+         * @description 某文档的分块分页列表(I2 浏览)。
+         *
+         *     total 是该文档全部分块数(不分页),供前端算分页;items 为当前
+         *     页条目(按 start, chunk_id 排序,见 index.py chunks_of_document)。
+         */
+        ChunkListResponse: {
+            /** Document Id */
+            document_id: string;
+            /** Items */
+            items: components["schemas"]["ChunkListEntry"][];
+            /** Total */
+            total: number;
+        };
+        /**
          * Citation
          * @description A safe reference placeholder for future retrieval-backed responses.
          */
@@ -751,6 +897,71 @@ export interface components {
             task_content: string;
         };
         /**
+         * KnowledgeBaseStatsDto
+         * @description 知识库语料统计(I1):教师端总览卡数据源。
+         *
+         *     total_pages 可空(纯 txt 语料无页概念时为 None);frontmatter_chunks
+         *     单独给出供教师了解噪音占比(检索侧默认排除,见 service.py 的
+         *     suppress_frontmatter)。
+         */
+        KnowledgeBaseStatsDto: {
+            /**
+             * Frontmatter Chunks
+             * @default 0
+             */
+            frontmatter_chunks?: number;
+            /** Total Chunks */
+            total_chunks: number;
+            /** Total Documents */
+            total_documents: number;
+            /**
+             * Total Pages
+             * @default null
+             */
+            total_pages?: number | null;
+        };
+        /**
+         * KnowledgeDocumentInfoDto
+         * @description 文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。
+         *
+         *     title / subjects / difficulty / ingested_at 可空:脚本入库的教材
+         *     由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
+         *     时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+         */
+        KnowledgeDocumentInfoDto: {
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /**
+             * Difficulty
+             * @default null
+             */
+            difficulty?: string | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Ingested At
+             * @default null
+             */
+            ingested_at?: string | null;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
+            /** Subjects */
+            subjects?: string[];
+            /**
+             * Title
+             * @default null
+             */
+            title?: string | null;
+        };
+        /**
          * KnowledgeDocumentListEntry
          * @description 知识库文档列表条目(只读元数据,不含内容)。
          *
@@ -800,6 +1011,18 @@ export interface components {
             page_count?: number | null;
             /** Source */
             source: string;
+        };
+        /**
+         * KnowledgeOverviewResponse
+         * @description 知识库总览:统计 + 每篇文档元数据(I1,一次请求覆盖教师端)。
+         *
+         *     documents 与 stats 同源(同一词法库聚合);阈值/重排器等检索
+         *     配置装配状态预留字段(I3/I10,本期不填)。
+         */
+        KnowledgeOverviewResponse: {
+            /** Documents */
+            documents: components["schemas"]["KnowledgeDocumentInfoDto"][];
+            stats: components["schemas"]["KnowledgeBaseStatsDto"];
         };
         /**
          * KnowledgeSearchRequest
@@ -1576,6 +1799,55 @@ export interface operations {
             };
         };
     };
+    get_chunk_knowledge_chunks__chunk_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chunk_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChunkDetailResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     list_documents_knowledge_documents_get: {
         parameters: {
             query?: never;
@@ -1691,6 +1963,105 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_document_chunks_knowledge_documents__document_id__chunks_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChunkListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    knowledge_overview_knowledge_overview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeOverviewResponse"];
+                };
             };
             /** @description Unprocessable Entity */
             422: {
