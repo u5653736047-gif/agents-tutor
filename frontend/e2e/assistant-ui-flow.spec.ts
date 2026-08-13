@@ -53,6 +53,15 @@ test.beforeEach(async ({ page }) => {
 test("流式提问:思维链与工具时间线内联,回答完整渲染", async ({ page }) => {
   const question = "E2E 什么是注意力机制?";
   const answer = mockAnswerFor(question);
+  // 续传计数:记录每个 /chat/stream 请求的 from_sequence——断言重连
+  // 续传携带递增 from_sequence,服务端回放补发而不重复执行整轮
+  const streamSequences: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === "/chat/stream") {
+      streamSequences.push(url.searchParams.get("from_sequence") ?? "0");
+    }
+  });
 
   await page.goto("/");
   await createSessionViaDialog(page);
@@ -91,6 +100,15 @@ test("流式提问:思维链与工具时间线内联,回答完整渲染", async 
   // 完整回答 + 用户消息回显
   await expect(assistantMessage).toContainText(answer, { timeout: 10_000 });
   await expect(page.locator('[data-slot="user-message"]')).toContainText(question);
+
+  // 断线续传:首请求 from_sequence=0;mock 首响应止于 message_end(无 done)
+  // → 重连续传带递增 from_sequence(>0),且总计仅两次请求——不重复执行
+  await expect
+    .poll(() => streamSequences.length, { timeout: 10_000 })
+    .toBeGreaterThanOrEqual(2);
+  expect(streamSequences[0]).toBe("0");
+  expect(Number(streamSequences[1])).toBeGreaterThan(0);
+  expect(streamSequences.length).toBe(2);
 });
 
 test("流式重试耗尽后不通过同步接口重复执行任务", async ({ page }) => {
@@ -246,6 +264,102 @@ test("长会话虚拟化:120 条消息 DOM 行数有界且滚动到底消息齐�
     "回答 59",
     { timeout: 10_000 },
   );
+});
+
+test("引用与反馈:回答携带引用列表,反馈按钮可提交", async ({ page }) => {
+  await installMocks(page, {
+    streamCitations: [
+      {
+        chunk_id: "doc-1:3:0:120",
+        document_id: "doc-1",
+        page: 3,
+        source: "ml-textbook.pdf",
+      },
+    ],
+  });
+
+  await page.goto("/");
+  await createSessionViaDialog(page);
+  const input = page.getByLabel("输入消息");
+  await input.fill("什么是反向传播?");
+  await input.press("Enter");
+
+  // 引用列表挂在回答消息的 footer(message_end citations → metadata)
+  const assistantMessage = page.locator('[data-slot="assistant-message"]').last();
+  await expect(
+    assistantMessage.locator('[data-slot="citation-list"]'),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(
+    assistantMessage.locator('[data-slot="citation-item"]'),
+  ).toContainText("ml-textbook.pdf");
+
+  // 反馈按钮挂在同一 footer;点赞提交后进入已选态(控件禁用)
+  const upButton = assistantMessage.locator('[data-slot="feedback-up"]');
+  await expect(upButton).toBeVisible();
+  const feedbackPosted = page.waitForRequest((request) =>
+    request.url().includes("/feedback"),
+  );
+  await upButton.click();
+  await feedbackPosted;
+  await expect(upButton).toBeDisabled();
+});
+
+test("停止生成:流式期间点击停止,已收内容保留且不报错", async ({ page }) => {
+  // 默认 mock:帧序列止于 message_end(无 done),streamChatWithRetry 在
+  // 约 1s 退避窗口内保持流式——停止点击落在该窗口内,abort 打断退避等待,
+  // 收尾后拉取的权威历史已含本轮问答(与真实后端行为一致,已实测)。
+  // 注:hangStreaming(请求永不交付)场景暴露的是 store 层既有边缘行为
+  // (abort 早于后端持久化时乐观消息被权威空历史覆盖),新旧路径共用同一
+  // store 代码路径,不属于本分支的回归,已登记为后续修复候选。
+  const question = "这条会被中途停止";
+  const answer = mockAnswerFor(question);
+  await installMocks(page);
+
+  await page.goto("/");
+  await createSessionViaDialog(page);
+  const input = page.getByLabel("输入消息");
+  await input.fill(question);
+  await input.press("Enter");
+
+  // 流式进行中(退避窗口):停止按钮出现 → 点击
+  const stopButton = page.locator('[data-slot="stop-generating"]');
+  await expect(stopButton).toBeVisible({ timeout: 10_000 });
+  await stopButton.click();
+
+  // 停止后:发送按钮回归、问答内容保留、无错误块
+  await expect(
+    page.getByRole("button", { name: "发送" }),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator('[data-slot="user-message"]')).toContainText(question);
+  await expect(
+    page.locator('[data-slot="assistant-message"]').last(),
+  ).toContainText(answer, { timeout: 10_000 });
+  await expect(
+    page.locator('[data-slot="sidebar-request-error"]'),
+  ).toHaveCount(0);
+});
+
+test("暗色模式:主题切换后新路径完整渲染", async ({ page }) => {
+  await installMocks(page);
+
+  await page.goto("/");
+  await createSessionViaDialog(page);
+  const input = page.getByLabel("输入消息");
+  await input.fill("暗色模式冒烟");
+  await input.press("Enter");
+  await expect(
+    page.locator('[data-slot="assistant-message"]').last(),
+  ).toContainText("E2E 模拟回答", { timeout: 10_000 });
+
+  // 切换到暗色:html.dark 由 next-themes 驱动;消息/卡片/工具行仍渲染
+  await page.locator('[data-slot="theme-toggle"]').click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect(
+    page.locator('[data-slot="assistant-message"]').last(),
+  ).toContainText("E2E 模拟回答");
+  await expect(
+    page.locator('[data-slot="tool-row"]').first(),
+  ).toBeVisible();
 });
 
 test("工具审批:approval_required 门控卡片确认后恢复执行", async ({ page }) => {

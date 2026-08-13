@@ -80,6 +80,10 @@ let mockPendingHandoff: MockPendingHandoff | null = null;
 let mockPendingToolApproval: Record<string, unknown> | null = null;
 // 门控挂起时暂存最终答案:审批恢复流据此补发 message_end,历史不重复追加
 const mockGatedAnswers = new Map<string, { answer: string; assistantAt: string }>();
+// T16:message_end 携带引用(引用/反馈用例)
+let mockStreamCitations: Record<string, unknown>[] | null = null;
+// T16:悬挂流(停止生成用例)——响应永不交付,请求挂起直到调用方 abort
+let hangStreaming = false;
 let failStreaming = false;
 let sessionCounter = 0;
 
@@ -91,6 +95,10 @@ export type InstallMocksOptions = {
   // 流式通道在 tool_call 后发 approval_required 并挂起(工具审批用例);
   // 决策经 /sessions/{id}/tool-approval/stream 恢复(见下方路由)
   pendingToolApproval?: Record<string, unknown> | null;
+  // message_end 携带的引用列表(引用/反馈用例,契约 Citation 形状)
+  streamCitations?: Record<string, unknown>[] | null;
+  // 悬挂流:响应永不交付(停止生成用例——isStreaming 持续为真直到 abort)
+  hangStreaming?: boolean;
   // 预置会话与消息(用例 3 历史回溯 / 用例 4 归档)
   seedSessions?: MockSession[];
   seedMessages?: Record<string, MockMessage[]>;
@@ -178,6 +186,8 @@ export async function installMocks(
   mockPendingHandoff = options.pendingHandoff ?? null;
   mockPendingToolApproval = options.pendingToolApproval ?? null;
   mockGatedAnswers.clear();
+  mockStreamCitations = options.streamCitations ?? null;
+  hangStreaming = options.hangStreaming ?? false;
   failStreaming = options.failStreaming ?? false;
   // review nit:会话计数一并重置,避免跨用例 id 递增(不影响正确性,
   // 仅让「mock-session-1」在用例间稳定可预期)。
@@ -244,6 +254,12 @@ export async function installMocks(
     };
     const sessionId = body.session_id ?? "mock-session";
     const question = body.message ?? "";
+
+    // T16:悬挂流——永不 fulfill,请求挂起(store 的 isStreaming 持续为真,
+    // 直到调用方 abort;stream-client 的 abort 静默返回语义覆盖收尾)
+    if (hangStreaming) {
+      return;
+    }
 
     if (failStreaming) {
       // 用例 2:恒 500(ErrorResponse 形状,stream-client readErrorDetail
@@ -354,13 +370,22 @@ export async function installMocks(
           agent: "supervisor",
           created_at: assistantAt,
         },
-        citations: null,
+        citations: mockStreamCitations,
       }),
     ];
     await route.fulfill({
       status: 200,
       headers: { "content-type": "text/event-stream" },
       body: frames.join(""),
+    });
+  });
+
+  // ── POST /feedback(T16 引用/反馈用例)——契约 FeedbackResponse ──
+  await page.route("**/feedback", async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ received: true }),
     });
   });
 
