@@ -146,6 +146,61 @@ test("tool call part renders pending, success and error states", async () => {
   assert.match(failed, /超时/);
 });
 
+test("tool call part shows the Chinese activity label for known tools", async () => {
+  const { ToolCallPart } = await loadToolCallPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(ToolCallPart, {
+      type: "tool-call",
+      toolCallId: "tc-9",
+      toolName: "search_knowledge",
+      args: {},
+      argsText: "query=x",
+      status: { type: "running" },
+    }),
+  );
+  assert.match(markup, /检索课程知识库/);
+
+  // 未登记工具诚实降级为原始 tool_name
+  const unknown = renderToStaticMarkup(
+    createElement(ToolCallPart, {
+      type: "tool-call",
+      toolCallId: "tc-10",
+      toolName: "future_tool",
+      args: {},
+      argsText: "",
+      status: { type: "running" },
+    }),
+  );
+  assert.match(unknown, /future_tool/);
+});
+
+// T6 受控复制守卫:新映射表必须与旧面板(collaboration-panel.tsx)保持同步——
+// 旧表每个「工具名: 中文名」条目都要在新表源码中原样出现,防止两处漂移。
+test("tool activity labels stay in sync with the legacy panel table", async () => {
+  const { readFileSync } = await import("node:fs");
+  const labelsPath = new URL("../lib/tool-activity-labels.ts", import.meta.url);
+  const legacyPath = new URL(
+    "../components/collaboration-panel.tsx",
+    import.meta.url,
+  );
+  assert.ok(existsSync(labelsPath), "missing tool-activity-labels lib");
+  const labelsSource = readFileSync(labelsPath, "utf8");
+  const legacySource = readFileSync(legacyPath, "utf8");
+
+  const entries = legacySource.match(/\w+: "[^"]+",/g) ?? [];
+  const toolEntries = entries.filter((entry) =>
+    /^(ask_|create_|detect_|search_|submit_|shell)/.test(entry),
+  );
+  assert.ok(toolEntries.length >= 8, "legacy label table not found");
+  for (const entry of toolEntries) {
+    assert.ok(
+      labelsSource.includes(entry.replace(/,$/, "")),
+      `label entry missing in tool-activity-labels.ts: ${entry}`,
+    );
+  }
+});
+
 // —— AgentSwitchPart / SubagentOutputPart(T4 基础/T8 锚点) ——
 
 test("agent switch part renders a divider with the target role badge", async () => {
