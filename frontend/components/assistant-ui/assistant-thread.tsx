@@ -12,6 +12,7 @@ import { ThreadPrimitive } from "@assistant-ui/react";
 
 import { ChatInput } from "@/components/chat-input";
 
+import { ApprovalCards } from "./approval-cards";
 import { AssistantMessage, UserMessage } from "./assistant-message";
 import { AssistantRuntimeBridge } from "./runtime-provider";
 
@@ -33,6 +34,9 @@ export default function AssistantThread() {
           >
             <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
               <ThreadPrimitive.Messages components={MESSAGE_COMPONENTS} />
+              {/* T9:审批卡片——消息列表尾部、与旧路径同一位置语义;无待决
+                  项时两张卡片均零渲染(组件自身降级) */}
+              <ApprovalCards />
             </div>
           </ThreadPrimitive.Viewport>
           <div
