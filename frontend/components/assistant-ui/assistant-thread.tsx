@@ -1,0 +1,50 @@
+"use client";
+
+// assistant-ui 接入(T4):新渲染路径的 Thread 壳。
+// 布局对齐旧 ConversationPanel(conversation-panel.tsx L613-724):
+// 可滚消息区(aria-live + data-slot="message-list" 锚点保留)+ 底部输入区。
+// 滚动:ThreadPrimitive.Viewport 自带 autoScroll(贴底跟随/上翻暂停,
+// T10 对照 lib/scroll-follow.ts 语义逐项验收);虚拟化 parity 属 T13。
+// 输入区一期原样复用 ChatInput(直连 store 提交,与 Thread 读同一 store,
+// 天然一致;附件/slash-commands/停止按钮零移植成本,原生 Composer 属 T14)。
+
+import { ThreadPrimitive } from "@assistant-ui/react";
+
+import { ChatInput } from "@/components/chat-input";
+
+import { AssistantMessage, UserMessage } from "./assistant-message";
+import { AssistantRuntimeBridge } from "./runtime-provider";
+
+// 消息组件分派表(模块级常量:ThreadPrimitive.Messages 的 memo 按引用比较)
+const MESSAGE_COMPONENTS = {
+  UserMessage,
+  AssistantMessage,
+} as const;
+
+export default function AssistantThread() {
+  return (
+    <AssistantRuntimeBridge>
+      <div className="flex min-h-0 flex-1 flex-col" data-slot="assistant-thread">
+        <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
+          <ThreadPrimitive.Viewport
+            aria-live="polite"
+            className="min-h-0 flex-1 overflow-y-auto"
+            data-slot="message-list"
+          >
+            <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
+              <ThreadPrimitive.Messages components={MESSAGE_COMPONENTS} />
+            </div>
+          </ThreadPrimitive.Viewport>
+          <div
+            className="bg-gradient-to-t from-background via-background to-transparent px-4 pb-4 pt-6 md:px-8"
+            data-slot="chat-input-area"
+          >
+            <div className="mx-auto w-full max-w-4xl">
+              <ChatInput />
+            </div>
+          </div>
+        </ThreadPrimitive.Root>
+      </div>
+    </AssistantRuntimeBridge>
+  );
+}

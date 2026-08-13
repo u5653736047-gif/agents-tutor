@@ -58,7 +58,9 @@ function formatAttachmentSize(size: number): string {
 //   - 加载中显示骨架占位,失败显示降级文案(诚实降级,不破图)。
 // effect 内 await fetch 后 setState(异步回调,set-state-in-effect 只拦
 // 同步路径),SSR 首帧 url=null 渲染占位,无 hydration mismatch。
-function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["attachments"]>[number] }) {
+// assistant-ui 接入(T4):导出供新渲染路径的用户消息组件复用
+// (鉴权 Blob 加载链路单一实现,不接受第二份拷贝)
+export function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["attachments"]>[number] }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const isImage = attachment.content_type?.startsWith("image/") ?? false;

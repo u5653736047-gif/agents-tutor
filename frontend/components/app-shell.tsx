@@ -11,6 +11,7 @@ import {
   Sparkles,
   Sun,
 } from "lucide-react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useTheme } from "next-themes";
 import {
@@ -26,7 +27,13 @@ import {
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
 import { WorkspaceDialog, type WorkspaceDialogMode } from "@/components/workspace-dialog";
+import {
+  ASSISTANT_UI_ENV_DEFAULT,
+  isAssistantUiEnabled,
+  subscribeAssistantUiFlag,
+} from "@/lib/feature-flags";
 import { apiBaseUrl } from "@/lib/api-base-url";
 import { isOnboardingSeen, markOnboardingSeen, subscribeOnboarding } from "@/lib/onboarding";
 import {
@@ -38,6 +45,32 @@ import {
   sidebarWidthForKey,
 } from "@/lib/sidebar-layout";
 import { useChatStore } from "@/stores/chat-store";
+
+// assistant-ui 接入(T4):新渲染路径按需加载——动态导入保证 assistant-ui
+// 代码进独立 async chunk,不增首屏体积(T1 预算门禁);灰度关闭时本分支
+// 完全不加载。loading 骨架与消息气泡结构对齐(徽章 + 两行文本占位)。
+const AssistantThread = dynamic(
+  () => import("@/components/assistant-ui/assistant-thread"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex min-h-0 flex-1 flex-col" data-slot="assistant-thread-loading">
+        <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-5 px-4 py-8 md:px-8">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
+            <div className="flex items-center gap-2">
+              <Skeleton className="size-5 rounded-full" />
+              <Skeleton className="h-4 w-16" />
+            </div>
+            <div className="mt-3 space-y-2">
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-4/5" />
+            </div>
+          </div>
+        </div>
+      </div>
+    ),
+  },
+);
 
 // D5-T4:空态示例问题——点击后按「建会话 → 流式提问」时序快速开始,
 // 不依赖引导标记,新老用户始终可见。
@@ -141,6 +174,15 @@ export function AppShell({ apiConnected }: AppShellProps) {
     subscribeOnboarding,
     isOnboardingSeen,
     () => false,
+  );
+
+  // assistant-ui 接入(T4):渲染路径开关——三快照模式复刻上方 onboarding
+  // 先例:服务端快照恒为 env 默认(SSR/客户端首帧一致,无 hydration
+  // mismatch);localStorage 覆盖在 hydration 后经订阅生效(灰度/回滚操作)。
+  const assistantUiEnabled = useSyncExternalStore(
+    subscribeAssistantUiFlag,
+    isAssistantUiEnabled,
+    () => ASSISTANT_UI_ENV_DEFAULT,
   );
 
   // D5-T4:示例问题点击时序——先 await createSession()(成功时 currentSessionId
@@ -428,8 +470,11 @@ export function AppShell({ apiConnected }: AppShellProps) {
           </div>
         </header>
 
+        {/* assistant-ui 接入(T4):渲染路径唯一切换点——开关开 =
+            AssistantThread(动态加载),关 = 旧 ConversationPanel(封存基线,
+            行为零变化)。除此条件表达式外本文件无任何 assistant-ui 耦合。 */}
         {currentSessionId ? (
-          <ConversationPanel />
+          assistantUiEnabled ? <AssistantThread /> : <ConversationPanel />
         ) : (
           <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-10 md:px-8">
             <div className="w-full max-w-2xl">
