@@ -29,11 +29,19 @@ import { useCallback, type PropsWithChildren } from "react";
 import { type ConvertedMessage } from "@/lib/assistant/message-converter";
 import { useChatStore } from "@/stores/chat-store";
 
+import {
+  attachmentFromPart,
+  createAttachmentAdapter,
+} from "./attachment-adapter";
 import { useThrottledConversation } from "./use-throttled-conversion";
 
 // 恒等转换:消息已在转换器中成形;模块级常量保证引用稳定
 // (convertMessage 变化会击穿 runtime 内部的消息缓存)
 const identityConverter = (message: ConvertedMessage) => message;
+
+// T14:附件适配器(模块级常量,发送时上传语义);T14 子开关关闭时
+// (旧 ChatInput 输入)适配器不被任何附件 UI 触达,零行为变化
+const attachmentAdapter = createAttachmentAdapter();
 
 export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
   // T12:转换输入经帧级合并(≤30fps),store 每 token 的高频 setState
@@ -52,10 +60,18 @@ export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
         .map((part) => part.text)
         .join("\n")
         .trim();
-      if (!text) {
+      // T14:附件回执还原(data-attachment part → 契约 Attachment;
+      // 宽容读取,非法项跳过)——经原生 Composer 提交才有附件
+      const attachments = (message.attachments ?? [])
+        .map((attachment) => attachmentFromPart(attachment))
+        .filter((attachment) => attachment !== null);
+      if (!text && attachments.length === 0) {
         return;
       }
-      await streamSendMessage(text);
+      await streamSendMessage(
+        text,
+        attachments.length > 0 ? attachments : undefined,
+      );
     },
     [streamSendMessage],
   );
@@ -75,6 +91,7 @@ export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
     onNew,
     onCancel,
     onReload,
+    adapters: { attachments: attachmentAdapter },
   });
 
   return (

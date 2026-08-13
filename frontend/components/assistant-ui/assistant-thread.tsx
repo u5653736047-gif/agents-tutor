@@ -12,15 +12,21 @@ import {
   ThreadPrimitive,
   unstable_useThreadMessageIds,
 } from "@assistant-ui/react";
-import { useRef, type RefObject } from "react";
+import { useRef, useSyncExternalStore, type RefObject } from "react";
 
 import { ChatInput } from "@/components/chat-input";
 
+import {
+  ASSISTANT_COMPOSER_ENV_DEFAULT,
+  isAssistantComposerEnabled,
+  subscribeAssistantComposerFlag,
+} from "@/lib/feature-flags";
 import { useChatStore } from "@/stores/chat-store";
 
 import { ApprovalCards } from "./approval-cards";
 import { AssistantMessage, UserMessage } from "./assistant-message";
 import { AssistantRuntimeBridge } from "./runtime-provider";
+import { ComposerNative } from "./composer-native";
 import { RunErrorBlocks } from "./run-error-blocks";
 import { VirtualizedMessages } from "./virtualized-messages";
 
@@ -68,6 +74,12 @@ function MessagesArea({
 export default function AssistantThread() {
   // T13:Viewport 滚动容器引用(虚拟化的 getScrollElement)
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  // T14:原生 Composer 子开关(三快照模式,与主开关同一先例)
+  const composerEnabled = useSyncExternalStore(
+    subscribeAssistantComposerFlag,
+    isAssistantComposerEnabled,
+    () => ASSISTANT_COMPOSER_ENV_DEFAULT,
+  );
   return (
     <AssistantRuntimeBridge>
       <div className="flex min-h-0 flex-1 flex-col" data-slot="assistant-thread">
@@ -95,7 +107,9 @@ export default function AssistantThread() {
             data-slot="chat-input-area"
           >
             <div className="mx-auto w-full max-w-4xl">
-              <ChatInput />
+              {/* T14:输入区子开关——默认旧 ChatInput(生产路径);原生
+                  Composer 单独灰度,行为矩阵等价测试全绿后才允许升默认 */}
+              {composerEnabled ? <ComposerNative /> : <ChatInput />}
             </div>
           </div>
         </ThreadPrimitive.Root>
