@@ -8,7 +8,11 @@
 // 输入区一期原样复用 ChatInput(直连 store 提交,与 Thread 读同一 store,
 // 天然一致;附件/slash-commands/停止按钮零移植成本,原生 Composer 属 T14)。
 
-import { ThreadPrimitive } from "@assistant-ui/react";
+import {
+  ThreadPrimitive,
+  unstable_useThreadMessageIds,
+} from "@assistant-ui/react";
+import { useRef, type RefObject } from "react";
 
 import { ChatInput } from "@/components/chat-input";
 
@@ -18,6 +22,7 @@ import { ApprovalCards } from "./approval-cards";
 import { AssistantMessage, UserMessage } from "./assistant-message";
 import { AssistantRuntimeBridge } from "./runtime-provider";
 import { RunErrorBlocks } from "./run-error-blocks";
+import { VirtualizedMessages } from "./virtualized-messages";
 
 // 消息组件分派表(模块级常量:ThreadPrimitive.Messages 的 memo 按引用比较)
 const MESSAGE_COMPONENTS = {
@@ -41,7 +46,28 @@ function LiveStatusLine() {
   );
 }
 
+// T13:消息区按数量阈值切换全量/虚拟化(与旧路径同一 50 条边界——短会话
+// 全量渲染保持既有行为,长会话虚拟化保 DOM 有界)
+function MessagesArea({
+  viewportRef,
+}: {
+  viewportRef: RefObject<HTMLDivElement | null>;
+}) {
+  const messageIds = unstable_useThreadMessageIds();
+  if (messageIds.length > 50) {
+    return (
+      <VirtualizedMessages
+        components={MESSAGE_COMPONENTS}
+        viewportRef={viewportRef}
+      />
+    );
+  }
+  return <ThreadPrimitive.Messages components={MESSAGE_COMPONENTS} />;
+}
+
 export default function AssistantThread() {
+  // T13:Viewport 滚动容器引用(虚拟化的 getScrollElement)
+  const viewportRef = useRef<HTMLDivElement | null>(null);
   return (
     <AssistantRuntimeBridge>
       <div className="flex min-h-0 flex-1 flex-col" data-slot="assistant-thread">
@@ -50,11 +76,12 @@ export default function AssistantThread() {
             aria-live="polite"
             className="min-h-0 flex-1 overflow-y-auto"
             data-slot="message-list"
+            ref={viewportRef}
           >
             {/* T10:aria-live 区域内的状态播报行(读屏用户可感知生成进行中) */}
             <LiveStatusLine />
             <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
-              <ThreadPrimitive.Messages components={MESSAGE_COMPONENTS} />
+              <MessagesArea viewportRef={viewportRef} />
               {/* T9:审批卡片——消息列表尾部、与旧路径同一位置语义;无待决
                   项时两张卡片均零渲染(组件自身降级) */}
               <ApprovalCards />

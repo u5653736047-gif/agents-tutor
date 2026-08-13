@@ -84,6 +84,25 @@ test("run error blocks wire store fields, presets and retry semantics", () => {
 
 // —— LiveStatusLine 与挂载位置(源码 wiring) ——
 
+test("the thread virtualizes long conversations above the legacy threshold", () => {
+  const source = readFileSync(threadPath, "utf8");
+  const virtualizedPath = new URL(
+    "../components/assistant-ui/virtualized-messages.tsx",
+    import.meta.url,
+  );
+  const virtualizedSource = readFileSync(virtualizedPath, "utf8");
+
+  // 阈值与旧路径同一边界(>50 条),参数照搬现版虚拟化配置
+  assert.match(source, /messageIds\.length > 50/);
+  assert.match(virtualizedSource, /estimateSize: \(\) => 96/);
+  assert.match(virtualizedSource, /overscan: 8/);
+  assert.match(virtualizedSource, /gap: 16/);
+  // headless 组合:id 序列 + 按 id 渲染单条
+  assert.match(virtualizedSource, /unstable_useThreadMessageIds/);
+  assert.match(virtualizedSource, /Unstable_MessageById/);
+  assert.match(virtualizedSource, /measureElement/);
+});
+
 test("the thread announces streaming state inside the aria-live region", () => {
   const source = readFileSync(threadPath, "utf8");
 
@@ -94,10 +113,10 @@ test("the thread announces streaming state inside the aria-live region", () => {
   assert.match(source, /data-slot="live-status"/);
   assert.match(source, /助手正在生成回答…/);
   assert.match(source, /正在发送…/);
-  // 挂载顺序:播报行 → 消息列表 → 审批卡片 → 错误块
-  // (带尖括号检索 JSX 用法,避开文件头注释里的同名提及)
+  // 挂载顺序:播报行 → 消息区(T13 起经 MessagesArea 全量/虚拟化分流)
+  // → 审批卡片 → 错误块(带尖括号检索 JSX 用法,避开注释里的同名提及)
   const liveAt = source.indexOf("<LiveStatusLine");
-  const messagesAt = source.indexOf("<ThreadPrimitive.Messages");
+  const messagesAt = source.indexOf("<MessagesArea");
   const cardsAt = source.indexOf("<ApprovalCards");
   const errorsAt = source.indexOf("<RunErrorBlocks");
   assert.ok(liveAt > 0 && liveAt < messagesAt, "live status before messages");
