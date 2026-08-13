@@ -46,6 +46,8 @@ function emptySlice(overrides: Record<string, unknown> = {}) {
     references: null,
     streamingAgent: null,
     streamingMessage: null,
+    taskPlan: null,
+    taskResults: null,
     ...overrides,
   };
 }
@@ -343,10 +345,12 @@ test("worker message_delta becomes subagent-output card; supervisor is skipped",
 
 test("unmapped event types are tolerated and skipped", async () => {
   const { convertConversationToThreadMessages } = await loadConverter();
+  // thinking 自 T8 起已映射为 data part;本用例只保留真正未映射的类型
+  // (approval_required 属 T9 消息外挂载;error/done 由 store 错误态呈现)
   const out = convertConversationToThreadMessages(
     emptySlice({
       events: [
-        makeEvent({ content: "阶段提示", event_type: "thinking", sequence: 1 }),
+        makeEvent({ event_type: "approval_required", sequence: 1 }),
         makeEvent({ event_type: "done", sequence: 2 }),
         makeEvent({ error_code: "model_call_failed", event_type: "error", sequence: 3 }),
       ],
@@ -448,6 +452,107 @@ test("process parts fold into the last assistant message after session reload", 
   assert.equal(parts[1]?.type, "tool-call");
   assert.deepEqual(parts[2], { type: "text", text: "权威回答" });
   assert.deepEqual(customOf(out[1]!).citations, citations);
+});
+
+// —— T8:thinking 与计划步骤 data parts ——
+
+test("thinking events become thinking data parts, skipping blanks", async () => {
+  const { convertConversationToThreadMessages } = await loadConverter();
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      events: [
+        makeEvent({
+          agent: "supervisor",
+          content: "正在分析问题并规划协作",
+          event_type: "thinking",
+          sequence: 1,
+        }),
+        makeEvent({ content: "  ", event_type: "thinking", sequence: 2 }),
+      ],
+      isStreaming: true,
+    }),
+  );
+
+  const parts = partsOf(out[0]!);
+  assert.deepEqual(parts, [
+    {
+      type: "data",
+      name: "thinking",
+      data: { agent: "supervisor", content: "正在分析问题并规划协作" },
+    },
+  ]);
+});
+
+test("task plan becomes a leading plan-steps data part", async () => {
+  const { convertConversationToThreadMessages } = await loadConverter();
+  const taskPlan = {
+    current_step_index: 1,
+    status: "active",
+    steps: [
+      { description: "检索资料", sequence: 1, target_agent: "learning_assistant" },
+      { description: "评价回答", sequence: 2, target_agent: "evaluator" },
+    ],
+  };
+  const taskResults = [
+    {
+      error_code: null,
+      output: "检索完成",
+      step_sequence: 1,
+      success: true,
+      target_agent: "learning_assistant",
+    },
+  ];
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      events: [
+        makeEvent({ content: "思考", event_type: "reasoning", sequence: 1 }),
+      ],
+      isStreaming: true,
+      taskPlan,
+      taskResults,
+    }),
+  );
+
+  const parts = partsOf(out[0]!);
+  // 计划步骤条在首位(计划先于执行),过程 parts 紧随其后
+  assert.equal(parts[0]?.type, "data");
+  assert.equal(parts[0]?.name, "plan-steps");
+  assert.deepEqual(parts[0]?.data, { plan: taskPlan, results: taskResults });
+  assert.deepEqual(parts[1], { type: "reasoning", text: "思考" });
+});
+
+test("plan and thinking parts fold into history on session reload", async () => {
+  const { convertConversationToThreadMessages } = await loadConverter();
+  const taskPlan = {
+    current_step_index: 2,
+    status: "completed",
+    steps: [
+      { description: "检索资料", sequence: 1, target_agent: "learning_assistant" },
+      { description: "评价回答", sequence: 2, target_agent: "evaluator" },
+    ],
+  };
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      events: [
+        makeEvent({
+          agent: "supervisor",
+          content: "规划完毕",
+          event_type: "thinking",
+          sequence: 1,
+        }),
+      ],
+      messages: [
+        makeMessage({ content: "问", created_at: "t1", role: "user" }),
+        makeMessage({ content: "答", created_at: "t2", role: "assistant" }),
+      ],
+      taskPlan,
+    }),
+  );
+
+  const parts = partsOf(out[1]!);
+  assert.equal(parts[0]?.name, "plan-steps");
+  assert.equal(parts[1]?.name, "thinking");
+  assert.deepEqual(parts[2], { type: "text", text: "答" });
 });
 
 // —— 性能:1000 事件转换单帧内完成(16ms 预算) ——

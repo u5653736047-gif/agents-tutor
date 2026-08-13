@@ -48,6 +48,9 @@ export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
   const streamSendMessage = useChatStore((state) => state.streamSendMessage);
   const cancelStreaming = useChatStore((state) => state.cancelStreaming);
   const retryLastMessage = useChatStore((state) => state.retryLastMessage);
+  // T8:任务计划与步骤结果(计划步骤条 data part 的数据源)
+  const taskPlan = useChatStore((state) => state.taskPlan);
+  const taskResults = useChatStore((state) => state.taskResults);
 
   const converted = useMemo(
     () =>
@@ -58,8 +61,19 @@ export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
         references,
         streamingAgent,
         streamingMessage,
+        taskPlan,
+        taskResults,
       }),
-    [events, isStreaming, messages, references, streamingAgent, streamingMessage],
+    [
+      events,
+      isStreaming,
+      messages,
+      references,
+      streamingAgent,
+      streamingMessage,
+      taskPlan,
+      taskResults,
+    ],
   );
 
   const onNew = useCallback(

@@ -19,9 +19,11 @@ import { useChatStore } from "@/stores/chat-store";
 
 import { AssistantMessageFooter } from "./assistant-message-footer";
 import { AgentSwitchPart } from "./parts/agent-switch-part";
+import { PlanStepsPart } from "./parts/plan-steps-part";
 import { ReasoningPart } from "./parts/reasoning-part";
 import { SubagentOutputPart } from "./parts/subagent-output-part";
 import { AssistantTextPart, UserTextPart } from "./parts/text-part";
+import { ThinkingPart } from "./parts/thinking-part";
 import { ToolCallPart } from "./parts/tool-call-part";
 
 type Attachment = NonNullable<
@@ -38,7 +40,9 @@ const ASSISTANT_PART_COMPONENTS = {
   data: {
     by_name: {
       "agent-switch": AgentSwitchPart,
+      "plan-steps": PlanStepsPart,
       "subagent-output": SubagentOutputPart,
+      thinking: ThinkingPart,
     },
   },
 } as const;

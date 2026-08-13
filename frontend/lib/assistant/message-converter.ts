@@ -23,8 +23,11 @@
 //   supervisor 流 / message_end → streamingMessage.content 作为在飞消息的
 //                            末尾 text part;references 写入该消息
 //                            metadata.custom.citations
-//   thinking / approval_required / error / done → v1 不映射(thinking 与
-//                            审批在 T8/T9 接入;error/done 由 store 错误态呈现)
+//   thinking               → { type: "data", name: "thinking" }(T8:阶段提示行)
+//   taskPlan/taskResults   → { type: "data", name: "plan-steps" }(T8:计划步骤
+//                            条,置于过程 parts 首位——计划先于执行)
+//   approval_required / error / done → 不映射(审批卡片属 T9 的消息外挂载;
+//                            error/done 由 store 错误态呈现)
 //
 // 在飞消息合成规则(避免与历史重复的关键):
 //   - isStreaming 或 streamingMessage 非空 → 追加一条在飞 assistant 消息,
@@ -55,6 +58,8 @@ type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
 type Citation = components["schemas"]["Citation"];
 type AgentRole = components["schemas"]["AgentRole"];
+type TaskPlan = components["schemas"]["TaskPlan"];
+type TaskResult = components["schemas"]["TaskResult"];
 type ConversationEvent = RunEvent | StreamEvent;
 
 /** 转换器的输入:chat-store 会话状态的最小只读切片。 */
@@ -65,6 +70,10 @@ export type ConversationSlice = {
   streamingAgent: AgentRole | null;
   isStreaming: boolean;
   references: Citation[] | null;
+  // T8:当前轮的任务计划与步骤结果(store 的 taskPlan/taskResults,
+  // 过程快照恢复时随 getSessionProcess 一并回填)
+  taskPlan: TaskPlan | null;
+  taskResults: TaskResult[] | null;
 };
 
 /** metadata.custom 的键——集中定义,渲染层(T4+)按此读取。 */
@@ -230,12 +239,39 @@ function appendToolOutput(
   // 旧 CollaborationPanel 一致:tool_output 只依附已有工具行)
 }
 
-function eventsToProcessParts(events: ConversationEvent[]): AssistantPart[] {
+function eventsToProcessParts(
+  events: ConversationEvent[],
+  taskPlan: TaskPlan | null,
+  taskResults: TaskResult[] | null,
+): AssistantPart[] {
   const state: ProcessParts = { parts: [], lastSwitchAgent: null };
   const indexByToolCallId = new Map<string, number>();
 
+  // T8:计划步骤条置于过程 parts 首位(计划先于执行);taskPlan 缺失时
+  // 不产生 part(直接回答轮次无计划,与旧面板空态语义一致)
+  if (taskPlan) {
+    state.parts.push({
+      type: "data",
+      name: "plan-steps",
+      data: { plan: taskPlan, results: taskResults },
+    });
+  }
+
   for (const event of events) {
     switch (event.event_type) {
+      case "thinking": {
+        // T8:阶段提示行(「正在分析问题并规划协作」等占位文案)
+        const content = event.content ?? "";
+        if (!content.trim()) {
+          break;
+        }
+        state.parts.push({
+          type: "data",
+          name: "thinking",
+          data: { agent: event.agent ?? null, content },
+        });
+        break;
+      }
       case "reasoning": {
         const text = event.content ?? "";
         if (!text.trim()) {
@@ -301,8 +337,8 @@ function eventsToProcessParts(events: ConversationEvent[]): AssistantPart[] {
         break;
       }
       default:
-        // thinking / approval_required / message_end / error / done / 未知类型:
-        // v1 不映射(见文件头映射表注释),宽容跳过
+        // approval_required / message_end / error / done / 未知类型不映射
+        // (见文件头映射表注释),宽容跳过
         break;
     }
   }
@@ -360,7 +396,11 @@ export function convertConversationToThreadMessages(
     convertHistoryMessage(message, index),
   );
 
-  const processParts = eventsToProcessParts(slice.events);
+  const processParts = eventsToProcessParts(
+    slice.events,
+    slice.taskPlan,
+    slice.taskResults,
+  );
   const liveMessage = buildLiveMessage(slice, processParts);
   if (liveMessage) {
     output.push(liveMessage);

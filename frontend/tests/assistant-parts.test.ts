@@ -27,6 +27,14 @@ const footerPath = new URL(
   "../components/assistant-ui/assistant-message-footer.tsx",
   import.meta.url,
 );
+const thinkingPartPath = new URL(
+  "../components/assistant-ui/parts/thinking-part.tsx",
+  import.meta.url,
+);
+const planStepsPartPath = new URL(
+  "../components/assistant-ui/parts/plan-steps-part.tsx",
+  import.meta.url,
+);
 
 async function loadReasoningPart() {
   assert.ok(existsSync(reasoningPartPath), "missing reasoning part");
@@ -51,6 +59,16 @@ async function loadSubagentOutputPart() {
 async function loadFooter() {
   assert.ok(existsSync(footerPath), "missing assistant message footer");
   return import("../components/assistant-ui/assistant-message-footer");
+}
+
+async function loadThinkingPart() {
+  assert.ok(existsSync(thinkingPartPath), "missing thinking part");
+  return import("../components/assistant-ui/parts/thinking-part");
+}
+
+async function loadPlanStepsPart() {
+  assert.ok(existsSync(planStepsPartPath), "missing plan-steps part");
+  return import("../components/assistant-ui/parts/plan-steps-part");
 }
 
 // —— ReasoningPart(T5) ——
@@ -306,4 +324,92 @@ test("assistant footer degrades to nothing without citations or feedback", async
   );
   assert.match(feedbackOnly, /data-slot="feedback-up"/);
   assert.doesNotMatch(feedbackOnly, /data-slot="citation-list"/);
+});
+
+// —— ThinkingPart / PlanStepsPart(T8) ——
+
+test("thinking part renders the stage line with role badge", async () => {
+  const { ThinkingPart } = await loadThinkingPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(ThinkingPart, {
+      type: "data",
+      name: "thinking",
+      data: { agent: "supervisor", content: "正在分析问题并规划协作" },
+      status: { type: "complete" },
+    }),
+  );
+  assert.match(markup, /data-slot="thinking-row"/);
+  assert.match(markup, /Supervisor/);
+  assert.match(markup, /正在分析问题并规划协作/);
+
+  // 空内容零渲染
+  const empty = renderToStaticMarkup(
+    createElement(ThinkingPart, {
+      type: "data",
+      name: "thinking",
+      data: { agent: null, content: " " },
+      status: { type: "complete" },
+    }),
+  );
+  assert.equal(empty, "");
+});
+
+test("plan steps part renders status pill, current highlight and result marks", async () => {
+  const { PlanStepsPart } = await loadPlanStepsPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(PlanStepsPart, {
+      type: "data",
+      name: "plan-steps",
+      data: {
+        plan: {
+          current_step_index: 1,
+          status: "active",
+          steps: [
+            {
+              description: "检索资料",
+              sequence: 1,
+              target_agent: "learning_assistant",
+            },
+            { description: "评价回答", sequence: 2, target_agent: "evaluator" },
+          ],
+        },
+        results: [
+          {
+            error_code: null,
+            output: "检索完成",
+            step_sequence: 1,
+            success: true,
+            target_agent: "learning_assistant",
+          },
+        ],
+      },
+      status: { type: "complete" },
+    }),
+  );
+
+  assert.match(markup, /data-slot="plan-steps"/);
+  assert.match(markup, /进行中/);
+  assert.match(markup, /计划共 2 步/);
+  assert.match(markup, /检索资料/);
+  assert.match(markup, /评价回答/);
+  // 当前步骤 ring 高亮 + 已完成步骤的成功标记
+  assert.match(markup, /data-current="true"/);
+  assert.match(markup, /data-result="success"/);
+  assert.match(markup, /检索完成/);
+});
+
+test("plan steps part renders nothing for dirty plan data", async () => {
+  const { PlanStepsPart } = await loadPlanStepsPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(PlanStepsPart, {
+      type: "data",
+      name: "plan-steps",
+      data: { plan: { status: "active" }, results: null },
+      status: { type: "complete" },
+    }),
+  );
+  assert.equal(markup, "");
 });
