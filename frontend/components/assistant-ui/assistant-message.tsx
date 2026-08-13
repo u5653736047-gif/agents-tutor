@@ -21,6 +21,7 @@ import { AssistantMessageFooter } from "./assistant-message-footer";
 import { AgentSwitchPart } from "./parts/agent-switch-part";
 import { PlanStepsPart } from "./parts/plan-steps-part";
 import { ReasoningPart } from "./parts/reasoning-part";
+import { StreamingEmpty } from "./parts/streaming-empty";
 import { SubagentOutputPart } from "./parts/subagent-output-part";
 import { AssistantTextPart, UserTextPart } from "./parts/text-part";
 import { ThinkingPart } from "./parts/thinking-part";
@@ -36,6 +37,8 @@ type Citation = components["schemas"]["Citation"];
 const ASSISTANT_PART_COMPONENTS = {
   Text: AssistantTextPart,
   Reasoning: ReasoningPart,
+  // T10:在飞消息首事件前的骨架(Empty 槽位,仅在飞 running 态展示)
+  Empty: StreamingEmpty,
   tools: { Fallback: ToolCallPart },
   data: {
     by_name: {

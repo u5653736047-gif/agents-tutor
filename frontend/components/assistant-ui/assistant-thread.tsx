@@ -12,15 +12,34 @@ import { ThreadPrimitive } from "@assistant-ui/react";
 
 import { ChatInput } from "@/components/chat-input";
 
+import { useChatStore } from "@/stores/chat-store";
+
 import { ApprovalCards } from "./approval-cards";
 import { AssistantMessage, UserMessage } from "./assistant-message";
 import { AssistantRuntimeBridge } from "./runtime-provider";
+import { RunErrorBlocks } from "./run-error-blocks";
 
 // 消息组件分派表(模块级常量:ThreadPrimitive.Messages 的 memo 按引用比较)
 const MESSAGE_COMPONENTS = {
   UserMessage,
   AssistantMessage,
 } as const;
+
+// T10:流式状态 sr-only 播报行——复刻旧面板(conversation-panel.tsx L298-302):
+// 位于 aria-live 区域内,进入/离开流式由读屏自然播报;结束不播报(live
+// region 内容清空即表示结束)。isStreaming 优先于 isSending(两者理论互斥)。
+function LiveStatusLine() {
+  const isSending = useChatStore((state) => state.isSending);
+  const isStreaming = useChatStore((state) => state.isStreaming);
+  if (!isStreaming && !isSending) {
+    return null;
+  }
+  return (
+    <p className="sr-only" data-slot="live-status">
+      {isStreaming ? "助手正在生成回答…" : "正在发送…"}
+    </p>
+  );
+}
 
 export default function AssistantThread() {
   return (
@@ -32,11 +51,16 @@ export default function AssistantThread() {
             className="min-h-0 flex-1 overflow-y-auto"
             data-slot="message-list"
           >
+            {/* T10:aria-live 区域内的状态播报行(读屏用户可感知生成进行中) */}
+            <LiveStatusLine />
             <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
               <ThreadPrimitive.Messages components={MESSAGE_COMPONENTS} />
               {/* T9:审批卡片——消息列表尾部、与旧路径同一位置语义;无待决
                   项时两张卡片均零渲染(组件自身降级) */}
               <ApprovalCards />
+              {/* T10:运行/网络错误块——审批卡片之后,与旧路径同一位置;
+                  无错误时零渲染 */}
+              <RunErrorBlocks />
             </div>
           </ThreadPrimitive.Viewport>
           <div
