@@ -24,57 +24,24 @@ import {
   useExternalStoreRuntime,
   type AppendMessage,
 } from "@assistant-ui/react";
-import { useCallback, useMemo, type PropsWithChildren } from "react";
+import { useCallback, type PropsWithChildren } from "react";
 
-import {
-  convertConversationToThreadMessages,
-  type ConvertedMessage,
-} from "@/lib/assistant/message-converter";
+import { type ConvertedMessage } from "@/lib/assistant/message-converter";
 import { useChatStore } from "@/stores/chat-store";
+
+import { useThrottledConversation } from "./use-throttled-conversion";
 
 // 恒等转换:消息已在转换器中成形;模块级常量保证引用稳定
 // (convertMessage 变化会击穿 runtime 内部的消息缓存)
 const identityConverter = (message: ConvertedMessage) => message;
 
 export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
-  const events = useChatStore((state) => state.events);
-  const isSending = useChatStore((state) => state.isSending);
-  const isStreaming = useChatStore((state) => state.isStreaming);
-  const messages = useChatStore((state) => state.messages);
-  const pendingToolApproval = useChatStore((state) => state.pendingToolApproval);
-  const references = useChatStore((state) => state.references);
-  const streamingAgent = useChatStore((state) => state.streamingAgent);
-  const streamingMessage = useChatStore((state) => state.streamingMessage);
+  // T12:转换输入经帧级合并(≤30fps),store 每 token 的高频 setState
+  // 在此降频;isRunning/isSendDisabled 同切片派生,语义不变
+  const { converted, isRunning, isSendDisabled } = useThrottledConversation();
   const streamSendMessage = useChatStore((state) => state.streamSendMessage);
   const cancelStreaming = useChatStore((state) => state.cancelStreaming);
   const retryLastMessage = useChatStore((state) => state.retryLastMessage);
-  // T8:任务计划与步骤结果(计划步骤条 data part 的数据源)
-  const taskPlan = useChatStore((state) => state.taskPlan);
-  const taskResults = useChatStore((state) => state.taskResults);
-
-  const converted = useMemo(
-    () =>
-      convertConversationToThreadMessages({
-        events,
-        isStreaming,
-        messages,
-        references,
-        streamingAgent,
-        streamingMessage,
-        taskPlan,
-        taskResults,
-      }),
-    [
-      events,
-      isStreaming,
-      messages,
-      references,
-      streamingAgent,
-      streamingMessage,
-      taskPlan,
-      taskResults,
-    ],
-  );
 
   const onNew = useCallback(
     async (message: AppendMessage) => {
@@ -103,8 +70,8 @@ export function AssistantRuntimeBridge({ children }: PropsWithChildren) {
   const runtime = useExternalStoreRuntime<ConvertedMessage>({
     messages: converted,
     convertMessage: identityConverter,
-    isRunning: isStreaming || isSending,
-    isSendDisabled: pendingToolApproval !== null,
+    isRunning,
+    isSendDisabled,
     onNew,
     onCancel,
     onReload,
