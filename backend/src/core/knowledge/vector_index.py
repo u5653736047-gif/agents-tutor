@@ -204,6 +204,10 @@ class InMemoryVectorKnowledgeIndex:
             if chunk_id in self._chunks
         }
 
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2）：不存在返回 None（内存 dict 查询）。"""
+        return self._chunks.get(chunk_id)
+
     def search(
         self,
         query: str,
@@ -431,6 +435,15 @@ class SqliteVectorKnowledgeIndex:
                 (document_id,),
             ).fetchone()
         return row is not None
+
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2）：从内存矩阵取，不存在返回 None。
+
+        向量库与词法库同源（同一批 upsert 写入），实现该读接口保持
+        协议完整；锁内浅拷贝读（与 search 同一并发约定）。
+        """
+        with self._lock:
+            return self._chunks.get(chunk_id)
 
     def close(self) -> None:
         """关闭底层数据库连接（进程退出前调用，与词法库用法一致）。"""

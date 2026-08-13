@@ -211,6 +211,17 @@ class KnowledgeIndex(Protocol):
         """
         ...
 
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """Fetch one chunk by ID (I2：查看原文 / 分块回溯的读接口）。
+
+        返回 None 表示不存在（约定与 delete_document 的幂等删除
+        一致：调用方不做存在性判断，读接口用 None 表达未命中）。
+        实现说明：可选能力——混合索引 / 服务层依赖它做「引用回溯」，
+        纯检索场景可以抛 NotImplementedError 或不实现（鸭子类型
+        不强制）；Sqlite / InMemory 必须实现（它们是底线索引）。
+        """
+        ...
+
 
 class InMemoryKnowledgeIndex:
     """内存词法索引：仅测试/单线程使用（生产装配用 SqliteKnowledgeIndex）。
@@ -234,6 +245,25 @@ class InMemoryKnowledgeIndex:
             for chunk_id, chunk in self._chunks.items()
             if chunk.document_id != document_id
         }
+
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2）：不存在返回 None（dict 查询）。"""
+        return self._chunks.get(chunk_id)
+
+    def chunks_of_document(self, document_id: str) -> list[KnowledgeChunk]:
+        """读取某文档的全部分块（I2 浏览）：按 (start, chunk_id) 排序。
+
+        与 SqliteKnowledgeIndex 的 chunks_of_document 同一顺序约定
+        （与入库顺序一致），保证多次读取顺序稳定、跨实现行为一致。
+        """
+        return sorted(
+            (
+                chunk
+                for chunk in self._chunks.values()
+                if chunk.document_id == document_id
+            ),
+            key=lambda chunk: (chunk.start, chunk.chunk_id),
+        )
 
     def search(
         self,
@@ -373,6 +403,41 @@ class SqliteKnowledgeIndex:
                 "DELETE FROM chunks WHERE document_id = ?", (document_id,)
             )
             self._conn.commit()
+
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2）：不存在返回 None。
+
+        与 upsert / chunks_of_document 同一行结构反序列化；锁内
+        execute + fetchone 取快照（同一连接不容并发操作）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT chunk_id, document_id, content, source, page, start, end, "
+                "metadata_json FROM chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        (
+            stored_chunk_id,
+            document_id,
+            content,
+            source,
+            page,
+            start,
+            end,
+            metadata_json,
+        ) = row
+        return KnowledgeChunk(
+            chunk_id=stored_chunk_id,
+            document_id=document_id,
+            content=content,
+            source=source,
+            page=page,
+            start=start,
+            end=end,
+            metadata=json.loads(metadata_json),
+        )
 
     def search(
         self,

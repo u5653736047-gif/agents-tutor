@@ -116,6 +116,27 @@ class HybridKnowledgeIndex:
         if self._vector is not None:
             self._vector.delete_document(document_id)
 
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2）：转发给词法路（永不降级的底线）。
+
+        两路同源（同一批 upsert 写入），以词法路为准——与 RRF 融合
+        时「chunk/citation 以词法路对象为准」同一约定（见 search）。
+        """
+        return self._lexical.chunk(chunk_id)
+
+    def chunks_of_document(self, document_id: str) -> list[KnowledgeChunk]:
+        """读取某文档的全部分块（I2 浏览）：转发给词法路。
+
+        与 chunk 同一约定（两路同源、以词法路为准，见 chunk 注释）。
+        词法路是 InMemory / Sqlite 实现，两者都有 chunks_of_document；
+        getattr 兜底与 search 降级语义一致——缺该能力（理论上的替身
+        索引）返回空列表，不抛错（browse 端点经服务层同样兜底）。
+        """
+        getter = getattr(self._lexical, "chunks_of_document", None)
+        if getter is None:
+            return []
+        return list(getter(document_id))
+
     def search(
         self,
         query: str,

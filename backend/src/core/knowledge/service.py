@@ -180,6 +180,22 @@ class KnowledgeService:
         """Remove all chunks for a document."""
         self._index.delete_document(document_id)
 
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2：查看原文 / 引用回溯的读接口）。
+
+        与 search 同一输入校验哲学（面向初学者）：chunk_id 是引用
+        凭证（document_id:page:start:end 形态），空白 / 过长的
+        chunk_id 不可能是合法引用——返回 None（未命中），不向索引
+        发起无意义的查询。索引未实现 chunk（鸭子契约缺失时）同样
+        返回 None，与「读接口未命中」语义一致，不抛错。
+        """
+        if not chunk_id or not chunk_id.strip() or len(chunk_id) > 512:
+            return None
+        getter = getattr(self._index, "chunk", None)
+        if getter is None:
+            return None
+        return getter(chunk_id)  # type: ignore[no-any-return]
+
     def search(
         self,
         query: str,
