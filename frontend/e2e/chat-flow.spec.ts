@@ -36,6 +36,18 @@ test.beforeEach(async ({ page }) => {
   }
 });
 
+// 现行 UI 的建会话链路:侧栏「新建会话」→ 工作空间对话框填路径提交
+// (validateWorkspace 由 mocks.ts 伪造)→ createSession。两个老用例写于
+// 对话框引入之前,此处补齐同步(测试破坏点强制同步规范)。
+async function createSessionViaDialog(page: import("@playwright/test").Page) {
+  await page.getByRole("button", { name: "新建会话" }).click();
+  const dialog = page.locator('[data-slot="workspace-dialog"]');
+  await expect(dialog).toBeVisible();
+  await page.getByLabel("工作空间绝对路径").fill("D:\\CODE\\Agents");
+  await dialog.getByRole("button", { name: "使用此文件夹" }).click();
+  await expect(dialog).toHaveCount(0);
+}
+
 test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染", async ({ page }) => {
   const question = "E2E 什么是注意力机制?";
   const answer = mockAnswerFor(question);
@@ -44,8 +56,8 @@ test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染
   // 空态:侧栏无会话
   await expect(page.getByText("暂无会话")).toBeVisible();
 
-  // 新建会话(侧栏按钮,aria-label="新建会话")
-  await page.getByRole("button", { name: "新建会话" }).click();
+  // 新建会话(侧栏按钮 → 工作空间对话框)
+  await createSessionViaDialog(page);
   const input = page.getByLabel("输入消息");
   await expect(input).toBeVisible();
 
@@ -100,7 +112,7 @@ test("流式重试耗尽后不通过同步接口重复执行任务", async ({ pa
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "新建会话" }).click();
+  await createSessionViaDialog(page);
   const input = page.getByLabel("输入消息");
   await expect(input).toBeVisible();
   await input.fill("这条任务只能执行一次");

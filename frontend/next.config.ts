@@ -8,6 +8,11 @@ const bundleAnalyzer = withBundleAnalyzer({
   enabled: process.env.ANALYZE === "true",
 });
 
-const nextConfig: NextConfig = {};
+const nextConfig: NextConfig = {
+  // Playwright e2e:Next 16 dev server 默认拦截「跨源」dev 资源请求
+  // (HMR/chunk 加载被阻,页面 JS 永不就绪)——本机回环地址加入白名单。
+  // 仅影响 dev server,生产构建无此路径。
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
+};
 
 export default bundleAnalyzer(nextConfig);

@@ -76,6 +76,10 @@ let mockSessions: MockSession[] = [];
 const mockMessagesBySession = new Map<string, MockMessage[]>();
 const mockProcessBySession = new Map<string, Record<string, unknown>[]>();
 let mockPendingHandoff: MockPendingHandoff | null = null;
+// assistant-ui 接入(T16):工具审批门控(approval_required 事件流用例)
+let mockPendingToolApproval: Record<string, unknown> | null = null;
+// 门控挂起时暂存最终答案:审批恢复流据此补发 message_end,历史不重复追加
+const mockGatedAnswers = new Map<string, { answer: string; assistantAt: string }>();
 let failStreaming = false;
 let sessionCounter = 0;
 
@@ -84,6 +88,9 @@ export type InstallMocksOptions = {
   failStreaming?: boolean;
   // 同步 /chat 与 GET /handoff 返回的待审批(独立接口用例使用)
   pendingHandoff?: MockPendingHandoff | null;
+  // 流式通道在 tool_call 后发 approval_required 并挂起(工具审批用例);
+  // 决策经 /sessions/{id}/tool-approval/stream 恢复(见下方路由)
+  pendingToolApproval?: Record<string, unknown> | null;
   // 预置会话与消息(用例 3 历史回溯 / 用例 4 归档)
   seedSessions?: MockSession[];
   seedMessages?: Record<string, MockMessage[]>;
@@ -169,6 +176,8 @@ export async function installMocks(
     mockProcessBySession.set(sessionId, [...events]);
   }
   mockPendingHandoff = options.pendingHandoff ?? null;
+  mockPendingToolApproval = options.pendingToolApproval ?? null;
+  mockGatedAnswers.clear();
   failStreaming = options.failStreaming ?? false;
   // review nit:会话计数一并重置,避免跨用例 id 递增(不影响正确性,
   // 仅让「mock-session-1」在用例间稳定可预期)。
@@ -200,6 +209,30 @@ export async function installMocks(
       body: JSON.stringify({ status: "ok" }),
     }),
   );
+
+  // ── 工作空间(T16 补登记):POST /workspaces/validate 与
+  //    GET /workspaces/directories——新建会话必经工作空间对话框
+  //    (D4-Tx 引入,早于本套件),按 WorkspacePath/DirectoryListing 契约伪造
+  await page.route("**/workspaces/validate", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      path?: string;
+    };
+    const requested = body.path ?? "D:\\CODE\\Agents";
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ name: "Agents", path: requested }),
+    });
+  });
+  await page.route("**/workspaces/directories", async (route) => {
+    const url = new URL(route.request().url());
+    const current = url.searchParams.get("path") ?? "D:\\CODE\\Agents";
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ directories: [], parent: null, path: current }),
+    });
+  });
 
   // ── POST /chat/stream?from_sequence=N(SSE) ──
   await page.route(/\/chat\/stream(?:\?.*)?$/, async (route) => {
@@ -282,6 +315,29 @@ export async function installMocks(
       },
     ];
     mockProcessBySession.set(sessionId, processEvents);
+    // T16:工具审批用例——tool_call 之后发 approval_required 即收尾
+    // (不发 message_end/done,模拟门控挂起;恢复走 tool-approval/stream)。
+    // 历史已在上方 appendHistory 写入最终问答;这里暂存答案供恢复流
+    // 补发 message_end(与历史同一条,不重复追加)。
+    if (mockPendingToolApproval) {
+      mockGatedAnswers.set(sessionId, { answer, assistantAt });
+      const frames = [
+        ...processEvents.map((event) => sseFrame(event)),
+        sseFrame({
+          event_type: "approval_required",
+          sequence: 5,
+          session_id: sessionId,
+          agent: "supervisor",
+          pending_tool_approval: mockPendingToolApproval,
+        }),
+      ];
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        body: frames.join(""),
+      });
+      return;
+    }
     const frames = [
       ...processEvents.map((event) => sseFrame(event)),
       // message_end:content 为最终消息全文,message 与 getSessionMessages
@@ -305,6 +361,52 @@ export async function installMocks(
       status: 200,
       headers: { "content-type": "text/event-stream" },
       body: frames.join(""),
+    });
+  });
+
+  // ── POST /sessions/{id}/tool-approval/stream(T16 工具审批恢复通道) ──
+  // 决策(confirm/reject)后后端恢复执行:补发门控时暂存的最终答案
+  // message_end + done 收尾(不重复执行整轮,与 D1-T3 回放语义一致)
+  await page.route("**/sessions/*/tool-approval/stream", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    const gated = mockGatedAnswers.get(sessionId) ?? {
+      answer: mockAnswerFor("审批后恢复"),
+      assistantAt: iso(),
+    };
+    mockPendingToolApproval = null;
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        sseFrame({
+          event_type: "message_end",
+          sequence: 6,
+          session_id: sessionId,
+          agent: "supervisor",
+          content: gated.answer,
+          message: {
+            role: "assistant",
+            content: gated.answer,
+            agent: "supervisor",
+            created_at: gated.assistantAt,
+          },
+          citations: null,
+        }),
+        sseFrame({ event_type: "done", sequence: 7, session_id: sessionId }),
+      ].join(""),
+    });
+  });
+
+  // ── GET /sessions/{id}/tool-approval(决策后兜底刷新) ──
+  await page.route("**/sessions/*/tool-approval", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        session_id: sessionId,
+        pending_tool_approval: mockPendingToolApproval,
+      }),
     });
   });
 
