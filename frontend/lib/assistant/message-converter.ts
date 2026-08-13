@@ -72,6 +72,9 @@ export const CUSTOM_METADATA_KEYS = {
   agent: "agent",
   attachments: "attachments",
   citations: "citations",
+  // 反馈提交的 message_id 契约值:后端按消息的 created_at 原文匹配,
+  // 必须原样透传(Date 序列化会丢微秒位,见 T7 转换处注释)
+  messageId: "messageId",
 } as const;
 
 /**
@@ -124,6 +127,11 @@ function convertHistoryMessage(
     message.attachments.length > 0
   ) {
     custom[CUSTOM_METADATA_KEYS.attachments] = message.attachments;
+  }
+  // T7:反馈按钮的 messageId——created_at 原样透传(权威历史消息才有;
+  // 乐观/流式消息缺省,反馈按钮按旧路径语义不渲染)
+  if (message.created_at) {
+    custom[CUSTOM_METADATA_KEYS.messageId] = message.created_at;
   }
   const converted: ConvertedMessage = {
     id: messageIdFor(message, index),
@@ -323,6 +331,10 @@ function buildLiveMessage(
   }
   if (references && references.length > 0) {
     custom[CUSTOM_METADATA_KEYS.citations] = references;
+  }
+  // T7:与历史消息同一语义——message_end 的权威消息携带 created_at 时透传
+  if (streamingMessage?.created_at) {
+    custom[CUSTOM_METADATA_KEYS.messageId] = streamingMessage.created_at;
   }
   return {
     id: streamingMessage?.created_at ?? "live-message",

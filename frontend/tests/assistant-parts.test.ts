@@ -23,6 +23,10 @@ const subagentOutputPartPath = new URL(
   "../components/assistant-ui/parts/subagent-output-part.tsx",
   import.meta.url,
 );
+const footerPath = new URL(
+  "../components/assistant-ui/assistant-message-footer.tsx",
+  import.meta.url,
+);
 
 async function loadReasoningPart() {
   assert.ok(existsSync(reasoningPartPath), "missing reasoning part");
@@ -42,6 +46,11 @@ async function loadAgentSwitchPart() {
 async function loadSubagentOutputPart() {
   assert.ok(existsSync(subagentOutputPartPath), "missing subagent-output part");
   return import("../components/assistant-ui/parts/subagent-output-part");
+}
+
+async function loadFooter() {
+  assert.ok(existsSync(footerPath), "missing assistant message footer");
+  return import("../components/assistant-ui/assistant-message-footer");
 }
 
 // —— ReasoningPart(T5) ——
@@ -254,4 +263,47 @@ test("subagent output part renders the worker card with role badge", async () =>
     }),
   );
   assert.equal(empty, "");
+});
+
+// —— AssistantMessageFooter(T7) ——
+
+test("assistant footer renders citations and feedback buttons when wired", async () => {
+  const { AssistantMessageFooter } = await loadFooter();
+
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMessageFooter, {
+      citations: [
+        { chunk_id: "c-1", document_id: "doc-1", page: 2, source: "ml.pdf" },
+      ],
+      feedbackSessionId: "s-1",
+      messageId: "2026-08-13T02:00:00Z",
+      onFeedback: () => {},
+    }),
+  );
+
+  assert.match(markup, /data-slot="assistant-message-footer"/);
+  assert.match(markup, /data-slot="citation-list"/);
+  assert.match(markup, /ml\.pdf/);
+  assert.match(markup, /data-slot="feedback-up"/);
+  assert.match(markup, /data-slot="feedback-down"/);
+});
+
+test("assistant footer degrades to nothing without citations or feedback", async () => {
+  const { AssistantMessageFooter } = await loadFooter();
+
+  const markup = renderToStaticMarkup(
+    createElement(AssistantMessageFooter, { citations: null }),
+  );
+  assert.equal(markup, "");
+
+  // 仅反馈接线(无引用)时只渲染按钮;citation-list 保持零渲染红线
+  const feedbackOnly = renderToStaticMarkup(
+    createElement(AssistantMessageFooter, {
+      citations: null,
+      feedbackSessionId: "s-1",
+      onFeedback: () => {},
+    }),
+  );
+  assert.match(feedbackOnly, /data-slot="feedback-up"/);
+  assert.doesNotMatch(feedbackOnly, /data-slot="citation-list"/);
 });
