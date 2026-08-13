@@ -260,11 +260,12 @@ function eventsToProcessParts(
   for (const event of events) {
     switch (event.event_type) {
       case "thinking": {
-        // T8:阶段提示行(「正在分析问题并规划协作」等占位文案)
-        const content = event.content ?? "";
-        if (!content.trim()) {
-          break;
-        }
+        // T8:阶段提示行。live 事件由后端流式层填充文案(stream.py 的
+        // _AGENT_PROGRESS_SUMMARIES 兑底);持久化快照(RunEvent)的
+        // content 为 null(阶段文案是流式期生成物)——与旧面板同一
+        // 兑底「正在思考…」(collaboration-panel EventTimeline 语义)。
+        const raw = event.content ?? "";
+        const content = raw.trim() ? raw : "正在思考…";
         state.parts.push({
           type: "data",
           name: "thinking",

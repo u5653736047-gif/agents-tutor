@@ -456,7 +456,7 @@ test("process parts fold into the last assistant message after session reload", 
 
 // —— T8:thinking 与计划步骤 data parts ——
 
-test("thinking events become thinking data parts, skipping blanks", async () => {
+test("thinking events become thinking data parts with the legacy fallback", async () => {
   const { convertConversationToThreadMessages } = await loadConverter();
   const out = convertConversationToThreadMessages(
     emptySlice({
@@ -467,7 +467,14 @@ test("thinking events become thinking data parts, skipping blanks", async () => 
           event_type: "thinking",
           sequence: 1,
         }),
-        makeEvent({ content: "  ", event_type: "thinking", sequence: 2 }),
+        // 持久化快照(RunEvent)的 thinking content 为 null——与旧面板同一
+        // 兑底「正在思考…」,不跳过(重载恢复后阶段行不丢失)
+        makeEvent({
+          agent: "learning_assistant",
+          content: null,
+          event_type: "thinking",
+          sequence: 2,
+        }),
       ],
       isStreaming: true,
     }),
@@ -479,6 +486,11 @@ test("thinking events become thinking data parts, skipping blanks", async () => 
       type: "data",
       name: "thinking",
       data: { agent: "supervisor", content: "正在分析问题并规划协作" },
+    },
+    {
+      type: "data",
+      name: "thinking",
+      data: { agent: "learning_assistant", content: "正在思考…" },
     },
   ]);
 });
