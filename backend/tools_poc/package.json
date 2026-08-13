@@ -1,0 +1,16 @@
+{
+  "name": "tools-poc",
+  "private": true,
+  "description": "POC: 将 pi 的 read/bash/edit/write 四个内置工具集成进自研 agent 应用",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  }
+}
