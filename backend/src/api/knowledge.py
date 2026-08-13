@@ -29,20 +29,31 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, TypedDict, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from api.schemas import (
     ApiErrorCode,
+    ChunkDetailResponse,
+    ChunkListEntry,
+    ChunkListResponse,
     Citation,
     ErrorDetail,
     ErrorResponse,
+    KnowledgeBaseStatsDto,
+    KnowledgeDocumentInfoDto,
     KnowledgeDocumentListEntry,
     KnowledgeDocumentListResponse,
     KnowledgeDocumentUploadResponse,
+    KnowledgeOverviewResponse,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
     SearchHitDto,
+)
+from core.knowledge.catalog import (
+    KnowledgeDocumentInfo,
+    SqliteKnowledgeCatalog,
+    merge_uploaded_catalog,
 )
 from core.knowledge.loaders import load_pdf, load_text
 from core.knowledge.models import KnowledgeChunk, KnowledgeDocument, SearchHit
@@ -66,6 +77,13 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 # SearchHitDto.summary 的截断上限(字符数):chunk 内容可能很长,对外
 # 只暴露摘要,防止单条命中撑爆响应体;超过上限截断并追加省略号。
 SUMMARY_MAX_LENGTH = 200
+# I2 chunk 原文端点:单条分块内容返回上限(字符数)。分块本身由 chunking
+# 限制(character 策略 ≤ chunk_size + overlap),这里防御性再截断一层,
+# 防止极端场景(超大单行 chunk)撑爆响应体。
+CHUNK_CONTENT_MAX_LENGTH = 8 * 1024
+# I2 分块浏览端点:单页分块条目上限(防御:分页参数由客户端指定,
+# 服务端设硬上限防止一次请求返回整本书的分块列表)。
+CHUNK_LIST_PAGE_SIZE_MAX = 200
 # D6-T5 上传限制:扩展名白名单是服务端校验(文件名小写后缀;浏览器/
 # 客户端可伪造 content-type,白名单以扩展名为准);大小上限在逐块读取
 # 时累计拦截,不能信 Content-Length(客户端可谎报),超限即 422。
@@ -306,27 +324,113 @@ async def upload_document(
 async def list_documents(
     request: Request,
 ) -> KnowledgeDocumentListResponse:
-    """列出通过 API 上传的文档元数据。
+    """列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。
 
-    core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
-    delete_document / search),因此 API 层维护进程内注册表
-    (_document_registry):只登记经 POST /knowledge/documents 上传的
-    文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
-    (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
-    app 生命周期,测试各 app 实例隔离)。
+    I1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库
+    的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API
+    可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表
+    (app.state.knowledge_documents)只作为「未落库条目」的防御性兜底
+    合并(理论上不触发,保留以兼容极端时序)。
     """
-    registry = _document_registry(request)
-    return KnowledgeDocumentListResponse(
-        documents=[
-            KnowledgeDocumentListEntry(
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        # catalog 未装配(lifespan 未跑/已退出):退化为注册表视图,
+        # 与 I1 之前行为一致(不报错,见组件头注释)。
+        registry_docs = [
+            KnowledgeDocumentInfo(
                 document_id=entry["document_id"],
                 source=entry["source"],
                 page_count=entry["page_count"],
-                chunk_count=entry["chunk_count"],
+                chunk_count=entry["chunk_count"] or 0,
             )
-            for entry in registry.values()
+            for entry in _document_registry(request).values()
         ]
+        return KnowledgeDocumentListResponse(
+            documents=[
+                _to_document_dto(doc)
+                for doc in sorted(
+                    registry_docs, key=lambda doc: doc.document_id
+                )
+            ]
+        )
+    catalog_docs = await run_in_threadpool(catalog.list_documents)
+    registry_docs = [
+        KnowledgeDocumentInfo(
+            document_id=entry["document_id"],
+            source=entry["source"],
+            page_count=entry["page_count"],
+            chunk_count=entry["chunk_count"] or 0,
+        )
+        for entry in _document_registry(request).values()
+    ]
+    merged = merge_uploaded_catalog(catalog_docs, registry_docs)
+    return KnowledgeDocumentListResponse(
+        documents=[_to_document_dto(doc) for doc in merged]
     )
+
+
+def _to_document_dto(doc: KnowledgeDocumentInfo) -> KnowledgeDocumentListEntry:
+    """core KnowledgeDocumentInfo → API 列表条目(与注册表回执同构)。"""
+    return KnowledgeDocumentListEntry(
+        document_id=doc.document_id,
+        source=doc.source,
+        page_count=doc.page_count,
+        chunk_count=doc.chunk_count,
+    )
+
+
+@router.get(
+    "/overview",
+    response_model=KnowledgeOverviewResponse,
+    responses=ERROR_RESPONSES,
+)
+async def knowledge_overview(
+    request: Request,
+) -> KnowledgeOverviewResponse:
+    """知识库总览(I1):语料统计 + 每篇文档元数据,一次请求覆盖教师端。
+
+    - 无 catalog 装配(部署问题):503 knowledge_unavailable(与检索
+      端点同一稳定错误码);
+    - 空库(从未入库):stats 全 0、documents 空列表,不报错(与
+      「空库检索返回空」语义一致);
+    - 只读聚合,不触发 embedding 模型加载(数据全部来自词法库)。
+    """
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        _raise_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            ApiErrorCode.KNOWLEDGE_UNAVAILABLE,
+            "Knowledge search is unavailable.",
+        )
+    stats, docs = await run_in_threadpool(_overview_snapshot, catalog)
+    return KnowledgeOverviewResponse(stats=stats, documents=docs)
+
+
+def _overview_snapshot(
+    catalog: SqliteKnowledgeCatalog,
+) -> tuple[KnowledgeBaseStatsDto, list[KnowledgeDocumentInfoDto]]:
+    """catalog 统计 + 清单 → API DTO(线程池内同步执行)。"""
+    core_stats = catalog.document_stats()
+    stats = KnowledgeBaseStatsDto(
+        total_documents=core_stats.total_documents,
+        total_chunks=core_stats.total_chunks,
+        total_pages=core_stats.total_pages,
+        frontmatter_chunks=core_stats.frontmatter_chunks,
+    )
+    documents = [
+        KnowledgeDocumentInfoDto(
+            document_id=doc.document_id,
+            source=doc.source,
+            title=doc.title,
+            page_count=doc.page_count,
+            chunk_count=doc.chunk_count,
+            subjects=doc.subjects,
+            difficulty=doc.difficulty,
+            ingested_at=doc.ingested_at,
+        )
+        for doc in catalog.list_documents()
+    ]
+    return stats, documents
 
 
 def _document_registry(request: Request) -> dict[str, _DocumentEntry]:
@@ -336,6 +440,18 @@ def _document_registry(request: Request) -> dict[str, _DocumentEntry]:
         registry = {}
         request.app.state.knowledge_documents = registry
     return registry
+
+
+def get_knowledge_catalog(request: Request) -> SqliteKnowledgeCatalog | None:
+    """从 app.state 取知识库清单服务(lifespan 装配,见 app.py)。
+
+    与 get_knowledge_service 同一 getattr 兜底哲学:lifespan 未跑/已
+    退出时该属性不存在,返回 None(调用方据此 503 或降级)。
+    """
+    catalog = getattr(request.app.state, "knowledge_catalog", None)
+    if isinstance(catalog, SqliteKnowledgeCatalog):
+        return catalog
+    return None
 
 
 @router.delete(
@@ -358,3 +474,115 @@ async def delete_document(
     """
     await run_in_threadpool(service.delete_document, document_id)
     _document_registry(request).pop(document_id, None)
+
+
+@router.get(
+    "/chunks/{chunk_id}",
+    response_model=ChunkDetailResponse,
+    responses=ERROR_RESPONSES,
+)
+async def get_chunk(
+    chunk_id: str,
+    service: Annotated[KnowledgeService, Depends(get_knowledge_service)],
+) -> ChunkDetailResponse:
+    """按 chunk_id 取回分块原文(I2 查看原文)。
+
+    - 未命中(不存在 / 空白 / 超长 chunk_id):404 chunk_not_found——
+      chunk_id 是引用凭证,引用指向不存在的分块属「资源不存在」,
+      与检索「空结果不报错」语义刻意不同(检索是查询,这里是定位);
+    - content 上限 CHUNK_CONTENT_MAX_LENGTH 截断(防撑爆响应体);
+    - 只暴露 chunk 文本 + 逻辑引用,不暴露文件路径(models 层
+      _validate_logical_source 保证)。
+    """
+    chunk = await run_in_threadpool(service.chunk, chunk_id)
+    if chunk is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ErrorDetail(
+                error_code=ApiErrorCode.INVALID_REQUEST,
+                message="Chunk not found.",
+            ).model_dump(mode="json"),
+        )
+    content = chunk.content
+    if len(content) > CHUNK_CONTENT_MAX_LENGTH:
+        content = content[:CHUNK_CONTENT_MAX_LENGTH]
+    return ChunkDetailResponse(
+        content=content,
+        citation=Citation(
+            document_id=chunk.document_id,
+            source=chunk.source,
+            page=chunk.page,
+            chunk_id=chunk.chunk_id,
+        ),
+    )
+
+
+@router.get(
+    "/documents/{document_id}/chunks",
+    response_model=ChunkListResponse,
+    responses=ERROR_RESPONSES,
+)
+async def list_document_chunks(
+    document_id: str,
+    request: Request,
+    service: Annotated[KnowledgeService, Depends(get_knowledge_service)],
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=CHUNK_LIST_PAGE_SIZE_MAX),
+) -> ChunkListResponse:
+    """列出某文档的分块(I2 浏览):分页,只带定位信息与摘要。
+
+    - offset 从 0 起、limit 默认 20;limit 由 FastAPI Query 参数拦截
+      越界(offset>=0、1<=limit<=CHUNK_LIST_PAGE_SIZE_MAX,422),不
+      依赖 core 校验;
+    - chunks_of_document 按 (start, chunk_id) 排序(与 ingest 顺序一致),
+      分页截取稳定;
+    - 条目只带摘要(SUMMARY_MAX_LENGTH 截断),完整原文经
+      GET /knowledge/chunks/{chunk_id} 获取——列表页先看摘要、点开
+      再看全文;
+    - 文档不存在:空 items(分页在空集合上就是空),不报 404——与
+      删除端点「不存在幂等」同一哲学(见 delete_document 注释);
+    - 用服务层的 chunk 能力做「索引未实现 chunk 的兜底」:若索引
+      未实现 chunk(getter 缺失),列表仍可用 chunks_of_document 逻辑?
+      ——不:本端点直接依赖 chunks_of_document(索引实现本身),与
+      chunk 单条端点无关。分页在 Python 侧完成(全部取出后切片),
+      数据量(单文档最多数千 chunk)可接受。
+    """
+    chunks = await run_in_threadpool(_chunks_of_document_safe, service, document_id)
+    page = chunks[offset : offset + limit]
+    return ChunkListResponse(
+        document_id=document_id,
+        total=len(chunks),
+        items=[
+            ChunkListEntry(
+                chunk_id=chunk.chunk_id,
+                page=chunk.page,
+                start=chunk.start,
+                end=chunk.end,
+                summary=_chunk_summary(chunk.content),
+            )
+            for chunk in page
+        ],
+    )
+
+
+def _chunks_of_document_safe(
+    service: KnowledgeService, document_id: str
+) -> list[KnowledgeChunk]:
+    """经服务层取某文档分块:索引未实现 chunk() 时退化为空(不报错)。
+
+    说明:本端点依赖索引的 chunks_of_document 能力(InMemory/Sqlite
+    均有),该能力不在 KnowledgeIndex 协议上(协议只有 upsert /
+    delete_document / search),因此走 getattr 兜底——测试替身索引
+    (只实现 search 的桩)调用本端点时返回空列表,不抛错。
+    """
+    getter = getattr(service._index, "chunks_of_document", None)
+    if getter is None:
+        return []
+    return list(getter(document_id))
+
+
+def _chunk_summary(content: str) -> str:
+    """与检索命中同口径的摘要截断(上限 SUMMARY_MAX_LENGTH + 省略号)。"""
+    if len(content) <= SUMMARY_MAX_LENGTH:
+        return content
+    return content[:SUMMARY_MAX_LENGTH] + "…"

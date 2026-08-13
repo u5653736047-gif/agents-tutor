@@ -25,6 +25,7 @@ from pytest import MonkeyPatch
 
 import api.app as api_app
 from api.app import create_app, create_knowledge_search_stack
+from core.knowledge.catalog import SqliteKnowledgeCatalog
 from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.models import KnowledgeChunk
@@ -56,6 +57,7 @@ def _make_lexical_db(path: Path) -> None:
     """构造带两个分块的词法库（与 ingest 产物同构：SqliteKnowledgeIndex）。"""
     index = SqliteKnowledgeIndex(path)
     index.upsert(_CHUNKS)
+    index.mark_document_complete("algebra", chunk_count=1, page_count=1)
     index.close()
 
 
@@ -428,3 +430,47 @@ def test_healthz_reports_lexical_only_on_dimension_mismatch(
         }
 
     asyncio.run(verify_runtime())
+
+
+# ── I1 知识库 catalog 装配 ─────────────────────────────────────────
+
+
+def test_lifespan_mounts_knowledge_catalog_and_exposes_documents(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """lifespan 装配 catalog 挂 app.state；/knowledge/overview 与
+    /knowledge/documents 经 catalog 返回脚本入库文档（不再只有注册表）。
+
+    与既有 lifespan 测试同一自包含模式：词法库指向 tmp（含
+    ingest_marks 标记）、向量库缺失自动降级、hash embedding 零依赖。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            catalog = getattr(app.state, "knowledge_catalog", None)
+            assert isinstance(catalog, SqliteKnowledgeCatalog)
+            # overview：catalog 聚合的统计与清单。
+            overview = await _get(app, "/knowledge/overview")
+            assert overview.status_code == 200
+            body = overview.json()
+            assert body["stats"]["total_documents"] == 2
+            assert body["stats"]["total_chunks"] == 2
+            docs = {doc["document_id"]: doc for doc in body["documents"]}
+            assert set(docs) == {"algebra", "ml"}
+            assert docs["algebra"]["ingested_at"] is not None
+            # 文档清单：脚本入库文档对 API 可见（I1 核心验收）。
+            listing = await _get(app, "/knowledge/documents")
+            assert listing.status_code == 200
+            assert {
+                doc["document_id"] for doc in listing.json()["documents"]
+            } == {"algebra", "ml"}
+
+    asyncio.run(verify_runtime())
+
+    # lifespan 退出后清空引用（与 service 同一清理语义）。
+    assert getattr(app.state, "knowledge_catalog", None) is None

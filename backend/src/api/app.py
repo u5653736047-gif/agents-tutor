@@ -31,6 +31,7 @@ from api.tool_approvals import router as tool_approval_router
 from api.workspaces import router as workspace_router
 from core.filesystem import WorkspaceFileSystem
 from core.graph_builder import CollaborativeAgentGraph
+from core.knowledge.catalog import SqliteKnowledgeCatalog
 from core.knowledge.embedding import (
     EmbeddingProvider,
     FastEmbedProvider,
@@ -143,6 +144,10 @@ class KnowledgeSearchStack:
     # app.state.knowledge_service 供 REST 路由注入(见 api/knowledge.py),
     # 与 search_knowledge 工具共用同一实例,检索行为一致。
     service: KnowledgeService | None = None
+    # I1:知识库清单服务实例,随装配结果一起暴露——lifespan 把它挂到
+    # app.state.knowledge_catalog 供 REST 清单/总览路由注入(见
+    # api/knowledge.py 的 get_knowledge_catalog),与检索共用同一词法库。
+    catalog: SqliteKnowledgeCatalog | None = None
 
 
 def _embedding_provider_candidates(mode: str) -> list[EmbeddingProvider]:
@@ -245,15 +250,28 @@ def create_knowledge_search_stack(
                 break
     hybrid = HybridKnowledgeIndex(lexical, vector)
     service = KnowledgeService(hybrid)
+    # I1:catalog 是独立连接(与索引相同的 RLock + check_same_thread=False
+    # 线程安全约定,见 catalog.py 模块 docstring)。它不在 hybrid.close
+    # 的转发范围内(hybrid 只关词法/向量两路),因此 close 回调要额外
+    # 关闭 catalog——用一个组合回调保证索引与清单的连接都不泄漏。
+    catalog = SqliteKnowledgeCatalog(knowledge_db)
+
+    def _close() -> None:
+        hybrid.close()
+        catalog.close()
+
     return KnowledgeSearchStack(
         tool=create_search_knowledge_tool(service),
-        close=hybrid.close,
+        close=_close,
         vector_enabled=hybrid.vector_enabled,
         vector_provider=vector_provider,
         vector_dimension=vector_dimension,
         # D6-T3:service 随 stack 暴露,让 lifespan 挂到 app.state 供
         # REST 检索路由使用(与工具共用同一实例,见 dataclass 注释)。
         service=service,
+        # I1:catalog 随 stack 暴露,让 lifespan 挂到 app.state 供
+        # REST 清单/总览路由使用(见 dataclass 注释)。
+        catalog=catalog,
     )
 
 
@@ -343,6 +361,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # 经 get_knowledge_service 依赖注入(见 api/knowledge.py)。
             # 挂在 try 内:图装配失败时不留下指向已关闭索引的服务。
             app.state.knowledge_service = knowledge_stack.service
+            # I1:知识库清单服务挂到 app.state,供 /knowledge/overview 与
+            # /knowledge/documents 路由经 get_knowledge_catalog 注入(见
+            # api/knowledge.py)。与 service 同挂在 try 内(同一清理语义)。
+            app.state.knowledge_catalog = knowledge_stack.catalog
             app.state.retrieval_diagnostics = {
                 "mode": mode,
                 "embedding_provider": knowledge_stack.vector_provider,
@@ -361,6 +383,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # D6-T3:检索服务一并清空,与「lifespan 未跑时不带知识
             # 服务」语义一致(路由经 getattr 兜底返回 503)。
             app.state.knowledge_service = None
+            # I1:清单服务一并清空(与 service 同一清理语义;catalog
+            # 连接已由 knowledge_stack.close 一并关闭)。
+            app.state.knowledge_catalog = None
 
 
 def create_app() -> FastAPI:

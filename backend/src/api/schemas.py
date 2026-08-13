@@ -458,6 +458,89 @@ class KnowledgeDocumentListResponse(ContractModel):
     documents: list[KnowledgeDocumentListEntry]
 
 
+class KnowledgeDocumentInfoDto(ContractModel):
+    """文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。
+
+    title / subjects / difficulty / ingested_at 可空:脚本入库的教材
+    由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
+    时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+    """
+
+    document_id: str
+    source: str
+    title: str | None = None
+    page_count: int | None = None
+    chunk_count: int = 0
+    subjects: list[str] = Field(default_factory=list)
+    difficulty: str | None = None
+    ingested_at: str | None = None
+
+
+class KnowledgeBaseStatsDto(ContractModel):
+    """知识库语料统计(I1):教师端总览卡数据源。
+
+    total_pages 可空(纯 txt 语料无页概念时为 None);frontmatter_chunks
+    单独给出供教师了解噪音占比(检索侧默认排除,见 service.py 的
+    suppress_frontmatter)。
+    """
+
+    total_documents: int
+    total_chunks: int
+    total_pages: int | None = None
+    frontmatter_chunks: int = 0
+
+
+class KnowledgeOverviewResponse(ContractModel):
+    """知识库总览:统计 + 每篇文档元数据(I1,一次请求覆盖教师端)。
+
+    documents 与 stats 同源(同一词法库聚合);阈值/重排器等检索
+    配置装配状态预留字段(I3/I10,本期不填)。
+    """
+
+    stats: KnowledgeBaseStatsDto
+    documents: list[KnowledgeDocumentInfoDto]
+
+
+class ChunkDetailResponse(ContractModel):
+    """单个分块原文(I2 查看原文):内容 + 配套引用凭证。
+
+    content 上限 8KB(后端截断,防撑爆响应,见 api/knowledge.py 的
+    CHUNK_CONTENT_MAX_LENGTH);citation 与检索命中的 Citation 同构
+    (document_id / source / page / chunk_id),可直接用于「查看原文」
+    跳转与引用展示。
+    """
+
+    content: str
+    citation: Citation
+
+
+class ChunkListEntry(ContractModel):
+    """分块列表条目(I2 浏览):不带全文,只带定位信息与摘要。
+
+    summary 由 chunk 内容截断生成(与检索命中同口径,上限
+    SUMMARY_MAX_LENGTH);完整原文经 GET /knowledge/chunks/{chunk_id}
+    单独获取——列表页先看摘要,点开再看全文。
+    """
+
+    chunk_id: str
+    page: int | None = None
+    start: int = 0
+    end: int = 0
+    summary: str
+
+
+class ChunkListResponse(ContractModel):
+    """某文档的分块分页列表(I2 浏览)。
+
+    total 是该文档全部分块数(不分页),供前端算分页;items 为当前
+    页条目(按 start, chunk_id 排序,见 index.py chunks_of_document)。
+    """
+
+    document_id: str
+    total: int
+    items: list[ChunkListEntry]
+
+
 class Attachment(ContractModel):
     """聊天消息附件引用(D7-T1 契约扩展预留)。
 
@@ -616,6 +699,12 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     KnowledgeDocumentListEntry,
     KnowledgeDocumentUploadResponse,
     KnowledgeDocumentListResponse,
+    KnowledgeDocumentInfoDto,
+    KnowledgeBaseStatsDto,
+    KnowledgeOverviewResponse,
+    ChunkDetailResponse,
+    ChunkListEntry,
+    ChunkListResponse,
     FileUploadResponse,
     Attachment,
 )
