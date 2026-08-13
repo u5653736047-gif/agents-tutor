@@ -19,6 +19,7 @@ reasonix.toml
 .tools/
 *.swp
 *.swo
+.qoder/
 
 # OS
 Thumbs.db
