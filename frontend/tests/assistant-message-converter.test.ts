@@ -146,6 +146,38 @@ test("reasoning events become reasoning parts, skipping blank content", async ()
   assert.deepEqual(out[0]?.status, { type: "running" });
 });
 
+test("reasoning parts carry the producer agent via providerMetadata", async () => {
+  const { PROVIDER_METADATA_NS, convertConversationToThreadMessages } =
+    await loadConverter();
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      events: [
+        makeEvent({
+          agent: "learning_assistant",
+          content: "助学思考",
+          event_type: "reasoning",
+          sequence: 1,
+        }),
+        // 无角色事件不携带元数据(缺省不伪造)
+        makeEvent({ content: "匿名思考", event_type: "reasoning", sequence: 2 }),
+      ],
+      isStreaming: true,
+    }),
+  );
+
+  const parts = partsOf(out[0]!);
+  assert.equal(parts.length, 2);
+  const metadata = (parts[0] as { providerMetadata?: Record<string, unknown> })
+    .providerMetadata;
+  assert.deepEqual(metadata?.[PROVIDER_METADATA_NS], {
+    agent: "learning_assistant",
+  });
+  assert.equal(
+    (parts[1] as { providerMetadata?: unknown }).providerMetadata,
+    undefined,
+  );
+});
+
 test("tool_call and tool_result pair into one evolving tool-call part", async () => {
   const { convertConversationToThreadMessages } = await loadConverter();
   const out = convertConversationToThreadMessages(

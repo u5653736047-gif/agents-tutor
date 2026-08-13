@@ -1,0 +1,202 @@
+// assistant-ui 接入(T5-T8):part 渲染器的 SSR 组件测试。
+// 与 collaboration-panel.test.ts 同一先例:renderToStaticMarkup 直渲组件,
+// data-slot 锚点断言;折叠交互是客户端行为,SSR 只测初始 open 态。
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import test from "node:test";
+
+const reasoningPartPath = new URL(
+  "../components/assistant-ui/parts/reasoning-part.tsx",
+  import.meta.url,
+);
+const toolCallPartPath = new URL(
+  "../components/assistant-ui/parts/tool-call-part.tsx",
+  import.meta.url,
+);
+const agentSwitchPartPath = new URL(
+  "../components/assistant-ui/parts/agent-switch-part.tsx",
+  import.meta.url,
+);
+const subagentOutputPartPath = new URL(
+  "../components/assistant-ui/parts/subagent-output-part.tsx",
+  import.meta.url,
+);
+
+async function loadReasoningPart() {
+  assert.ok(existsSync(reasoningPartPath), "missing reasoning part");
+  return import("../components/assistant-ui/parts/reasoning-part");
+}
+
+async function loadToolCallPart() {
+  assert.ok(existsSync(toolCallPartPath), "missing tool-call part");
+  return import("../components/assistant-ui/parts/tool-call-part");
+}
+
+async function loadAgentSwitchPart() {
+  assert.ok(existsSync(agentSwitchPartPath), "missing agent-switch part");
+  return import("../components/assistant-ui/parts/agent-switch-part");
+}
+
+async function loadSubagentOutputPart() {
+  assert.ok(existsSync(subagentOutputPartPath), "missing subagent-output part");
+  return import("../components/assistant-ui/parts/subagent-output-part");
+}
+
+// —— ReasoningPart(T5) ——
+
+test("reasoning part streams open and shows the producer agent badge", async () => {
+  const { ReasoningPart } = await loadReasoningPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(ReasoningPart, {
+      type: "reasoning",
+      text: "正在分析学习需求",
+      status: { type: "running" },
+      providerMetadata: { "agents-tutor": { agent: "teaching_assistant" } },
+    }),
+  );
+
+  assert.match(markup, /data-slot="reasoning-block"/);
+  // 流式中自动展开
+  assert.match(markup, /<details[^>]*open/);
+  // 产出角色徽章(助教)与思维链标题
+  assert.match(markup, /助教/);
+  assert.match(markup, /思维链/);
+  assert.match(markup, /正在分析学习需求/);
+});
+
+test("reasoning part collapses when complete and tolerates dirty metadata", async () => {
+  const { ReasoningPart } = await loadReasoningPart();
+
+  const settled = renderToStaticMarkup(
+    createElement(ReasoningPart, {
+      type: "reasoning",
+      text: "已完成的思考",
+      status: { type: "complete" },
+    }),
+  );
+  // 结束后默认折叠(open 属性缺席),无角色时不渲染徽章
+  assert.doesNotMatch(settled, /<details[^>]*open/);
+  assert.doesNotMatch(settled, /data-slot="agent-badge"/);
+  assert.match(settled, /已完成的思考/);
+
+  // 脏数据(非法 providerMetadata 结构)不崩溃、不渲染徽章
+  const dirty = renderToStaticMarkup(
+    createElement(ReasoningPart, {
+      type: "reasoning",
+      text: "x",
+      status: { type: "complete" },
+      providerMetadata: { "agents-tutor": { agent: "not-a-role" } },
+    }),
+  );
+  assert.doesNotMatch(dirty, /data-slot="agent-badge"/);
+});
+
+// —— ToolCallPart(T4 基础/T6 锚点) ——
+
+test("tool call part renders pending, success and error states", async () => {
+  const { ToolCallPart } = await loadToolCallPart();
+
+  const pending = renderToStaticMarkup(
+    createElement(ToolCallPart, {
+      type: "tool-call",
+      toolCallId: "tc-1",
+      toolName: "search_knowledge",
+      args: {},
+      argsText: "query=反向传播",
+      status: { type: "running" },
+    }),
+  );
+  assert.match(pending, /data-slot="tool-row"/);
+  assert.match(pending, /执行中/);
+  // 执行中只有参数,没有结果区
+  assert.match(pending, /data-slot="tool-details"/);
+  assert.doesNotMatch(pending, /data-slot="tool-result"/);
+
+  const succeeded = renderToStaticMarkup(
+    createElement(ToolCallPart, {
+      type: "tool-call",
+      toolCallId: "tc-1",
+      toolName: "search_knowledge",
+      args: {},
+      argsText: "query=反向传播",
+      result: "命中 3 条",
+      isError: false,
+      status: { type: "complete" },
+    }),
+  );
+  assert.match(succeeded, /完成/);
+  assert.match(succeeded, /命中 3 条/);
+
+  const failed = renderToStaticMarkup(
+    createElement(ToolCallPart, {
+      type: "tool-call",
+      toolCallId: "tc-2",
+      toolName: "shell",
+      args: {},
+      argsText: "",
+      result: "超时",
+      isError: true,
+      status: { type: "complete" },
+    }),
+  );
+  assert.match(failed, /失败/);
+  assert.match(failed, /超时/);
+});
+
+// —— AgentSwitchPart / SubagentOutputPart(T4 基础/T8 锚点) ——
+
+test("agent switch part renders a divider with the target role badge", async () => {
+  const { AgentSwitchPart } = await loadAgentSwitchPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(AgentSwitchPart, {
+      type: "data",
+      name: "agent-switch",
+      data: { agent: "learning_assistant" },
+      status: { type: "complete" },
+    }),
+  );
+  assert.match(markup, /data-slot="agent-switch"/);
+  assert.match(markup, /助学/);
+
+  // 非法数据零渲染(宽容读取)
+  const dirty = renderToStaticMarkup(
+    createElement(AgentSwitchPart, {
+      type: "data",
+      name: "agent-switch",
+      data: {},
+      status: { type: "complete" },
+    }),
+  );
+  assert.equal(dirty, "");
+});
+
+test("subagent output part renders the worker card with role badge", async () => {
+  const { SubagentOutputPart } = await loadSubagentOutputPart();
+
+  const markup = renderToStaticMarkup(
+    createElement(SubagentOutputPart, {
+      type: "data",
+      name: "subagent-output",
+      data: { agent: "evaluator", content: "评价阶段结论" },
+      status: { type: "complete" },
+    }),
+  );
+  assert.match(markup, /data-slot="subagent-message"/);
+  assert.match(markup, /评价/);
+  assert.match(markup, /评价阶段结论/);
+
+  // 空内容零渲染
+  const empty = renderToStaticMarkup(
+    createElement(SubagentOutputPart, {
+      type: "data",
+      name: "subagent-output",
+      data: { agent: "evaluator", content: "   " },
+      status: { type: "complete" },
+    }),
+  );
+  assert.equal(empty, "");
+});

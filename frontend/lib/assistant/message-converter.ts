@@ -90,6 +90,12 @@ type AssistantPart = Exclude<
   string
 >[number];
 
+/**
+ * providerMetadata 的应用命名空间(T5):reasoning part 无自定义字段,
+ * 角色等应用级元数据挂在该命名空间键下({ "agents-tutor": { agent } })。
+ */
+export const PROVIDER_METADATA_NS = "agents-tutor";
+
 // —— 历史消息转换(WeakMap 引用缓存) ——
 
 const historyCache = new WeakMap<Message, ConvertedMessage>();
@@ -227,7 +233,16 @@ function eventsToProcessParts(events: ConversationEvent[]): AssistantPart[] {
         if (!text.trim()) {
           break;
         }
-        state.parts.push({ type: "reasoning", text });
+        // T5:角色随 part 透传(providerMetadata 是命名的扩展位,
+        // reasoning part 契约无自定义字段)——多智能体交错时思维链块
+        // 头部可展示产出角色徽章
+        state.parts.push({
+          type: "reasoning",
+          text,
+          ...(event.agent
+            ? { providerMetadata: { [PROVIDER_METADATA_NS]: { agent: event.agent } } }
+            : {}),
+        });
         break;
       }
       case "tool_call": {
