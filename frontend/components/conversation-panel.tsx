@@ -60,7 +60,15 @@ function formatAttachmentSize(size: number): string {
 // 同步路径),SSR 首帧 url=null 渲染占位,无 hydration mismatch。
 // assistant-ui 接入(T4):导出供新渲染路径的用户消息组件复用
 // (鉴权 Blob 加载链路单一实现,不接受第二份拷贝)
-export function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["attachments"]>[number] }) {
+export function AttachmentPreview({
+  attachment,
+  tone = "onPrimary",
+}: {
+  attachment: NonNullable<Message["attachments"]>[number];
+  // T5-3:链接配色按气泡底色区分——用户主色气泡用 onPrimary（默认，保持
+  // 既有视觉），助手浅色卡片用 primary（生成文件下载入口）。
+  tone?: "onPrimary" | "default";
+}) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const isImage = attachment.content_type?.startsWith("image/") ?? false;
@@ -126,7 +134,9 @@ export function AttachmentPreview({ attachment }: { attachment: NonNullable<Mess
     </a>
   ) : (
     <a
-      className="w-fit max-w-full truncate text-primary-foreground underline underline-offset-2"
+      className={`w-fit max-w-full truncate underline underline-offset-2 ${
+        tone === "onPrimary" ? "text-primary-foreground" : "text-primary"
+      }`}
       data-slot="attachment-link"
       download={attachment.name}
       href={url}
@@ -203,10 +213,10 @@ export function MessageRow({
         {isUser ? (
           <>
             <p className="whitespace-pre-wrap">{message.content}</p>
-            {/* D7-T3:附件区——仅用户消息且携带附件时渲染(文本之后);
+            {/* D7-T3:附件区——用户消息携带附件时渲染(文本之后);
                 无附件零渲染(data-slot 不出现):历史消息后端映射
-                attachments=null,自然降级;助手消息理论上不携带附件,
-                防御性不渲染(仅用户侧)。 */}
+                attachments=null,自然降级;助手消息的生成文件附件在
+                下方助手分支渲染(T5-3)。 */}
             {message.attachments && message.attachments.length > 0 ? (
               <div
                 className="mt-3 flex flex-col items-start gap-2"
@@ -224,6 +234,22 @@ export function MessageRow({
         ) : (
           <div className="mt-2">
             <AssistantMarkdown content={message.content} />
+            {/* T5-3:助手消息附件区——officecli 生成的文件经后端注册为
+                受控下载附件,这里呈现下载入口;无附件零渲染(与用户侧同一语义)。 */}
+            {message.attachments && message.attachments.length > 0 ? (
+              <div
+                className="mt-3 flex flex-col items-start gap-2"
+                data-slot="message-attachments"
+              >
+                {message.attachments.map((attachment) => (
+                  <AttachmentPreview
+                    attachment={attachment}
+                    key={attachment.file_id}
+                    tone="default"
+                  />
+                ))}
+              </div>
+            ) : null}
           </div>
         )}
       </div>

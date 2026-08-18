@@ -157,6 +157,16 @@ export function AssistantMessage() {
       isString,
     ),
   );
+  // T5-3:助手消息的生成文件下载回执(officecli_edit 产出,后端已注册为
+  // 受控附件)——与用户消息附件同一 metadata 键、同一 AttachmentPreview
+  // 鉴权加载链路,仅配色按浅色卡片调整(tone="default")
+  const attachments = useAuiState((state) =>
+    customMetadata(
+      state.message.metadata.custom as Record<string, unknown> | undefined,
+      CUSTOM_METADATA_KEYS.attachments,
+      isAttachmentArray,
+    ),
+  );
   // T7:反馈接线照抄旧面板(conversation-panel.tsx L585-588)——闭包绑定
   // 当前会话;store action 不写 requestError,失败由 FeedbackButtons 组件内
   // 错误行呈现(失败静默降级,不阻塞对话)
@@ -188,6 +198,20 @@ export function AssistantMessage() {
           <div className="mt-2 flex flex-col gap-2">
             <MessagePrimitive.Parts components={ASSISTANT_PART_COMPONENTS} />
           </div>
+          {attachments && attachments.length > 0 ? (
+            <div
+              className="mt-3 flex flex-col items-start gap-2"
+              data-slot="message-attachments"
+            >
+              {attachments.map((attachment) => (
+                <AttachmentPreview
+                  attachment={attachment}
+                  key={attachment.file_id}
+                  tone="default"
+                />
+              ))}
+            </div>
+          ) : null}
         </div>
         <AssistantMessageFooter
           citations={citations}

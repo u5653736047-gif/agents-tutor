@@ -130,11 +130,10 @@ function convertHistoryMessage(
   if (message.role === "assistant" && message.agent) {
     custom[CUSTOM_METADATA_KEYS.agent] = message.agent;
   }
-  if (
-    message.role === "user" &&
-    message.attachments &&
-    message.attachments.length > 0
-  ) {
+  // T5-3:附件透传不再限用户消息——助手消息的 attachments 是 officecli
+  // 生成文件的下载回执(后端 Message.attachments 契约),渲染层按角色
+  // 选择配色(tone),转换层只做角色无关的透传。
+  if (message.attachments && message.attachments.length > 0) {
     custom[CUSTOM_METADATA_KEYS.attachments] = message.attachments;
   }
   // T7:反馈按钮的 messageId——created_at 原样透传(权威历史消息才有;
@@ -368,6 +367,12 @@ function buildLiveMessage(
   }
   if (references && references.length > 0) {
     custom[CUSTOM_METADATA_KEYS.citations] = references;
+  }
+  // T5-3:message_end 权威消息的生成文件附件——流式完成到权威历史替换
+  // 之间的窗口同样渲染下载入口(历史替换后由 convertHistoryMessage 透传)
+  const liveAttachments = streamingMessage?.attachments;
+  if (liveAttachments && liveAttachments.length > 0) {
+    custom[CUSTOM_METADATA_KEYS.attachments] = liveAttachments;
   }
   // T7:与历史消息同一语义——message_end 的权威消息携带 created_at 时透传
   if (streamingMessage?.created_at) {

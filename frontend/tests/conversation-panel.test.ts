@@ -623,7 +623,7 @@ test("message rows omit the attachment area when there are no attachments", asyn
   assert.doesNotMatch(markup, /data-slot="attachment-link"/);
 });
 
-test("assistant message rows never render attachments even if present", async () => {
+test("assistant message rows render generated-file attachments (T5-3)", async () => {
   const { MessageRow } = await loadConversationPanel();
 
   const markup = renderToStaticMarkup(
@@ -632,18 +632,25 @@ test("assistant message rows never render attachments even if present", async ()
       message: {
         agent: "supervisor",
         attachments: [
-          { content_type: "image/png", file_id: "x-1", name: "x.png", size: 1 },
+          {
+            content_type:
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_id: "gen-1.xlsx",
+            name: "成绩单.xlsx",
+            size: 4096,
+          },
         ],
-        content: "回答",
+        content: "已生成成绩单",
         role: "assistant",
       },
     }),
   );
 
-  // 仅用户侧渲染附件(助手理论上不携带;防御性零渲染,data-slot 不出现)
-  assert.doesNotMatch(markup, /data-slot="message-attachments"/);
-  assert.doesNotMatch(markup, /data-slot="attachment-image"/);
-  assert.doesNotMatch(markup, /data-slot="attachment-link"/);
+  // T5-3 行为变更(本测试由「助手永不渲染附件」反转而来):officecli 生成的
+  // 文件经后端注册为受控附件,助手消息必须渲染下载入口;SSR 首帧为加载
+  // 占位(与用户侧同一鉴权 Blob 链路),无附件时仍零渲染。
+  assert.match(markup, /data-slot="message-attachments"/);
+  assert.match(markup, /animate-pulse/);
 });
 
 test("attachment rendering lives inside MessageRow so both render paths share it", () => {

@@ -92,6 +92,68 @@ test("history user message converts to text part with attachments metadata", asy
   assert.deepEqual(customOf(out[0]!).attachments, attachments);
 });
 
+// T5-3:助手消息附件透传(officecli 生成文件下载回执)———————————————
+
+test("history assistant message carries generated-file attachments metadata", async () => {
+  const { convertConversationToThreadMessages } = await loadConverter();
+  const attachments = [
+    {
+      content_type:
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      file_id: "gen-1.xlsx",
+      name: "成绩单.xlsx",
+      size: 4096,
+    },
+  ];
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      messages: [
+        makeMessage({
+          agent: "supervisor",
+          attachments,
+          content: "已生成成绩单",
+          created_at: "2026-08-18T01:00:00Z",
+          role: "assistant",
+        }),
+      ],
+    }),
+  );
+
+  assert.equal(out.length, 1);
+  assert.equal(out[0]?.role, "assistant");
+  assert.deepEqual(customOf(out[0]!).attachments, attachments);
+});
+
+test("live message from message_end carries generated-file attachments metadata", async () => {
+  const { convertConversationToThreadMessages } = await loadConverter();
+  const attachments = [
+    {
+      content_type:
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      file_id: "gen-2.docx",
+      name: "报告.docx",
+      size: 2048,
+    },
+  ];
+  const out = convertConversationToThreadMessages(
+    emptySlice({
+      isStreaming: false,
+      streamingMessage: makeMessage({
+        agent: "supervisor",
+        attachments,
+        content: "报告已生成",
+        created_at: "2026-08-18T01:01:00Z",
+        role: "assistant",
+      }),
+    }),
+  );
+
+  // 在飞消息(message_end 到权威历史替换之间)同样透传下载入口
+  const live = out[out.length - 1];
+  assert.equal(live?.role, "assistant");
+  assert.deepEqual(customOf(live!).attachments, attachments);
+});
+
 test("history assistant message carries agent metadata and joinStrategy none", async () => {
   const { convertConversationToThreadMessages } = await loadConverter();
   const out = convertConversationToThreadMessages(
