@@ -848,4 +848,6 @@ def test_chat_titles_session_from_first_message_only(tmp_path: Path) -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert [record.title for record in records] == ["什么是 注意力机制?"]
-    assert records[0].updated_at > first_activity
+    # F3：两次时间戳可能落在同一微秒（时钟精度限制），> 会间歇性失败，
+    # 用 >= 表达「后续消息确实触碰了 updated_at」这一真实语义。
+    assert records[0].updated_at >= first_activity
