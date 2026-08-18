@@ -296,3 +296,171 @@ def test_grep_files_returns_literal_line_matches_and_skips_binary(tmp_path: Path
     filtered_count = result["filtered_count"]
     assert isinstance(filtered_count, int)
     assert filtered_count >= 1
+
+
+def test_resolve_readable_file_returns_authorized_absolute_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    document = workspace / "报告.docx"
+    document.write_bytes(b"docx")
+    filesystem = WorkspaceFileSystem(workspace)
+
+    resolved = filesystem.resolve_readable_file(
+        "报告.docx",
+        allowed_extensions={".docx", ".xlsx"},
+    )
+
+    assert resolved == document.resolve()
+    # 已授权绝对路径同样可解析（additional root 场景共用该入口）
+    assert filesystem.resolve_readable_file(str(document)) == document.resolve()
+
+
+def test_resolve_readable_file_rejects_extension_outside_whitelist(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.txt").write_text("text", encoding="utf-8")
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_readable_file("notes.txt", allowed_extensions={".docx"})
+
+    assert _error_code(error) is WorkspaceFileErrorCode.INVALID_REQUEST
+
+
+def test_resolve_writable_file_allows_create_inside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    filesystem = WorkspaceFileSystem(workspace)
+
+    resolved = filesystem.resolve_writable_file(
+        "新建/成绩单.xlsx",
+        allow_create=True,
+        allowed_extensions={".xlsx"},
+    )
+
+    # 待创建目标返回词法绝对路径（文件尚不存在，无法 resolve）
+    assert resolved == Path(os.path.abspath(workspace / "新建" / "成绩单.xlsx"))
+
+
+def test_resolve_writable_file_existing_file_must_be_a_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "docs").mkdir()
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file("docs", allow_create=False)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.NOT_A_FILE
+
+
+def test_resolve_writable_file_requires_existence_without_create(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file("missing.docx", allow_create=False)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.NOT_FOUND
+
+
+def test_resolve_writable_file_rejects_create_outside_authorized_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file(str(outside / "escape.docx"), allow_create=True)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE
+
+
+def test_resolve_writable_file_rejects_symlink_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    target = outside / "secret.docx"
+    target.write_bytes(b"secret")
+    link = workspace / "linked.docx"
+    try:
+        os.symlink(target, link)
+    except OSError:
+        pytest.skip("symbolic links are unavailable on this platform")
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file("linked.docx", allow_create=False)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE
+
+
+def test_resolve_writable_file_rejects_dangling_symlink_on_create(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    link = workspace / "dangling.docx"
+    try:
+        os.symlink(outside / "never-created.docx", link)
+    except OSError:
+        pytest.skip("symbolic links are unavailable on this platform")
+    filesystem = WorkspaceFileSystem(workspace)
+
+    # 悬空链接指向授权 root 外：创建语义下必须拒绝，防止穿透链接落盘
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file("dangling.docx", allow_create=True)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE
+
+
+def test_resolve_writable_file_rejects_junction_escape_on_parent_chain(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    junction = workspace / "linked-dir"
+    junction_created = True
+    try:
+        # Windows junction 不需要特权（与 symlink 不同），优先用它模拟
+        # 「父目录是 reparse point」的逃逸；不支持时退化为符号链接目录。
+        if os.name == "nt":
+            import subprocess
+
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                check=False,
+                capture_output=True,
+            )
+            junction_created = completed.returncode == 0
+        else:
+            os.symlink(outside, junction)
+    except OSError:
+        junction_created = False
+    if not junction_created or not junction.exists():
+        pytest.skip("junction/symlink creation is unavailable on this platform")
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file("linked-dir/new.docx", allow_create=True)
+
+    assert _error_code(error) is WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE
+
+
+def test_resolve_writable_file_rejects_sensitive_and_ignored_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    filesystem = WorkspaceFileSystem(workspace)
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file(".env", allow_create=True)
+    assert _error_code(error) is WorkspaceFileErrorCode.SENSITIVE_FILE
+
+    with pytest.raises(WorkspaceFileError) as error:
+        filesystem.resolve_writable_file(".git/config.docx", allow_create=True)
+    assert _error_code(error) is WorkspaceFileErrorCode.SENSITIVE_FILE

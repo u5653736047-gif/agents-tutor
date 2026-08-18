@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -165,6 +165,121 @@ class WorkspaceFileSystem:
             expected="directory",
         )
         return resolved
+
+    def resolve_readable_file(
+        self,
+        path: str,
+        *,
+        allowed_extensions: Collection[str] | None = None,
+    ) -> Path:
+        """Resolve an existing file inside one authorized root.
+
+        对 ``_resolve_existing(expected="file")`` 的公开包装，供需要
+        「把文件参数重写为授权绝对路径」的工具（如 officecli 集成）复用
+        同一套穿越/链接逃逸/敏感路径防线。``allowed_extensions`` 是小写
+        带点扩展名白名单（如 ``{".docx"}``），不在列时抛
+        ``INVALID_REQUEST``——扩展名校验放在解析之后，对符号链接的
+        真实目标生效。
+        """
+        resolved, _display, _root, _absolute = self._resolve_existing(
+            path,
+            expected="file",
+        )
+        self._assert_extension(resolved, allowed_extensions)
+        return resolved
+
+    def resolve_writable_file(
+        self,
+        path: str,
+        *,
+        allow_create: bool,
+        allowed_extensions: Collection[str] | None = None,
+    ) -> Path:
+        """Resolve a file path authorized for writing inside one root.
+
+        与只读解析共用全部防线，并按写场景补充两条规则：
+
+        1. 已存在的目标：严格 resolve 后仍须落在同一授权 root 内（防
+           符号链接/junction 逃逸），且必须是文件而非目录；
+        2. 不存在的目标：``allow_create=True`` 时允许创建——最近已存在
+           祖先目录必须 resolve 到同一 root 内（父链上的 junction 指向
+           外部会被拒绝），目标本身是悬空符号链接时拒绝（防止经链接
+           把新文件写到 root 外）；``allow_create=False`` 时按只读语义
+           抛 ``NOT_FOUND``。
+
+        返回规范化绝对路径：已存在目标是 resolve 后的真实路径，待创建
+        目标是词法绝对路径（不存在，无法 resolve）。
+        """
+        candidate, _absolute_display = self._candidate_path(path)
+        lexical = Path(os.path.abspath(candidate))
+        lexical_root = self._authorized_root_for(lexical)
+        if lexical_root is None:
+            raise WorkspaceFileError(WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE)
+        lexical_relative = self._relative_to_root(lexical, lexical_root)
+        self._assert_allowed(lexical_relative)
+        # 扩展名按词法路径校验：待创建目标没有真实路径可言，且用户在
+        # 命令里写的就是这个词法形式，校验它对模型最易理解。
+        self._assert_extension(lexical, allowed_extensions)
+        if lexical.exists():
+            try:
+                resolved = lexical.resolve(strict=True)
+            except PermissionError as error:
+                raise WorkspaceFileError(WorkspaceFileErrorCode.ACCESS_DENIED) from error
+            except OSError as error:
+                raise WorkspaceFileError(WorkspaceFileErrorCode.INVALID_PATH) from error
+            resolved_root = self._authorized_root_for(resolved)
+            # 与 _resolve_existing 同一规则：链接/挂载不得跨授权 root 跳跃。
+            if resolved_root is None or resolved_root != lexical_root:
+                raise WorkspaceFileError(WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE)
+            self._assert_allowed(self._relative_to_root(resolved, resolved_root))
+            if not resolved.is_file():
+                raise WorkspaceFileError(WorkspaceFileErrorCode.NOT_A_FILE)
+            return resolved
+        if not allow_create:
+            raise WorkspaceFileError(WorkspaceFileErrorCode.NOT_FOUND)
+        if lexical.is_symlink():
+            # 悬空符号链接：exists() 为 False 进入创建分支，若放行，写工具
+            # 会穿透链接把新文件落到链接目标（可能在授权 root 之外）。
+            raise WorkspaceFileError(WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE)
+        ancestor = self._nearest_existing_ancestor(lexical, lexical_root)
+        try:
+            resolved_ancestor = ancestor.resolve(strict=True)
+        except OSError as error:
+            raise WorkspaceFileError(WorkspaceFileErrorCode.ACCESS_DENIED) from error
+        if (
+            not resolved_ancestor.is_dir()
+            or self._authorized_root_for(resolved_ancestor) != lexical_root
+        ):
+            raise WorkspaceFileError(WorkspaceFileErrorCode.PATH_OUTSIDE_WORKSPACE)
+        return lexical
+
+    @staticmethod
+    def _nearest_existing_ancestor(path: Path, stop_at: Path) -> Path:
+        """向上找第一个已存在的祖先目录；到达授权 root 仍未找到时返回 root。
+
+        词法路径已在 ``stop_at`` 内（调用方保证），因此循环至多走到
+        root 就会命中存在的目录，不会越过它继续向上。
+        """
+        ancestor = path.parent
+        while not ancestor.exists():
+            if ancestor == stop_at:
+                break
+            parent = ancestor.parent
+            if parent == ancestor:
+                break
+            ancestor = parent
+        return ancestor
+
+    @staticmethod
+    def _assert_extension(
+        path: Path,
+        allowed_extensions: Collection[str] | None,
+    ) -> None:
+        if (
+            allowed_extensions is not None
+            and path.suffix.lower() not in allowed_extensions
+        ):
+            raise WorkspaceFileError(WorkspaceFileErrorCode.INVALID_REQUEST)
 
     def read_file(
         self,
