@@ -14,6 +14,7 @@
 - 工具名称唯一校验、角色权限和结构化错误
 - 每会话可选择主工作区并追加授权根目录；只读文件工具支持相对路径与已授权绝对路径，含路径逃逸、链接越界与敏感文件防护
 - `inspect_workspace` 可把多项只读检查合并为一次工具调用；Supervisor 还可提出一条复合 Shell 命令，经用户逐次审批后实时回显 stdout/stderr
+- 可选 officecli 集成：`officecli_inspect` 只读查看、`officecli_edit` 经人工审批后修改工作区内 `.docx/.xlsx/.pptx`（默认禁用，见「Office 文档工具」一节）
 - 安全运行事件以及 handoff、Agent 切换上限
 - 可选 SQLite 持久化，按 `user_id + session_id` 逻辑分区
 - 可选模型上下文裁剪，checkpoint 仍保留完整历史
@@ -60,6 +61,11 @@ npm install
 | `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
 | `API_WORKSPACE_ROOT` | 可选，新会话的默认主工作区；启动脚本默认绑定当前仓库根。用户可在创建会话时选择其他目录。 |
 | `API_WORKSPACE_ALLOWED_ROOTS` | 可选，部署侧允许用户选择的目录边界；多个根用系统 PATH 分隔符分隔（Windows `;`、Linux/macOS `:`）。未设置时本地模式允许明确选择任意现有目录；生产部署建议必设。 |
+| `API_OFFICECLI_ENABLED` | 可选，默认 `0`（不注册 office 工具、不探测二进制）；显式设 `1` 才启用，启用时启动自检失败会中止启动。 |
+| `API_OFFICECLI_BINARY` | 可选，officecli 二进制名或绝对路径；默认 `officecli`（PATH 查找）。 |
+| `API_OFFICECLI_TIMEOUT_READ_SECONDS` | 可选，只读工具子进程超时；默认 `60`。 |
+| `API_OFFICECLI_TIMEOUT_WRITE_SECONDS` | 可选，写工具子进程超时；默认 `120`。 |
+| `API_OFFICECLI_MAX_OUTPUT_BYTES` | 可选，单次 stdout+stderr 合并上限；默认 `131072`。 |
 
 ### 启用真实语义检索（可选）
 
@@ -102,6 +108,38 @@ embedding_provider=FastEmbedProvider vector_dimension=512`）或
 命令、工作目录与超时，批准后在同一工具卡片内逐段显示 stdout/stderr，随后继续生成最终回答。
 最后切换或刷新页面验证权威全文仍在历史中，再归档会话。模型或编排失败时，对话区应
 显示稳定错误提示，不能只结束加载状态而没有回答。
+
+## Office 文档工具（officecli，可选）
+
+以 CLI 子进程方式集成 officecli，为四个角色提供
+Office 文档读写能力（设计决策与威胁模型见 `docs/officecli-integration-plan.md`）：
+
+| 工具 | 用途 | 审批 | 角色 |
+| --- | --- | --- | --- |
+| `officecli_inspect` | 只读：help / load_skill / view / get / query / validate | 不需要 | 四个角色均可用 |
+| `officecli_edit` | 写操作：create / set / add / remove / move / swap / batch / import / merge | 必须人工审批 | Supervisor、助教、评价 |
+
+安全要点：动词/选项/batch 子命令三层白名单（默认拒绝）；文件参数与 `--prop`
+中的文件引用全部限定在当前会话工作区内并重写为授权绝对路径；子进程 stdin
+始终关闭、不弹窗、禁后台更新与 resident；同一文件的读写命令由 per-file 锁
+串行（仅单进程语义，多 worker 部署不在本期范围）。
+
+启用步骤：
+
+1. 在部署机安装 officecli 并确认 `officecli --version` 可用（基线版本
+   1.0.144，不一致时启动日志只告警不阻断）；
+2. `.env` 中设 `API_OFFICECLI_ENABLED=1`（其余 `API_OFFICECLI_*` 变量见上表）；
+3. 启动后端。找不到二进制或自检失败会 fail-fast；未启用时完全不探测二进制。
+
+验收：
+
+```powershell
+cd backend
+uv run python scripts/verify_officecli_integration.py   # 输出 PASS 即全链路可用
+```
+
+本期非目标：HTML/截图预览与 `watch` 实时预览不接入（`view` 仅文本模式）；
+PDF 导出、MCP 适配器、`raw`/`dump`/`plugins` 等命令不在白名单内。
 
 ## 容器启动（Docker Compose）
 
