@@ -494,7 +494,7 @@ async def _native_stream_events(
                 )
             )
         elif not error_emitted:
-            final_message = _final_assistant_message(state, previous_count)
+            final_message = _final_assistant_message(state, previous_count, user_id)
             if final_message is None:
                 sequence += 1
                 yield _sse_frame(
@@ -650,7 +650,7 @@ async def tool_approval_stream_events(
                 )
             )
         elif not error_emitted:
-            final_message = _final_assistant_message(state, previous_count)
+            final_message = _final_assistant_message(state, previous_count, user_id)
             sequence += 1
             if final_message is None:
                 yield _sse_frame(
@@ -799,7 +799,7 @@ async def _stream_events(
                     replay_sequence += 1
                     yield _sse_frame(state_error)
             elif not error_replayed:
-                final_message = _final_assistant_message(current_state, 0)
+                final_message = _final_assistant_message(current_state, 0, user_id)
                 replay_sequence += 1
                 if final_message is None:
                     yield _sse_frame(
@@ -976,7 +976,9 @@ async def _stream_events(
                             )
                         )
                     elif not error_emitted:
-                        final_message = _final_assistant_message(state, previous_count)
+                        final_message = _final_assistant_message(
+                            state, previous_count, user_id
+                        )
                         last_sequence += 1
                         if final_message is None:
                             yield _sse_frame(

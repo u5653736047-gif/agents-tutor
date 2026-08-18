@@ -284,6 +284,75 @@ def message_references(message: BaseMessage) -> list[Citation] | None:
     return citations
 
 
+# ─────────────────────────────────────────────
+# 助手消息的生成文件元数据（T5-3 下载回执）
+# ─────────────────────────────────────────────
+#
+# officecli_edit 写工具成功后，结果会携带 generated_files 清单（见
+# core/tools/office_tools.py）；图在 _wrap 闸口把清单挂到本轮终端回答
+# 消息的 additional_kwargs——与 references 同一机制、同一序列化路径，
+# checkpoint 往返保留。API 层读取后把工作区文件注册为受控下载附件
+# （api/files.py），前端按消息渲染下载入口。
+GENERATED_FILES_METADATA_KEY = "generated_files"
+
+
+class GeneratedFile(BaseModel):
+    """一次写操作产出的工作区文件回执元数据（msgpack 原生可序列化）。
+
+    - path：授权绝对路径（core 侧唯一事实来源，绝不直接暴露给前端）；
+    - name：展示文件名（纯文件名，不含目录）；
+    - size / mtime_ns：写入完成时刻的大小与修改时间，API 层据此派生
+      版本化下载 ID（同一文件多轮修改各是各的回执）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+
+
+def with_generated_files(
+    message: AIMessage,
+    files: Sequence[GeneratedFile],
+) -> AIMessage:
+    """返回携带生成文件清单的 AIMessage 副本（不修改原对象）。
+
+    与 with_references 同一副本语义与空序列防御：files 为空时原样返回、
+    不注入空键（「无生成文件就不携带」的语义，与零命中不挂引用一致）。
+    """
+    if not files:
+        return message
+    additional_kwargs = dict(message.additional_kwargs)
+    additional_kwargs[GENERATED_FILES_METADATA_KEY] = [
+        file.model_dump(mode="json") for file in files
+    ]
+    return message.model_copy(update={"additional_kwargs": additional_kwargs})
+
+
+def message_generated_files(message: BaseMessage) -> list[GeneratedFile] | None:
+    """从消息元数据读出生成文件清单；无法确定时返回 None。
+
+    读取端宽容（与 message_references 同一哲学）：键缺失或值不是列表
+    → None；列表内的非法项逐项跳过，合法项照常返回；保证
+    get_history() 的消费者（API 附件组装、前端下载入口）不会因异常
+    数据崩溃。
+    """
+    raw = message.additional_kwargs.get(GENERATED_FILES_METADATA_KEY)
+    if not isinstance(raw, list):
+        return None
+    files: list[GeneratedFile] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            files.append(GeneratedFile.model_validate(item))
+        except ValidationError:
+            continue
+    return files
+
+
 # 可被分派执行任务的 Worker 角色子集（Supervisor 只调度、不执行）
 WorkerAgentRole = Literal[
     AgentRole.TEACHING_ASSISTANT,
@@ -875,6 +944,14 @@ class AgentState(TypedDict, total=False):
     # 追加式累积，保留完整调用历史供审计
     tool_results: Annotated[list[ToolResult], operator.add]
 
+    # --- 生成文件回执（T5-3） ---
+    # 审批门（_approve_tool）执行 officecli_edit 成功后写入本通道；
+    # _wrap 把它挂到本轮终端回答消息的 additional_kwargs 后清空。
+    # 不用 operator.add 而用整体替换：回执是「最近一次批准的写操作」
+    # 语义，跨用户轮次在 _new_run_state 重置为空，不能跨轮累积
+    # （否则新一轮的回答会重复携带旧轮次的下载入口）。
+    generated_files: Annotated[list[GeneratedFile], _replace]
+
     # --- 会话元信息 ---
     session_id: Annotated[str | None, _replace]
     user_id: Annotated[str | None, _replace]
@@ -936,6 +1013,7 @@ def create_initial_state(
         task_plan=None,
         task_results=[],
         tool_results=[],
+        generated_files=[],
         session_id=session_id,
         user_id=user_id,
         run_id=run_id,

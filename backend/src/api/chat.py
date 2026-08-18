@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Request, status
 from langchain_core.messages import AIMessage, BaseMessage
 from starlette.concurrency import run_in_threadpool
 
+from api.files import attachments_for_generated_files
 from api.schemas import (
     AgentRole,
     ApiErrorCode,
@@ -175,7 +176,9 @@ def _is_answer_message(message: BaseMessage) -> bool:
 
 
 def _final_assistant_message(
-    state: AgentState, previous_message_count: int
+    state: AgentState,
+    previous_message_count: int,
+    user_id: str | None = None,
 ) -> Message | None:
     agent = _public_agent(state.get("current_agent"))
     messages = state.get("messages", [])
@@ -194,6 +197,8 @@ def _final_assistant_message(
             content=content,
             agent=agent,
             created_at=_safe_created_at(message),
+            # T5-3：officecli_edit 生成的文件注册为可下载附件（无则 None）。
+            attachments=attachments_for_generated_files(user_id, message),
         )
     return None
 
@@ -471,7 +476,7 @@ async def chat_response_for_state(
     return ChatResponse(
         session_id=session_id,
         run_id=state.get("run_id"),
-        message=_final_assistant_message(state, previous_count),
+        message=_final_assistant_message(state, previous_count, user_id),
         references=_response_references(state, previous_count),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),

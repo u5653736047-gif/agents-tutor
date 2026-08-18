@@ -140,7 +140,7 @@ def _safe_created_at(message: BaseMessage) -> datetime | None:
     return created_at if isinstance(created_at, datetime) else None
 
 
-def _public_message(message: BaseMessage) -> Message | None:
+def _public_message(message: BaseMessage, user_id: str | None = None) -> Message | None:
     if isinstance(message, HumanMessage):
         role = MessageRole.USER
     elif isinstance(message, AIMessage) and not message.tool_calls:
@@ -150,19 +150,31 @@ def _public_message(message: BaseMessage) -> Message | None:
 
     if not isinstance(message.content, str):
         return None
+    # 延迟导入避免模块环：api/files.py 在模块顶部从本模块导入
+    # current_user_id（与 get_session_process 延迟导入 api.chat 同一模式）。
+    from api.files import attachments_for_generated_files
+
     return Message(
         role=role,
         content=message.content,
         agent=_safe_agent(message),
         created_at=_safe_created_at(message),
-        # D7-T3:core 消息无附件元数据,预留字段显式置 None,契约完整;
-        # 前端据此零渲染,待 core 携带附件元数据后由这里透传。
-        attachments=None,
+        # T5-3:core 助手消息可能携带 officecli 生成文件元数据,这里注册为
+        # 受控下载附件后透传;无元数据时返回 None,前端零渲染(与 D7-T3
+        # 预留语义一致)。
+        attachments=attachments_for_generated_files(user_id, message),
     )
 
 
-def _public_messages(messages: Iterable[BaseMessage]) -> list[Message]:
-    return [public_message for message in messages if (public_message := _public_message(message))]
+def _public_messages(
+    messages: Iterable[BaseMessage],
+    user_id: str | None = None,
+) -> list[Message]:
+    return [
+        public_message
+        for message in messages
+        if (public_message := _public_message(message, user_id))
+    ]
 
 
 def _latest_run_events(state: Mapping[str, Any]) -> list[object]:
@@ -334,7 +346,10 @@ def get_session_history(
             ApiErrorCode.SESSION_NOT_FOUND,
             "Session was not found.",
         )
-    return _public_messages(_graph(request).get_history(session_id, user_id=user_id))
+    return _public_messages(
+        _graph(request).get_history(session_id, user_id=user_id),
+        user_id,
+    )
 
 
 @router.get(
