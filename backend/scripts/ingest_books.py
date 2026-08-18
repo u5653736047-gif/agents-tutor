@@ -92,9 +92,9 @@ import json
 import re
 import sqlite3
 import sys
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
 
 from core.knowledge.embedding import (
     EmbeddingProvider,
@@ -192,7 +192,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         raise ValueError(f"无法读取知识清单 {manifest_path}: {exc}") from exc
 
     if not isinstance(raw, dict) or not isinstance(raw.get("version"), int):
-        raise ValueError("知识清单缺少整数 version 字段")
+        raise TypeError("知识清单缺少整数 version 字段")
     raw_books = raw.get("books")
     if not isinstance(raw_books, list) or not raw_books:
         raise ValueError("知识清单的 books 必须是非空数组")
@@ -202,7 +202,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
     seen_sources: set[str] = set()
     for index, entry in enumerate(raw_books):
         if not isinstance(entry, dict):
-            raise ValueError(f"第 {index + 1} 本书的条目必须是对象")
+            raise TypeError(f"第 {index + 1} 本书的条目必须是对象")
         source = _validate_source_identifier(str(entry.get("source", "")))
         if source in seen_sources:
             raise ValueError(f"source 重复：{source!r}")
@@ -266,7 +266,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         verify: list[VerifyCase] = []
         for case_index, case in enumerate(raw_verify):
             if not isinstance(case, dict):
-                raise ValueError(f"{book.source}: 第 {case_index + 1} 个用例必须是对象")
+                raise TypeError(f"{book.source}: 第 {case_index + 1} 个用例必须是对象")
             query = str(case.get("query", "")).strip()
             expected = str(case.get("expected_source", ""))
             if not query:
