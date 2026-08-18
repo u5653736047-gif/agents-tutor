@@ -30,3 +30,11 @@ Thumbs.db
 
 # Runtime data (knowledge source PDFs and SQLite stores stay out of git)
 data/
+
+# Archived research artifacts: kept locally under docs/ for reference,
+# intentionally not versioned (HTML share packages, UI research reports,
+# and ad-hoc review screenshots).
+docs/.trae-html-share-packages/
+docs/agent-plug-and-play-ui-research/
+docs/agent-streaming-ui-research/
+docs/ui-review-shots/13-assistant-ui-final-verify.png
