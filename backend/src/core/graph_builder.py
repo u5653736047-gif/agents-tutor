@@ -43,6 +43,7 @@ from .state import (
     AgentState,
     EvaluationResult,
     EvaluationVerdict,
+    GeneratedFile,
     HandoffApprovalAction,
     HandoffApprovalDecision,
     HandoffApprovalRequest,
@@ -63,9 +64,11 @@ from .state import (
     create_initial_state,
     message_references,
     with_agent_role,
+    with_generated_files,
     with_references,
 )
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
+from .tools.office_tools import GENERATED_FILES_RESULT_KEY, approved_office_execution
 from .tools.shell_tool import approved_shell_execution, shell_output_scope
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
@@ -715,7 +718,23 @@ class CollaborativeAgentGraph:
                 cast(list[BaseMessage], updates["messages"]),
                 tool_results,
             )
+            # T5-3：officecli_edit 成功产出的文件清单挂到本轮终端回答，
+            # API 层读取后转为可下载附件（与引用同一闸口、同一副本语义，
+            # 聚合改写的 model_copy 会原样保留 additional_kwargs）。
+            # 来源有两路：审批门写入 state 通道的回执（唯一执行路径），
+            # 以及防御性兼容的本轮内联工具结果解析。
+            pending_generated = _generated_files_from_state(
+                state.get("generated_files")
+            )
+            updated_messages, generated_attached = _attach_generated_files(
+                updated_messages,
+                tool_results,
+                pending_generated,
+            )
             updates["messages"] = updated_messages
+            if generated_attached and pending_generated:
+                # 挂载后清空通道：同一轮后续 Agent 的回答不重复携带
+                updates["generated_files"] = []
             target = _handoff_target(tool_results)  # 本轮模型请求的转交目标
             new_plan = _task_plan_from_results(tool_results)  # 本轮模型新建的计划
             existing_plan = _task_plan_from_state(state)  # 已持久化的活动计划
@@ -1451,6 +1470,9 @@ class CollaborativeAgentGraph:
                     additional_roots=state.get("additional_workspace_roots", []),
                 ),
                 approved_shell_execution(),
+                # officecli_edit 的运行时门与 shell 并列进入批准上下文
+                # （计划 3.7：双保险缺一即无法写文件，高危 H3 的接线点）。
+                approved_office_execution(),
                 shell_output_scope(forward_output),
             ):
                 execution = executor.execute(tool_call, pending.agent_role)
@@ -1462,17 +1484,21 @@ class CollaborativeAgentGraph:
             duration_ms=execution.result.duration_ms,
             error_code=execution.result.error_code,
         )
-        return cast(
-            AgentState,
-            {
-                "messages": [execution.message],
-                "tool_results": [execution.result],
-                "events": emitted,
-                "next_agent": pending.agent_role.value,
-                "pending_tool_approval": None,
-                "run_error": None,
-            },
-        )
+        gate_updates: dict[str, object] = {
+            "messages": [execution.message],
+            "tool_results": [execution.result],
+            "events": emitted,
+            "next_agent": pending.agent_role.value,
+            "pending_tool_approval": None,
+            "run_error": None,
+        }
+        # T5-3：审批门是 requires_approval 工具的唯一执行路径，officecli_edit
+        # 的生成文件在这里收集并写入 state 通道；_wrap 在后续终端回答上
+        # 挂载并清空（见 AgentState.generated_files 注释）。
+        gate_generated = _generated_files_from_tool_results([execution.result])
+        if gate_generated:
+            gate_updates["generated_files"] = gate_generated
+        return cast(AgentState, gate_updates)
 
     def _approve_handoff(self, state: AgentState) -> AgentState:
         """暂停并提交分派决定；恢复时仅重放这个无外部副作用的 gate。"""
@@ -1654,6 +1680,9 @@ class CollaborativeAgentGraph:
                     "reference_verification": None,
                     "task_plan": None,
                     "task_results": [],
+                    # T5-3：生成文件回执按用户轮次重置（跨轮不累积，
+                    # 新一轮回答不重复携带旧轮次的下载入口）
+                    "generated_files": [],
                     "run_error": None,
                     "handoff_count": 0,
                     "agent_switch_count": 0,
@@ -2095,6 +2124,90 @@ def _citations_from_tool_results(
             seen_chunk_ids.add(citation.chunk_id)
             citations.append(citation)
     return citations
+
+
+def _generated_files_from_tool_results(
+    tool_results: Sequence[ToolResult],
+) -> list[GeneratedFile]:
+    """从本轮 officecli_edit 成功结果中收集生成文件清单（T5-3）。
+
+    写工具成功时输出 JSON 携带 generated_files 键（见 office_tools.py 的
+    GENERATED_FILES_RESULT_KEY）；「本轮」同样由 updates["tool_results"]
+    天然界定。解析失败/键缺失/项非法逐项跳过（宽容读取，与
+    _citations_from_tool_results 同一哲学）；同一文件按 path 去重，
+    保留最后一次修改的回执元数据（size/mtime_ns 取最新值）。
+    """
+    collected: dict[str, GeneratedFile] = {}
+    for result in tool_results:
+        if result.tool_name != "officecli_edit" or not result.success:
+            continue
+        try:
+            payload = json.loads(result.output)
+        except (TypeError, ValueError):
+            continue
+        raw_files = (
+            payload.get(GENERATED_FILES_RESULT_KEY)
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(raw_files, list):
+            continue
+        for item in raw_files:
+            try:
+                entry = GeneratedFile.model_validate(item)
+            except (TypeError, ValidationError):
+                continue
+            # dict 赋值去重：同一路径后出现的（更新的）覆盖先前的
+            collected[entry.path] = entry
+    return list(collected.values())
+
+
+def _generated_files_from_state(value: object) -> list[GeneratedFile]:
+    """宽容读取 state 通道中的生成文件回执。
+
+    checkpoint 反序列化后模型实例与 dict 两种形态都可能出现（与既有
+    tool_results 等通道的序列化语义一致），非法项逐项跳过。
+    """
+    if not isinstance(value, list):
+        return []
+    files: list[GeneratedFile] = []
+    for item in value:
+        if isinstance(item, GeneratedFile):
+            files.append(item)
+        elif isinstance(item, dict):
+            try:
+                files.append(GeneratedFile.model_validate(item))
+            except ValidationError:
+                continue
+    return files
+
+
+def _attach_generated_files(
+    messages: Sequence[BaseMessage],
+    tool_results: Sequence[ToolResult],
+    pending_generated: Sequence[GeneratedFile] = (),
+) -> tuple[list[BaseMessage], bool]:
+    """把生成文件清单挂到本轮终端回答消息上（T5-3）。
+
+    与 _attach_references 同一闸口语义：目标是本轮最后一个无
+    tool_calls 的 AIMessage；无终端回答（如本轮只发起工具调用）时不挂，
+    返回 attached=False 让调用方保留通道待后续轮次再挂。
+    无生成文件时原样返回、不注入空键。
+    """
+    files = [
+        *_generated_files_from_tool_results(tool_results),
+        *pending_generated,
+    ]
+    if not files:
+        return list(messages), False
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if not (isinstance(message, AIMessage) and not message.tool_calls):
+            continue
+        updated[index] = with_generated_files(message, files)
+        return updated, True
+    return updated, False
 
 
 def _attach_references(

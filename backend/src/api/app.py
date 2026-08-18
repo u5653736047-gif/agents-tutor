@@ -52,8 +52,12 @@ from core.sessions import SessionStore
 from core.state import AgentRole
 from core.tools import (
     MAX_SHELL_TIMEOUT_SECONDS,
+    OFFICECLI_TIMEOUT_MARGIN_SECONDS,
+    create_office_tools,
     create_read_only_file_tools,
     create_shell_tool,
+    load_officecli_settings,
+    officecli_enabled,
 )
 
 DEFAULT_MODEL = "deepseek-chat"
@@ -114,6 +118,28 @@ _READ_ONLY_FILE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
 }
 _SHELL_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
     "shell": frozenset({AgentRole.SUPERVISOR}),
+}
+# ── officecli 工具的角色授权（计划 3.9 权限矩阵）──────────────────
+# officecli_inspect 只读，四个角色均可用；officecli_edit 有副作用且需
+# 人工审批，授给 Supervisor / 助教 / 评价，助学（面向学生的答疑角色）
+# 不具备文档写权限。注意：API_OFFICECLI_ENABLED=0 时工具不注册，本
+# 表也必须同步省略——graph_builder 会拒绝「权限声明了未注册工具」。
+_OFFICE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
+    "officecli_inspect": frozenset(
+        {
+            AgentRole.SUPERVISOR,
+            AgentRole.TEACHING_ASSISTANT,
+            AgentRole.LEARNING_ASSISTANT,
+            AgentRole.EVALUATOR,
+        }
+    ),
+    "officecli_edit": frozenset(
+        {
+            AgentRole.SUPERVISOR,
+            AgentRole.TEACHING_ASSISTANT,
+            AgentRole.EVALUATOR,
+        }
+    ),
 }
 REQUEST_LOGGER = logging.getLogger("api.request")
 _LOGGER = logging.getLogger("api.app")
@@ -303,6 +329,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     workspace_filesystem = WorkspaceFileSystem(workspace_root)
     read_only_file_tools = create_read_only_file_tools(workspace_filesystem)
     shell_tool = create_shell_tool(workspace_filesystem)
+    # officecli 集成（计划 3.5）：默认禁用（ENABLED=0 时完全不注册工具、
+    # 不做任何二进制探测，保证无 officecli 的 CI/评委环境不受影响）；
+    # 显式开启时解析二进制并启动自检，失败 fail-fast。
+    office_tools: tuple[BaseTool, ...] = ()
+    office_tool_permissions: dict[str, Collection[AgentRole]] = {}
+    office_tool_timeouts: dict[str, float] = {}
+    if officecli_enabled():
+        office_settings = load_officecli_settings()
+        office_tools = create_office_tools(workspace_filesystem, office_settings)
+        office_tool_permissions = dict(_OFFICE_TOOL_PERMISSIONS)
+        # 双层超时推导（计划 M2）：执行器时限 = 子进程超时 + 5 秒，
+        # 从同一常量推导，保证子进程先超时并返回自带诊断。
+        office_tool_timeouts = {
+            "officecli_inspect": float(
+                office_settings.timeout_read_seconds + OFFICECLI_TIMEOUT_MARGIN_SECONDS
+            ),
+            "officecli_edit": float(
+                office_settings.timeout_write_seconds + OFFICECLI_TIMEOUT_MARGIN_SECONDS
+            ),
+        }
 
     with open_sqlite_checkpointer(checkpoint_path) as checkpointer:
         session_store = SessionStore(
@@ -345,16 +391,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # 内容的两个 Worker（理由见模块底部 _KNOWLEDGE_TOOL_PERMISSIONS
                 # 的注释）；graph_builder 会校验权限声明完整（缺工具或
                 # 权限为 None 会抛 ValueError）。
-                tools=[knowledge_stack.tool, *read_only_file_tools, shell_tool],
+                tools=[
+                    knowledge_stack.tool,
+                    *read_only_file_tools,
+                    shell_tool,
+                    *office_tools,
+                ],
                 tool_permissions={
                     **_KNOWLEDGE_TOOL_PERMISSIONS,
                     **_READ_ONLY_FILE_TOOL_PERMISSIONS,
                     **_SHELL_TOOL_PERMISSIONS,
+                    **office_tool_permissions,
                 },
                 # Shell enforces its own user-selected timeout (max 120s).
                 # Keep the generic executor deadline slightly above it so the
                 # shell can terminate its process tree and return diagnostics.
-                tool_timeouts={"shell": MAX_SHELL_TIMEOUT_SECONDS + 5},
+                tool_timeouts={
+                    "shell": MAX_SHELL_TIMEOUT_SECONDS + 5,
+                    **office_tool_timeouts,
+                },
             )
             app.state.session_store = session_store
             # D6-T3:检索服务挂到 app.state,供 /knowledge/search 路由

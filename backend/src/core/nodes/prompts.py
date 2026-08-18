@@ -11,6 +11,19 @@ _WORKSPACE_RULE = (
     "不得猜测或访问未授权位置。多文件分析优先用 inspect_workspace 合并操作，"
     "禁止相同参数重复扫描。"
 )
+# Office 文档工具使用策略（officecli 集成，计划 T3-2）：短策略不贴长
+# SKILL——详细用法由模型经 officecli_inspect 的 help/load_skill 自取。
+# 刻意不提 save/close：非 resident 路径下每条写命令即时落盘，引导
+# 「保存」只会白耗一张审批卡（计划 M4）。
+_OFFICE_READ_RULE = (
+    "读取 Office 文档（.docx/.xlsx/.pptx）用 officecli_inspect"
+    "（先 help 了解用法），文件须在当前会话工作区。"
+)
+_OFFICE_EDIT_RULE = (
+    f"{_OFFICE_READ_RULE}"
+    "修改用 officecli_edit（需用户批准）：改前先 inspect 看结构，"
+    "多步合并为一次 batch --commands，完成后 validate；import 仅支持 .xlsx 目标。"
+)
 
 ROLE_PROMPTS: dict[AgentRole, str] = {
     # 协调者：意图识别 + 任务分派，复杂请求拆子任务、简单请求直接交接。
@@ -26,6 +39,7 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "[TASK_RESULTS] 时只据其汇总，失败项必须明确说明缺失，不得补造。"
         "若学生自述基础水平（如“我基础差”“我学得比较深”），"
         "调用 detect_level 记录水平画像后再分派。"
+        f"{_OFFICE_EDIT_RULE}"
     ),
     # S4-T2 检索约定：search_knowledge 已注入备课角色（授权见
     # api/app.py 模块注释）。备课/教案/例题是教材内容的再加工，
@@ -36,6 +50,7 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "你是助教，负责知识讲解与备课支持。"
         "备课/教案/例题生成必须先调用 search_knowledge 检索教材，"
         "基于检索结果生成，禁止脱离教材凭空编写。"
+        f"{_OFFICE_EDIT_RULE}"
     ),
     # S2-T2 分层讲解：静态部分只约定「分层策略」，不绑定具体水平——
     # 具体水平由 learning_assistant_system_prompt() 在运行时按
@@ -60,6 +75,7 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "再作答，禁止凭空编造教材内容；"
         "检索无命中时如实说明「知识库未覆盖」而非强行作答；"
         "回答基于检索到的知识片段组织，引用编号由系统自动生成，无需自行编写。"
+        f"{_OFFICE_READ_RULE}"
     ),
     # 评价者：必须基于检索证据做结构化评价，禁止凭空打分。
     AgentRole.EVALUATOR: (
@@ -68,6 +84,7 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
         "提交结构化结论：verdict 总结论、fact_accuracy 事实准确性、"
         "citation_completeness 引用完整性（无检索证据引用时不得判通过）、"
         "reason 理由；再给出简要评价文本。"
+        f"{_OFFICE_EDIT_RULE}"
     ),
 }
 
@@ -89,6 +106,7 @@ TOOL_ORCHESTRATION_SUPERVISOR_PROMPT = (
     "和合理 timeout_seconds；调用会暂停并向用户展示完整命令，只有用户明确批准后"
     "才执行。不得用 shell 绕过工作区授权，不得启动后台或交互进程，不得重复执行"
     "已经得到结果的命令。普通文件分析仍优先使用 inspect_workspace。"
+    f"{_OFFICE_EDIT_RULE}"
 )
 
 # ─────────────────────────────────────────────

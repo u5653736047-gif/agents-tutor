@@ -111,3 +111,73 @@ def test_lifespan_uses_workspace_configuration_for_new_sessions(
                 )
 
     asyncio.run(verify_runtime())
+
+
+def test_lifespan_wires_office_tools_when_enabled(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ENABLED=1：office 工具对按 3.9 权限矩阵注册，双层超时按 +5s 推导。
+
+    用 sys.executable 充当假二进制（--version 自检可真实运行，版本不一致
+    仅告警），覆盖开启态的完整装配路径。
+    """
+    import sys
+
+    _configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("API_OFFICECLI_ENABLED", "1")
+    monkeypatch.setenv("API_OFFICECLI_BINARY", sys.executable)
+    monkeypatch.setenv("API_OFFICECLI_TIMEOUT_READ_SECONDS", "60")
+    monkeypatch.setenv("API_OFFICECLI_TIMEOUT_WRITE_SECONDS", "120")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            graph = app.state.graph
+            inspect_tool = graph.registry.get("officecli_inspect")
+            edit_tool = graph.registry.get("officecli_edit")
+            assert inspect_tool is not None and edit_tool is not None
+            assert inspect_tool.extras == {"category": "office", "read_only": True}
+            assert edit_tool.extras == {
+                "category": "office",
+                "requires_approval": True,
+                "status_from_ok": True,
+            }
+            # 3.9 权限矩阵：inspect 四角色可用；edit 不授给助学
+            for role in AgentRole:
+                assert graph.registry.is_authorized("officecli_inspect", role)
+            assert graph.registry.is_authorized("officecli_edit", AgentRole.SUPERVISOR)
+            assert graph.registry.is_authorized(
+                "officecli_edit", AgentRole.TEACHING_ASSISTANT
+            )
+            assert graph.registry.is_authorized("officecli_edit", AgentRole.EVALUATOR)
+            assert not graph.registry.is_authorized(
+                "officecli_edit", AgentRole.LEARNING_ASSISTANT
+            )
+            # 双层超时推导：执行器时限 = 子进程超时 + 5
+            executor = graph.agents[AgentRole.SUPERVISOR].tool_executor
+            assert executor.timeout_seconds_for("officecli_inspect") == 65
+            assert executor.timeout_seconds_for("officecli_edit") == 125
+            # 写工具运行时门：未批准上下文直接调用必须被拒
+            with pytest.raises(PermissionError, match="approval"):
+                edit_tool.invoke({"command": ["create", "x.xlsx"]})
+
+    asyncio.run(verify_runtime())
+
+
+def test_lifespan_omits_office_tools_when_disabled(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ENABLED 缺省（0）：工具与权限声明同步缺席，graph 权限校验不受影响。"""
+    _configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.delenv("API_OFFICECLI_ENABLED", raising=False)
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            graph = app.state.graph
+            assert graph.registry.get("officecli_inspect") is None
+            assert graph.registry.get("officecli_edit") is None
+
+    asyncio.run(verify_runtime())
