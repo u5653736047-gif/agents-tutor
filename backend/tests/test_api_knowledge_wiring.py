@@ -234,13 +234,17 @@ def test_lifespan_wires_search_knowledge_tool_and_permissions(
             assert graph.registry.is_authorized(
                 "search_knowledge", AgentRole.TEACHING_ASSISTANT
             )
-            # 最小权限：协调者与评价者不授（supervisor 是调度者、
-            # evaluator 基于历史工具观察结果评价，无需自己检索）。
+            # 六大功能 P2-11：evaluator 授权（有意逆转既定默认）——
+            # 批改场景 loop 中无其他 Agent 产出检索证据，评分依据必须
+            # 自己检索对齐（客观题佐证 + 主观题评分标准，理由见 app.py
+            # 模块底部注释更新）。
+            assert graph.registry.is_authorized(
+                "search_knowledge", AgentRole.EVALUATOR
+            )
+            # 最小权限：协调者不授（supervisor 是调度者，不直接产出
+            # 知识内容）。
             assert not graph.registry.is_authorized(
                 "search_knowledge", AgentRole.SUPERVISOR
-            )
-            assert not graph.registry.is_authorized(
-                "search_knowledge", AgentRole.EVALUATOR
             )
 
     asyncio.run(verify_runtime())
@@ -474,3 +478,51 @@ def test_lifespan_mounts_knowledge_catalog_and_exposes_documents(
 
     # lifespan 退出后清空引用（与 service 同一清理语义）。
     assert getattr(app.state, "knowledge_catalog", None) is None
+
+
+# ── 审查 S5：/healthz 的 ocr 诊断字段（P0-6）────────────────────
+
+
+def test_healthz_reports_ocr_disabled_when_mode_off(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """API_OCR_MODE=off → /healthz 的 ocr.enabled 如实报告 false。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_OCR_MODE", "off")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+            assert response.status_code == 200
+            assert response.json()["ocr"] == {"enabled": False}
+
+    asyncio.run(verify_runtime())
+
+
+def test_healthz_reports_ocr_state_when_auto(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """auto 模式下诊断如实报告：依赖缺失→false、已装 extra→true。
+
+    断言值与 create_ocr_provider("auto") 的探测结果同源——两种路径
+    都是「诊断如实」，不依赖本地是否装了 rapidocr。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_OCR_MODE", "auto")
+    app = create_app()
+
+    from core.ocr import create_ocr_provider
+
+    expected_enabled = create_ocr_provider("auto") is not None
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+            assert response.status_code == 200
+            assert response.json()["ocr"] == {"enabled": expected_enabled}
+
+    asyncio.run(verify_runtime())

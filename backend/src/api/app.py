@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
@@ -22,6 +23,7 @@ from api.chat import router as chat_router
 from api.feedback import router as feedback_router
 from api.files import router as files_router
 from api.knowledge import router as knowledge_router
+from api.learning import router as learning_router
 from api.openapi import install_openapi_contract
 from api.schemas import ApiErrorCode, ErrorDetail, ErrorResponse
 from api.sessions import router as session_router
@@ -42,11 +44,15 @@ from core.knowledge.hybrid import (
     open_vector_index_if_available,
 )
 from core.knowledge.index import SqliteKnowledgeIndex
+from core.knowledge.policy import HeuristicRetrievalPolicy, RetrievalPolicy
+from core.knowledge.retrieval import HeuristicQueryRefiner, QueryRefiner
 from core.knowledge.service import KnowledgeService
 from core.knowledge.tools import create_search_knowledge_tool
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
+from core.learning import LearningRecordStore
 from core.models import DeepSeekSettings, create_deepseek_model
 from core.nodes.react_agent import ChatModel
+from core.ocr import OcrProvider, create_ocr_provider
 from core.persistence import open_sqlite_checkpointer
 from core.sessions import SessionStore
 from core.state import AgentRole
@@ -90,13 +96,43 @@ DEFAULT_CHECKPOINT_PATH = str(_REPO_ROOT / "data" / "api_checkpoints.sqlite3")
 DEFAULT_KNOWLEDGE_DB_PATH = str(_REPO_ROOT / "data" / "knowledge.db")
 DEFAULT_VECTOR_DB_PATH = str(_REPO_ROOT / "data" / "vector_knowledge.db")
 DEFAULT_EMBEDDING_MODE = "auto"
+# ── 学习记录库路径（六大功能计划 P0-4）────────────────────
+# 与 API_KNOWLEDGE_DB_PATH 同一命名风格：学情诊断/路径规划/陪伴的
+# 跨会话学生数据底座（data/learning.db，WAL，见 core/learning/store.py）。
+DEFAULT_LEARNING_DB_PATH = str(_REPO_ROOT / "data" / "learning.db")
+DEFAULT_OCR_MODE = "auto"
+# ── 上下文预算默认值（六大功能计划 P0-1）───────────────────
+# 背后模型为 1M 窗口，512K 是**护栏上限而非目标填充量**：批改整份
+# PDF 作业正文 + 评分依据检索 + 多轮历史才可能逼近，普通对话远达
+# 不到；内置估算器按中文 1 字符≈1 token 保守高估，实际送入模型的
+# token 少于预算值，方向安全（不会击穿模型窗口）。权衡提示：ReAct
+# 每轮 model.invoke 全量重放历史（react_agent.py），极端长会话的输入
+# 成本与 prefill 延迟随历史增长，按 extra["context_token_count"]
+# 埋点观测，必要时环境变量下调。附带收益：大窗口 + 裁剪护栏已覆盖
+# 长对话，TASK_BREAKDOWN 1.3.2 的「长对话摘要压缩」可继续不做。
+DEFAULT_MAX_CONTEXT_TOKENS = 524288
+DEFAULT_MAX_CONTEXT_MESSAGES = 200
+# 自适应检索相关性阈值（六大功能计划 P0-2）：量纲跟随索引分数——
+# 生产混合检索为 RRF 融合分（单项第 1 名 ≈ 1/61 ≈ 0.0164，双路
+# 第 1 名 ≈ 0.0328，见 hybrid.py 模块注释），0.01 约可滤掉排名≈40
+# 以后的极低相关命中；纯词法降级模式分数为命中词数（≥ 1），全部
+# 达标不受影响。未达标时工具 Observation 会提示「知识库可能未覆盖」
+# （tools.py _THRESHOLD_MISS_HINT），Agent 应如实说明而非强行作答。
+DEFAULT_RETRIEVAL_THRESHOLD = 0.01
 # 未显式配置时只开放进程工作目录，绝不通过源码层级推导到磁盘根目录。
 # 本地启动脚本会显式设为仓库根；容器显式设为只读挂载的 /workspace。
 DEFAULT_WORKSPACE_ROOT = str(Path.cwd().resolve())
 # ── search_knowledge 工具的角色授权声明（理由见模块注释）──────────
 _KNOWLEDGE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
+    # 六大功能 P2-11：evaluator 加入检索授权（有意逆转既定默认，理由
+    # 更新见模块底部注释）——批改场景 loop 中无其他 Agent 产出检索
+    # 证据，评分依据必须对齐教材检索（客观题佐证 + 主观题评分标准）。
     "search_knowledge": frozenset(
-        {AgentRole.LEARNING_ASSISTANT, AgentRole.TEACHING_ASSISTANT}
+        {
+            AgentRole.LEARNING_ASSISTANT,
+            AgentRole.TEACHING_ASSISTANT,
+            AgentRole.EVALUATOR,
+        }
     ),
 }
 _READ_ONLY_FILE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
@@ -144,6 +180,49 @@ _OFFICE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
 REQUEST_LOGGER = logging.getLogger("api.request")
 _LOGGER = logging.getLogger("api.app")
 RequestHandler = Callable[[Request], Awaitable[Response]]
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """读取正整数环境变量；缺失/非法/非正时回退默认值（警告日志）。
+
+    配置错误的处置取舍：与 embedding/OCR 模式的 fail-fast 不同，
+    上下文预算是护栏参数而非能力开关——非法值回退安全默认不阻断
+    启动，但要留警告日志让运维发现拼写错误。
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        _LOGGER.warning("环境变量 %s 非法（%r），回退默认值 %s", name, raw, default)
+        return default
+    if value <= 0:
+        _LOGGER.warning("环境变量 %s 非正（%s），回退默认值 %s", name, value, default)
+        return default
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """读取正浮点环境变量；缺失/非法/非正/非有限时回退默认（审查 S4）。
+
+    与 _env_positive_int 同一护栏哲学：检索阈值是护栏参数而非能力
+    开关——裸 float() 会让拼写错误（"0,01"）直接崩启动，而
+    float("nan") 使比较恒 False（阈值静默失效）、float("inf") 使
+    所有命中被判未达标（语义反转），三者都必须回退安全默认并留日志。
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        _LOGGER.warning("环境变量 %s 非法（%r），回退默认值 %s", name, raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        _LOGGER.warning("环境变量 %s 非正或非有限（%s），回退默认值 %s", name, value, default)
+        return default
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +303,9 @@ def create_knowledge_search_stack(
     vector_db: Path,
     *,
     embedding: str = DEFAULT_EMBEDDING_MODE,
+    adaptive_policy: RetrievalPolicy | None = None,
+    relevance_threshold: float | None = None,
+    query_refiner: QueryRefiner | None = None,
 ) -> KnowledgeSearchStack:
     """装配知识检索链路：词法库 → 向量库（可选）→ 混合索引 → 服务 → 工具。
 
@@ -239,6 +321,14 @@ def create_knowledge_search_stack(
         KnowledgeService(混合索引)              ← 服务层（校验、可选改写）
               ↓
         create_search_knowledge_tool(服务)      ← Agent 可调用的工具
+
+    自适应检索装配（六大功能计划 P0-2）：adaptive_policy /
+    relevance_threshold / query_refiner 默认全 None——工具走原
+    service.search 路径，输出与接入前逐项一致（测试路径零回归）；
+    生产 lifespan 显式注入（寒暄/纯计算免检索的启发式策略 + 相关性
+    阈值 + 零 LLM 启发式精化器）后走 adaptive 路径。不接入 LLM
+    rewriter（拒绝方案 6：每查询多一次模型调用拉高首 token 延迟）；
+    reranker 留作可选装配（当前无本地重排器实现）。
 
     降级语义：向量库是可选增强——文件不存在、维度与 provider 不匹配
     （换过 embedding 未重建库）、SQLite 损坏，任一情况都返回 None
@@ -275,7 +365,12 @@ def create_knowledge_search_stack(
                 vector_dimension = provider.dimension
                 break
     hybrid = HybridKnowledgeIndex(lexical, vector)
-    service = KnowledgeService(hybrid)
+    # P0-2：精化器注入时重检上限取 1（每轮重检 = 一次完整检索，
+    # 启发式精化的收益不值得多轮；未注入精化器时该参数无实际作用）。
+    service = KnowledgeService(
+        hybrid,
+        max_refine_rounds=1 if query_refiner is not None else 2,
+    )
     # I1:catalog 是独立连接(与索引相同的 RLock + check_same_thread=False
     # 线程安全约定,见 catalog.py 模块 docstring)。它不在 hybrid.close
     # 的转发范围内(hybrid 只关词法/向量两路),因此 close 回调要额外
@@ -287,7 +382,12 @@ def create_knowledge_search_stack(
         catalog.close()
 
     return KnowledgeSearchStack(
-        tool=create_search_knowledge_tool(service),
+        tool=create_search_knowledge_tool(
+            service,
+            policy=adaptive_policy,
+            relevance_threshold=relevance_threshold,
+            refiner=query_refiner,
+        ),
         close=_close,
         vector_enabled=hybrid.vector_enabled,
         vector_provider=vector_provider,
@@ -315,6 +415,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     checkpoint_path = Path(os.getenv("API_CHECKPOINT_PATH", DEFAULT_CHECKPOINT_PATH))
     knowledge_db = Path(os.getenv("API_KNOWLEDGE_DB_PATH", DEFAULT_KNOWLEDGE_DB_PATH))
     vector_db = Path(os.getenv("API_VECTOR_DB_PATH", DEFAULT_VECTOR_DB_PATH))
+    # P0-4：学习记录库（学情诊断/路径规划/陪伴的跨会话数据底座）。
+    learning_db = Path(os.getenv("API_LEARNING_DB_PATH", DEFAULT_LEARNING_DB_PATH))
     workspace_root = Path(os.getenv("API_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT))
     raw_allowed_workspace_roots = os.getenv("API_WORKSPACE_ALLOWED_ROOTS")
     allowed_workspace_roots = (
@@ -329,6 +431,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     workspace_filesystem = WorkspaceFileSystem(workspace_root)
     read_only_file_tools = create_read_only_file_tools(workspace_filesystem)
     shell_tool = create_shell_tool(workspace_filesystem)
+    # P0-4 装配链路：学习记录 store 随 lifespan 创建/注入/关闭
+    #（仿 knowledge_stack 的生命周期管理；传入图的可选构造参数
+    # learning_store 后条件注册两个学习记录工具，见 graph_builder）。
+    learning_store = LearningRecordStore(learning_db)
+    # P0-6：OCR provider 按模式装配（auto=探测到依赖才启用），
+    # 不可用时 None——附件提取链路返回友好提示而非报错；
+    # 挂 app.state 供批改附件消费（P2-7），/healthz 诊断可观测。
+    ocr_provider: OcrProvider | None = create_ocr_provider(
+        os.getenv("API_OCR_MODE", DEFAULT_OCR_MODE)
+    )
     # officecli 集成（计划 3.5）：默认禁用（ENABLED=0 时完全不注册工具、
     # 不做任何二进制探测，保证无 officecli 的 CI/评委环境不受影响）；
     # 显式开启时解析二进制并启动自检，失败 fail-fast。
@@ -364,6 +476,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             knowledge_db,
             vector_db,
             embedding=os.getenv("API_KNOWLEDGE_EMBEDDING", DEFAULT_EMBEDDING_MODE),
+            # P0-2 生产接线：寒暄/纯计算免检索的启发式策略 + 相关性
+            # 阈值 + 零 LLM 启发式精化器（阈值量纲说明见
+            # DEFAULT_RETRIEVAL_THRESHOLD 注释，env 可覆盖）。
+            adaptive_policy=HeuristicRetrievalPolicy(),
+            # 审查 S4：阈值用护栏解析（非法/nan/inf 回退默认+警告），
+            # 与上下文预算同一处置哲学，避免拼写错误崩启动或静默失效。
+            relevance_threshold=_env_positive_float(
+                "API_RETRIEVAL_THRESHOLD", DEFAULT_RETRIEVAL_THRESHOLD
+            ),
+            query_refiner=HeuristicQueryRefiner(),
         )
         # H-T1 统一结构化启动日志：hybrid / lexical_only 都打，让运维
         # 一眼看出语义检索是否在线。只打模式 / provider / 维度，不打印
@@ -387,6 +509,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # 的工具调用，结果返回 supervisor 后由其整合本轮答案。
                 # 不在委派处 interrupt，避免请求在子代理响应前提前结束。
                 orchestration_mode="tool",
+                # P0-1 上下文预算（默认值依据与权衡见
+                # DEFAULT_MAX_CONTEXT_TOKENS 注释）：护栏上限而非目标
+                # 填充量，env 可随时调整；裁剪设施 context.py 已就绪，
+                # 不传计数器时走内置保守估算（零新依赖）。
+                max_context_tokens=_env_positive_int(
+                    "API_MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS
+                ),
+                max_context_messages=_env_positive_int(
+                    "API_MAX_CONTEXT_MESSAGES", DEFAULT_MAX_CONTEXT_MESSAGES
+                ),
+                # P0-4：学习记录 store 注入（None 时学习工具不注册、
+                # 图行为与现状逐字节一致——既有测试零改动红线）。
+                learning_store=learning_store,
                 # 业务工具与授权：search_knowledge 只授给需要产出知识
                 # 内容的两个 Worker（理由见模块底部 _KNOWLEDGE_TOOL_PERMISSIONS
                 # 的注释）；graph_builder 会校验权限声明完整（缺工具或
@@ -425,13 +560,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "embedding_provider": knowledge_stack.vector_provider,
                 "vector_dimension": knowledge_stack.vector_dimension,
             }
+            # P0-4/P0-6：学习记录 store 与 OCR provider 挂 app.state，
+            # 供 api/learning.py 诊断端点（P3-15）与附件提取链路
+            # （P2-7）依赖注入；与 knowledge_service 同挂在 try 内
+            # （图装配失败时不留下指向已关闭资源的引用）。
+            app.state.learning_store = learning_store
+            app.state.ocr_provider = ocr_provider
             yield
         finally:
             # 释放顺序：先关知识索引（图已不再执行，工具闭包不再被
-            # 调用），再关会话库，最后清空状态引用。诊断快照一并清除，
+            # 调用），再关会话库与学习记录库，最后清空状态引用。诊断快照一并清除，
             # 与「lifespan 未跑时 /healthz 不带 retrieval」语义一致。
             knowledge_stack.close()
             session_store.close()
+            learning_store.close()
             app.state.graph = None
             app.state.session_store = None
             app.state.retrieval_diagnostics = None
@@ -441,6 +583,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # I1:清单服务一并清空(与 service 同一清理语义;catalog
             # 连接已由 knowledge_stack.close 一并关闭)。
             app.state.knowledge_catalog = None
+            # P0-4/P0-6：学习 store 与 OCR provider 引用清空（同一
+            # 「lifespan 未跑时该属性不存在/为 None」的 getattr 兜底语义）。
+            app.state.learning_store = None
+            app.state.ocr_provider = None
 
 
 def create_app() -> FastAPI:
@@ -456,6 +602,8 @@ def create_app() -> FastAPI:
     app.include_router(stats_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
+    # 六大功能 P3-15：学情诊断端点（learning.db 聚合视图）。
+    app.include_router(learning_router)
     app.include_router(files_router)
     app.include_router(workspace_router)
 
@@ -496,18 +644,26 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     def healthz(request: Request) -> dict[str, object]:
-        """存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+        """存活探针；lifespan 装配后附带检索与 OCR 诊断（H-T1 / P0-6）。
 
         - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
           {"status": "ok"} 现状，不破坏既有探针语义与测试；
         - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
-          vector_dimension），运维据此判断语义检索是否在线。诊断只含
-          这三个字段，绝不含任何文件路径。
+          vector_dimension）与 ocr 字段（enabled，P0-6：图片附件识别
+          能力是否在线），运维据此判断可选能力状态。诊断只含状态字段，
+          绝不含任何文件路径。
         """
         diagnostics = getattr(request.app.state, "retrieval_diagnostics", None)
         if diagnostics is None:
             return {"status": "ok"}
-        return {"status": "ok", "retrieval": diagnostics}
+        return {
+            "status": "ok",
+            "retrieval": diagnostics,
+            "ocr": {
+                "enabled": getattr(request.app.state, "ocr_provider", None)
+                is not None
+            },
+        }
 
     return app
 
@@ -524,10 +680,14 @@ def create_app() -> FastAPI:
 # - supervisor（协调者）：不授权。prompt 中它是调度者（意图识别、
 #   handoff、任务计划），简单答疑直接回答、复杂答疑转 learning_assistant
 #   ——不直接产出知识内容，保持最小权限；
-# - evaluator（评价者）：不授权。prompt 要求「基于本轮最终回答与检索
-#   证据（工具观察结果）评价」——检索证据来自其他 Agent 调用工具的
-#   观察结果（消息历史中的 ToolMessage），不需要自己调检索工具；
-#   且引用校验（chunk 级真实命中比对）由核心侧确定性完成，不依赖
+# - evaluator（评价者）：六大功能 P2-11 起**授权**（有意逆转既定默认）。
+#   原决策前提是「评价系统回答时，检索证据来自其他 Agent 调用工具的
+#   观察结果（消息历史中的 ToolMessage）」；但作业批改场景（功能 2）
+#   的 loop 中无其他 Agent——评分依据必须由 evaluator 自己检索对齐：
+#   客观题缺失标准答案时先检索佐证（answer_source 如实标 generated），
+#   主观题按教材评分标准打分（零证据不得满分）。对系统回答的评价
+#   （submit_evaluation）行为不变——仍可只依据消息历史中的工具观察。
+#   引用校验（chunk 级真实命中比对）由核心侧确定性完成，不依赖
 #   evaluator 检索。
 # 若未来 supervisor 需要直接引用知识作答，在此追加角色即可（graph_builder
 # 只要求权限声明完整，不限制谁可用）。
