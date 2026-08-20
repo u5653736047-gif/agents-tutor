@@ -34,6 +34,12 @@ class EventType(StrEnum):
     # （随 checkpoint 持久化，供审计读取）——与「事件不记录敏感正文」的
     # 仓库惯例一致（RunEvent 无 content/arguments 字段，见该类注释）。
     EVALUATION_COMPLETED = "evaluation_completed"
+    # 六大功能 P2-8：evaluator 完成一次结构化批改后发出（agent=evaluator，
+    # 载体字段见 RunEvent 的 grading_* 注释）。与 EVALUATION_COMPLETED
+    # 同一脱敏原则：事件只记数字摘要（题数/总分），逐题反馈等正文存
+    # state["grading"] 与消息元数据（随 checkpoint 持久化供审计/回放）。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射本类型时安全跳过。
+    GRADING_COMPLETED = "grading_completed"
     # S4-T3 检索决策：search_knowledge 工具的检索元数据由 core 侧
     # （graph_builder._wrap）解析后发出（agent=调用检索工具的角色，
     # tool_name="search_knowledge"，字段见 RunEvent 的 retrieval_* 注释）。
@@ -119,6 +125,14 @@ class RunEvent(BaseModel):
     # 被评价内容的细节，属敏感正文；完整结论存 state["evaluation"] 供
     # 审计读取）。默认 None 向后兼容——旧事件与未评价轮次不携带该字段。
     evaluation_verdict: str | None = None
+    # ── 六大功能 P2-8 批改摘要字段（GRADING_COMPLETED 事件携带）──
+    # pi 审查 🟡C：RunEvent 是 extra="forbid"，「题数与总分摘要」必须
+    # 走专有字段（仿 evaluation_verdict 先例）。脱敏原则：只记数字摘要，
+    # 不记题目正文与逐题反馈（完整结论存 state["grading"]）。全部默认
+    # None 向后兼容：旧事件与非批改轮次不携带。
+    grading_item_count: int | None = Field(default=None, ge=0)
+    grading_total_score: float | None = Field(default=None, ge=0)
+    grading_max_total_score: float | None = Field(default=None, ge=0)
     # ── S4-T3 检索决策字段（RETRIEVAL_DECISION 事件携带）──
     # 来源：graph_builder._wrap 从 search_knowledge 成功 ToolResult 的
     # JSON metadata 解析（转换在 core 侧，knowledge 包零依赖本模块）。

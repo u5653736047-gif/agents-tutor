@@ -532,6 +532,10 @@ def test_graph_accepts_empty_tools_and_permissions() -> None:
         "detect_level",
         # S2-T3：结构化评价工具（仅 evaluator 可用，与 detect_intent 同约定）
         "submit_evaluation",
+        # 六大功能 P2-9：批改工具（仅 evaluator，与 submit_evaluation 同约定；
+        # 学习记录工具是条件注册——无 store 注入时不出现在清单里）
+        "grade_objective_answers",
+        "submit_grading",
     ]
 
 

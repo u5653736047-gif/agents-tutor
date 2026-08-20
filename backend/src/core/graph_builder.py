@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from collections.abc import Collection, Hashable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from threading import RLock
@@ -27,6 +29,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -34,6 +37,7 @@ from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
 from .filesystem import workspace_scope
 from .knowledge.models import Citation
+from .learning import LEARNING_OUTCOMES, LearningRecordStore, learning_scope
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
 from .nodes.react_agent import ChatModel, tool_output_summary
@@ -44,6 +48,8 @@ from .state import (
     EvaluationResult,
     EvaluationVerdict,
     GeneratedFile,
+    GradingItem,
+    GradingResult,
     HandoffApprovalAction,
     HandoffApprovalDecision,
     HandoffApprovalRequest,
@@ -65,6 +71,7 @@ from .state import (
     message_references,
     with_agent_role,
     with_generated_files,
+    with_grading,
     with_references,
 )
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
@@ -250,6 +257,150 @@ def submit_evaluation(
     )
 
 
+# ── 六大功能 P2-9：批改工具 ──────────────────────────────────
+
+
+class _ObjectiveItemInput(BaseModel):
+    """一道客观题的确定性批改输入（P2-9；pi 审查 🟡6：answer_source
+    披露标准答案来源，防止「模型自答自批」被误认为确定性评分）。
+
+    extra="forbid" 与 detect_intent 三件套同一约定。answer_source：
+    provided = 教师/用户提供的标准答案（消息或附件材料中）；
+    generated = 模型检索佐证后生成的参考答案（须如实标注）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=120)
+    standard_answer: str = Field(min_length=1, max_length=500)
+    student_answer: str = Field(default="", max_length=2000)
+    max_score: float = Field(gt=0)
+    answer_source: Literal["provided", "generated"] = "provided"
+
+
+class _ObjectiveGradingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[_ObjectiveItemInput] = Field(min_length=1, max_length=50)
+
+
+def _normalize_answer(text: str) -> str:
+    """客观题答案归一化：去全部空白、转小写（确定性比对的预处理）。"""
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _answers_match(standard_answer: str, student_answer: str) -> bool:
+    """确定性比对规则（零 LLM、可单测、评分可复现）：
+
+    1. 归一化（去全部空白 + 转小写）后严格相等 → 正确；
+    2. 学生答案为空 → 错误。
+
+    为什么不做多选「集合相等」容忍（审查 W1 复盘）：由 a-h 字母组成
+    的英文单词（face/bad/cab…）与多选答案在形态上**本质不可区分**
+    （bad 既可以是拼写题答案也可以是合法多选），任何形态守卫都无法
+    兼容两者；而集合比较一旦误判（拼写题 "cafe" 判为正确），错误
+    结论会经 submit_grading 确定性落库 learning_records，污染学情
+    诊断且无法事后区分——误判代价比「顺序容忍」收益高得多。多选
+    乱序作答（"ba" vs "AB"）由模型在调用本工具前规范化学生答案
+    解决（evaluator 角色卡约定客观题先整理作答内容）。
+    """
+    normalized_standard = _normalize_answer(standard_answer)
+    normalized_student = _normalize_answer(student_answer)
+    if not normalized_student:
+        return False
+    return normalized_standard == normalized_student
+
+
+@tool(args_schema=_ObjectiveGradingInput)
+def grade_objective_answers(items: list[_ObjectiveItemInput]) -> str:
+    """自动批阅客观题：按标准答案确定性比对，逐题给出对错与得分。"""
+    # 纯确定性逻辑，零 LLM：比对规则见 _answers_match 注释。
+    results = []
+    for item in items:
+        correct = _answers_match(item.standard_answer, item.student_answer)
+        results.append(
+            {
+                "question_id": item.question_id,
+                "correct": correct,
+                "score": float(item.max_score) if correct else 0.0,
+                "max_score": item.max_score,
+                "answer_source": item.answer_source,
+            }
+        )
+    correct_count = sum(1 for result in results if result["correct"])
+    return json.dumps(
+        {
+            "items": results,
+            "correct_count": correct_count,
+            "total_count": len(results),
+        },
+        ensure_ascii=False,
+    )
+
+
+class _GradingItemInput(BaseModel):
+    """一道题的批改结论输入（P2-9）。
+
+    knowledge_point/error_tag 供 P2-10 确定性落库 learning_records
+    （学情诊断的主要数据源，pi 审查 🔴3）；feedback 承载评分依据与
+    改进建议（赛题要求），截断有界。score 不得超 max_score（schema
+    层即拒，避免脏数据进审计链）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=120)
+    score: float = Field(ge=0)
+    max_score: float = Field(gt=0)
+    # feedback 不设 Field 长度上限（审查 S3：与 EvaluationResult.reason
+    # 同一单口径——超长由下方 validator 截断而非 schema 拒绝，避免
+    # 声明与实施的双口径误导容量推导）。
+    feedback: str = ""
+    knowledge_point: str | None = Field(default=None, max_length=120)
+    error_tag: str | None = Field(default=None, max_length=60)
+
+    @field_validator("feedback")
+    @classmethod
+    def feedback_must_be_bounded(cls, feedback: str) -> str:
+        return feedback[:300]
+
+    @model_validator(mode="after")
+    def score_must_not_exceed_max(self) -> _GradingItemInput:
+        if self.score > self.max_score:
+            raise ValueError("score must not exceed max_score")
+        return self
+
+
+class _GradingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[_GradingItemInput] = Field(min_length=1, max_length=50)
+    # overall_comment 不设 Field 上限，由工具函数 [:500] 截断
+    #（审查 S3：单口径，与 reason 先例一致）。
+    overall_comment: str = ""
+
+
+@tool(args_schema=_GradingInput)
+def submit_grading(
+    items: list[_GradingItemInput], overall_comment: str = ""
+) -> str:
+    """提交一次作业/试题批改的结构化结论（评价 Agent 专用，批改完成后必调）。"""
+    # 总分由核心侧确定性汇总（不信任模型自报总分，与 evidence_tool_names
+    # 「证据由核心侧确定」同一哲学）；_grading_from_results 解析本 JSON
+    # 构造 GradingResult 写通道，并逐题确定性落库（P2-10）。
+    total_score = sum(item.score for item in items)
+    max_total_score = sum(item.max_score for item in items)
+    return json.dumps(
+        {
+            "items": [item.model_dump(mode="json") for item in items],
+            "overall_comment": overall_comment[:500],
+            "total_score": total_score,
+            "max_total_score": max_total_score,
+        },
+        ensure_ascii=False,
+    )
+
+
 class CollaborativeAgentGraph:
     """注册四个同构 ReAct Agent，并负责它们之间的路由。"""
 
@@ -271,6 +422,7 @@ class CollaborativeAgentGraph:
         checkpointer: BaseCheckpointSaver[str] | None = None,
         interrupt_before_handoff: bool = False,
         orchestration_mode: OrchestrationMode = "handoff",
+        learning_store: LearningRecordStore | None = None,
     ) -> None:
         # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
         approval_tool_names = frozenset(
@@ -352,6 +504,44 @@ class CollaborativeAgentGraph:
             submit_evaluation,
             allowed_roles={AgentRole.EVALUATOR},
         )
+        # ── P2-9 批改工具（仅 evaluator；与 submit_evaluation 同一
+        # 构造器内注册约定，不进 app.py 业务权限矩阵）──
+        # 客观题确定性比对工具 + 结构化批改提交工具；批改结果的通道
+        # 写入与学习记录落库由 _wrap 确定性完成（P2-10），不靠模型自觉。
+        registry.register(
+            grade_objective_answers,
+            allowed_roles={AgentRole.EVALUATOR},
+        )
+        registry.register(
+            submit_grading,
+            allowed_roles={AgentRole.EVALUATOR},
+        )
+        # ── P0-5 学习记录工具（条件注册，pi 三轮审查 🔴1/🔴2 修复）──
+        # 注册路径唯一：仿 submit_evaluation 先例在构造器内注册、不进
+        # app.py 业务权限矩阵（权限校验会把不在 tools 列表里的声明
+        # 拒为「非业务工具」，两条路径互斥）；闭包工具捕获
+        # self._learning_store（模块级 @tool 拿不到 per-graph 实例）。
+        # 条件注册红线：仅当 learning_store 非 None 时注册——
+        # test_graph_accepts_empty_tools_and_permissions 对 registry
+        # 工具清单做精确列表断言，无条件注册必击穿「无 store 注入时
+        # 既有测试零改动」验收；工具不存在即不可被调用，None 容忍
+        # 只保留在 _wrap 落库守卫一处。
+        self._learning_store = learning_store
+        if learning_store is not None:
+            registry.register(
+                self._create_record_learning_outcome_tool(),
+                allowed_roles={
+                    AgentRole.LEARNING_ASSISTANT,
+                    AgentRole.EVALUATOR,
+                },
+            )
+            registry.register(
+                self._create_get_learning_records_tool(),
+                allowed_roles={
+                    AgentRole.LEARNING_ASSISTANT,
+                    AgentRole.EVALUATOR,
+                },
+            )
         # 业务工具：按外部权限白名单注册（未授权角色调用会被工具层拒绝）
         for business_tool in tools:
             registry.register(
@@ -417,6 +607,93 @@ class CollaborativeAgentGraph:
             extras={"subagent": True},
         )(invoke_subagent)
 
+    def _create_record_learning_outcome_tool(self) -> BaseTool:
+        """创建学习结果记录工具（P0-5 闭包工具，捕获 store 实例）。
+
+        user_id/session_id 从 learning_scope 注入（_wrap.node() 在
+        _ACTIVE_PARENT_STATE.set 同位设置）——**模型不可见不可控**，
+        防跨用户伪造记录；scope 缺失（非图执行上下文直调）时返回
+        recorded=False 而非报错（防御性，正常图执行必有 scope）。
+        """
+        store = self._learning_store
+
+        class _RecordOutcomeInput(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
+            knowledge_point: str = Field(min_length=1, max_length=120)
+            outcome: Literal["correct", "partial", "incorrect"]
+            kind: Literal["answer", "diagnosis", "path_plan"] = "answer"
+            error_tag: str | None = Field(default=None, max_length=60)
+
+        def record_learning_outcome(
+            knowledge_point: str,
+            outcome: str,
+            kind: str = "answer",
+            error_tag: str | None = None,
+        ) -> str:
+            scope = learning_scope.get()
+            user_id = None if scope is None else scope.get("user_id")
+            if scope is None or user_id is None or store is None:
+                return json.dumps(
+                    {"recorded": False, "reason": "no learning scope"},
+                    ensure_ascii=False,
+                )
+            # kind 由 schema Literal 约束为三值（不含 grading——批改
+            # 落库由 _wrap 确定性完成，不经过模型工具，见 P2-10）；
+            # 枚举合法性在 store 层双保险校验。
+            assert outcome in LEARNING_OUTCOMES
+            inserted = store.append_record(
+                user_id,
+                session_id=scope.get("session_id"),
+                knowledge_point=knowledge_point.strip(),
+                outcome=outcome,
+                kind=kind,
+                error_tag=(error_tag.strip() if error_tag else None),
+            )
+            return json.dumps(
+                {"recorded": inserted, "knowledge_point": knowledge_point.strip()},
+                ensure_ascii=False,
+            )
+
+        return tool(
+            "record_learning_outcome",
+            args_schema=_RecordOutcomeInput,
+            description=(
+                "记录一次学习结果（知识点、对错、错因标签），"
+                "供学情诊断与学习路径规划使用。"
+            ),
+        )(record_learning_outcome)
+
+    def _create_get_learning_records_tool(self) -> BaseTool:
+        """创建学习记录聚合查询工具（P0-5 闭包工具，只读）。"""
+        store = self._learning_store
+
+        def get_learning_records() -> str:
+            scope = learning_scope.get()
+            user_id = None if scope is None else scope.get("user_id")
+            if scope is None or user_id is None or store is None:
+                return json.dumps(
+                    {
+                        "user_id": None,
+                        "total_attempts": 0,
+                        "knowledge_points": [],
+                        "weak_points": [],
+                    },
+                    ensure_ascii=False,
+                )
+            summary = store.summarize(user_id)
+            return json.dumps(
+                {"user_id": user_id, **summary}, ensure_ascii=False
+            )
+
+        return tool(
+            "get_learning_records",
+            description=(
+                "读取当前学生的作答聚合：知识点尝试次数、正确率、"
+                "薄弱点与最近练习时间（学情诊断/路径规划决策前必调）。"
+            ),
+        )(get_learning_records)
+
     def _run_subagent(self, target_role: AgentRole, task: str) -> str:
         """在隔离消息上下文中执行专业 Agent，并返回有界结构化结果。"""
         parent = _ACTIVE_PARENT_STATE.get()
@@ -447,21 +724,33 @@ class CollaborativeAgentGraph:
         output = _terminal_agent_output(result.messages)
         if output is None:
             raise RuntimeError("subagent returned no final output")
-        citations = _citations_from_tool_results(
-            cast(list[ToolResult], result.updates.get("tool_results", []))
+        child_tool_results = cast(
+            list[ToolResult], result.updates.get("tool_results", [])
         )
-        return json.dumps(
-            {
-                "agent": target_role.value,
-                "output": output,
-                "found": bool(citations),
-                "hits": [
-                    {"citation": citation.model_dump(mode="json")}
-                    for citation in citations
-                ],
-            },
-            ensure_ascii=False,
-        )
+        citations = _citations_from_tool_results(child_tool_results)
+        payload: dict[str, Any] = {
+            "agent": target_role.value,
+            "output": output,
+            "found": bool(citations),
+            "hits": [
+                {"citation": citation.model_dump(mode="json")}
+                for citation in citations
+            ],
+        }
+        # ── P2-10 tool 模式结构化回传（批改在生产模式可见的唯一通道）──
+        # 子代理直调 run() 不经 _wrap（见模块补缺说明），其 submit_grading
+        # 结果只以 JSON 文本回到 Supervisor——这里把解析后的批改结论与
+        # **子代理 submit_grading 的 tool_call_id 一并放入负载**（pi 审查
+        # 🟡B：Supervisor 轮 _wrap 手里只有 ask_evaluator 的 ToolResult，
+        # 不传递则拿不到落库幂等键），由 Supervisor 轮 _wrap 提取写通道。
+        grading_pair = _grading_from_results(child_tool_results)
+        if grading_pair is not None:
+            grading_result, grading_tool_call_id = grading_pair
+            payload["grading"] = {
+                "result": grading_result.model_dump(mode="json"),
+                "tool_call_id": grading_tool_call_id,
+            }
+        return json.dumps(payload, ensure_ascii=False)
 
     def build(self) -> CompiledAgentGraph:
         """构建一次并缓存可执行图。"""
@@ -656,9 +945,19 @@ class CollaborativeAgentGraph:
             subagent_traces: list[list[RunEvent]] = []
             parent_state_token = _ACTIVE_PARENT_STATE.set(run_state)
             trace_token = _SUBAGENT_EVENT_TRACES.set(subagent_traces)
+            # P0-5：学习记录作用域与父状态同位设置（工具层从 scope
+            # 读 user_id/session_id，模型不可见不可控）；无条件设置，
+            # 无 store 时工具未注册、无人读取，零副作用。
+            learning_scope_token = learning_scope.set(
+                {
+                    "user_id": run_state.get("user_id"),
+                    "session_id": run_state.get("session_id"),
+                }
+            )
             try:
                 result = agent.run(run_state)
             finally:
+                learning_scope.reset(learning_scope_token)
                 _SUBAGENT_EVENT_TRACES.reset(trace_token)
                 _ACTIVE_PARENT_STATE.reset(parent_state_token)
 
@@ -838,6 +1137,11 @@ class CollaborativeAgentGraph:
                 degraded: bool | None = None,
                 event_intent: str | None = None,
                 event_verdict: str | None = None,
+                # 六大功能 P2-8：GRADING_COMPLETED 事件携带的数字摘要
+                # （脱敏：只记题数/总分，正文在 state["grading"]）。
+                grading_item_count: int | None = None,
+                grading_total_score: float | None = None,
+                grading_max_total_score: float | None = None,
                 # S4-T3 检索决策：RETRIEVAL_DECISION 事件携带的工具名与
                 # 决策摘要字段（语义见 events.py 的 retrieval_* 注释）。
                 # 全部默认 None，既有调用方零改动、旧事件不携带。
@@ -865,6 +1169,9 @@ class CollaborativeAgentGraph:
                         degraded=degraded,
                         intent=event_intent,
                         evaluation_verdict=event_verdict,
+                        grading_item_count=grading_item_count,
+                        grading_total_score=grading_total_score,
+                        grading_max_total_score=grading_max_total_score,
                         tool_name=event_tool_name,
                         retrieval_needed=retrieval_needed,
                         retrieval_need_reason=retrieval_need_reason,
@@ -1045,6 +1352,46 @@ class CollaborativeAgentGraph:
                     EventType.EVALUATION_COMPLETED,
                     agent.role.value,
                     event_verdict=evaluation_input["verdict"],
+                )
+
+            # ── P2-10 批改结论：通道写入 + 消息挂载 + 确定性落库 + 事件 ──
+            # 双来源（角色守卫同 evaluation 模式）：
+            # - handoff 模式：evaluator 轮自身 tool_results 里的
+            #   submit_grading 结果；
+            # - tool 模式（生产）：Supervisor 轮从 ask_evaluator 输出
+            #   提取（_run_subagent 已把子代理批改负载与幂等键放进
+            #   grading 键——子代理不经 _wrap，这是生产可见的唯一通道）。
+            # 落库不靠模型自觉（pi 审查 🔴3）：解析成功即逐题确定性
+            # 落库；store 未注入时静默跳过（None 容忍守卫在落库函数内）。
+            grading_pair: tuple[GradingResult, str] | None = None
+            if agent.role is AgentRole.EVALUATOR:
+                grading_pair = _grading_from_results(tool_results)
+            elif agent.role is AgentRole.SUPERVISOR:
+                grading_pair = _grading_from_supervisor_results(tool_results)
+            if grading_pair is not None:
+                grading_result, grading_tool_call_id = grading_pair
+                updates["grading"] = grading_result
+                # 消息元数据回放（pi 审查 🟡4）：挂到本轮终端回答，
+                # 任意历史轮的批改卡刷新后经 history 端点恢复。
+                updates["messages"] = _attach_grading(
+                    cast(list[BaseMessage], updates["messages"]),
+                    grading_result,
+                )
+                _persist_grading_records(
+                    self._learning_store,
+                    grading_result,
+                    state.get("user_id"),
+                    state.get("session_id"),
+                    grading_tool_call_id,
+                )
+                # 事件脱敏：只发数字摘要（pi 审查 🟡C），逐题反馈等
+                # 正文在 state["grading"] 与消息元数据随 checkpoint 持久化。
+                emit(
+                    EventType.GRADING_COMPLETED,
+                    agent.role.value,
+                    grading_item_count=len(grading_result.items),
+                    grading_total_score=grading_result.total_score,
+                    grading_max_total_score=grading_result.max_total_score,
                 )
 
             # ── S2-T5 引用真实性校验结论写入 state ──
@@ -1677,6 +2024,9 @@ class CollaborativeAgentGraph:
                     "pending_tool_approval": None,
                     "intent": None,
                     "evaluation": None,
+                    # P2-8：批改结论与 evaluation 同构、每轮重置
+                    #（历史批改经消息元数据恢复，见 GRADING_METADATA_KEY）。
+                    "grading": None,
                     "reference_verification": None,
                     "task_plan": None,
                     "task_results": [],
@@ -2499,6 +2849,145 @@ def _evaluation_from_results(
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return None
     return None
+
+
+def _grading_from_payload(payload: object) -> GradingResult | None:
+    """把 submit_grading 的 JSON 负载构造为 GradingResult（核心侧组装）。
+
+    与 _evaluation_from_results 同一哲学（写入端严格、读取端宽容）：
+    逐题用 GradingItem 校验（score 超满分、非法字段等脏数据 → None，
+    本轮退化为「无批改」，不击穿运行）；total_score / max_total_score
+    由核心侧从 items 确定性汇总——不信任负载里模型自报的总分
+    （与 evidence_tool_names「证据由核心侧确定」同一哲学）。
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            return None
+        items = [GradingItem.model_validate(item) for item in raw_items]
+        return GradingResult(
+            items=items,
+            overall_comment=str(payload.get("overall_comment", "")),
+            total_score=sum(item.score for item in items),
+            max_total_score=sum(item.max_score for item in items),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _grading_from_results(
+    tool_results: Sequence[ToolResult],
+) -> tuple[GradingResult, str] | None:
+    """handoff 模式：从本轮 evaluator 成功调用的最后一个 submit_grading
+    结果解析批改结论（连同 tool_call_id，供落库幂等键使用）。
+
+    读取端宽容与 _evaluation_from_results 一致：脏数据返回 None，
+    不击穿运行。tool_call_id 缺失（不应发生）时以空串占位——复合
+    幂等键 (tool_call_id, question_id) 仍互不冲突，只是失去重放保护。
+    """
+    for result in reversed(tool_results):
+        if result.tool_name == "submit_grading" and result.success:
+            try:
+                payload = json.loads(result.output)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            grading = _grading_from_payload(payload)
+            if grading is None:
+                return None
+            return grading, result.tool_call_id
+    return None
+
+
+def _grading_from_supervisor_results(
+    tool_results: Sequence[ToolResult],
+) -> tuple[GradingResult, str] | None:
+    """tool 模式：从本轮成功的子代理工具（ask_*）输出提取批改结论。
+
+    _run_subagent 在子代理成功调用 submit_grading 时把解析后的结论与
+    tool_call_id 放进负载的 grading 键（见该方法注释）。角色守卫在
+    调用方（_wrap 只在 SUPERVISOR 轮调用本函数）；读取端宽容：负载
+    无 grading 键 / 结构非法 → None，不击穿运行。
+    """
+    subagent_tool_names = set(_SUBAGENT_TOOL_NAMES.values())
+    for result in reversed(tool_results):
+        if result.tool_name not in subagent_tool_names or not result.success:
+            continue
+        try:
+            payload = json.loads(result.output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        grading_block = payload.get("grading")
+        if not isinstance(grading_block, Mapping):
+            continue
+        grading = _grading_from_payload(grading_block.get("result"))
+        if grading is None:
+            continue
+        return grading, str(grading_block.get("tool_call_id", ""))
+    return None
+
+
+def _attach_grading(
+    messages: Sequence[BaseMessage], grading: GradingResult
+) -> list[BaseMessage]:
+    """把批改结论挂到本轮终端回答消息（与 _attach_generated_files 同一
+    闸口语义：最后一个无 tool_calls 的 AIMessage；无终端回答则不挂）。
+
+    为什么挂消息元数据（P2-12 / pi 审查 🟡4）：grading 通道每轮重置、
+    SessionProcess 只是末轮快照——挂消息后任意历史轮的批改卡刷新/
+    切会话都能经 history 端点恢复。
+    """
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if not (isinstance(message, AIMessage) and not message.tool_calls):
+            continue
+        updated[index] = with_grading(message, grading)
+        break
+    return updated
+
+
+def _persist_grading_records(
+    store: LearningRecordStore | None,
+    grading: GradingResult,
+    user_id: str | None,
+    session_id: str | None,
+    tool_call_id: str,
+) -> None:
+    """批改结果的确定性逐题落库（P2-10；pi 审查 🔴3：不靠模型自觉）。
+
+    None 容忍守卫：store 未注入（既有测试构造点）或 user_id 缺失
+    （未登录会话）时静默跳过——批改的 state 通道与消息元数据不受
+    影响，只是学情诊断缺少该轮数据。复合幂等键
+    (tool_call_id, question_id) 由 store 层 UNIQUE 约束保证重放不
+    重复入库（pi 三轮审查 🟡3）。任何落库异常都被吞掉并记日志：
+    落库是诊断的增强路径，不允许击穿批改主链路。
+    """
+    if store is None or user_id is None:
+        return
+    try:
+        store.append_grading_records(
+            [
+                {
+                    "question_id": item.question_id,
+                    "score": item.score,
+                    "max_score": item.max_score,
+                    "knowledge_point": item.knowledge_point,
+                    "error_tag": item.error_tag,
+                }
+                for item in grading.items
+            ],
+            user_id=user_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+    except Exception:
+        logging.getLogger("core.graph_builder").warning(
+            "批改落库失败（不影响批改结论返回）", exc_info=True
+        )
 
 
 def _retrieval_decisions_from_results(

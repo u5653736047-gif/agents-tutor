@@ -69,7 +69,13 @@ class Intent(StrEnum):
       learning_assistant（助学 Agent）做深入辅导/学习规划；
     - LESSON_PREP 备课/讲解请求：生成教案/讲解材料 → teaching_assistant（助教）；
     - EVALUATION 评价/批改：作业评价/批改 → evaluator（评价 Agent）；
-    - OTHER 其他：模型能确定但不在上述三类 → 直接回答；
+    - DIAGNOSIS 学情诊断（六大功能 P3）：薄弱点分析/学情报告/学习
+      预警 → evaluator（基于学习记录聚合写诊断报告）；
+    - LEARNING_PATH 学习路径规划（六大功能 P4）：规划学习计划/推送
+      资源 → learning_assistant（读学习记录 + 难度过滤检索）；
+    - STUDY_COACHING 学习陪伴（六大功能 P5）：知识点巩固/错题归因/
+      学习策略 → learning_assistant（导师/学伴语气，苏格拉底式引导）；
+    - OTHER 其他：模型能确定但不在上述类别 → 直接回答；
     - UNCLEAR 意图不明：模型无法确定 → Supervisor 必须追问澄清，
       禁止 handoff 或 create_task_plan（graph_builder 有运行时兜底拦截）。
     """
@@ -77,6 +83,11 @@ class Intent(StrEnum):
     ANSWER_QUESTION = "answer_question"
     LESSON_PREP = "lesson_prep"
     EVALUATION = "evaluation"
+    # 六大功能 P3-P5：三个新意图（子集断言安全加法，见
+    # test_intent_recognition.py 的 <= 口径）。
+    DIAGNOSIS = "diagnosis"
+    LEARNING_PATH = "learning_path"
+    STUDY_COACHING = "study_coaching"
     OTHER = "other"
     UNCLEAR = "unclear"
 
@@ -351,6 +362,49 @@ def message_generated_files(message: BaseMessage) -> list[GeneratedFile] | None:
         except ValidationError:
             continue
     return files
+
+
+# ─────────────────────────────────────────────
+# 助手消息的批改结果元数据（六大功能 P2-12 历史回放）
+# ─────────────────────────────────────────────
+#
+# 批改结果（GradingResult）除写入 state["grading"] 通道（当轮直出
+# ChatResponse.grading）外，还挂到本轮终端回答消息的 additional_kwargs
+# ——与 references 同一机制、同一序列化路径。为什么必须挂消息元数据
+# （pi 审查 🟡4）：state 通道的 grading 每轮重置，且 SessionProcess
+# 只是最近一轮快照——批改发生在更早轮次时，刷新/切会话后批改卡会
+# 消失；挂在消息上则任意历史轮的批改卡都能经 history 端点恢复。
+GRADING_METADATA_KEY = "grading"
+
+
+def with_grading(message: AIMessage, grading: GradingResult) -> AIMessage:
+    """返回携带批改结果的 AIMessage 副本（不修改原对象）。
+
+    与 with_references 同一副本语义：模型返回的 AIMessage 可能被调用
+    方复用，就地修改会污染模型看到的历史；model_copy 只替换
+    additional_kwargs，既有键（角色/references/generated_files）保留。
+    值存 model_dump(mode="json") 的 dict：msgpack 原生类型，checkpoint
+    序列化往返无需类型注册（与 references 同理）。
+    """
+    additional_kwargs = dict(message.additional_kwargs)
+    additional_kwargs[GRADING_METADATA_KEY] = grading.model_dump(mode="json")
+    return message.model_copy(update={"additional_kwargs": additional_kwargs})
+
+
+def message_grading(message: BaseMessage) -> GradingResult | None:
+    """从消息元数据读出批改结果；无法确定时返回 None。
+
+    读取端宽容（与 message_references 同一哲学）：键缺失/值不是 dict
+    → None；脏数据（历史数据、未来字段变更）校验失败 → None，保证
+    get_history() 的消费者（前端批改卡渲染）不会因异常崩溃。
+    """
+    raw = message.additional_kwargs.get(GRADING_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return GradingResult.model_validate(raw)
+    except ValidationError:
+        return None
 
 
 # 可被分派执行任务的 Worker 角色子集（Supervisor 只调度、不执行）
@@ -766,6 +820,70 @@ class EvaluationResult(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 批改结果模型（六大功能 P2-8：作业与试题批改）
+# ─────────────────────────────────────────────
+
+
+class GradingItem(BaseModel):
+    """一道题的批改结论（P2-8；pi 审查 🔴3 补知识点维度）。
+
+    knowledge_point/error_tag 是学情诊断（功能 3）的主要数据源：
+    _wrap 解析成功后逐题确定性落库 learning_records（P2-10），缺失
+    知识点的题记为「未分类」参与总量统计。feedback 承载改进建议
+    （赛题要求「提供评分依据与改进建议」），截断有界保证 checkpoint
+    审计字段不膨胀（与 EvaluationResult.reason 同一哲学）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=120)
+    score: float = Field(ge=0)
+    max_score: float = Field(gt=0)
+    # feedback/overall_comment 不设 Field 长度上限（审查 S3：与
+    # EvaluationResult.reason 同一单口径——超长由 validator 截断而非
+    # schema 拒绝，声明与实施单口径，避免误导容量推导）。
+    feedback: str = ""
+    knowledge_point: str | None = Field(default=None, max_length=120)
+    error_tag: str | None = Field(default=None, max_length=60)
+
+    @field_validator("feedback")
+    @classmethod
+    def feedback_must_be_bounded(cls, feedback: str) -> str:
+        # 工具层已截断，这里兜底再截一次（同 reason_must_be_bounded）。
+        return feedback[:300]
+
+    @model_validator(mode="after")
+    def score_must_not_exceed_max(self) -> GradingItem:
+        if self.score > self.max_score:
+            raise ValueError("score must not exceed max_score")
+        return self
+
+
+class GradingResult(BaseModel):
+    """一次批改的结构化结论（P2-8；与 EvaluationResult 语义区分——
+    pi 审查拒绝方案 4：批改是逐题得分/反馈，不复用「评价系统回答」
+    的三枚举维度，避免污染审计语义）。
+
+    total_score / max_total_score 由核心侧（_wrap）从 items 确定性
+    汇总——模型只提交逐题结论与总评，总分不信任模型自报（与
+    evidence_tool_names「证据由核心侧确定」同一哲学）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[GradingItem] = Field(min_length=1, max_length=50)
+    overall_comment: str = ""
+    total_score: float = Field(ge=0)
+    max_total_score: float = Field(gt=0)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("overall_comment")
+    @classmethod
+    def overall_comment_must_be_bounded(cls, comment: str) -> str:
+        return comment[:500]
+
+
+# ─────────────────────────────────────────────
 # Reducer 函数
 # ─────────────────────────────────────────────
 
@@ -905,6 +1023,14 @@ class AgentState(TypedDict, total=False):
     # 视序列化器而定）由读取方宽容处理（测试已兼容两种形式）。
     evaluation: Annotated[EvaluationResult | None, _replace]
 
+    # --- 批改结论（六大功能 P2-8） ---
+    # evaluator 对一次作业/试题批改的结构化结论（GradingResult 模型）；
+    # last-write-wins，由 submit_grading 工具结果经 _wrap 校验后写入，
+    # run() 在新用户轮次重置为 None（与 evaluation 同构：批改结论是
+    # 「这一轮的成果」，历史轮次的批改卡经消息元数据恢复——见
+    # GRADING_METADATA_KEY 注释，不靠通道跨轮保留）。
+    grading: Annotated[GradingResult | None, _replace]
+
     # --- 引用真实性校验结论（S2-T5） ---
     # 引用校验层对本轮引用的自动校验结论（ReferenceVerification 模型）；
     # last-write-wins，由 _wrap 在引用写入消息元数据时同步产出，
@@ -1006,6 +1132,9 @@ def create_initial_state(
         # S2-T3 评价结论：初始为 None（「本轮尚无评价」），
         # 与 intent 同构、每轮重置（评价是单轮结论，见 AgentState.evaluation）。
         evaluation=None,
+        # P2-8 批改结论：初始为 None（「本轮尚无批改」），
+        # 与 evaluation 同构、每轮重置（历史批改经消息元数据恢复）。
+        grading=None,
         # S2-T5 引用真实性校验结论：初始为 None（「本轮尚无校验内容」），
         # 与 evaluation 同构、每轮重置（校验结论是单轮事实记录）。
         reference_verification=None,

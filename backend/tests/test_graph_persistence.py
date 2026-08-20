@@ -610,3 +610,91 @@ def test_graph_rejects_empty_session_ids(session_id: str, method_name: str) -> N
             graph.run("question", session_id=session_id, user_id="user-1")
         else:
             getattr(graph, method_name)(session_id, user_id="user-1")
+
+
+def _grading_flow_responses() -> list[AIMessage]:
+    """handoff 模式批改流（与 test_grading._handoff_responses 同构，
+    内联以避免跨测试文件导入）。"""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "handoff",
+                    "args": {"target": "evaluator"},
+                    "id": "handoff-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="转交评价助手批改。"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "submit_grading",
+                    "args": {
+                        "items": [
+                            {
+                                "question_id": "q1",
+                                "score": 10,
+                                "max_score": 10,
+                                "knowledge_point": "梯度下降",
+                            },
+                            {
+                                "question_id": "q2",
+                                "score": 5,
+                                "max_score": 10,
+                            },
+                        ],
+                        "overall_comment": "整体良好。",
+                    },
+                    "id": "grading-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="批改完成，请查看评分。"),
+        AIMessage(content="已为你批改本次作业。"),
+    ]
+
+
+def test_grading_message_metadata_survives_sqlite_checkpoint_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """审查 W3：批改元数据（GRADING_METADATA_KEY 的 model_dump dict）
+    在真实 SqliteSaver msgpack 往返下保留——with_grading 写入 →
+    序列化落盘 → 重新打开库 → 新图实例读回一致（references 先例有
+    同型往返测试，grading 补齐对应用例）。"""
+    from core.state import message_grading
+
+    db_path = tmp_path / "checkpoints.sqlite3"
+    with open_sqlite_checkpointer(db_path) as checkpointer:
+        graph = CollaborativeAgentGraph(
+            model=ScriptedModel(_grading_flow_responses()),
+            checkpointer=checkpointer,
+        )
+        graph.run("请批改我的作业", "session-graded", user_id="user-1")
+
+    # 重新打开同一 checkpoint 库：新图实例读历史，批改元数据应完好。
+    with open_sqlite_checkpointer(db_path) as checkpointer:
+        restored_graph = CollaborativeAgentGraph(
+            model=ScriptedModel([]),
+            checkpointer=checkpointer,
+        )
+        state = restored_graph.get_state("session-graded", user_id="user-1")
+
+    assert state is not None
+    graded_messages = [
+        message
+        for message in state["messages"]
+        if message_grading(message) is not None
+    ]
+    assert len(graded_messages) == 1
+    restored = message_grading(graded_messages[0])
+    assert restored is not None
+    assert restored.total_score == 15
+    assert restored.max_total_score == 20
+    assert restored.items[0].question_id == "q1"
+    assert restored.items[0].knowledge_point == "梯度下降"
+    assert restored.overall_comment == "整体良好。"

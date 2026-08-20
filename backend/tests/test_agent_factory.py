@@ -78,7 +78,10 @@ def test_factory_builds_same_agent_with_short_role_prompts() -> None:
     # officecli 集成（docs/officecli-integration-plan.md T3-2）：各角色追加
     # office 工具使用短策略（supervisor/助教/评价约 120 字符，助学约 60），
     # 最长角色卡现状 766，上限放宽到 800，仍防止无边界膨胀。
-    assert max(map(len, ROLE_PROMPTS.values())) <= 800
+    # 六大功能 P2-11/P3-P5：supervisor 卡追加三个新意图路由说明、
+    # evaluator 卡追加批改与学情诊断约定，现状最长 883（supervisor），
+    # 上限放宽到 920，仍防止无边界膨胀。
+    assert max(map(len, ROLE_PROMPTS.values())) <= 920
     assert model.bind_count == 1
 
 
@@ -91,12 +94,15 @@ def test_learning_assistant_dynamic_prompt_length_is_bounded() -> None:
     上限取 470 留出少量余量，防止未来指导词膨胀撑爆上下文预算。
     officecli 集成（T3-2）：助学角色追加 officecli_inspect 只读策略
     约 60 字符，现状最长 545，上限放宽到 580。
+    六大功能计划 P1（功能 5 分步引导）：静态卡加分步引导约定 +
+    _LEVEL_GUIDANCE 三档各加一句分步粒度，现状最长 593，上限
+    放宽到 620，仍防无边界膨胀。
     """
     lengths = [
         len(learning_assistant_system_prompt(level))
         for level in (None, "basic", "advanced")
     ]
-    assert max(lengths) <= 580
+    assert max(lengths) <= 620
 
 
 def test_worker_prompts_define_retrieval_contract() -> None:

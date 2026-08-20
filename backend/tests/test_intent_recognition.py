@@ -147,12 +147,31 @@ def test_intent_enum_covers_required_categories() -> None:
     assert "evaluation" in values
     assert "other" in values
     assert "unclear" in values
+    # 六大功能 P3-P5：学情诊断/学习路径/学习陪伴三个新意图（子集加法）
+    assert {
+        Intent.DIAGNOSIS,
+        Intent.LEARNING_PATH,
+        Intent.STUDY_COACHING,
+    } <= set(Intent)
+    assert "diagnosis" in values
+    assert "learning_path" in values
+    assert "study_coaching" in values
 
 
 def test_supervisor_prompt_defines_intent_contract() -> None:
-    """验收：意图集合写在 prompts 中，含五类值与「不明只追问、禁止分派」。"""
+    """验收：意图集合写在 prompts 中，含各类值与「不明只追问、禁止分派」。"""
     prompt = ROLE_PROMPTS[AgentRole.SUPERVISOR]
-    for value in ("answer_question", "lesson_prep", "evaluation", "other", "unclear"):
+    for value in (
+        "answer_question",
+        "lesson_prep",
+        "evaluation",
+        # 六大功能 P3-P5：新意图路由说明必须写在 Supervisor 提示词里
+        "diagnosis",
+        "learning_path",
+        "study_coaching",
+        "other",
+        "unclear",
+    ):
         assert value in prompt
     assert "detect_intent" in prompt
     assert "禁止" in prompt  # 意图不明时禁止分派的硬性约定
@@ -279,6 +298,72 @@ def test_evaluation_intent_routes_to_evaluator() -> None:
     assert _switched_agents(result) == ["evaluator", "supervisor"]
     assert result["task_context"] is not None
     assert result["task_context"].intent == Intent.EVALUATION.value
+    assert result["run_error"] is None
+
+
+def test_diagnosis_intent_routes_to_evaluator() -> None:
+    """六大功能 P3：学情诊断 → 评价 Agent（evaluator）。"""
+    model = ScriptedModel(
+        [
+            _intent_response("diagnosis", "分析薄弱点"),
+            _handoff_response("evaluator"),
+            AIMessage(content="任务已分派"),
+            AIMessage(content="诊断报告已生成"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model)
+
+    result = graph.run("分析一下我的学习薄弱点", "intent-diagnosis")
+
+    assert result["intent"] == Intent.DIAGNOSIS
+    assert _switched_agents(result) == ["evaluator", "supervisor"]
+    assert result["task_context"] is not None
+    assert result["task_context"].intent == Intent.DIAGNOSIS.value
+    assert result["run_error"] is None
+
+
+def test_learning_path_intent_routes_to_learning_assistant() -> None:
+    """六大功能 P4：学习路径规划 → 助学 Agent（learning_assistant）。"""
+    model = ScriptedModel(
+        [
+            _intent_response("learning_path", "规划学习路径"),
+            _handoff_response("learning_assistant"),
+            AIMessage(content="任务已分派"),
+            AIMessage(content="学习路径已生成"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model)
+
+    result = graph.run("帮我规划一条机器学习的学习路径", "intent-learning-path")
+
+    assert result["intent"] == Intent.LEARNING_PATH
+    assert _switched_agents(result) == ["learning_assistant", "supervisor"]
+    assert result["task_context"] is not None
+    assert result["task_context"].intent == Intent.LEARNING_PATH.value
+    assert result["run_error"] is None
+
+
+def test_study_coaching_intent_routes_to_learning_assistant() -> None:
+    """六大功能 P5：学习陪伴 → 助学 Agent（learning_assistant）。"""
+    model = ScriptedModel(
+        [
+            _intent_response("study_coaching", "错题归因"),
+            _handoff_response("learning_assistant"),
+            AIMessage(content="任务已分派"),
+            AIMessage(content="错题分析完成"),
+            AIMessage(content="最终汇总"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model)
+
+    result = graph.run("帮我分析一下错题原因", "intent-study-coaching")
+
+    assert result["intent"] == Intent.STUDY_COACHING
+    assert _switched_agents(result) == ["learning_assistant", "supervisor"]
+    assert result["task_context"] is not None
+    assert result["task_context"].intent == Intent.STUDY_COACHING.value
     assert result["run_error"] is None
 
 
