@@ -176,6 +176,8 @@ def test_chat_creates_missing_session_runs_in_worker_and_returns_event_delta(tmp
         "agent": "evaluator",
         "created_at": None,
         "attachments": None,
+        # P2-12:无批改元数据时显式为 null（契约新增可选字段）
+        "grading": None,
     }
     assert response.json()["current_agent"] == "evaluator"
     assert [session.session_id for session in sessions] == ["session-1"]

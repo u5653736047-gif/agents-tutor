@@ -138,13 +138,14 @@ export interface paths {
         };
         /**
          * Healthz
-         * @description 存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+         * @description 存活探针；lifespan 装配后附带检索与 OCR 诊断（H-T1 / P0-6）。
          *
          *     - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
          *       {"status": "ok"} 现状，不破坏既有探针语义与测试；
          *     - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
-         *       vector_dimension），运维据此判断语义检索是否在线。诊断只含
-         *       这三个字段，绝不含任何文件路径。
+         *       vector_dimension）与 ocr 字段（enabled，P0-6：图片附件识别
+         *       能力是否在线），运维据此判断可选能力状态。诊断只含状态字段，
+         *       绝不含任何文件路径。
          */
         get: operations["healthz_healthz_get"];
         put?: never;
@@ -329,6 +330,29 @@ export interface paths {
          *       细节(与 api/feedback 的存储异常处理同构)。
          */
         post: operations["search_knowledge_knowledge_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/learning/diagnosis/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Diagnosis Summary
+         * @description 返回学情诊断摘要（默认当前用户；student_id 供教师视角查询）。
+         *
+         *     边界与降级见模块 docstring：v1 的 student_id 查询是演示环境可信
+         *     声明（无鉴权），生产需待认证落地；store 缺失或空数据返回空报告。
+         */
+        get: operations["diagnosis_summary_learning_diagnosis_summary_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -647,6 +671,8 @@ export interface components {
             /** Events */
             events?: components["schemas"]["RunEvent"][];
             /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
+            /** @default null */
             message?: components["schemas"]["Message"] | null;
             /** @default null */
             pending_handoff?: components["schemas"]["PendingHandoff"] | null;
@@ -766,6 +792,54 @@ export interface components {
             workspace_root?: string | null;
         };
         /**
+         * DiagnosisKnowledgePoint
+         * @description 学情诊断：一个知识点的作答聚合（六大功能 P3-15）。
+         */
+        DiagnosisKnowledgePoint: {
+            /** Accuracy */
+            accuracy: number;
+            /** Attempts */
+            attempts: number;
+            /** Correct */
+            correct: number;
+            /** Knowledge Point */
+            knowledge_point: string;
+            /**
+             * Last At
+             * @default null
+             */
+            last_at?: string | null;
+        };
+        /**
+         * DiagnosisSummary
+         * @description 学情诊断摘要（六大功能 P3-15）。
+         *
+         *     数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =
+         *     attempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM
+         *     叙述只出现在对话内诊断报告，不在本契约里。
+         */
+        DiagnosisSummary: {
+            /** Knowledge Points */
+            knowledge_points?: components["schemas"]["DiagnosisKnowledgePoint"][];
+            /**
+             * Total Attempts
+             * @default 0
+             */
+            total_attempts?: number;
+            /**
+             * Uncategorized Attempts
+             * @default 0
+             */
+            uncategorized_attempts?: number;
+            /**
+             * User Id
+             * @default null
+             */
+            user_id?: string | null;
+            /** Weak Points */
+            weak_points?: string[];
+        };
+        /**
          * ErrorCode
          * @description Stable API error codes aligned with the current Core classification.
          * @enum {string}
@@ -850,6 +924,54 @@ export interface components {
             size: number;
             /** Url */
             url: string;
+        };
+        /**
+         * GradingItemDto
+         * @description 一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。
+         */
+        GradingItemDto: {
+            /**
+             * Error Tag
+             * @default null
+             */
+            error_tag?: string | null;
+            /**
+             * Feedback
+             * @default
+             */
+            feedback?: string;
+            /**
+             * Knowledge Point
+             * @default null
+             */
+            knowledge_point?: string | null;
+            /** Max Score */
+            max_score: number;
+            /** Question Id */
+            question_id: string;
+            /** Score */
+            score: number;
+        };
+        /**
+         * GradingResultDto
+         * @description 一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。
+         *
+         *     total_score / max_total_score 由核心侧确定性汇总（不信任模型自报），
+         *     语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，
+         *     教师复核」（LLM 主观题评分的既有产品口径）。
+         */
+        GradingResultDto: {
+            /** Items */
+            items: components["schemas"]["GradingItemDto"][];
+            /** Max Total Score */
+            max_total_score: number;
+            /**
+             * Overall Comment
+             * @default
+             */
+            overall_comment?: string;
+            /** Total Score */
+            total_score: number;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -1069,6 +1191,8 @@ export interface components {
              * @default null
              */
             created_at?: string | null;
+            /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
             role: components["schemas"]["MessageRole"];
         };
         /**
@@ -1340,6 +1464,8 @@ export interface components {
              */
             error_code?: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"] | null;
             event_type: components["schemas"]["StreamEventType"];
+            /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
             /**
              * Input Summary
              * @default null
@@ -2139,6 +2265,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    diagnosis_summary_learning_diagnosis_summary_get: {
+        parameters: {
+            query?: {
+                student_id?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnosisSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

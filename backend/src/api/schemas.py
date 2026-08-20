@@ -191,7 +191,9 @@ class ChatRequest(ContractModel):
     # D7-T1:附件引用(契约扩展预留)——chat 路由当前忽略该字段(缺失
     # 或携带均不影响现有行为),由 D7-T3 或后续 core 能力决定如何进入
     # 模型上下文;留空列表与 None 等价。
-    attachments: list[Attachment] | None = None
+    # max_length=10（审查 W2）：服务端自保上限——附件提取含磁盘 IO，
+    # 与单附件 30K/合计 100K 字符护栏同为「防单轮注入失控」的双层防线。
+    attachments: list[Attachment] | None = Field(default=None, max_length=10)
 
     @field_validator("session_id", "message")
     @classmethod
@@ -200,6 +202,56 @@ class ChatRequest(ContractModel):
         if not value.strip():
             raise ValueError("must not be blank")
         return value
+
+
+class DiagnosisKnowledgePoint(ContractModel):
+    """学情诊断：一个知识点的作答聚合（六大功能 P3-15）。"""
+
+    knowledge_point: str
+    attempts: int = Field(ge=0)
+    correct: int = Field(ge=0)
+    accuracy: float = Field(ge=0, le=1)
+    last_at: str | None = None
+
+
+class DiagnosisSummary(ContractModel):
+    """学情诊断摘要（六大功能 P3-15）。
+
+    数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =
+    attempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM
+    叙述只出现在对话内诊断报告，不在本契约里。
+    """
+
+    user_id: str | None = None
+    total_attempts: int = Field(default=0, ge=0)
+    knowledge_points: list[DiagnosisKnowledgePoint] = Field(default_factory=list)
+    uncategorized_attempts: int = Field(default=0, ge=0)
+    weak_points: list[str] = Field(default_factory=list)
+
+
+class GradingItemDto(ContractModel):
+    """一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。"""
+
+    question_id: str
+    score: float = Field(ge=0)
+    max_score: float = Field(gt=0)
+    feedback: str = ""
+    knowledge_point: str | None = None
+    error_tag: str | None = None
+
+
+class GradingResultDto(ContractModel):
+    """一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。
+
+    total_score / max_total_score 由核心侧确定性汇总（不信任模型自报），
+    语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，
+    教师复核」（LLM 主观题评分的既有产品口径）。
+    """
+
+    items: list[GradingItemDto] = Field(min_length=1)
+    overall_comment: str = ""
+    total_score: float = Field(ge=0)
+    max_total_score: float = Field(gt=0)
 
 
 class Message(ContractModel):
@@ -212,6 +264,10 @@ class Message(ContractModel):
     # D7-T3:附件引用(可选;历史消息/非附件消息为 None)。core 消息当前
     # 无附件元数据,映射侧保持 None——契约预留,前端按字段渲染。
     attachments: list[Attachment] | None = None
+    # 六大功能 P2-12（pi 审查 🟡4）：消息级批改元数据——挂在产出
+    # 批改的作答消息上，任意历史轮的批改卡刷新/切会话后经 history
+    # 端点恢复（grading 通道每轮重置，不靠它跨轮保留）。
+    grading: GradingResultDto | None = None
 
 
 class ToolApprovalRequest(ContractModel):
@@ -307,6 +363,9 @@ class StreamEvent(ContractModel):
     is_delta: bool | None = None  # reasoning/message 的增量与完整快照标记
     message: Message | None = None  # message_end 的完整消息(可选)
     citations: list[Citation] | None = None
+    # 六大功能 P2-12：message_end 载荷携带本轮批改结论（与 citations
+    # 同位；非批改轮为 None）。
+    grading: GradingResultDto | None = None
     current_agent: AgentRole | None = None
     pending_tool_approval: PendingToolApproval | None = None
 
@@ -610,6 +669,9 @@ class ChatResponse(ContractModel):
     pending_handoff: PendingHandoff | None = None
     pending_tool_approval: PendingToolApproval | None = None
     references: list[Citation] | None = None
+    # 六大功能 P2-12：本轮批改结论（可选；非批改轮为 None）。历史
+    # 轮次的批改经 Message.grading 消息元数据恢复（pi 审查 🟡4）。
+    grading: GradingResultDto | None = None
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
     current_agent: AgentRole | None = None
@@ -685,6 +747,10 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     PendingHandoffResponse,
     HandoffDecisionRequest,
     Citation,
+    DiagnosisKnowledgePoint,
+    DiagnosisSummary,
+    GradingItemDto,
+    GradingResultDto,
     TaskPlanStep,
     TaskPlan,
     TaskResult,

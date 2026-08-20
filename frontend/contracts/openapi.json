@@ -123,6 +123,7 @@
                 "items": {
                   "$ref": "#/components/schemas/Attachment"
                 },
+                "maxItems": 10,
                 "type": "array"
               },
               {
@@ -171,6 +172,17 @@
             },
             "title": "Events",
             "type": "array"
+          },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "message": {
             "anyOf": [
@@ -439,6 +451,98 @@
         "title": "CreateSessionRequest",
         "type": "object"
       },
+      "DiagnosisKnowledgePoint": {
+        "additionalProperties": false,
+        "description": "学情诊断：一个知识点的作答聚合（六大功能 P3-15）。",
+        "properties": {
+          "accuracy": {
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Accuracy",
+            "type": "number"
+          },
+          "attempts": {
+            "minimum": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "correct": {
+            "minimum": 0,
+            "title": "Correct",
+            "type": "integer"
+          },
+          "knowledge_point": {
+            "title": "Knowledge Point",
+            "type": "string"
+          },
+          "last_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Last At"
+          }
+        },
+        "required": [
+          "knowledge_point",
+          "attempts",
+          "correct",
+          "accuracy"
+        ],
+        "title": "DiagnosisKnowledgePoint",
+        "type": "object"
+      },
+      "DiagnosisSummary": {
+        "additionalProperties": false,
+        "description": "学情诊断摘要（六大功能 P3-15）。\n\n数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =\nattempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM\n叙述只出现在对话内诊断报告，不在本契约里。",
+        "properties": {
+          "knowledge_points": {
+            "items": {
+              "$ref": "#/components/schemas/DiagnosisKnowledgePoint"
+            },
+            "title": "Knowledge Points",
+            "type": "array"
+          },
+          "total_attempts": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Total Attempts",
+            "type": "integer"
+          },
+          "uncategorized_attempts": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Uncategorized Attempts",
+            "type": "integer"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Id"
+          },
+          "weak_points": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Weak Points",
+            "type": "array"
+          }
+        },
+        "title": "DiagnosisSummary",
+        "type": "object"
+      },
       "ErrorCode": {
         "description": "Stable API error codes aligned with the current Core classification.",
         "enum": [
@@ -616,6 +720,98 @@
           "url"
         ],
         "title": "FileUploadResponse",
+        "type": "object"
+      },
+      "GradingItemDto": {
+        "additionalProperties": false,
+        "description": "一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。",
+        "properties": {
+          "error_tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Tag"
+          },
+          "feedback": {
+            "default": "",
+            "title": "Feedback",
+            "type": "string"
+          },
+          "knowledge_point": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Point"
+          },
+          "max_score": {
+            "exclusiveMinimum": 0,
+            "title": "Max Score",
+            "type": "number"
+          },
+          "question_id": {
+            "title": "Question Id",
+            "type": "string"
+          },
+          "score": {
+            "minimum": 0,
+            "title": "Score",
+            "type": "number"
+          }
+        },
+        "required": [
+          "question_id",
+          "score",
+          "max_score"
+        ],
+        "title": "GradingItemDto",
+        "type": "object"
+      },
+      "GradingResultDto": {
+        "additionalProperties": false,
+        "description": "一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。\n\ntotal_score / max_total_score 由核心侧确定性汇总（不信任模型自报），\n语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，\n教师复核」（LLM 主观题评分的既有产品口径）。",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GradingItemDto"
+            },
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "max_total_score": {
+            "exclusiveMinimum": 0,
+            "title": "Max Total Score",
+            "type": "number"
+          },
+          "overall_comment": {
+            "default": "",
+            "title": "Overall Comment",
+            "type": "string"
+          },
+          "total_score": {
+            "minimum": 0,
+            "title": "Total Score",
+            "type": "number"
+          }
+        },
+        "required": [
+          "items",
+          "total_score",
+          "max_total_score"
+        ],
+        "title": "GradingResultDto",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -1051,6 +1247,17 @@
             ],
             "default": null,
             "title": "Created At"
+          },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "role": {
             "$ref": "#/components/schemas/MessageRole"
@@ -1721,6 +1928,17 @@
           },
           "event_type": {
             "$ref": "#/components/schemas/StreamEventType"
+          },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "input_summary": {
             "anyOf": [
@@ -2594,7 +2812,7 @@
     },
     "/healthz": {
       "get": {
-        "description": "存活探针；lifespan 装配后附带检索模式诊断（H-T1）。\n\n- lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持\n  {\"status\": \"ok\"} 现状，不破坏既有探针语义与测试；\n- lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /\n  vector_dimension），运维据此判断语义检索是否在线。诊断只含\n  这三个字段，绝不含任何文件路径。",
+        "description": "存活探针；lifespan 装配后附带检索与 OCR 诊断（H-T1 / P0-6）。\n\n- lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持\n  {\"status\": \"ok\"} 现状，不破坏既有探针语义与测试；\n- lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /\n  vector_dimension）与 ocr 字段（enabled，P0-6：图片附件识别\n  能力是否在线），运维据此判断可选能力状态。诊断只含状态字段，\n  绝不含任何文件路径。",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {
@@ -3041,6 +3259,73 @@
         "summary": "Search Knowledge",
         "tags": [
           "knowledge"
+        ]
+      }
+    },
+    "/learning/diagnosis/summary": {
+      "get": {
+        "description": "返回学情诊断摘要（默认当前用户；student_id 供教师视角查询）。\n\n边界与降级见模块 docstring：v1 的 student_id 查询是演示环境可信\n声明（无鉴权），生产需待认证落地；store 缺失或空数据返回空报告。",
+        "operationId": "diagnosis_summary_learning_diagnosis_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "student_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Student Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosisSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Diagnosis Summary",
+        "tags": [
+          "learning"
         ]
       }
     },

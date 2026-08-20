@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Request, status
 from langchain_core.messages import AIMessage, BaseMessage
 from starlette.concurrency import run_in_threadpool
 
+from api.attachments import compose_message_with_attachments
 from api.files import attachments_for_generated_files
 from api.schemas import (
     AgentRole,
@@ -20,6 +21,8 @@ from api.schemas import (
     ChatResponse,
     Citation,
     ErrorResponse,
+    GradingItemDto,
+    GradingResultDto,
     HandoffRequest,
     Message,
     MessageRole,
@@ -45,9 +48,11 @@ from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
 from core.sessions import SessionRecord, SessionStore, derive_session_title
 from core.state import AgentState, PendingHandoffApproval
+from core.state import GradingResult as CoreGradingResult
 from core.state import PendingToolApproval as CorePendingToolApproval
 from core.state import TaskPlan as CoreTaskPlan
 from core.state import TaskStepResult as CoreTaskStepResult
+from core.state import message_grading as core_message_grading
 from core.state import message_references as core_message_references
 
 router = APIRouter(tags=["chat"])
@@ -199,6 +204,8 @@ def _final_assistant_message(
             created_at=_safe_created_at(message),
             # T5-3：officecli_edit 生成的文件注册为可下载附件（无则 None）。
             attachments=attachments_for_generated_files(user_id, message),
+            # P2-12：该消息若挂着批改元数据则随消息透出（无则 None）。
+            grading=_message_grading_dto(message),
         )
     return None
 
@@ -260,6 +267,38 @@ def _response_references(
             if references is not None:
                 return references
     return None
+
+
+def _public_grading(grading: object) -> GradingResultDto | None:
+    """core GradingResult → 公开契约 GradingResultDto（字段逐项映射）。
+
+    与 _public_task_plan 同一哲学：整体类型不符 → None（宽容读取，
+    checkpoint 反序列化后的脏 dict 不击穿响应）；core 模型 extra=
+    "forbid" + 校验保证实例字段必然合法，故不做字段级降级。
+    """
+    if not isinstance(grading, CoreGradingResult):
+        return None
+    return GradingResultDto(
+        items=[
+            GradingItemDto(
+                question_id=item.question_id,
+                score=item.score,
+                max_score=item.max_score,
+                feedback=item.feedback,
+                knowledge_point=item.knowledge_point,
+                error_tag=item.error_tag,
+            )
+            for item in grading.items
+        ],
+        overall_comment=grading.overall_comment,
+        total_score=grading.total_score,
+        max_total_score=grading.max_total_score,
+    )
+
+
+def _message_grading_dto(message: BaseMessage) -> GradingResultDto | None:
+    """消息元数据里的批改结论 → 契约 DTO（历史回放用，pi 审查 🟡4）。"""
+    return _public_grading(core_message_grading(message))
 
 
 def _previous_sequence(state: AgentState | None) -> int:
@@ -386,12 +425,18 @@ def _ensure_session_with_title(
 def _workspace_call_kwargs(
     method: object,
     session: SessionRecord,
-) -> dict[str, object]:
-    """Pass workspace capability only to graph implementations that support it."""
+) -> dict[str, Any]:
+    """Pass workspace capability only to graph implementations that support it.
+
+    返回 dict[str, Any] 而非 dict[str, object]：调用方以 ** 解包传给
+    run/stream（参数类型为 str | None / Sequence[str]），object 值与
+    这些形参不兼容会被 mypy 拒绝；Any 是「动态透传」的正确口径
+    （值在运行时由本函数按参数名精选，类型安全由 SessionRecord 保证）。
+    """
     if not callable(method):
         return {}
     parameters = inspect.signature(method).parameters
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, Any] = {}
     if "workspace_root" in parameters:
         kwargs["workspace_root"] = session.workspace_root
     if "additional_workspace_roots" in parameters:
@@ -478,6 +523,9 @@ async def chat_response_for_state(
         run_id=state.get("run_id"),
         message=_final_assistant_message(state, previous_count, user_id),
         references=_response_references(state, previous_count),
+        # P2-12：本轮批改结论（grading 通道每轮重置；历史轮经消息
+        # 元数据恢复，见 Message.grading）。
+        grading=_public_grading(state.get("grading")),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),
         events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
@@ -516,6 +564,19 @@ async def chat(
             user_id,
             payload.message,
         )
+        # P2-7：消费 attachments 契约字段（此前路由忽略）——附件提取
+        # 文本拼入本轮用户消息；无附件时与原消息逐字节一致（零回归）。
+        # 会话标题仍用原消息（简洁），附件材料只进模型上下文。
+        # 提取含磁盘 IO / PDF 全页解析 / OCR CPU 推理，必须走线程池
+        # （审查 C1：同步执行会阻塞事件循环，殃及全部并发请求），
+        # 与下方 _ensure_session_with_title / get_state 同一模式。
+        message_text = await run_in_threadpool(
+            compose_message_with_attachments,
+            payload.message,
+            payload.attachments,
+            user_id,
+            getattr(request.app.state, "ocr_provider", None),
+        )
         previous_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id
         )
@@ -523,7 +584,7 @@ async def chat(
             state = await run_in_threadpool(
                 _run_graph_turn,
                 graph,
-                payload.message,
+                message_text,
                 payload.session_id,
                 user_id,
                 session,

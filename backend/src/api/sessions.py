@@ -152,6 +152,10 @@ def _public_message(message: BaseMessage, user_id: str | None = None) -> Message
         return None
     # 延迟导入避免模块环：api/files.py 在模块顶部从本模块导入
     # current_user_id（与 get_session_process 延迟导入 api.chat 同一模式）。
+    # P2-12（pi 审查 🟡4）：历史消息的批改卡恢复——批改元数据挂在
+    # 产出批改的作答消息上（GRADING_METADATA_KEY），刷新/切会话后经
+    # 本映射透出；延迟导入 api.chat 与上面同一模块环规避模式。
+    from api.chat import _message_grading_dto
     from api.files import attachments_for_generated_files
 
     return Message(
@@ -163,6 +167,7 @@ def _public_message(message: BaseMessage, user_id: str | None = None) -> Message
         # 受控下载附件后透传;无元数据时返回 None,前端零渲染(与 D7-T3
         # 预留语义一致)。
         attachments=attachments_for_generated_files(user_id, message),
+        grading=_message_grading_dto(message),
     )
 
 

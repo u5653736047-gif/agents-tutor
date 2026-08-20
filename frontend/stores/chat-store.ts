@@ -66,6 +66,10 @@ type TaskResult = components["schemas"]["TaskResult"];
 // D3-T4:回答引用(ChatResponse.references)——与既有字段同一取型方式,
 // 直接取生成契约,保持单一数据源
 type Citation = components["schemas"]["Citation"];
+// P2-12:本轮批改结论(ChatResponse.grading / StreamEvent.grading)——
+// 与 references 同一取型与归一化口径;历史轮次的批改经消息级
+// Message.grading 元数据恢复(刷新/切会话不丢,pi 审查 🟡4)。
+type GradingResult = NonNullable<components["schemas"]["GradingResultDto"]>;
 
 // D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
 // streamChatWithRetry 的 maxRetries;耗尽后向用户报告连接错误，绝不
@@ -92,6 +96,9 @@ export type ChatStore = {
   decideToolApproval(action: "confirm" | "reject"): Promise<void>;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
+  // P2-12:本轮批改结论(null = 非批改轮,与后端「无批改不携带」契约
+  // 一致;GradingCard 组件零渲染降级)
+  grading: GradingResult | null;
   isDecidingHandoff: boolean;
   isDecidingToolApproval: boolean;
   isLoadingMessages: boolean;
@@ -148,6 +155,8 @@ function emptyConversationState() {
     messages: [] as Message[],
     pendingHandoff: null,
     pendingToolApproval: null,
+    // P2-12:批改结论与引用同一轮次语义(对应最后一轮回答,不残留)
+    grading: null,
     // D3-T4:引用随轮次清空(引用对应最后一轮回答,切会话/新建会话不残留)
     references: null,
     runError: null,
@@ -179,6 +188,8 @@ function applyChatResponse(
     events: [...(response.events ?? [])],
     pendingHandoff: response.pending_handoff ?? null,
     pendingToolApproval: response.pending_tool_approval ?? null,
+    // P2-12:批改结论同一归一化口径(缺失 → null,组件零渲染)
+    grading: response.grading ?? null,
     // D3-T4:响应缺失(undefined/null)统一归一为 null,store 语义与
     // 其它可选字段一致,组件层收到 null 时零渲染
     references: response.references ?? null,
@@ -315,6 +326,8 @@ function dispatchStreamEvent(
         streamingAgent: event.agent ?? null,
         streamingMessage: streamed,
         references: event.citations ?? null,
+        // P2-12:流式 message_end 载荷携带本轮批改结论(与 citations 同位)
+        grading: event.grading ?? null,
       });
       break;
     }

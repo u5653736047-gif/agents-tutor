@@ -8,6 +8,7 @@ import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
+import { GradingCard } from "@/components/grading-card";
 import {
   CollaborationPanel,
   type CollaborationPanelProps,
@@ -248,6 +249,16 @@ export function MessageRow({
                     tone="default"
                   />
                 ))}
+              </div>
+            ) : null}
+            {/* P2-12(pi 审查 🟡4 + 审查 W7)：消息级批改卡——后端把
+                批改元数据挂在产出批改的作答消息上，刷新/切会话后经
+                history 端点恢复；无 grading 元数据时整段（含包装 div）
+                零渲染，不给每条助手消息添加空白与外边距（与附件区
+                同一条件渲染惯例） */}
+            {message.grading ? (
+              <div className="mt-3">
+                <GradingCard grading={message.grading} />
               </div>
             ) : null}
           </div>
@@ -554,6 +565,9 @@ export function ConversationPanel() {
   const pendingToolApproval = useChatStore(
     (state) => state.pendingToolApproval,
   );
+  // P2-12:本轮批改结论(store 从 ChatResponse.grading / StreamEvent
+  // grading 归一),null 时 GradingCard 零渲染
+  const grading = useChatStore((state) => state.grading);
   // D3-T4:本轮回答的引用列表(store 从 ChatResponse.references 归一),
   // null 时 CitationList 零渲染,无引用轮次不显示任何东西
   const references = useChatStore((state) => state.references);
@@ -627,6 +641,7 @@ export function ConversationPanel() {
     isSending,
     isStreaming,
     events,
+    grading,
     messages,
     pendingHandoff,
     pendingToolApproval,
@@ -726,6 +741,10 @@ export function ConversationPanel() {
               最后一轮回答,跟随该轮回答一起展示;store
               的 references 为 null 时组件零渲染,不占位 */}
           <CitationList citations={references} />
+          {/* P2-12:批改卡片——与引用卡片同位;grading 为 null 时零渲染。
+              历史轮次的批改卡由消息级 Message.grading 元数据承载
+              (刷新后经 history 端点恢复,后端契约已就绪) */}
+          <GradingCard grading={grading} />
           {/* D4-T8:虚拟化尾 spacer——补足未渲染行的估算高度,
               保证滚动条总高度与全量模式一致 */}
           {isVirtualized ? (

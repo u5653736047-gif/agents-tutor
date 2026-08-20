@@ -303,6 +303,8 @@ def test_history_projects_only_safe_user_and_assistant_messages(tmp_path: Path) 
             "created_at": None,
             # D7-T3:core 消息无附件元数据,契约字段显式为 null
             "attachments": None,
+            # P2-12:无批改元数据时显式为 null
+            "grading": None,
         },
         {
             "role": "assistant",
@@ -310,11 +312,72 @@ def test_history_projects_only_safe_user_and_assistant_messages(tmp_path: Path) 
             "agent": "evaluator",
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
     ]
     assert "secret-key" not in response.text
     assert "secret tool output" not in response.text
     assert "internal payload" not in response.text
+
+
+def test_history_restores_message_level_grading_metadata(
+    tmp_path: Path,
+) -> None:
+    """审查 W3：任意历史轮的批改卡经 history 端点恢复（pi 审查 🟡4
+    修复的最后一公里守护：若 _public_message 的 grading 映射被未来
+    重构破坏，本用例直接失败）。"""
+    from core.state import GradingItem, GradingResult, with_grading
+
+    graded_message = with_grading(
+        AIMessage(content="批改完成。", name="evaluator"),
+        GradingResult(
+            items=[
+                GradingItem(
+                    question_id="q1",
+                    score=8,
+                    max_score=10,
+                    feedback="基本正确。",
+                    knowledge_point="梯度下降",
+                )
+            ],
+            overall_comment="总体良好。",
+            total_score=8,
+            max_total_score=10,
+        ),
+    )
+    histories = {
+        ("session-graded", "user-1"): [
+            HumanMessage(content="请批改我的作业"),
+            graded_message,
+            AIMessage(content="已为你批改本次作业。", name="supervisor"),
+        ]
+    }
+    app, store = _session_app(tmp_path, HistoryGraph(histories))
+    store.create_session("session-graded", user_id="user-1")
+    try:
+        response = asyncio.run(
+            _request(
+                app,
+                "GET",
+                "/sessions/session-graded/messages",
+                headers={"X-User-Id": "user-1"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    messages = response.json()
+    # 批改作答消息：grading 元数据完整透出
+    graded = messages[1]
+    assert graded["grading"] is not None
+    assert graded["grading"]["total_score"] == 8
+    assert graded["grading"]["max_total_score"] == 10
+    assert graded["grading"]["items"][0]["knowledge_point"] == "梯度下降"
+    assert graded["grading"]["overall_comment"] == "总体良好。"
+    # 非批改消息保持 null（用户消息与聚合回答）
+    assert messages[0]["grading"] is None
+    assert messages[2]["grading"] is None
 
 
 def test_process_history_replays_reasoning_and_redacted_tool_details(
@@ -492,13 +555,21 @@ def test_history_prefers_agent_role_metadata_over_name(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json() == [
-        {"role": "user", "content": "你好", "agent": None, "created_at": None, "attachments": None},
+        {
+            "role": "user",
+            "content": "你好",
+            "agent": None,
+            "created_at": None,
+            "attachments": None,
+            "grading": None,
+        },
         {
             "role": "assistant",
             "content": "督导回答",
             "agent": "supervisor",
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
     ]
 
@@ -545,13 +616,21 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
 
     assert response.status_code == 200
     assert response.json() == [
-        {"role": "user", "content": "旧问题", "agent": None, "created_at": None, "attachments": None},
+        {
+            "role": "user",
+            "content": "旧问题",
+            "agent": None,
+            "created_at": None,
+            "attachments": None,
+            "grading": None,
+        },
         {
             "role": "assistant",
             "content": "旧回答",
             "agent": "evaluator",
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
         {
             "role": "assistant",
@@ -559,6 +638,7 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
             "agent": None,
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
         {
             "role": "assistant",
@@ -566,6 +646,7 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
             "agent": "teaching_assistant",
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
         {
             "role": "assistant",
@@ -573,6 +654,7 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
             "agent": None,
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
         {
             "role": "assistant",
@@ -580,6 +662,7 @@ def test_history_falls_back_to_name_and_degrades_for_legacy_messages(
             "agent": None,
             "created_at": None,
             "attachments": None,
+            "grading": None,
         },
     ]
 

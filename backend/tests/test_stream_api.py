@@ -736,6 +736,8 @@ def test_stream_tool_events_carry_redacted_input_and_output_summaries(
         "message_id",
         "message",
         "citations",
+        # P2-12:批改结论（契约新增可选字段，非批改事件为 null/缺省）
+        "grading",
         "current_agent",
         "tool_call_id",
         "parent_tool_call_id",

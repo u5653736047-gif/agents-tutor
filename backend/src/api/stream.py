@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessageChunk
 from starlette.concurrency import run_in_threadpool
 
+from api.attachments import compose_message_with_attachments
 from api.chat import (
     PENDING_RESUME_ERROR_PREFIX,
     _ensure_session_with_title,
@@ -46,6 +47,7 @@ from api.chat import (
     _public_agent,
     _public_event,
     _public_events,
+    _public_grading,
     _public_run_error,
     _response_references,
     _run_graph_turn,
@@ -66,11 +68,25 @@ from api.sessions import current_user_id
 from core.events import EventType
 from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
+from core.ocr import OcrProvider
 from core.sessions import SessionRecord, SessionStore
 from core.state import AgentState, ToolApprovalDecision
 
 router = APIRouter(tags=["chat"])
 _LOGGER = logging.getLogger("api.stream")
+
+
+def _ocr_provider_from_request(request: Request) -> object | None:
+    """从 app.state 取 OCR provider；request 无 app 时返回 None。
+
+    防御性访问：生产 Request 恒有 app；测试替身（只实现
+    is_disconnected 的 _ConnectedRequest 等）没有 app 属性——此时
+    OCR 按 None 处理（图片附件走友好提示降级），不击穿替身路径。
+    """
+    app = getattr(request, "app", None)
+    if app is None:
+        return None
+    return getattr(app.state, "ocr_provider", None)
 
 # SSE 轮询间隔:core 是同步 run,事件在 checkpoint 里逐步落盘,
 # 生成器以固定间隔轮询 get_state 拿增量(50ms 对事件级推送足够)。
@@ -376,6 +392,16 @@ async def _native_stream_events(
     run_id = str(uuid4())
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    # P2-7：附件提取文本拼入用户消息（无附件时与原消息逐字节一致）。
+    # 提取含磁盘 IO / PDF 解析 / OCR 推理，走线程池避免阻塞事件循环
+    #（审查 C1，与 pump 的 run_in_threadpool 同一模式）。
+    message_text = await run_in_threadpool(
+        compose_message_with_attachments,
+        payload.message,
+        payload.attachments,
+        user_id,
+        cast(OcrProvider | None, _ocr_provider_from_request(request)),
+    )
 
     def pump() -> None:
         try:
@@ -384,7 +410,7 @@ async def _native_stream_events(
             if "run_id" in inspect.signature(stream_method).parameters:
                 stream_kwargs["run_id"] = run_id
             stream_items = stream_method(
-                payload.message,
+                message_text,
                 payload.session_id,
                 user_id,
                 **stream_kwargs,
@@ -519,6 +545,8 @@ async def _native_stream_events(
                         content=final_message.content,
                         message=final_message,
                         citations=_response_references(state, previous_count),
+                        # P2-12：本轮批改结论与 citations 同位透出。
+                        grading=_public_grading(state.get("grading")),
                     )
                 )
         sequence += 1
@@ -866,11 +894,20 @@ async def _stream_events(
 
         last_sequence = _previous_sequence(previous_state)
         previous_count = _previous_message_count(previous_state)
+        # P2-7：兼容路径同样消费附件；提取含磁盘 IO / PDF 解析 / OCR
+        # 推理，先在线程池内完成组装（审查 C1），再后台启动图轮。
+        message_text = await run_in_threadpool(
+            compose_message_with_attachments,
+            payload.message,
+            payload.attachments,
+            user_id,
+            cast(OcrProvider | None, _ocr_provider_from_request(request)),
+        )
         background_task = asyncio.create_task(
             run_in_threadpool(
                 _run_graph_turn,
                 graph,
-                payload.message,
+                message_text,
                 payload.session_id,
                 user_id,
                 session,
