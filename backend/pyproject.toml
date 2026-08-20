@@ -24,6 +24,14 @@ dev = [
 embedding = [
     "fastembed>=0.8.0",
 ]
+# OCR 可选依赖组（六大功能计划 P0-6）：图片附件文本提取，
+# 服务批改（手写作业照片）与答疑（手写公式照片）。
+# rapidocr-onnxruntime：PP-OCR 同源模型、纯 pip 约 50MB、模型内置
+# wheel 无需联网下载、Windows/CI 无 paddlepaddle 环境坑（选型理由
+# 见 core/ocr.py 模块注释）；未安装时 API_OCR_MODE=auto 自动降级。
+ocr = [
+    "rapidocr-onnxruntime>=1.4",
+]
 
 [build-system]
 requires = ["hatchling"]
