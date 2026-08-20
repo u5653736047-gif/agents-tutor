@@ -31,6 +31,7 @@ from core.graph_builder import CollaborativeAgentGraph
 from core.knowledge.index import InMemoryKnowledgeIndex
 from core.knowledge.models import KnowledgeChunk
 from core.knowledge.policy import HeuristicRetrievalPolicy
+from core.knowledge.retrieval import HeuristicQueryRefiner
 from core.knowledge.service import KnowledgeService
 from core.knowledge.tools import create_search_knowledge_tool
 from core.state import AgentRole
@@ -654,3 +655,123 @@ def test_graph_malformed_metadata_skips_event(dirty_output: object) -> None:
 
     assert result["run_error"] is None  # 不击穿
     assert _retrieval_events(result) == []
+
+
+# ── P0-3 过滤参数在 adaptive 分支的透传（六大功能计划，pi 审查
+# 🔴2 硬性验收：注入 policy/threshold 后生产走 adaptive 路径，
+# 若只透传非 adaptive 分支，难度/课标过滤会在生产静默失效；
+# 只测非 adaptive 路径的用例发现不了该缺口）─────────────
+
+
+def _difficulty_metadata_service() -> KnowledgeService:
+    index = InMemoryKnowledgeIndex()
+    index.upsert(
+        [
+            KnowledgeChunk(
+                chunk_id="c-basic",
+                document_id="doc-ml",
+                content="支持向量机的基础概念与直观解释",
+                source="ml.txt",
+                page=None,
+                start=0,
+                end=14,
+                metadata={"difficulty": "basic"},
+            ),
+            KnowledgeChunk(
+                chunk_id="c-adv",
+                document_id="doc-ml",
+                content="支持向量机的核方法与对偶问题推导",
+                source="ml.txt",
+                page=None,
+                start=0,
+                end=15,
+                metadata={"difficulty": "advanced"},
+            ),
+        ]
+    )
+    return KnowledgeService(index)
+
+
+def test_adaptive_branch_still_applies_metadata_filter() -> None:
+    """注入 policy/threshold（启用 adaptive）后过滤仍生效。"""
+    search_tool = create_search_knowledge_tool(
+        _difficulty_metadata_service(),
+        policy=HeuristicRetrievalPolicy(),
+        relevance_threshold=0.5,
+    )
+
+    result = search_tool.invoke(
+        {"query": "支持向量机", "difficulty": "basic"}
+    )
+
+    # 确认确实走了 adaptive 路径（metadata 键存在），再断言过滤生效
+    assert "metadata" in result
+    assert result["metadata"]["needed"] is True
+    assert [hit["citation"]["chunk_id"] for hit in result["hits"]] == ["c-basic"]
+
+
+def test_adaptive_branch_without_filter_returns_all() -> None:
+    search_tool = create_search_knowledge_tool(
+        _difficulty_metadata_service(),
+        policy=HeuristicRetrievalPolicy(),
+        relevance_threshold=0.5,
+    )
+
+    result = search_tool.invoke({"query": "支持向量机", "top_k": 10})
+
+    assert "metadata" in result
+    assert {hit["citation"]["chunk_id"] for hit in result["hits"]} == {
+        "c-basic",
+        "c-adv",
+    }
+
+
+# ── 审查 W5：HeuristicQueryRefiner（P0-2 生产装配的零 LLM 精化器）
+# 规则单测 + 与 adaptive 工具的集成（此前零测试守护）──────────
+
+
+def test_heuristic_query_refiner_denoises_punctuation() -> None:
+    """规则 1：含标点/符号的查询 → 去噪后的净化查询。"""
+    refiner = HeuristicQueryRefiner()
+
+    refined = refiner.refine("什么是、梯度下降？？？", 0.0)
+
+    assert refined == "什么是 梯度下降"
+
+
+def test_heuristic_query_refiner_truncates_long_tail() -> None:
+    """规则 2：无标点但超长（>32 字符）→ 去尾部 8 字符保留主体。"""
+    refiner = HeuristicQueryRefiner()
+    long_query = "请帮我详细解释一下反向传播算法在深度神经网络训练过程中到底起了什么作用"
+    assert len(long_query) > refiner._LONG_QUERY_CHARS
+
+    refined = refiner.refine(long_query, 0.0)
+
+    assert refined == long_query[: -refiner._TAIL_DROP_CHARS]
+
+
+def test_heuristic_query_refiner_raises_when_no_opportunity() -> None:
+    """规则 3：短且无标点 → 抛 ValueError（由 _safe_refine 兑底为
+    「停止重检」，避免用原 query 白耗一轮检索）。"""
+    refiner = HeuristicQueryRefiner()
+
+    with pytest.raises(ValueError, match="no refinement opportunity"):
+        refiner.refine("梯度下降", 0.0)
+
+
+def test_heuristic_refiner_integrates_with_adaptive_tool() -> None:
+    """集成：未达标触发精化——零命中的短查询无精化空间，
+    HeuristicQueryRefiner 抛 ValueError 被 _safe_refine 兑底停止，
+    元数据 rounds=1 且 stopped_reason 不含「精化」。"""
+    search_tool = create_search_knowledge_tool(
+        _gamma_service(),
+        policy=HeuristicRetrievalPolicy(),
+        relevance_threshold=0.5,
+        refiner=HeuristicQueryRefiner(),
+    )
+
+    result = search_tool.invoke({"query": "alpha"})
+
+    assert result["metadata"]["threshold_met"] is False
+    assert result["metadata"]["rounds"] == 1
+    assert result["found"] is False

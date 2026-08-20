@@ -207,6 +207,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -457,6 +458,37 @@ class IdentityQueryRefiner:
 
     def refine(self, query: str, top_score: float) -> str:
         return query
+
+
+class HeuristicQueryRefiner:
+    """启发式查询精化器（六大功能计划 P0-2）：零 LLM、零外部依赖。
+
+    阈值未达标时的两条确定性修正规则（按序尝试，命中即返回）：
+    1. 去噪：剔除标点/符号后与原查询不同 → 返回净化后的查询
+       （长查询夹带的标点噪声会干扰词法分词与向量 embedding）；
+    2. 截长：查询显著超长时去掉尾部（尾部常是补充说明与噪声），
+       保留主体重新检索；
+    3. 无可精化空间：抛 ValueError——协议约定精化失败由 _safe_refine
+       兜底为「停止重检」（见 QueryRefiner 注释），避免用原 query
+       白耗一轮检索。
+    为什么不用 LLM 精化：拒绝方案 6（计划）——每轮重检多一次模型
+    调用会拉高首 token 延迟；启发式规则零成本、完全确定、可单测。
+    """
+
+    # 显著超长的判定阈值与尾部截断长度（经验值，可单测）。
+    _LONG_QUERY_CHARS = 32
+    _TAIL_DROP_CHARS = 8
+
+    def refine(self, query: str, top_score: float) -> str:
+        cleaned = " ".join(
+            re.findall(r"[\w\u4e00-\u9fff]+", query)
+        ).strip()
+        original = query.strip()
+        if cleaned and cleaned != original:
+            return cleaned
+        if len(original) > self._LONG_QUERY_CHARS:
+            return original[: -self._TAIL_DROP_CHARS].strip()
+        raise ValueError("query has no refinement opportunity")
 
 
 @dataclass(frozen=True)
