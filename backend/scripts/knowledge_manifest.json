@@ -92,6 +92,21 @@
           "expected_source": "ai-russell"
         }
       ]
+    },
+    {
+      "source": "cs-ai-curriculum",
+      "file": "人工智能学科课程标准.pdf",
+      "title": "人工智能学科课程标准",
+      "authors": [],
+      "subjects": ["课程标准"],
+      "difficulty": "intermediate",
+      "blocked": "curriculum-standard-pdf-not-provided：把课程标准 PDF 放入 data/books/ 并用此文件名后，删除本 blocked 标记并重跑 ingest_books.py 即可入库（六大功能 P6-21：智能备课的教学目标对齐依据）",
+      "verify": [
+        {
+          "query": "课程目标 知识体系 能力要求",
+          "expected_source": "cs-ai-curriculum"
+        }
+      ]
     }
   ]
 }
