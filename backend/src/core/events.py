@@ -49,6 +49,11 @@ class EventType(StrEnum):
     # 决策摘要供评价 Agent 与审计链路核对——「知识库未覆盖」这类结论
     # 不应只在工具输出里一闪而过，事件通道随 checkpoint 持久化。
     RETRIEVAL_DECISION = "retrieval_decision"
+    # S5-A1 tool 模式：Supervisor 成功创建任务计划后发出。脱敏原则与
+    # 既有事件一致：事件只记步骤数（content 字段，字符串数字），计划
+    # 正文（步骤描述/目标角色）在 state["task_plan"] 随 checkpoint 持久化。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射本类型时安全跳过。
+    TASK_PLAN_CREATED = "task_plan_created"
     # 计划步骤结果已归档（写入 task_results 通道）
     TASK_RESULT_ARCHIVED = "task_result_archived"
     # 任务计划结果聚合动作发生（成功或失败都会发出）

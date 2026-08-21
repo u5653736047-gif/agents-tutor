@@ -493,6 +493,15 @@ class TaskPlanStep(BaseModel):
     sequence: int = Field(ge=1)
     description: str = Field(min_length=1)
     target_agent: WorkerAgentRole
+    # S5-A2 步骤失败策略（core 内部字段，不扩 API 契约）：
+    # - abort（默认）：步骤失败即计划 FAILED，后续计划内 ask_* 硬熔断；
+    # - continue：记失败结果后推进游标继续后续步骤；
+    # - retry：预算内允许同目标重试一次（不推进游标、计一次
+    #   retries_used），重试再失败按 abort 收口。
+    # 默认 abort 是有意的保守选择：未显式表达可跳过的步骤失败时，
+    # 宁可熔断也不带着缺失结果聚合作答。提示词侧引导模型对资料收集
+    # 类步骤显式设 continue（见 TOOL_ORCHESTRATION_SUPERVISOR_PROMPT）。
+    on_failure: Literal["abort", "continue", "retry"] = "abort"
 
     @field_validator("description")
     @classmethod
@@ -510,6 +519,9 @@ class TaskPlan(BaseModel):
     steps: list[TaskPlanStep] = Field(min_length=2)
     current_step_index: int = Field(default=0, ge=0)
     status: TaskPlanStatus = TaskPlanStatus.ACTIVE
+    # S5-A2 每计划重试预算的已用计数（有界防循环；预算常量在
+    # graph_builder._TOOL_PLAN_RETRY_BUDGET）。core 内部字段不扩 API 契约。
+    retries_used: int = Field(default=0, ge=0)
 
     @field_validator("steps")
     @classmethod

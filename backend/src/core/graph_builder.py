@@ -143,6 +143,224 @@ def create_task_plan(steps: list[TaskPlanStep]) -> str:
     return TaskPlan(steps=steps).model_dump_json()
 
 
+# ── S5-A1/A2：tool 模式的计划执行管控 ─────────────────────────
+# 设计见类与函数注释。核心思路：handoff 模式的顺序管控在图结构里
+# （调度节点逐 Worker 分派），tool 模式没有这个结构——Supervisor 在
+# 自己的 ReAct 循环内经 ask_* 同步调子代理，顺序控制必须下沉到工具层，
+# 不能交给模型自觉。
+
+# 每计划重试预算（A2 有界防循环）：所有步骤共享，用完即按 abort 收口。
+_TOOL_PLAN_RETRY_BUDGET = 1
+
+# TaskStepResult 校验器允许的「本地可恢复」失败分类（与 handoff 模式
+# Worker 轮能产生的错误码同一集合）；不在集合内的子代理异常统一归一为
+# AGENT_OUTPUT_INVALID（保持既有不变量，不扩校验集合）。
+_SUBAGENT_STEP_ERROR_CODES = {
+    ErrorCode.MODEL_CALL_FAILED,
+    ErrorCode.REACT_ITERATION_LIMIT,
+    ErrorCode.AGENT_OUTPUT_INVALID,
+}
+
+
+class _SubagentRunError(RuntimeError):
+    """子代理同步执行失败，携带可归档进 TaskStepResult 的稳定错误分类。"""
+
+    def __init__(self, error_code: ErrorCode) -> None:
+        super().__init__("subagent execution failed")
+        self.error_code = error_code
+
+
+def _archivable_step_error(error_code: ErrorCode) -> ErrorCode:
+    """归一到 TaskStepResult 校验器允许的错误分类（见上方集合注释）。"""
+    return error_code if error_code in _SUBAGENT_STEP_ERROR_CODES else ErrorCode.AGENT_OUTPUT_INVALID
+
+
+class _ToolPlanHolder:
+    """轮内计划执行状态的可变持有者（跨线程共享）。
+
+    为什么需要一层盒子：工具在线程池中执行（executor 用 copy_context()
+    快照传播上下文）——工具内对 ContextVar 的 set 只改快照副本，主线程
+    轮末不可见；而 holder 对象本身是引用共享的，工具改 holder.execution
+    （如同轮新建计划、逐步记账），_wrap 轮末读同一对象即可拿到全部变化。
+    """
+
+    def __init__(self, execution: _ToolModePlanExecution | None) -> None:
+        self.execution = execution
+
+
+_TOOL_PLAN_EXECUTION: ContextVar[_ToolPlanHolder | None] = ContextVar(
+    "tool_mode_plan_execution",
+    default=None,
+)
+
+
+class _ToolModePlanExecution:
+    """一次 Supervisor 轮内 tool 模式计划执行的可变状态。
+
+    为什么需要轮内可变状态：ask_* 可能在同一 ReAct 轮内被多次调用，
+    而计划的游标推进要到轮末才写回 state——工具层门控若直接读
+    state["task_plan"] 会拿到过期游标，无法拦住「同轮第二次乱序调用」。
+    本对象由 _wrap 在 agent.run 前创建并经 ContextVar 注入工具闭包，
+    每次成功/失败即时推进；轮末由 _wrap 读回并写入 updates。
+
+    失败记录口径（A2）：只有终局结果落 task_results——continue/abort
+    落失败结果，retry 中间失败只计 retries_used 不落结果。这保持
+    「每步至多一条结果、连续前缀」的不变量（_validate_task_result_prefix
+    依赖），重试痕迹经 retries_used 与工具事件审计可见。
+    """
+
+    def __init__(self, plan: TaskPlan, results: list[TaskStepResult]) -> None:
+        self.plan = plan
+        self.results = list(results)
+        self.retries_used = plan.retries_used
+        # 本轮起点：结果数超过它的新增部分即本轮新落结果（发事件用）
+        self._baseline = len(self.results)
+        # 是否产生了需要写回 state 的变化（游标/状态/重试计数）
+        self.dirty = False
+
+    @property
+    def _next_index(self) -> int:
+        return len(self.results)
+
+    def check_gate(self, target_role: AgentRole) -> str | None:
+        """工具层确定性门控：返回 None 放行，否则返回给模型看的 JSON 拒绝理由。"""
+        if self.plan.status is not TaskPlanStatus.ACTIVE:
+            return json.dumps(
+                {
+                    "error": (
+                        f"任务计划已结束（{self.plan.status.value}），"
+                        "不再接受计划内子任务调用"
+                    ),
+                    "plan_status": self.plan.status.value,
+                },
+                ensure_ascii=False,
+            )
+        step = self.plan.steps[self._next_index]
+        if step.target_agent is not target_role:
+            return json.dumps(
+                {
+                    "error": (
+                        f"当前计划步骤 {step.sequence} 的目标角色是 "
+                        f"{step.target_agent.value}，不能调用 "
+                        f"{target_role.value}；请按计划顺序执行"
+                    ),
+                    "expected_target": step.target_agent.value,
+                    "current_step_sequence": step.sequence,
+                    "current_step_description": step.description,
+                },
+                ensure_ascii=False,
+            )
+        return None
+
+    def record_success(self, target_role: AgentRole, output: str) -> None:
+        """成功完成当前步骤：落结果、推进游标，最后一步转 COMPLETED。"""
+        step = self.plan.steps[self._next_index]
+        self.results.append(
+            TaskStepResult(
+                step_sequence=step.sequence,
+                target_agent=step.target_agent,
+                success=True,
+                output=output or None,
+            )
+        )
+        next_index = self._next_index
+        self.plan = self.plan.model_copy(
+            update={
+                "current_step_index": next_index,
+                "status": (
+                    TaskPlanStatus.COMPLETED
+                    if next_index == len(self.plan.steps)
+                    else TaskPlanStatus.ACTIVE
+                ),
+                "retries_used": self.retries_used,
+            }
+        )
+        self.dirty = True
+
+    def record_failure(
+        self,
+        target_role: AgentRole,
+        error_code: ErrorCode = ErrorCode.AGENT_OUTPUT_INVALID,
+    ) -> None:
+        """当前步骤失败：按 on_failure 策略处置（语义见类注释与 state.py）。"""
+        step = self.plan.steps[self._next_index]
+        if (
+            step.on_failure == "retry"
+            and self.retries_used < _TOOL_PLAN_RETRY_BUDGET
+        ):
+            # 重试不推进游标、不落中间失败结果：同目标可再次调用，
+            # 由下次调用的成败决定步骤终态。
+            self.retries_used += 1
+            self.dirty = True
+            return
+        self.results.append(
+            TaskStepResult(
+                step_sequence=step.sequence,
+                target_agent=step.target_agent,
+                success=False,
+                output=None,
+                error_code=error_code,
+            )
+        )
+        if step.on_failure == "continue":
+            next_index = self._next_index
+            self.plan = self.plan.model_copy(
+                update={
+                    "current_step_index": next_index,
+                    "status": (
+                        TaskPlanStatus.COMPLETED
+                        if next_index == len(self.plan.steps)
+                        else TaskPlanStatus.ACTIVE
+                    ),
+                    "retries_used": self.retries_used,
+                }
+            )
+        else:
+            # abort（含 retry 预算耗尽收口）：计划 FAILED，后续
+            # ask_* 被 check_gate 硬熔断。
+            self.plan = self.plan.model_copy(
+                update={
+                    "status": TaskPlanStatus.FAILED,
+                    "retries_used": self.retries_used,
+                }
+            )
+        self.dirty = True
+
+    def newly_recorded_results(self) -> list[TaskStepResult]:
+        """本轮新落的终局结果（供 _wrap 逐一发 TASK_RESULT_ARCHIVED）。"""
+        return self.results[self._baseline :]
+
+
+@tool("create_task_plan", args_schema=_TaskPlanInput)
+def create_task_plan_tool_mode(steps: list[TaskPlanStep]) -> str:
+    """为需要至少两个有序子任务的复杂请求创建一次任务计划。"""
+    # tool 模式专用变体：已有 ACTIVE 计划时工具层拒绝（S5-A1 冲突语义），
+    # 返回模型可读的 JSON 提示而非抛错——模型有机会先收口当前计划。
+    # 双保险：即便门控被绕过，_wrap 的 replacing_plan 拦截仍会兜底。
+    execution = _TOOL_PLAN_EXECUTION.get()
+    current = execution.execution if execution is not None else None
+    if current is not None and current.plan.status is TaskPlanStatus.ACTIVE:
+        return json.dumps(
+            {
+                "error": (
+                    "已存在进行中的任务计划，不允许覆盖；"
+                    "请先按计划完成或等待其失败后再创建新计划"
+                ),
+                "active_plan_steps": len(current.plan.steps),
+                "completed_steps": current.plan.current_step_index,
+            },
+            ensure_ascii=False,
+        )
+    plan = TaskPlan(steps=steps)
+    # 安装/替换轮内执行上下文：使同一 ReAct 轮内后续的 ask_* 立即受门控
+    # 并逐步记账（模型惯例是创建计划后紧接着开始执行，不能等下一轮）。
+    # 写入的是 holder 盒子内容（引用共享，跨线程可见），不是 ContextVar
+    # 重绑定——后者在工具线程的快照上下文里会丢失。
+    if execution is not None:
+        execution.execution = _ToolModePlanExecution(plan, [])
+    return plan.model_dump_json()
+
+
 class _IntentInput(BaseModel):
     """仅暴露给模型的意图分类输入，intent 取值由 Intent 枚举严格约束。
 
@@ -401,6 +619,47 @@ def submit_grading(
     )
 
 
+# ── S5-A3 子代理上下文增强的有界参数 ──────────────────────
+# 最近对话注入量刻意有界：子代理是执行者不是对话者，只需要「多轮
+# 追问指代的是什么」这一最小上下文；无界携带既费 token 又稀释任务
+# 消息的注意力。
+_SUBAGENT_CONTEXT_MESSAGE_LIMIT = 4
+_SUBAGENT_CONTEXT_MESSAGE_MAX_CHARS = 1000
+_SUBAGENT_CONTEXT_TOTAL_MAX_CHARS = (
+    _SUBAGENT_CONTEXT_MESSAGE_LIMIT * _SUBAGENT_CONTEXT_MESSAGE_MAX_CHARS
+)
+
+
+def _recent_context_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """取父状态最近的人类/AI 文本消息（有界），按时间正序返回。
+
+    边界：剔除工具消息与空消息；每条截断到单条上限，总量另有累计上限
+    （双保险，防止单条上限内仍堆满长文）；只保留纯文本 content（列表型
+    content 的多模态消息不适用于子代理的纯文本上下文）。
+    返回新构造的消息副本（截断后的内容），不共享父状态消息实例。
+    """
+    picked: list[BaseMessage] = []
+    total_chars = 0
+    for message in reversed(messages):
+        if len(picked) >= _SUBAGENT_CONTEXT_MESSAGE_LIMIT:
+            break
+        if not isinstance(message, (HumanMessage, AIMessage)):
+            continue
+        content = message.content
+        if not isinstance(content, str) or not content.strip():
+            continue
+        truncated = content[:_SUBAGENT_CONTEXT_MESSAGE_MAX_CHARS]
+        if total_chars + len(truncated) > _SUBAGENT_CONTEXT_TOTAL_MAX_CHARS:
+            break
+        total_chars += len(truncated)
+        if isinstance(message, HumanMessage):
+            picked.append(HumanMessage(content=truncated))
+        else:
+            picked.append(AIMessage(content=truncated))
+    picked.reverse()
+    return picked
+
+
 class CollaborativeAgentGraph:
     """注册四个同构 ReAct Agent，并负责它们之间的路由。"""
 
@@ -484,6 +743,14 @@ class CollaborativeAgentGraph:
                     self._create_subagent_tool(target_role, tool_name),
                     allowed_roles={AgentRole.SUPERVISOR},
                 )
+            # S5-A1：tool 模式同样开放计划能力（生产点亮）。用带冲突
+            # 门控的变体而非 handoff 共用工具：已有 ACTIVE 计划时工具层
+            # 拒绝并给模型可读提示，而不是像 handoff 那样靠 _wrap 轮末
+            # fail 硬收口（tool 模式的模型有机会先收口当前计划再重建）。
+            registry.register(
+                create_task_plan_tool_mode,
+                allowed_roles={AgentRole.SUPERVISOR},
+            )
         # S2-T1 意图识别：detect_intent 仅 Supervisor 可用，
         # 与 handoff / create_task_plan 一样由模型在 ReAct 循环中调用。
         registry.register(
@@ -592,10 +859,37 @@ class CollaborativeAgentGraph:
         target_role: AgentRole,
         tool_name: str,
     ) -> BaseTool:
-        """创建一个会等待目标 Agent 完成并返回结果的同步工具。"""
+        """创建一个会等待目标 Agent 完成并返回结果的同步工具。
+
+        S5-A1/A2：tool 模式下若存在活跃计划（经 _TOOL_PLAN_EXECUTION
+        注入），调用受确定性门控约束——目标必须等于当前步骤的
+        target_agent，完成后按步骤落 TaskStepResult 并推进游标，失败按
+        on_failure 策略处置。无计划（execution is None）时行为与既往
+        完全一致（零回归）。
+        """
 
         def invoke_subagent(task: str) -> str:
-            return self._run_subagent(target_role, task)
+            holder = _TOOL_PLAN_EXECUTION.get()
+            execution = holder.execution if holder is not None else None
+            if execution is not None:
+                gate_error = execution.check_gate(target_role)
+                if gate_error is not None:
+                    # 返回 JSON 拒绝理由而非抛错：模型能读到期望目标并
+                    # 自行纠偏（与 record_learning_outcome 的 JSON 语义
+                    # 同一模式）；门控拒绝不产生子代理运行，零成本。
+                    return gate_error
+            try:
+                result = self._run_subagent(target_role, task)
+            except _SubagentRunError as exc:
+                # 子代理运行失败：按计划失败策略记录后原样上抛（ReAct
+                # 层把异常转成失败工具结果，模型可见）。无计划时与既往
+                # 语义完全一致。
+                if execution is not None and execution.plan.status is TaskPlanStatus.ACTIVE:
+                    execution.record_failure(target_role, exc.error_code)
+                raise
+            if execution is not None and execution.plan.status is TaskPlanStatus.ACTIVE:
+                execution.record_success(target_role, output=result)
+            return result
 
         return tool(
             tool_name,
@@ -695,7 +989,12 @@ class CollaborativeAgentGraph:
         )(get_learning_records)
 
     def _run_subagent(self, target_role: AgentRole, task: str) -> str:
-        """在隔离消息上下文中执行专业 Agent，并返回有界结构化结果。"""
+        """在隔离消息上下文中执行专业 Agent，并返回有界结构化结果。
+
+        S5-A3：子代理默认只见任务字符串，但多轮追问（如「再讲细一点」）
+        脱离近期对话就无法理解指代——把父状态最近的有界文本对话放在任务
+        消息之前，使子代理能看到必要语境；工具消息不含用户意图，剔除。
+        """
         parent = _ACTIVE_PARENT_STATE.get()
         child_state = create_initial_state(
             session_id=None if parent is None else parent.get("session_id"),
@@ -708,7 +1007,15 @@ class CollaborativeAgentGraph:
                 else parent.get("additional_workspace_roots", [])
             ),
         )
-        child_state["messages"] = [HumanMessage(content=task)]
+        context_messages: list[BaseMessage] = []
+        if parent is not None:
+            context_messages = _recent_context_messages(
+                cast(list[BaseMessage], parent.get("messages", []))
+            )
+        child_state["messages"] = [
+            *context_messages,
+            HumanMessage(content=task),
+        ]
         if parent is not None:
             child_state["level"] = parent.get("level")
             child_state["task_context"] = parent.get("task_context")
@@ -720,10 +1027,12 @@ class CollaborativeAgentGraph:
                 cast(list[RunEvent], result.updates.get("events", []))
             )
         if result.error is not None:
-            raise RuntimeError("subagent execution failed")
+            raise _SubagentRunError(
+                _archivable_step_error(result.error.error_code)
+            )
         output = _terminal_agent_output(result.messages)
         if output is None:
-            raise RuntimeError("subagent returned no final output")
+            raise _SubagentRunError(ErrorCode.AGENT_OUTPUT_INVALID)
         child_tool_results = cast(
             list[ToolResult], result.updates.get("tool_results", [])
         )
@@ -945,6 +1254,30 @@ class CollaborativeAgentGraph:
             subagent_traces: list[list[RunEvent]] = []
             parent_state_token = _ACTIVE_PARENT_STATE.set(run_state)
             trace_token = _SUBAGENT_EVENT_TRACES.set(subagent_traces)
+            # S5-A1/A2：tool 模式 Supervisor 轮且有 ACTIVE 计划时，注入
+            # 轮内执行上下文（ask_* 门控与步骤记账的共享状态）。handoff
+            # 模式与无计划的 tool 模式注入 None——工具层行为与既往完全
+            # 一致（零回归）。
+            tool_plan_holder: _ToolPlanHolder | None = None
+            if (
+                self.orchestration_mode == "tool"
+                and agent.role is AgentRole.SUPERVISOR
+            ):
+                # 无 ACTIVE 计划也注入空 holder：同轮新建计划时工具需要
+                # 一个可写的盒子（见 _ToolPlanHolder 注释）。
+                active_plan = _task_plan_from_state(run_state)
+                tool_plan_holder = _ToolPlanHolder(
+                    _ToolModePlanExecution(
+                        active_plan,
+                        _task_results_from_state(run_state),
+                    )
+                    if (
+                        active_plan is not None
+                        and active_plan.status is TaskPlanStatus.ACTIVE
+                    )
+                    else None
+                )
+            tool_plan_token = _TOOL_PLAN_EXECUTION.set(tool_plan_holder)
             # P0-5：学习记录作用域与父状态同位设置（工具层从 scope
             # 读 user_id/session_id，模型不可见不可控）；无条件设置，
             # 无 store 时工具未注册、无人读取，零副作用。
@@ -960,6 +1293,13 @@ class CollaborativeAgentGraph:
                 learning_scope.reset(learning_scope_token)
                 _SUBAGENT_EVENT_TRACES.reset(trace_token)
                 _ACTIVE_PARENT_STATE.reset(parent_state_token)
+                _TOOL_PLAN_EXECUTION.reset(tool_plan_token)
+            # 轮末重读（而非用 run 前的旧引用）：create_task_plan_tool_mode
+            # 可能在同轮新建计划并替换 holder 里的执行对象；holder 为引用
+            # 共享，工具线程内的变更在此可见。
+            executed_plan = (
+                tool_plan_holder.execution if tool_plan_holder is not None else None
+            )
 
             updates = dict(result.updates)
             # ── 注入「产出 Agent 角色」元数据：写入会话历史的唯一闸口 ──
@@ -1146,6 +1486,9 @@ class CollaborativeAgentGraph:
                 # 决策摘要字段（语义见 events.py 的 retrieval_* 注释）。
                 # 全部默认 None，既有调用方零改动、旧事件不携带。
                 event_tool_name: str | None = None,
+                # S5-A1：TASK_PLAN_CREATED 事件携带的步骤数（字符串数字，
+                # 脱敏——计划正文在 state 通道，事件只记摘要）。
+                content: str | None = None,
                 retrieval_needed: bool | None = None,
                 retrieval_need_reason: str | None = None,
                 retrieval_threshold_met: bool | None = None,
@@ -1173,6 +1516,7 @@ class CollaborativeAgentGraph:
                         grading_total_score=grading_total_score,
                         grading_max_total_score=grading_max_total_score,
                         tool_name=event_tool_name,
+                        content=content,
                         retrieval_needed=retrieval_needed,
                         retrieval_need_reason=retrieval_need_reason,
                         retrieval_threshold_met=retrieval_threshold_met,
@@ -1182,6 +1526,45 @@ class CollaborativeAgentGraph:
                         retrieval_top_score=retrieval_top_score,
                     )
                 )
+
+            # ── S5-A1/A2：tool 模式计划事件与执行写回 ──
+            # 顺序：先发计划创建事件，再发本轮新落的步骤结果事件，最后
+            # 把执行上下文的变化写回 state（plan 局部变量同步更新，使
+            # 下游 fail/聚合分支看到推进后的计划状态）。
+            if (
+                self.orchestration_mode == "tool"
+                and new_plan is not None
+                and existing_plan is None
+            ):
+                # 脱敏：事件只记步骤数（content 字符串），计划正文在
+                # state["task_plan"] 随 checkpoint 持久化。仅 tool 模式
+                # 发：handoff 模式行为零改动（不新增事件，既有测试零回归）。
+                emit(
+                    EventType.TASK_PLAN_CREATED,
+                    agent.role.value,
+                    content=str(len(new_plan.steps)),
+                )
+            if executed_plan is not None and executed_plan.dirty:
+                updates["task_plan"] = executed_plan.plan
+                updates["task_results"] = executed_plan.results
+                plan = executed_plan.plan
+                for step_result in executed_plan.newly_recorded_results():
+                    emit(
+                        EventType.TASK_RESULT_ARCHIVED,
+                        step_result.target_agent.value,
+                        success=step_result.success,
+                        error_code=step_result.error_code,
+                        plan_step_sequence=step_result.step_sequence,
+                    )
+                # 本轮内完成全部步骤 → 聚合分支需要拿到完整结果（轮首
+                # 预检时计划还是 ACTIVE，aggregation_results 为 None）：
+                # 用执行上下文的最终结果作为聚合输入，复用既有的确定性
+                # 聚合机制（缺失结果提示 + TASK_RESULTS_AGGREGATED）。
+                if (
+                    aggregation_results is None
+                    and plan.status is TaskPlanStatus.COMPLETED
+                ):
+                    aggregation_results = executed_plan.results
 
             # ── S2-T1 意图事件与状态写入 ──
             # 事件是瞬时信号：消费方（api/chat.py 的 EVENT_TYPE_MAP 白名单）对
@@ -3083,10 +3466,18 @@ def _retrieval_decisions_from_results(
 
 
 def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | None:
-    """只解析本次 Supervisor 成功创建的最后一个结构化计划。"""
+    """只解析本次 Supervisor 成功创建的最后一个结构化计划。
+
+    宽容读取：tool 模式的门控变体（create_task_plan_tool_mode）在冲突时
+    返回成功执行的 JSON 拒绝提示（非计划正文）——解析失败视为「本轮无
+    新计划」而不是崩溃（与仓库「读取端宽容」哲学一致；合法计划不受影响）。
+    """
     for result in reversed(tool_results):
         if result.tool_name == "create_task_plan" and result.success:
-            return TaskPlan.model_validate_json(result.output)
+            try:
+                return TaskPlan.model_validate_json(result.output)
+            except ValidationError:
+                continue
     return None
 
 
