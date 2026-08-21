@@ -72,6 +72,7 @@ from core.tools import (
     load_officecli_settings,
     officecli_enabled,
 )
+from core.vision import create_vision_provider
 
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -566,6 +567,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ocr_provider: OcrProvider | None = create_ocr_provider(
         os.getenv("API_OCR_MODE", DEFAULT_OCR_MODE)
     )
+    # S5-B3：视觉理解 provider 按模式装配（auto=配置了端点才启用），
+    # 附件图片三级降级链的第一级；未配置时 None，行为与现状一致。
+    vision_provider = create_vision_provider(
+        os.getenv("API_VISION_MODE", "auto")
+    )
     # officecli 集成（计划 3.5）：默认禁用（ENABLED=0 时完全不注册工具、
     # 不做任何二进制探测，保证无 officecli 的 CI/评委环境不受影响）；
     # 显式开启时解析二进制并启动自检，失败 fail-fast。
@@ -718,6 +724,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # （图装配失败时不留下指向已关闭资源的引用）。
             app.state.learning_store = learning_store
             app.state.ocr_provider = ocr_provider
+            app.state.vision_provider = vision_provider
             yield
         finally:
             # 释放顺序：先关知识索引（图已不再执行，工具闭包不再被
@@ -739,6 +746,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # 「lifespan 未跑时该属性不存在/为 None」的 getattr 兜底语义）。
             app.state.learning_store = None
             app.state.ocr_provider = None
+            app.state.vision_provider = None
 
 
 def create_app() -> FastAPI:

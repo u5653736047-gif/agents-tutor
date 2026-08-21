@@ -576,6 +576,7 @@ async def chat(
             payload.attachments,
             user_id,
             getattr(request.app.state, "ocr_provider", None),
+            getattr(request.app.state, "vision_provider", None),
         )
         previous_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id

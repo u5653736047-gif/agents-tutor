@@ -71,6 +71,7 @@ from core.graph_builder import CollaborativeAgentGraph
 from core.ocr import OcrProvider
 from core.sessions import SessionRecord, SessionStore
 from core.state import AgentState, ToolApprovalDecision
+from core.vision import VisionProvider
 
 router = APIRouter(tags=["chat"])
 _LOGGER = logging.getLogger("api.stream")
@@ -87,6 +88,14 @@ def _ocr_provider_from_request(request: Request) -> object | None:
     if app is None:
         return None
     return getattr(app.state, "ocr_provider", None)
+
+
+def _vision_provider_from_request(request: Request) -> object | None:
+    """从 app.state 取视觉理解 provider（S5-B3）；防御语义同上。"""
+    app = getattr(request, "app", None)
+    if app is None:
+        return None
+    return getattr(app.state, "vision_provider", None)
 
 # SSE 轮询间隔:core 是同步 run,事件在 checkpoint 里逐步落盘,
 # 生成器以固定间隔轮询 get_state 拿增量(50ms 对事件级推送足够)。
@@ -401,6 +410,7 @@ async def _native_stream_events(
         payload.attachments,
         user_id,
         cast(OcrProvider | None, _ocr_provider_from_request(request)),
+        cast(VisionProvider | None, _vision_provider_from_request(request)),
     )
 
     def pump() -> None:
@@ -902,6 +912,7 @@ async def _stream_events(
             payload.attachments,
             user_id,
             cast(OcrProvider | None, _ocr_provider_from_request(request)),
+            cast(VisionProvider | None, _vision_provider_from_request(request)),
         )
         background_task = asyncio.create_task(
             run_in_threadpool(

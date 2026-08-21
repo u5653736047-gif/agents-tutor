@@ -66,36 +66,53 @@ def iter_pdf_pages(
     # 惰性导入：纯文本加载路径不依赖 pypdf。
     from pypdf import PdfReader
 
+    # S5-B2：表格结构化提取（可选增强）。API_PDF_TABLE_MODE=off 或
+    # 未装 pdfplumber 时 extractor 为 None → 行为与现状逐项一致；
+    # 模式值非法在此处直接抛 ValueError（离线脚本场景配置错误要暴露）。
+    from ..pdf_table import open_pdf_table_extractor
+
     source = Path(path)
     public_source = _public_source(source, source_label)
+    table_mode = os.getenv("API_PDF_TABLE_MODE", "auto").strip() or "auto"
+    extractor = open_pdf_table_extractor(source, mode=table_mode)
     try:
-        reader = PdfReader(source)
-    except Exception as exc:
-        raise ValueError(f"Cannot read PDF '{source.name}': {exc}") from exc
+        try:
+            reader = PdfReader(source)
+        except Exception as exc:
+            raise ValueError(f"Cannot read PDF '{source.name}': {exc}") from exc
 
-    # 整份 PDF 的所有页共用一个 document_id，页与页之间靠 page 字段区分。
-    resolved_id = document_id if document_id is not None else _default_document_id(source)
-    total_pages = len(reader.pages)
-    found_nonempty = False
-    try:
-        for page_number, page in enumerate(reader.pages, start=1):  # 页码从 1 开始
-            if progress is not None:
-                progress(page_number, total_pages)
-            content = (page.extract_text() or "").strip()  # 无文本页返回 None，空串兜底后跳过
-            if content:
-                found_nonempty = True
-                yield KnowledgeDocument(
-                    document_id=resolved_id,
-                    content=content,
-                    source=public_source,
-                    page=page_number,
-                )
-    except Exception as exc:
-        raise ValueError(f"Cannot extract text from PDF '{source.name}': {exc}") from exc
+        # 整份 PDF 的所有页共用一个 document_id，页与页之间靠 page 字段区分。
+        resolved_id = (
+            document_id if document_id is not None else _default_document_id(source)
+        )
+        total_pages = len(reader.pages)
+        found_nonempty = False
+        try:
+            for page_number, page in enumerate(reader.pages, start=1):  # 页码从 1 开始
+                if progress is not None:
+                    progress(page_number, total_pages)
+                content = (page.extract_text() or "").strip()  # 无文本页返回 None，空串兜底后跳过
+                if extractor is not None:
+                    tables = extractor.page_tables_markdown(page_number)
+                    if tables:
+                        content = f"{content}\n\n{tables}" if content else tables
+                if content:
+                    found_nonempty = True
+                    yield KnowledgeDocument(
+                        document_id=resolved_id,
+                        content=content,
+                        source=public_source,
+                        page=page_number,
+                    )
+        except Exception as exc:
+            raise ValueError(f"Cannot extract text from PDF '{source.name}': {exc}") from exc
 
-    # 整份 PDF 一页可提取文本都没有，直接报错避免静默入库空文档。
-    if not found_nonempty:
-        raise ValueError(f"PDF '{source.name}' contains no extractable text")
+        # 整份 PDF 一页可提取文本都没有，直接报错避免静默入库空文档。
+        if not found_nonempty:
+            raise ValueError(f"PDF '{source.name}' contains no extractable text")
+    finally:
+        if extractor is not None:
+            extractor.close()
 
 
 def _public_source(source: Path, source_label: str | None) -> str:

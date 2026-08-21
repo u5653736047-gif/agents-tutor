@@ -30,6 +30,8 @@ from pypdf import PdfReader
 from api.files import _is_safe_segment, _sanitize_user_key, _uploads_root
 from api.schemas import Attachment
 from core.ocr import OcrProvider
+from core.pdf_table import PdfTableExtractor, open_pdf_table_extractor
+from core.vision import VisionProvider
 
 # 提取文本上限（pi 审查 🟡5）：env 可调，默认值见模块注释。
 DEFAULT_ATTACHMENT_MAX_CHARS = 30000
@@ -43,6 +45,10 @@ _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
 _OCR_UNAVAILABLE_HINT = (
     "当前部署未启用图片识别，请上传 txt/pdf 或让管理员启用 OCR"
     "（uv sync --extra ocr）"
+)
+_VISION_UNAVAILABLE_HINT = (
+    "当前部署未启用图片理解，且图片中未识别出文本；"
+    "如需图片内容分析请联系管理员配置视觉端点"
 )
 
 
@@ -83,14 +89,64 @@ def _resolve_attachment_path(file_id: str, user_id: str | None) -> Path | None:
     return path if path.is_file() else None
 
 
+def _pdf_table_mode() -> str:
+    """PDF 表格提取模式（env API_PDF_TABLE_MODE，auto|off）。
+
+    在进入单附件提取的宽容 try 之前调用并校验：配置拼写错误要暴露
+    （ValueError 直接上抛），不能被吞成「附件内容提取失败」。
+    """
+    raw = os.getenv("API_PDF_TABLE_MODE")
+    if raw is None or not raw.strip():
+        return "auto"
+    value = raw.strip()
+    if value not in {"auto", "off"}:
+        raise ValueError("API_PDF_TABLE_MODE 只支持 auto 或 off")
+    return value
+
+
+def _extract_image_text(
+    image_bytes: bytes,
+    ocr_provider: OcrProvider | None,
+    vision_provider: VisionProvider | None,
+) -> str:
+    """图片三级降级链（S5-B3）：VLM 理解 → OCR 文字 → 友好提示。
+
+    每一级失败（异常/空结果）都沉降到下一级，任何一级成功即返回——
+    视觉端点故障不影响既有 OCR 行为，OCR 缺失不影响友好提示兜底。
+    """
+    if vision_provider is not None:
+        try:
+            description = vision_provider.describe_image(image_bytes)
+            if description.strip():
+                return description
+        except Exception:  # noqa: BLE001, S110 - 降级链：视觉失败静默沉降 OCR
+            pass
+    if ocr_provider is not None:
+        text = ocr_provider.extract_text(image_bytes)
+        if text.strip():
+            return text
+    return _VISION_UNAVAILABLE_HINT
+
+
 def _extract_text(
-    path: Path, ocr_provider: OcrProvider | None, *, char_limit: int
+    path: Path,
+    ocr_provider: OcrProvider | None,
+    *,
+    char_limit: int,
+    table_extractor: PdfTableExtractor | None = None,
+    vision_provider: VisionProvider | None = None,
 ) -> str:
     """按扩展名提取附件文本；提取失败返回带原因的标注文本。
 
     char_limit（审查 S1）：PDF 逐页累计、达到上限即停止解析——截断
     发生在提取过程中而非提取之后，避免大 PDF 全量解析自白耗 CPU
     （500 页教材只需解析到满足 30K 字符的页数即停）。
+
+    table_extractor（S5-B1）：非 None 时每页文本后附「[表格]」Markdown
+    小节；表格文本计入同一 char_limit 预算（护栏不因增强而放宽）。
+
+    vision_provider（S5-B3）：图片分支三级降级链的第一级，None 时与
+    现状一致（OCR → 友好提示）。
     """
     ext = path.suffix.lower()
     try:
@@ -100,17 +156,21 @@ def _extract_text(
             reader = PdfReader(path)
             chunks: list[str] = []
             size = 0
-            for page in reader.pages:
+            for page_index, page in enumerate(reader.pages, start=1):
                 text = page.extract_text() or ""
+                if table_extractor is not None:
+                    tables = table_extractor.page_tables_markdown(page_index)
+                    if tables:
+                        text = f"{text}\n\n{tables}" if text else tables
                 chunks.append(text)
                 size += len(text)
                 if size >= char_limit:
                     break
             return "\n".join(chunks)
         if ext in _IMAGE_EXTENSIONS:
-            if ocr_provider is None:
-                return _OCR_UNAVAILABLE_HINT
-            return ocr_provider.extract_text(path.read_bytes())
+            return _extract_image_text(
+                path.read_bytes(), ocr_provider, vision_provider
+            )
     except Exception:  # noqa: BLE001 - 单附件提取失败不中断其余附件
         return "附件内容提取失败（文件可能损坏或格式异常）"
     return "不支持的附件类型"
@@ -121,6 +181,7 @@ def compose_message_with_attachments(
     attachments: list[Attachment] | None,
     user_id: str | None,
     ocr_provider: OcrProvider | None,
+    vision_provider: VisionProvider | None = None,
 ) -> str:
     """把附件提取文本拼入用户消息；无附件时原样返回（零回归）。
 
@@ -140,6 +201,10 @@ def compose_message_with_attachments(
         overflow_note = None
     per_attachment_limit = _attachment_max_chars()
     total_limit = _attachments_total_max_chars()
+    # S5-B1：模式校验在宽容 try 之外（配置错误直接暴露，不吞成
+    # 「附件内容提取失败」）；提取器按 PDF 附件惰性打开，off /
+    # 未装 pdfplumber 时为 None → 行为与现状逐项一致。
+    pdf_table_mode = _pdf_table_mode()
     sections: list[str] = []
     total_chars = 0
     for index, attachment in enumerate(attachments, start=1):
@@ -150,7 +215,22 @@ def compose_message_with_attachments(
                 "该附件不可用（文件不存在或无访问权限），已忽略其内容。"
             )
             continue
-        text = _extract_text(path, ocr_provider, char_limit=per_attachment_limit)
+        extractor = (
+            open_pdf_table_extractor(path, mode=pdf_table_mode)
+            if path.suffix.lower() == ".pdf"
+            else None
+        )
+        try:
+            text = _extract_text(
+                path,
+                ocr_provider,
+                char_limit=per_attachment_limit,
+                table_extractor=extractor,
+                vision_provider=vision_provider,
+            )
+        finally:
+            if extractor is not None:
+                extractor.close()
         if len(text) > per_attachment_limit:
             text = (
                 text[:per_attachment_limit]

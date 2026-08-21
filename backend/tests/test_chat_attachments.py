@@ -111,7 +111,8 @@ def test_image_without_ocr_returns_friendly_hint(
         "请批改", [_attachment("img002.jpg", "照片.jpg")], "student-a", None
     )
 
-    assert "当前部署未启用图片识别" in composed
+    # S5-B3 三级降级链末级：VLM 与 OCR 均不可用时的友好提示。
+    assert "当前部署未启用图片理解" in composed
 
 
 def test_per_attachment_limit_truncates_with_marker(
