@@ -254,3 +254,34 @@ PDF、不重算向量，直接更新两库 metadata_json，幂等）：
   - 持久化重载、ingest 同步与增量补建用例均离线可跑。
 - 维护点：若未来默认 provider 换成 FastEmbedProvider，这些测试不需要改
   （替身仍然有效）；只有「真实语义效果」的验证才需要真实模型（第 5 节）。
+
+---
+
+## 8. 附：Cross-Encoder 重排器选型（S5 增补，2026-08-20）
+
+> 背景：S4-T2 在检索编排层预留了 Reranker 协议（`backend/src/core/knowledge/retrieval.py`
+> 第 7 节），但当时刻意不实现真实模型（避免检索层反向依赖 Agent 层）。
+> S5 把真实重排器接上生产装配（`backend/src/core/knowledge/reranker.py`）。
+
+### 候选对比
+
+| 候选 | 中文效果 | 离线可用性 | 依赖增量 | 结论 |
+| --- | --- | --- | --- | --- |
+| **fastembed TextCrossEncoder + BAAI/bge-reranker-base**（onnxruntime） | 好：bge reranker 中英可用，与 embedding 同生态 | 好：模型约 280MB，首次下载后缓存本地，之后完全离线 | **零新增包**（复用 `embedding` 可选组的 fastembed） | **推荐路径**（本实现） |
+| LLM-as-reranker（主模型打分候选） | 好 | 差：每次检索多一轮在线模型调用，延迟与成本显著 | 零 | 违背「检索层不被可选增强拖慢」的延迟预算，不选 |
+| sentence-transformers CrossEncoder（torch） | 好（模型同源） | 好 | **重**：连带 torch，与第 2 节 embedding 不选 torch 同理 | 过重，不选 |
+
+### 与 embedding 选型的关键差异：只改顺序、不改分数
+
+重排器 `rerank()` 只重排候选顺序，**保留初检的 RRF 融合分**——若把
+score 改写成 Cross-Encoder 分数，`adaptive_search` 的相关性阈值
+（`API_RETRIEVAL_THRESHOLD`，RRF 量纲）会静默失准。因此阈值语义与
+审计口径在启用重排前后完全一致（详见 reranker.py 模块注释第 3 节）。
+
+### 验证方式
+
+- 单元测试注入确定性打分替身（`backend/tests/test_knowledge_reranker.py`），
+  零模型零网络；
+- 真实模型的检索质量对比（词法 / 混合 / 混合+重排的 Recall@K、MRR）
+  由 `backend/scripts/evaluate_retrieval.py` 产出，报告归档
+  `docs/perf-evidence/`。

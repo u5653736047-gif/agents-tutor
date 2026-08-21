@@ -22,6 +22,7 @@
 |---|---|---|---|
 | 上下文预算 | API_MAX_CONTEXT_TOKENS / API_MAX_CONTEXT_MESSAGES | 524288 / 200 | 背后模型 1M 窗口，512K 为护栏上限而非填充目标；内置保守估算器（中文 1 字符≈1 token） |
 | 自适应检索 | API_RETRIEVAL_THRESHOLD | 0.01 | 启发式必要性策略 + 相关性阈值 + 零 LLM 启发式精化器（1 轮） |
+| 检索增强（S5） | API_KNOWLEDGE_REWRITE / API_KNOWLEDGE_RERANK / API_RERANK_MODEL | auto / auto / bge-reranker-base | LLM 查询改写（多变体联合检索，未配置 key 自动跳过）+ Cross-Encoder 重排（fastembed 复用 embedding 依赖组，只改顺序不改分数，构造失败自动降级） |
 | 学习记录库 | API_LEARNING_DB_PATH | data/learning.db | SQLite WAL；复合唯一键 (source_tool_call_id, question_id) 防重放重复入库 |
 | OCR | API_OCR_MODE / uv sync --extra ocr | auto | rapidocr-onnxruntime（PP-OCR 同源）；依赖缺失自动降级为友好提示 |
 | 附件提取护栏 | API_ATTACHMENT_MAX_CHARS / API_ATTACHMENTS_TOTAL_MAX_CHARS | 30000 / 100000 | 超限截断并附标注 |
