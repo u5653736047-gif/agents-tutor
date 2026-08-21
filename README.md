@@ -59,6 +59,9 @@ npm install
 | `API_KNOWLEDGE_DB_PATH` | 可选，知识库词法 SQLite 文件；默认根目录 `data/knowledge.db`（由 ingest 脚本生成，永不降级的底线检索）。 |
 | `API_VECTOR_DB_PATH` | 可选，知识库向量 SQLite 文件；默认根目录 `data/vector_knowledge.db`；不可用（文件不存在 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断启动。 |
 | `API_KNOWLEDGE_EMBEDDING` | 可选，向量 embedding 提供方模式：`auto`（默认，优先 fastembed 真实语义模型，未安装时自动回退零依赖哈希）或 `hash`（强制哈希，完全离线部署用）。 |
+| `API_KNOWLEDGE_REWRITE` | 可选，LLM 查询改写开关：`auto`（默认，已配置 `DEEPSEEK_API_KEY` 时启用——把一个查询改写成多个检索变体联合检索提升召回）或 `off`（强制关闭）；未配置 key 时 `auto` 自动跳过。 |
+| `API_KNOWLEDGE_RERANK` | 可选，Cross-Encoder 重排开关：`auto`（默认，fastembed 可用时装配 bge-reranker，对初检候选精排；构造失败自动降级为不重排）或 `off`（强制关闭）。 |
+| `API_RERANK_MODEL` | 可选，重排模型名；默认 `BAAI/bge-reranker-base`（首次启用需联网下载模型约 280MB，之后离线）。 |
 | `API_WORKSPACE_ROOT` | 可选，新会话的默认主工作区；启动脚本默认绑定当前仓库根。用户可在创建会话时选择其他目录。 |
 | `API_WORKSPACE_ALLOWED_ROOTS` | 可选，部署侧允许用户选择的目录边界；多个根用系统 PATH 分隔符分隔（Windows `;`、Linux/macOS `:`）。未设置时本地模式允许明确选择任意现有目录；生产部署建议必设。 |
 | `API_OFFICECLI_ENABLED` | 可选，默认 `0`（不注册 office 工具、不探测二进制）；显式设 `1` 才启用，启用时启动自检失败会中止启动。 |
@@ -87,7 +90,8 @@ uv run python scripts/ingest_books.py --force --vector --provider fastembed
 embedding_provider=FastEmbedProvider vector_dimension=512`）或
 `GET /healthz` 返回的 `retrieval` 字段：`mode` 为 `hybrid` /
 `lexical_only`，`embedding_provider` 为实际打开向量库的 provider 类名，
-`vector_dimension` 为其维度。`mode=hybrid` 且
+`vector_dimension` 为其维度；`rewrite_enabled` / `reranker_enabled`
+分别表示 LLM 查询改写与 Cross-Encoder 重排是否启用。`mode=hybrid` 且
 `embedding_provider=FastEmbedProvider` 即真实语义检索在线；否则是哈希
 替身或纯词法降级。诊断字段不含任何文件路径。
 
@@ -242,12 +246,18 @@ Graph 自动同步。归档只让默认会话列表隐藏该记录，不会删�
 `--vector` 可选生成向量索引（默认 `data/vector_knowledge.db`），可用时默认
 检索路径为词法 + 向量混合：两路结果按 RRF 融合排序（S3-T5）；向量索引
 不可用（文件缺失 / 维度不匹配 / 损坏）时自动降级为纯词法检索，不阻断
-启动——相关环境变量见上文表格 `API_KNOWLEDGE_*`。调用方加载或直接构造
+启动——相关环境变量见上文表格 `API_KNOWLEDGE_*`。混合初检之上还有两个
+可选增强（S5）：LLM 查询改写（`API_KNOWLEDGE_REWRITE`，一个查询改写为
+多个变体联合检索，原查询永远参与、改写失败自动降级单路）与
+Cross-Encoder 重排（`API_KNOWLEDGE_RERANK`，对初检候选窗口精排，只改
+顺序不改分数）。调用方加载或直接构造
 `KnowledgeDocument`，交给 `KnowledgeService`，再通过
 `create_search_knowledge_tool()` 封装为 `search_knowledge` 工具。接入 Graph 时
 应使用 `tool_permissions` 显式授权助教、助学和评价角色；零命中只返回空结果，
 不会生成 Citation。同一 `document_id` 重导入会替换旧分块；同一 PDF 的多页应在
-一次 `add_documents()` 调用中提交。
+一次 `add_documents()` 调用中提交。检索质量的离线评测（Recall@K / MRR 三
+配置对比）见 `backend/scripts/evaluate_retrieval.py`，报告产物归档在
+`docs/perf-evidence/`。
 
 核心架构说明见
 [`backend/AGENT_NODE_IMPLEMENTATION.md`](backend/AGENT_NODE_IMPLEMENTATION.md)。

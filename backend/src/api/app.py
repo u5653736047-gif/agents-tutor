@@ -44,8 +44,15 @@ from core.knowledge.hybrid import (
     open_vector_index_if_available,
 )
 from core.knowledge.index import SqliteKnowledgeIndex
+from core.knowledge.llm_rewriter import LLMQueryRewriter
 from core.knowledge.policy import HeuristicRetrievalPolicy, RetrievalPolicy
-from core.knowledge.retrieval import HeuristicQueryRefiner, QueryRefiner
+from core.knowledge.reranker import DEFAULT_RERANK_MODEL, FastEmbedReranker
+from core.knowledge.retrieval import (
+    HeuristicQueryRefiner,
+    QueryRefiner,
+    QueryRewriter,
+    Reranker,
+)
 from core.knowledge.service import KnowledgeService
 from core.knowledge.tools import create_search_knowledge_tool
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
@@ -101,6 +108,17 @@ DEFAULT_EMBEDDING_MODE = "auto"
 # 跨会话学生数据底座（data/learning.db，WAL，见 core/learning/store.py）。
 DEFAULT_LEARNING_DB_PATH = str(_REPO_ROOT / "data" / "learning.db")
 DEFAULT_OCR_MODE = "auto"
+# ── RAG 增强组件开关（S5：改写/重排接线）────────────────────────────
+# 与 API_KNOWLEDGE_EMBEDDING / API_OCR_MODE 同一「auto|off」约定：
+# - API_KNOWLEDGE_REWRITE：auto（默认）= 已配置模型 key 时装配 LLM
+#   查询改写器（多变体联合检索提升召回）；off = 强制关闭；未配置
+#   key（评委/CI 环境）时 auto 自动跳过，避免每次检索白调必失败的模型。
+# - API_KNOWLEDGE_RERANK：auto（默认）= fastembed 可用时装配
+#   Cross-Encoder 重排器（精排初检候选）；构造失败（未安装/模型不可
+#   用）自动降级为不重排，不阻断启动；off = 强制关闭。
+# - API_RERANK_MODEL：重排模型名（默认 bge-reranker-base）。
+DEFAULT_REWRITE_MODE = "auto"
+DEFAULT_RERANK_MODE = "auto"
 # ── 上下文预算默认值（六大功能计划 P0-1）───────────────────
 # 背后模型为 1M 窗口，512K 是**护栏上限而非目标填充量**：批改整份
 # PDF 作业正文 + 评分依据检索 + 多轮历史才可能逼近，普通对话远达
@@ -238,13 +256,18 @@ class KnowledgeSearchStack:
       打开时使用的 provider 类名与其向量维度（如 "HashEmbeddingProvider"
       / 256、"FastEmbedProvider" / 512），向量路未打开时为 None。
       供启动日志与 /healthz 诊断「语义检索是否在线」，不参与检索。
+    - rewrite_enabled / reranker_enabled（S5 诊断字段）：LLM 查询改写
+      器与 Cross-Encoder 重排器是否实际装配启用，供启动日志与
+      /healthz 诊断「检索增强是否在线」，不参与检索。
     """
-
+    
     tool: BaseTool
     close: Callable[[], None]
     vector_enabled: bool
     vector_provider: str | None = None
     vector_dimension: int | None = None
+    rewrite_enabled: bool = False
+    reranker_enabled: bool = False
     # D6-T3:检索服务实例,随装配结果一起暴露——lifespan 把它挂到
     # app.state.knowledge_service 供 REST 路由注入(见 api/knowledge.py),
     # 与 search_knowledge 工具共用同一实例,检索行为一致。
@@ -287,15 +310,105 @@ def _embedding_provider_candidates(mode: str) -> list[EmbeddingProvider]:
         # 真实语义模型优先：只有它能匹配 T1 的 512 维 fastembed 库
         #（哈希 256 维打开会因维度不匹配被拒，等于浪费向量路）。
         candidates.append(FastEmbedProvider())
-    except (ImportError, RuntimeError, OSError):
+    except Exception as exc:  # noqa: BLE001 — 可选能力探测，降级是设计意图
         # 未安装 fastembed / 模型加载失败 → 降级哈希（不阻断启动，
         # 见 embedding.py FastEmbedProvider 的惰性导入说明）。
-        pass
+        # 为什么拓宽到 Exception（S5）：模型首次下载走网络，httpx
+        # ConnectError 等传输异常不继承 OSError，离线/网络抖动环境下
+        # 原来的三类收窄捕获会让「可选增强不可用」击穿启动——与
+        # retrieval.py 的 _safe_* 同一「外部组件任何异常都意味着不可用」
+        # 哲学；不捕获 BaseException。
+        _LOGGER.warning(
+            "FastEmbedProvider 不可用（%s），回退哈希 embedding",
+            type(exc).__name__,
+        )
     # 哈希始终兜底：256 维哈希库能直接打开；512 维 fastembed 库
     # 打不开（维度不匹配 ValueError 被 hybrid 层吞掉）则返回 None，
     # 由调用方决定是否试下一个候选——候选本身不抛错。
     candidates.append(HashEmbeddingProvider())
     return candidates
+
+
+def _env_mode(name: str, default: str, allowed: frozenset[str]) -> str:
+    """读取枚举型环境变量（auto|off 类开关）；缺失/空白回退默认，非法值抛错。
+
+    与 _env_positive_int/float 的「非法回退默认 + 警告」刻意不同：
+    模式开关是能力配置而非护栏参数——拼写错误（如 "auot"）若静默
+    回退默认，运维会误以为增强已启用/已关闭，因此与
+    API_KNOWLEDGE_EMBEDDING / API_OCR_MODE 同一哲学：非法值尽早
+    暴露（启动期 ValueError），空白视为未配置回退默认。
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip()
+    if value not in allowed:
+        raise ValueError(
+            f"环境变量 {name} 只支持 {sorted(allowed)}，实际为 {value!r}"
+        )
+    return value
+
+
+def _create_query_rewriter(
+    mode: str, settings: DeepSeekSettings
+) -> LLMQueryRewriter | None:
+    """按模式装配 LLM 查询改写器（S5）；不可用时返回 None（降级，不抛错）。
+
+    模式语义与 embedding/OCR 同一约定（配置拼写错误要暴露）：
+    - "off"：强制关闭，返回 None（检索走原始 query 单路，零回归）；
+    - "auto"（默认）：已配置真实模型 key 时装配；未配置（默认值
+      "not-configured"，评委/CI 环境）→ None——没有 key 时装配出来
+      也只会每次检索白调一次必失败的模型，不如明确跳过；
+    - 其它值：抛 ValueError（与 embedding 模式校验同一哲学）。
+
+    改写模型用独立轻量实例（timeout/max_retries/max_tokens 收紧）：
+    改写是 ReAct 中间轮的辅助调用，失败会由检索层降级为原始 query，
+    重试没有收益；紧超时把改写延迟限定在可控范围，与主对话模型互
+    不影响（详见 core/knowledge/llm_rewriter.py 模块注释第 5 节）。
+    """
+    if mode == "off":
+        return None
+    if mode != "auto":
+        raise ValueError("API_KNOWLEDGE_REWRITE 只支持 auto 或 off")
+    if settings.api_key == DEFAULT_API_KEY:
+        return None
+    # cast 与图装配处同一先例（见下方 CollaborativeAgentGraph 的
+    # model=cast(ChatModel, ...)）：ChatOpenAI 的 invoke 形参名与协议
+    # 不同（input vs messages），类型层面不可直接判配，行为层面满足。
+    rewrite_model = cast(
+        ChatModel,
+        create_deepseek_model(settings, timeout=10, max_retries=0, max_tokens=128),
+    )
+    return LLMQueryRewriter(rewrite_model)
+
+
+def _create_reranker(mode: str, model_name: str) -> FastEmbedReranker | None:
+    """按模式装配 Cross-Encoder 重排器（S5）；不可用时返回 None（降级）。
+
+    模式语义与 _create_query_rewriter 同一约定：
+    - "off"：强制关闭，返回 None（检索保持初检顺序，零回归）；
+    - "auto"（默认）：尝试构造 FastEmbedReranker；fastembed 未安装 /
+      模型不可用（含模型下载的网络异常——httpx 传输异常不继承
+      OSError）→ None 降级为不重排，不阻断启动（与 embedding/OCR
+      的「可用才开」同一哲学）；
+    - 其它值：抛 ValueError（配置错误要暴露，不静默当成 auto）。
+    注意：首次构造会联网下载重排模型（一次性，之后离线）。
+    """
+    if mode == "off":
+        return None
+    if mode != "auto":
+        raise ValueError("API_KNOWLEDGE_RERANK 只支持 auto 或 off")
+    try:
+        return FastEmbedReranker(model_name=model_name)
+    except Exception as exc:  # noqa: BLE001 — 可选能力探测，降级是设计意图
+        # 与 retrieval.py 的 _safe_rerank 同一哲学：重排是可选增强，构造
+        # 失败（未安装 fastembed / 模型下载网络异常 / 模型名非法）都意味着
+        # 「重排不可用」，不应阻断启动。为什么捕 Exception 而不是更窄的
+        # 类型：模型首次下载走网络，httpx ConnectError 等传输异常不继承
+        # OSError，收窄捕获在离线/抖动环境会让启动被可选增强击窊；
+        # 不捕获 BaseException。
+        _LOGGER.warning("重排器不可用（%s），降级为不重排", type(exc).__name__)
+        return None
 
 
 def create_knowledge_search_stack(
@@ -306,6 +419,8 @@ def create_knowledge_search_stack(
     adaptive_policy: RetrievalPolicy | None = None,
     relevance_threshold: float | None = None,
     query_refiner: QueryRefiner | None = None,
+    query_rewriter: QueryRewriter | None = None,
+    reranker: Reranker | None = None,
 ) -> KnowledgeSearchStack:
     """装配知识检索链路：词法库 → 向量库（可选）→ 混合索引 → 服务 → 工具。
 
@@ -326,9 +441,15 @@ def create_knowledge_search_stack(
     relevance_threshold / query_refiner 默认全 None——工具走原
     service.search 路径，输出与接入前逐项一致（测试路径零回归）；
     生产 lifespan 显式注入（寒暄/纯计算免检索的启发式策略 + 相关性
-    阈值 + 零 LLM 启发式精化器）后走 adaptive 路径。不接入 LLM
-    rewriter（拒绝方案 6：每查询多一次模型调用拉高首 token 延迟）；
-    reranker 留作可选装配（当前无本地重排器实现）。
+    阈值 + 零 LLM 启发式精化器）后走 adaptive 路径。
+
+    S5 检索增强装配：query_rewriter / reranker 默认 None——不走
+    改写与重排，行为与接入前逐项一致（零回归）；生产 lifespan 按
+    API_KNOWLEDGE_REWRITE / API_KNOWLEDGE_RERANK 装配
+    LLMQueryRewriter 与 FastEmbedReranker 后启用（改写延迟控制与
+    重排模型选型见 core/knowledge/llm_rewriter.py、reranker.py 的
+    模块注释）。重排只改顺序不改 score（reranker.py 第 3 节），
+    relevance_threshold 的量纲语义不受重排影响。
 
     降级语义：向量库是可选增强——文件不存在、维度与 provider 不匹配
     （换过 embedding 未重建库）、SQLite 损坏，任一情况都返回 None
@@ -370,6 +491,8 @@ def create_knowledge_search_stack(
     service = KnowledgeService(
         hybrid,
         max_refine_rounds=1 if query_refiner is not None else 2,
+        rewriter=query_rewriter,
+        reranker=reranker,
     )
     # I1:catalog 是独立连接(与索引相同的 RLock + check_same_thread=False
     # 线程安全约定,见 catalog.py 模块 docstring)。它不在 hybrid.close
@@ -392,6 +515,8 @@ def create_knowledge_search_stack(
         vector_enabled=hybrid.vector_enabled,
         vector_provider=vector_provider,
         vector_dimension=vector_dimension,
+        rewrite_enabled=query_rewriter is not None,
+        reranker_enabled=reranker is not None,
         # D6-T3:service 随 stack 暴露,让 lifespan 挂到 app.state 供
         # REST 检索路由使用(与工具共用同一实例,见 dataclass 注释)。
         service=service,
@@ -468,6 +593,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             default_workspace_root=workspace_root,
             allowed_workspace_roots=allowed_workspace_roots,
         )
+        # S5 检索增强装配：LLM 改写器 + Cross-Encoder 重排器（默认
+        # auto，不可用时各自降级为 None，不阻断启动；模式校验与降级
+        # 语义见 _create_query_rewriter / _create_reranker 注释）。
+        query_rewriter = _create_query_rewriter(
+            _env_mode(
+                "API_KNOWLEDGE_REWRITE",
+                DEFAULT_REWRITE_MODE,
+                frozenset({"auto", "off"}),
+            ),
+            model_settings,
+        )
+        reranker = _create_reranker(
+            _env_mode(
+                "API_KNOWLEDGE_RERANK",
+                DEFAULT_RERANK_MODE,
+                frozenset({"auto", "off"}),
+            ),
+            (os.getenv("API_RERANK_MODEL") or "").strip() or DEFAULT_RERANK_MODEL,
+        )
         # 装配知识检索链路（工作单 T2）：词法 → 向量（可选）→ 混合 →
         # 服务 → 工具；向量不可用自动降级词法，不阻断启动（详见
         # create_knowledge_search_stack 注释）。词法库打不开会在此
@@ -486,21 +630,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "API_RETRIEVAL_THRESHOLD", DEFAULT_RETRIEVAL_THRESHOLD
             ),
             query_refiner=HeuristicQueryRefiner(),
+            query_rewriter=query_rewriter,
+            reranker=reranker,
         )
         # H-T1 统一结构化启动日志：hybrid / lexical_only 都打，让运维
-        # 一眼看出语义检索是否在线。只打模式 / provider / 维度，不打印
-        # 任何文件路径（旧日志打印 vector_db 绝对路径，属部署细节）。
+        # 一眼看出语义检索是否在线。只打模式 / provider / 维度与增强
+        # 开关状态，不打印任何文件路径（旧日志打印 vector_db 绝对路径，
+        # 属部署细节）。
         mode = "hybrid" if knowledge_stack.vector_enabled else "lexical_only"
         _LOGGER.info(
-            "知识检索模式=%s embedding_provider=%s vector_dimension=%s",
+            "知识检索模式=%s embedding_provider=%s vector_dimension=%s "
+            "query_rewrite=%s reranker=%s",
             mode,
             knowledge_stack.vector_provider,
             knowledge_stack.vector_dimension,
+            knowledge_stack.rewrite_enabled,
+            knowledge_stack.reranker_enabled,
         )
         # 诊断快照挂到 app.state，供 /healthz 输出（字段只含 mode /
-        # provider / 维度，绝不含路径；lifespan 未跑或已退出时该属性
-        # 不存在/为 None，/healthz 用 getattr 兜底保持现状）。挂在 try
-        # 内：图装配失败时不留「与实际不符」的快照。
+        # provider / 维度与改写/重排开关状态，绝不含路径；lifespan 未跑
+        # 或已退出时该属性不存在/为 None，/healthz 用 getattr 兜底保持
+        # 现状）。挂在 try 内：图装配失败时不留「与实际不符」的快照。
         try:
             app.state.graph = CollaborativeAgentGraph(
                 model=cast(ChatModel, create_deepseek_model(model_settings)),
@@ -559,6 +709,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "mode": mode,
                 "embedding_provider": knowledge_stack.vector_provider,
                 "vector_dimension": knowledge_stack.vector_dimension,
+                "rewrite_enabled": knowledge_stack.rewrite_enabled,
+                "reranker_enabled": knowledge_stack.reranker_enabled,
             }
             # P0-4/P0-6：学习记录 store 与 OCR provider 挂 app.state，
             # 供 api/learning.py 诊断端点（P3-15）与附件提取链路
