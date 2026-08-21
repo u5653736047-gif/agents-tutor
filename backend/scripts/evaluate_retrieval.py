@@ -109,6 +109,13 @@ _EXTENDED_CASES: list[tuple[str, str]] = [
     ("马尔可夫决策过程与价值迭代", "ai-russell"),
     ("博弈搜索中的 alpha-beta 剪枝", "ai-russell"),
     ("什么是遗传算法", "ai-russell"),
+    # 表格内容专项（S5-B2 验收）：查询指向教材中以表格呈现的知识点，
+    # 用于量化「PDF 表格转 Markdown」入库增强的检索收益。注意：需
+    # --force 重入库且启用 pdf-table 后才能完全兑现；重入库前这些
+    # 用例可能命中不佳（表格被 pypdf 拍平），属预期的基线对照。
+    ("决策树 ID3 算法的信息增益对比", "ml-zhouzhihua"),
+    ("常见激活函数的性质对比表", "dl-d2l"),
+    ("各优化器的学习率自适应程度比较", "dl-d2l"),
 ]
 
 

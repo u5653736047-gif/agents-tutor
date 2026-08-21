@@ -22,6 +22,7 @@ chat / stream 端点消费 ChatRequest.attachments（schemas.py 已预留契约
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from api.schemas import Attachment
 from core.ocr import OcrProvider
 from core.pdf_table import PdfTableExtractor, open_pdf_table_extractor
 from core.vision import VisionProvider
+
+_LOGGER = logging.getLogger(__name__)
 
 # 提取文本上限（pi 审查 🟡5）：env 可调，默认值见模块注释。
 DEFAULT_ATTACHMENT_MAX_CHARS = 30000
@@ -112,19 +115,28 @@ def _extract_image_text(
     """图片三级降级链（S5-B3）：VLM 理解 → OCR 文字 → 友好提示。
 
     每一级失败（异常/空结果）都沉降到下一级，任何一级成功即返回——
-    视觉端点故障不影响既有 OCR 行为，OCR 缺失不影响友好提示兜底。
+    视觉端点故障不影响既有 OCR 行为，OCR 缺失或引擎故障都落到友好
+    提示兜底，不把「引擎故障」误报成「文件损坏」。
     """
     if vision_provider is not None:
         try:
             description = vision_provider.describe_image(image_bytes)
             if description.strip():
                 return description
-        except Exception:  # noqa: BLE001, S110 - 降级链：视觉失败静默沉降 OCR
-            pass
+        except Exception as exc:  # noqa: BLE001 - 降级链：视觉失败沉降至 OCR
+            # 只记异常类型不打响应体（可能含敏感信息）；持续故障时运维
+            # 可从日志发现「配置了视觉端点却永远在走 OCR」。
+            _LOGGER.warning(
+                "视觉端点描述失败，降级到 OCR：%s", type(exc).__name__
+            )
     if ocr_provider is not None:
-        text = ocr_provider.extract_text(image_bytes)
-        if text.strip():
-            return text
+        try:
+            text = ocr_provider.extract_text(image_bytes)
+        except Exception as exc:  # noqa: BLE001 - 降级链：OCR 故障落到提示级
+            _LOGGER.warning("OCR 提取失败，降级到友好提示：%s", type(exc).__name__)
+        else:
+            if text.strip():
+                return text
     return _VISION_UNAVAILABLE_HINT
 
 

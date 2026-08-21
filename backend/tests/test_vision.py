@@ -2,7 +2,7 @@
 
 覆盖清单：
 1. 工厂模式分支：off → None；auto 未配置端点 → None（默认部署零改动）；
-   非法值 → ValueError；
+   非法值 → ValueError；三元组齐备 → 构造出带轻量预算的实例；
 2. OpenAICompatibleVisionProvider：成功描述（替身模型，校验 base64
    图片内容块）；空回答抛错；超长描述有界截断；
 3. 附件三级降级链：VLM 成功 → 用描述；VLM 失败 → 沉降 OCR；VLM 与
@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
+from typing import Any
 
 from pytest import MonkeyPatch
 
@@ -157,6 +159,62 @@ def test_image_falls_back_to_ocr_when_vision_fails(
     assert "OCR 识别文本" in composed
 
 
+def test_image_ocr_engine_failure_falls_to_friendly_hint(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """第二级 OCR 引擎抛异常也沉降到第三级，而非误报「文件损坏」。"""
+    monkeypatch.setenv("API_UPLOAD_DIR", str(tmp_path))
+    _write_image(tmp_path, "u1", "img.png")
+
+    class _BrokenOcr:
+        def extract_text(self, image_bytes: bytes) -> str:
+            raise RuntimeError("ocr engine crashed")
+
+    composed = compose_message_with_attachments(
+        "看图", [_attachment("img.png", "题.png")], "u1", _BrokenOcr(), None
+    )
+
+    assert "当前部署未启用图片理解，且图片中未识别出文本" in composed
+
+
+def test_create_vision_provider_auto_builds_lightweight_model(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """三元组齐备 → 构造出带轻量预算的实例（构造本身不发网络请求）。
+
+    预算参数（timeout=10 / max_retries=0 / max_tokens=512）是计划硬性
+    验收口径，用捕获 kwargs 的假类锁定，防止后续回归悄悄放宽。
+    """
+    monkeypatch.setenv("API_VISION_BASE_URL", "https://vision.example/v1")
+    monkeypatch.setenv("API_VISION_MODEL", "qwen-vl-plus")
+    monkeypatch.setenv("API_VISION_API_KEY", "sk-test")
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "langchain_openai", _FakeModule(_FakeChatOpenAI))
+
+    provider = create_vision_provider("auto")
+
+    assert isinstance(provider, OpenAICompatibleVisionProvider)
+    assert captured_kwargs["model"] == "qwen-vl-plus"
+    assert captured_kwargs["base_url"] == "https://vision.example/v1"
+    assert captured_kwargs["temperature"] == 0
+    assert captured_kwargs["timeout"] == 10
+    assert captured_kwargs["max_retries"] == 0
+    assert captured_kwargs["max_tokens"] == 512
+
+
+class _FakeModule:
+    """langchain_openai 模块替身：monkeypatch.setitem(sys.modules) 用。"""
+
+    def __init__(self, chat_open_ai: type) -> None:
+        self.ChatOpenAI = chat_open_ai
+
+
 def test_image_friendly_hint_when_both_unavailable(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
@@ -167,7 +225,8 @@ def test_image_friendly_hint_when_both_unavailable(
         "看图", [_attachment("img.png", "题.png")], "u1", None, None
     )
 
-    assert "图片理解" in composed or "图片识别" in composed
+    # 精确匹配实际第三级提示文案（attachments.py _VISION_UNAVAILABLE_HINT）。
+    assert "当前部署未启用图片理解，且图片中未识别出文本" in composed
 
 
 def test_image_vision_success_does_not_touch_ocr(

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from pytest import MonkeyPatch
 
 from api.attachments import compose_message_with_attachments
@@ -97,6 +98,21 @@ def test_table_to_markdown_empty_table_returns_empty() -> None:
     assert _table_to_markdown([[None, ""], ["", None]]) == ""
 
 
+def test_table_to_markdown_escapes_backslash_before_pipe() -> None:
+    """原文含「\\|」时先转义反斜杠再转义竖线，列结构不被静默破坏。
+
+    若只转义竖线，「a\\|b」会产出「a\\\\|b」——GFM 把「\\\\」渲染为字面
+    反斜杠，随后的「|」变成未转义分隔符，该行多出一列、后续全部错位。
+    """
+    markdown = _table_to_markdown([("公式", "片段"), ("a\\|b", "c")])
+    lines = markdown.splitlines()
+    bs = chr(92)  # 字面反斜杠
+    expected_cell = "a" + bs * 3 + "|b"  # 原文 a 反斜杠 竖线 b 的正确转义形态
+    assert lines[2] == f"| {expected_cell} | c |"
+    # 行列数不变（表头 + 分隔 + 1 数据行）。
+    assert len(lines) == 3
+
+
 # ── 2. 工厂降级语义 ───────────────────────────────────────────────
 
 
@@ -123,10 +139,12 @@ def test_open_extractor_corrupt_file_degrades_to_none(tmp_path: Path) -> None:
     assert open_pdf_table_extractor(corrupt, mode="auto") is None
 
 
-# ── 3. 真实表格 PDF 端到端 ────────────────────────────────────────
+# ── 3. 真实表格 PDF 端到端（依赖真实 pdfplumber，未装则跳过；
+# 先例见 test_ocr.py 的 importorskip——全新 dev-only 环境零影响）──────
 
 
 def test_page_tables_markdown_renders_real_table(tmp_path: Path) -> None:
+    pytest.importorskip("pdfplumber")
     _build_table_pdf(tmp_path / "table.pdf")
     extractor = PdfTableExtractor.open(tmp_path / "table.pdf")
     try:
@@ -140,6 +158,7 @@ def test_page_tables_markdown_renders_real_table(tmp_path: Path) -> None:
 
 
 def test_page_tables_markdown_out_of_range_page_is_empty(tmp_path: Path) -> None:
+    pytest.importorskip("pdfplumber")
     _build_table_pdf(tmp_path / "table.pdf")
     with PdfTableExtractor.open(tmp_path / "table.pdf") as extractor:
         assert extractor.page_tables_markdown(99) == ""
@@ -156,6 +175,7 @@ def _attachment(file_id: str, name: str) -> Attachment:
 def test_attachment_pdf_tables_enter_message(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    pytest.importorskip("pdfplumber")
     monkeypatch.setenv("API_UPLOAD_DIR", str(tmp_path))
     monkeypatch.delenv("API_PDF_TABLE_MODE", raising=False)
     user_dir = tmp_path / "student-a"
@@ -186,7 +206,10 @@ def test_attachment_pdf_mode_off_keeps_legacy_output(
     )
 
     assert "[表格]" not in composed
-    assert "Name Score" in composed or "Name" in composed
+    # 精确钉住 pypdf 拍平形态（同一行文字被空格拼接、无 Markdown 管道）。
+    assert "Name Score" in composed
+    assert "Tom 95" in composed
+    assert "| Name |" not in composed
 
 
 def test_attachment_pdf_invalid_mode_fails_loudly(
@@ -213,6 +236,7 @@ def test_attachment_table_text_counts_toward_char_budget(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     """表格文本计入同一护栏预算：极小上限时截断标注出现。"""
+    pytest.importorskip("pdfplumber")
     monkeypatch.setenv("API_UPLOAD_DIR", str(tmp_path))
     monkeypatch.setenv("API_ATTACHMENT_MAX_CHARS", "10")
     user_dir = tmp_path / "student-a"
@@ -232,6 +256,7 @@ def test_attachment_table_text_counts_toward_char_budget(
 def test_iter_pdf_pages_includes_table_markdown(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    pytest.importorskip("pdfplumber")
     _build_table_pdf(tmp_path / "textbook.pdf")
     monkeypatch.delenv("API_PDF_TABLE_MODE", raising=False)
 

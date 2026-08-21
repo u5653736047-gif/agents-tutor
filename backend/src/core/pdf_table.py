@@ -37,12 +37,20 @@ _TABLE_SECTION_HEADER = "[表格]"
 
 
 def _cell_text(cell: Any) -> str:
-    """单元格归一：None → 空串、去首尾空白、竖线转义、换行折为空格。"""
+    """单元格归一：None → 空串、去首尾空白、转义、换行折为空格。"""
     if cell is None:
         return ""
     text = str(cell).strip()
-    # GFM 用竖线分列：内容里的竖线必须转义；单元格内换行会破坏行结构。
-    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    # 转义顺序不可颠倒：必须先转义反斜杠再转义竖线。若原文已含「\|」
+    # （代码/LaTeX 片段常见），只转义竖线会产出「\\|」——GFM 把「\\」
+    # 渲染为字面反斜杠，随后的「|」变成未转义的列分隔符，静默破坏
+    # 列结构并把错位的行送进模型上下文与检索索引。
+    return (
+        text.replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
 
 
 def _table_to_markdown(table: list[list[Any]]) -> str:
