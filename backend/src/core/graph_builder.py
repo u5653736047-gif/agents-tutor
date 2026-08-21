@@ -334,19 +334,24 @@ class _ToolModePlanExecution:
 @tool("create_task_plan", args_schema=_TaskPlanInput)
 def create_task_plan_tool_mode(steps: list[TaskPlanStep]) -> str:
     """为需要至少两个有序子任务的复杂请求创建一次任务计划。"""
-    # tool 模式专用变体：已有 ACTIVE 计划时工具层拒绝（S5-A1 冲突语义），
-    # 返回模型可读的 JSON 提示而非抛错——模型有机会先收口当前计划。
-    # 双保险：即便门控被绕过，_wrap 的 replacing_plan 拦截仍会兜底。
+    # tool 模式专用变体：一轮至多创建一次计划（S5-A1 冲突语义，审查
+    # 加固）——只要 holder 内已有执行对象（无论 ACTIVE/COMPLETED/FAILED），
+    # 同轮再次创建一律拒绝。为什么不限缩到 ACTIVE：同轮内已完成计划的
+    # 结果与 TASK_RESULT_ARCHIVED 事件已落账，若允许替换会让旧结果静默
+    # 蒸发；跨轮重建不受影响（新轮 holder 重新从 state 构建，终态计划
+    # 不会进入 holder）。返回模型可读的 JSON 提示而非抛错——模型有机会
+    # 纠偏。双保险：即便门控被绕过，_wrap 的 replacing_plan 拦截仍会兜底。
     execution = _TOOL_PLAN_EXECUTION.get()
     current = execution.execution if execution is not None else None
-    if current is not None and current.plan.status is TaskPlanStatus.ACTIVE:
+    if current is not None:
         return json.dumps(
             {
                 "error": (
-                    "已存在进行中的任务计划，不允许覆盖；"
-                    "请先按计划完成或等待其失败后再创建新计划"
+                    "本轮已创建过任务计划，不允许重复创建；"
+                    "请继续执行或整合当前计划的结果"
                 ),
-                "active_plan_steps": len(current.plan.steps),
+                "plan_status": current.plan.status.value,
+                "plan_steps": len(current.plan.steps),
                 "completed_steps": current.plan.current_step_index,
             },
             ensure_ascii=False,
@@ -1081,14 +1086,18 @@ class CollaborativeAgentGraph:
         if self._approval_tool_names:
             routes[_TOOL_APPROVAL_NODE] = _TOOL_APPROVAL_NODE
 
+        # 路由函数绑定本图的编排模式（S5-A1：tool 模式活动计划不走分派
+        # 节点，见 _route 注释）；lambda 保持 LangGraph 期望的 fn(state) 签名。
+        route_fn = lambda state: self._route(state, self.orchestration_mode)
+
         for role, agent in self.agents.items():
             graph.add_node(role.value, self._wrap(agent))
-            graph.add_conditional_edges(role.value, self._route, routes)
+            graph.add_conditional_edges(role.value, route_fn, routes)
 
         graph.add_node(_TASK_PLAN_DISPATCH_NODE, self._dispatch_task_plan)
         graph.add_conditional_edges(
             _TASK_PLAN_DISPATCH_NODE,
-            self._route,
+            route_fn,
             routes,
         )
 
@@ -1096,7 +1105,7 @@ class CollaborativeAgentGraph:
             graph.add_node(_HANDOFF_APPROVAL_NODE, self._approve_handoff)
             graph.add_conditional_edges(
                 _HANDOFF_APPROVAL_NODE,
-                self._route,
+                route_fn,
                 routes,
             )
 
@@ -1104,7 +1113,7 @@ class CollaborativeAgentGraph:
             graph.add_node(_TOOL_APPROVAL_NODE, self._approve_tool)
             graph.add_conditional_edges(
                 _TOOL_APPROVAL_NODE,
-                self._route,
+                route_fn,
                 routes,
             )
 
@@ -1277,6 +1286,12 @@ class CollaborativeAgentGraph:
                     )
                     else None
                 )
+            # 轮前初始执行对象（用于判定「本轮是否新建了计划」：轮末对象
+            # 与它身份不同即说明 create_task_plan_tool_mode 在轮内安装了
+            # 新执行上下文，审批早退分支也要据此补发创建事件）。
+            initial_tool_execution = (
+                tool_plan_holder.execution if tool_plan_holder is not None else None
+            )
             tool_plan_token = _TOOL_PLAN_EXECUTION.set(tool_plan_holder)
             # P0-5：学习记录作用域与父状态同位设置（工具层从 scope
             # 读 user_id/session_id，模型不可见不可控）；无条件设置，
@@ -1339,6 +1354,69 @@ class CollaborativeAgentGraph:
                 updates["next_agent"] = None
                 updates["pending_handoff"] = None
                 updates["run_error"] = None
+                # ── S5-A1/A2：审批暂停同样持久化轮内计划簿记（审查 🔴）──
+                # 审批中断是计划内调 shell 的正常交互而非异常路径：若在此
+                # 直接返回，holder 内的游标推进/步骤结果/事件随 ContextVar
+                # reset 全部丢失，恢复后路由器会把已完成的步骤重跑一遍。
+                # 因此在这里补做与正常轮末等价的写回；事件直接构造并追加
+                # 进本轮 events（序号沿用全局最大序号递增，与 emit 闭包同
+                # 一口径——此处位于闭包定义之前，无法复用）。无论计划被
+                # 推进到何种状态（ACTIVE/COMPLETED/FAILED）都持久化：
+                # 终态计划的结果同样不能丢，且恢复后路由按状态自然分流。
+                # 写回条件不依赖 dirty：「本轮新建了计划但尚未执行任何
+                # 步骤即暂停」时 dirty 为 False，但计划本身必须入库，
+                # 否则恢复后门控与记账静默失效（验收发现的边界缺口）。
+                plan_created_this_round = (
+                    executed_plan is not None
+                    and executed_plan is not initial_tool_execution
+                )
+                if executed_plan is not None and (
+                    executed_plan.dirty or plan_created_this_round
+                ):
+                    updates["task_plan"] = executed_plan.plan
+                    updates["task_results"] = executed_plan.results
+                    approval_events = cast(
+                        list[RunEvent], list(updates.get("events", []))
+                    )
+                    sequence = max(
+                        (
+                            event.sequence
+                            for event in [
+                                *state.get("events", []),
+                                *approval_events,
+                            ]
+                        ),
+                        default=-1,
+                    )
+                    if plan_created_this_round:
+                        # 本轮新建了计划（执行对象与轮前不是同一个）：
+                        # 补发创建事件，脱敏口径与正常路径一致（只记步骤数）。
+                        sequence += 1
+                        approval_events.append(
+                            RunEvent(
+                                event_type=EventType.TASK_PLAN_CREATED,
+                                sequence=sequence,
+                                session_id=state.get("session_id"),
+                                run_id=state.get("run_id"),
+                                agent=agent.role.value,
+                                content=str(len(executed_plan.plan.steps)),
+                            )
+                        )
+                    for step_result in executed_plan.newly_recorded_results():
+                        sequence += 1
+                        approval_events.append(
+                            RunEvent(
+                                event_type=EventType.TASK_RESULT_ARCHIVED,
+                                sequence=sequence,
+                                session_id=state.get("session_id"),
+                                run_id=state.get("run_id"),
+                                agent=step_result.target_agent.value,
+                                success=step_result.success,
+                                error_code=step_result.error_code,
+                                plan_step_sequence=step_result.step_sequence,
+                            )
+                        )
+                    updates["events"] = approval_events
                 return cast(AgentState, updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             # ── S2-T4 结构化引用：把本轮检索命中挂到终端回答 ──
@@ -1918,7 +1996,16 @@ class CollaborativeAgentGraph:
                         handoff_count += 1
                         switch_count += 1
                         emit(EventType.AGENT_SWITCHED, target)
-                elif plan is None or plan.status is not TaskPlanStatus.ACTIVE:
+                elif (
+                    plan is None
+                    or plan.status is not TaskPlanStatus.ACTIVE
+                    # S5-A1：tool 模式 Supervisor 轮结束即运行收口（活动
+                    # 计划不走分派节点，见 _route 注释），因此也要发
+                    # RUN_COMPLETED——否则「建计划后模型直接作答」的轮次
+                    # 无收口事件。聚合块内 aggregation_results 对 ACTIVE
+                    # 计划恒为 None，不会误触发聚合。
+                    or self.orchestration_mode == "tool"
+                ):
                     if aggregation_results is not None:
                         if plan is None:
                             raise RuntimeError("aggregation requires a task plan")
@@ -2364,8 +2451,15 @@ class CollaborativeAgentGraph:
         return cast(AgentState, updates)
 
     @staticmethod
-    def _route(state: AgentState) -> str:
-        """有 handoff 时转给目标；Worker 完成后回到 Supervisor。"""
+    def _route(
+        state: AgentState,
+        orchestration_mode: OrchestrationMode = "handoff",
+    ) -> str:
+        """有 handoff 时转给目标；Worker 完成后回到 Supervisor。
+
+        orchestration_mode 由 build() 注册边时绑定（默认 handoff 兼容
+        既有直调方）；tool 模式下活动计划不走分派节点，见下方分支注释。
+        """
         if state.get("run_error") is not None:
             return "end"  # 已判死：终止
         if state.get("pending_tool_approval") is not None:
@@ -2376,8 +2470,18 @@ class CollaborativeAgentGraph:
         if next_agent in {role.value for role in AgentRole}:
             return next_agent  # 模型指定了合法目标：直接转交
         plan = _task_plan_from_state(state)
-        if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
-            return _TASK_PLAN_DISPATCH_NODE  # 活动计划：由调度节点决定下一 Worker
+        # 活动计划交调度节点分派——这是 handoff 模式的专属路径。tool 模式
+        # 的计划在 Supervisor 的 ReAct 循环内经 ask_* 同步执行（S5-A1），
+        # 若也走分派节点会绕开工具层门控与失败策略、把 Worker 当图节点
+        # 直派（审查发现的管控旁路）；因此 tool 模式下 Supervisor 轮结束
+        # 即运行收口，未完成的 ACTIVE 计划留在 checkpoint（下一用户轮
+        # 由 create_initial_state 的轮次重置自然清空）。
+        if (
+            plan is not None
+            and plan.status is TaskPlanStatus.ACTIVE
+            and orchestration_mode == "handoff"
+        ):
+            return _TASK_PLAN_DISPATCH_NODE
         if state.get("current_agent") != AgentRole.SUPERVISOR.value:
             return AgentRole.SUPERVISOR.value  # Worker 收尾：交回 Supervisor
         return "end"  # 无待办：终止

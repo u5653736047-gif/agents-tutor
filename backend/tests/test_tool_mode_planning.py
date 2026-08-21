@@ -16,20 +16,25 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from core.events import ErrorCode, EventType
+from core.filesystem import WorkspaceFileSystem
 from core.graph_builder import CollaborativeAgentGraph, _recent_context_messages
 from core.state import (
     AgentRole,
     TaskPlan,
     TaskPlanStatus,
     TaskStepResult,
+    ToolApprovalAction,
+    ToolApprovalDecision,
 )
-from tests.test_graph_builder import ScriptedModel
+from core.tools.shell_tool import create_shell_tool
+from tests.test_graph_builder import ScriptedModel, shell_response
 
 
 def plan_step(
@@ -105,6 +110,8 @@ def test_tool_mode_plan_created_executed_and_completed() -> None:
     graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
 
     state = graph.run("先讲概念再出例题", session_id="plan-session")
+    # 脚本消耗严格对齐：Supervisor 4 次决策 + 两个子代理各 1 次。
+    assert len(model.calls) == 6
 
     # 计划状态推进到 COMPLETED，游标走满。
     plan = TaskPlan.model_validate(state["task_plan"])
@@ -176,7 +183,11 @@ def test_tool_mode_gate_rejects_out_of_order_ask_then_recovers() -> None:
 
 
 def test_tool_mode_rejects_second_plan_while_active() -> None:
-    """ACTIVE 计划期间重复创建被拒（冲突语义），原计划继续可用。"""
+    """同轮重复创建被拒（一轮一计划），原计划继续可用。
+
+    S5 审查加固：拒绝条件从「仅 ACTIVE」扩大到「本轮已存在任何执行
+    上下文」——已完成计划的结果与事件已落账，允许替换会让它们静默蒸发。
+    """
     model = ScriptedModel(
         [
             create_plan_response(
@@ -206,13 +217,55 @@ def test_tool_mode_rejects_second_plan_while_active() -> None:
     rejection = next(
         message.content
         for message in tool_messages(state)
-        if "不允许覆盖" in str(message.content)
+        if "不允许重复创建" in str(message.content)
     )
-    assert json.loads(str(rejection))["active_plan_steps"] == 2
+    assert json.loads(str(rejection))["plan_steps"] == 2
     # 原计划不受影响，正常完成。
     plan = TaskPlan.model_validate(state["task_plan"])
     assert plan.status is TaskPlanStatus.COMPLETED
     assert plan.steps[0].target_agent is AgentRole.LEARNING_ASSISTANT
+
+
+def test_tool_mode_rejects_recreation_after_completion() -> None:
+    """完成计划后同轮再建也被拒：已落账结果不被新计划静默蒸发（审查加固）。"""
+    model = ScriptedModel(
+        [
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            ask_response("ask_learning_assistant", "讲解"),
+            AIMessage(content="学习助手讲解"),
+            ask_response("ask_teaching_assistant", "出题"),
+            AIMessage(content="教学助手出题"),
+            # 计划已完成，同轮再建 → 拒绝。
+            create_plan_response(
+                [
+                    plan_step(1, "teaching_assistant", "再来一套"),
+                    plan_step(2, "teaching_assistant", "又一套"),
+                ]
+            ),
+            AIMessage(content="整合完成"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
+
+    state = graph.run("讲完出题再建一个", session_id="post-completion")
+
+    rejection = next(
+        message.content
+        for message in tool_messages(state)
+        if "不允许重复创建" in str(message.content)
+    )
+    payload = json.loads(str(rejection))
+    assert payload["plan_status"] == "completed"
+    # 已完成计划的簿记完整保留。
+    plan = TaskPlan.model_validate(state["task_plan"])
+    assert plan.status is TaskPlanStatus.COMPLETED
+    results = [TaskStepResult.model_validate(item) for item in state["task_results"]]
+    assert [item.success for item in results] == [True, True]
 
 
 # ── 2. A2 失败策略 ────────────────────────────────────────────────
@@ -245,7 +298,7 @@ def _run_with_first_step_failure(on_failure: str) -> tuple[dict[str, Any], list[
 
 def test_failure_abort_marks_plan_failed_and_hard_stops() -> None:
     """abort：计划 FAILED、后续 ask_* 硬拒绝、不发 RUN_FAILED（运行不判死）。"""
-    state, _ = _run_with_first_step_failure("abort")
+    state, calls = _run_with_first_step_failure("abort")
 
     plan = TaskPlan.model_validate(state["task_plan"])
     assert plan.status is TaskPlanStatus.FAILED
@@ -265,6 +318,8 @@ def test_failure_abort_marks_plan_failed_and_hard_stops() -> None:
     )
     # Supervisor 用已有信息作答，运行正常结束（脚本第 5 项成为终态回答）。
     assert state["messages"][-1].content == "教学助手出题"
+    # 脚本消耗严格对齐：create + ask_LA + LA 空答 + ask_TA(被拒) + 终答。
+    assert len(calls) == 5
 
 
 def test_failure_continue_advances_cursor_and_completes() -> None:
@@ -303,6 +358,8 @@ def test_failure_retry_succeeds_within_budget() -> None:
     )
     graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
     state = graph.run("讲解并出题", session_id="retry-success")
+    # 脚本消耗严格对齐：Supervisor 4 次决策 + LA 两次各 1 次 + TA 1 次。
+    assert len(model.calls) == 8
 
     plan = TaskPlan.model_validate(state["task_plan"])
     assert plan.status is TaskPlanStatus.COMPLETED
@@ -386,6 +443,8 @@ def test_tool_orchestration_prompt_documents_plan_conventions() -> None:
     assert "create_task_plan" in TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
     assert "按计划顺序" in TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
     assert "on_failure=continue" in TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
+    # 审查 🟡：retry 被工具指纹去重拦截时，提示词引导模型调整表述。
+    assert "调整任务表述" in TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
 
 
 def test_tool_mode_completed_plan_replayable_from_checkpoint() -> None:
@@ -455,3 +514,177 @@ def test_subagent_sees_recent_conversation_before_task() -> None:
     assert len(subagent_call) >= 2
     prior_contents = [str(message.content) for message in subagent_call[:-1]]
     assert any("梯度下降是一阶优化算法" in content for content in prior_contents)
+
+
+# ── 4. 审查修复回归：审批暂停簿记持久化 / 路由管控 / 兼容性 ──────
+
+
+def test_approval_pause_persists_plan_bookkeeping(tmp_path: Path) -> None:
+    """审查 🔴 回归：计划执行中途触发 shell 审批，簿记不丢失。
+
+    场景：创建计划 → ask_learning_assistant 完成步骤 1 → 调 shell 触发
+    审批暂停。暂停返回的 state 必须携带推进后的游标、已落账的步骤结果
+    与对应事件——否则恢复后已完成步骤会被重复执行。
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = ScriptedModel(
+        [
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            ask_response("ask_learning_assistant", "讲解"),
+            AIMessage(content="学习助手讲解"),
+            # 步骤 1 已完成、游标在步骤 2 时调 shell（非 ask_*，不受门控）
+            # → 触发审批暂停。
+            shell_response(),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        tools=[create_shell_tool(WorkspaceFileSystem(workspace))],
+        tool_permissions={"shell": {AgentRole.SUPERVISOR}},
+        checkpointer=InMemorySaver(),
+        orchestration_mode="tool",
+    )
+
+    paused = graph.run("讲完出题再查资料", session_id="approval-plan", workspace_root=str(workspace))
+
+    assert paused["pending_tool_approval"] is not None
+    # 簿记持久化：游标推进 + 步骤结果落账（修复前此处为空）。
+    plan = TaskPlan.model_validate(paused["task_plan"])
+    assert plan.status is TaskPlanStatus.ACTIVE
+    assert plan.current_step_index == 1
+    results = [TaskStepResult.model_validate(item) for item in paused["task_results"]]
+    assert [(item.step_sequence, item.success) for item in results] == [(1, True)]
+    # 事件齐备：创建 + 步骤归档，且序号严格递增。
+    event_types = [event.event_type for event in paused["events"]]
+    assert EventType.TASK_PLAN_CREATED in event_types
+    archived = [
+        event
+        for event in paused["events"]
+        if event.event_type == EventType.TASK_RESULT_ARCHIVED
+    ]
+    assert [event.plan_step_sequence for event in archived] == [1]
+    sequences = [event.sequence for event in paused["events"]]
+    assert sequences == sorted(sequences)
+
+    # 恢复审批后 shell 执行，运行继续收口；步骤 2 由 Supervisor 继续
+    # 经 ask_* 推进（不重复执行步骤 1，也不走分派节点）。
+    model.responses.append(ask_response("ask_teaching_assistant", "出题"))
+    model.responses.append(AIMessage(content="教学助手出题"))
+    model.responses.append(AIMessage(content="整合回答"))
+    pending = graph.get_pending_tool_approval("approval-plan")
+    assert pending is not None
+    resumed = graph.resume_tool_approval(
+        "approval-plan",
+        ToolApprovalDecision(
+            interrupt_id=pending.interrupt_id,
+            action=ToolApprovalAction.CONFIRM,
+        ),
+    )
+    # 脚本恰好耗尽（5 次恢复前 + 3 次恢复后），无静默欠消耗。
+    assert len(model.responses) == 0
+    # 步骤 2 正常推进至完成，且步骤 1 未被重复执行。
+    final_plan = TaskPlan.model_validate(resumed["task_plan"])
+    assert final_plan.status is TaskPlanStatus.COMPLETED
+    final_results = [
+        TaskStepResult.model_validate(item) for item in resumed["task_results"]
+    ]
+    assert [item.step_sequence for item in final_results] == [1, 2]
+    assert resumed["messages"][-1].content == "整合回答"
+
+
+def test_approval_pause_with_zero_progress_still_persists_plan(tmp_path: Path) -> None:
+    """验收残留缺口回归：同轮建计划后零步骤即暂停，计划本身不丢失。
+
+    写回不能只看 dirty——新建计划未执行任何 ask_* 就触发审批时，
+    dirty 为 False 但计划必须入库，否则恢复后门控与记账静默失效。
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = ScriptedModel(
+        [
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            # 建计划后未执行任何 ask_* 直接调 shell → 审批暂停。
+            shell_response(),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        tools=[create_shell_tool(WorkspaceFileSystem(workspace))],
+        tool_permissions={"shell": {AgentRole.SUPERVISOR}},
+        checkpointer=InMemorySaver(),
+        orchestration_mode="tool",
+    )
+
+    paused = graph.run("查资料", session_id="approval-zero", workspace_root=str(workspace))
+
+    assert paused["pending_tool_approval"] is not None
+    plan = TaskPlan.model_validate(paused["task_plan"])
+    assert plan.status is TaskPlanStatus.ACTIVE
+    assert plan.current_step_index == 0
+    event_types = [event.event_type for event in paused["events"]]
+    assert EventType.TASK_PLAN_CREATED in event_types
+
+
+def test_tool_mode_active_plan_does_not_dispatch_workers() -> None:
+    """审查 🟡 回归：tool 模式 ACTIVE 计划不走 handoff 分派节点。
+
+    Supervisor 创建计划后直接作答收尾（计划仍 ACTIVE）：运行必须以
+    RUN_COMPLETED 收口，不得把 Worker 当图节点直派（那会绕开 ask_*
+    门控与失败策略）；ACTIVE 计划留在 checkpoint，下一用户轮自然清空。
+    """
+    model = ScriptedModel(
+        [
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            AIMessage(content="本轮先到这里"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
+
+    state = graph.run("先建个计划", session_id="no-dispatch")
+
+    assert len(model.calls) == 2
+    event_types = [event.event_type for event in state["events"]]
+    assert EventType.RUN_COMPLETED in event_types
+    # 无 Worker 被直派：没有指向 worker 角色的切换事件。
+    worker_values = {role.value for role in AgentRole if role is not AgentRole.SUPERVISOR}
+    switches = [
+        event.agent
+        for event in state["events"]
+        if event.event_type == EventType.AGENT_SWITCHED
+    ]
+    assert not [agent for agent in switches if agent in worker_values]
+    plan = TaskPlan.model_validate(state["task_plan"])
+    assert plan.status is TaskPlanStatus.ACTIVE
+
+
+def test_task_plan_backward_compatible_without_new_fields() -> None:
+    """A2 验收项：旧 checkpoint 的计划缺 on_failure/retries_used 时回退默认。"""
+    legacy = {
+        "steps": [
+            {"sequence": 1, "description": "旧步骤一", "target_agent": "learning_assistant"},
+            {"sequence": 2, "description": "旧步骤二", "target_agent": "teaching_assistant"},
+        ],
+        "current_step_index": 1,
+        "status": "active",
+    }
+
+    plan = TaskPlan.model_validate(legacy)
+
+    assert all(step.on_failure == "abort" for step in plan.steps)
+    assert plan.retries_used == 0
