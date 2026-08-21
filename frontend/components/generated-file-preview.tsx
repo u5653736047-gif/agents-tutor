@@ -11,8 +11,10 @@
 // 已含 CVE-2023-30533 / CVE-2024-22363 修复；npm 源的 0.18.5 有
 // 未修复通告，禁止降级回 npm 源版本）。
 //
-// 依赖按需加载：mammoth / xlsx / dompurify 都在点击「预览」时才动态
-// import——不进首屏 bundle，未点预览的用户零成本。
+// 依赖加载时机：mammoth / xlsx 在点击「预览」时才动态 import——
+// 拆进独立 chunk，不进首屏 bundle，未点预览的用户零成本；dompurify
+// 是静态 import（见 lib/sanitize-html.ts），随面板 chunk 加载
+// （约 20KB gz）——安全边界必须常驻，不做懒加载。
 import { useState } from "react";
 
 import { DEMO_USER_ID, getFileUrl } from "@/lib/api-client";
@@ -73,6 +75,11 @@ export function GeneratedFilePreview({
   }
 
   async function toggle() {
+    // 重入防护：loading 态重复点击会并发发起第二次 fetch+解析，
+    // 后到者覆盖前者的 setState（浪费请求且大文件双倍解析开销）。
+    if (state.kind === "loading") {
+      return;
+    }
     if (state.kind === "ready") {
       setState({ kind: "idle" });
       return;
@@ -99,8 +106,9 @@ export function GeneratedFilePreview({
   return (
     <div data-slot="generated-file-preview">
       <button
-        className="text-caption text-primary underline underline-offset-2"
+        className="text-caption text-primary underline underline-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
         data-slot="generated-file-preview-toggle"
+        disabled={state.kind === "loading"}
         onClick={() => {
           void toggle();
         }}

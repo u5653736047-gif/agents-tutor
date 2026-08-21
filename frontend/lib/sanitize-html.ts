@@ -9,6 +9,8 @@
 // 实现说明：DOMPurify 需要一个 DOM；浏览器端用全局 window，测试端由
 // jsdom 提供（tests/generated-file-preview.test.ts 先挂 window 再动态
 // import 本模块）。惰性创建单例，避免模块加载期触碰 DOM（SSR 安全）。
+// 加载时机：本模块对 dompurify 是静态 import，随引用链（面板 chunk）
+// 一起加载——消毒是安全边界必须常驻；mammoth/xlsx 才是点击时动态加载。
 import createDOMPurify from "dompurify";
 
 let cached: ReturnType<typeof createDOMPurify> | null = null;
