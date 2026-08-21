@@ -8,6 +8,7 @@ import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
+import { GeneratedFilePreview } from "@/components/generated-file-preview";
 import { GradingCard } from "@/components/grading-card";
 import {
   CollaborationPanel,
@@ -134,19 +135,23 @@ export function AttachmentPreview({
       />
     </a>
   ) : (
-    <a
-      className={`w-fit max-w-full truncate underline underline-offset-2 ${
-        tone === "onPrimary" ? "text-primary-foreground" : "text-primary"
-      }`}
-      data-slot="attachment-link"
-      download={attachment.name}
-      href={url}
-    >
-      {attachment.name}
-      <span className="ml-1 text-caption opacity-70">
-        {formatAttachmentSize(attachment.size)}
-      </span>
-    </a>
+    <>
+      <a
+        className={`w-fit max-w-full truncate underline underline-offset-2 ${
+          tone === "onPrimary" ? "text-primary-foreground" : "text-primary"
+        }`}
+        data-slot="attachment-link"
+        download={attachment.name}
+        href={url}
+      >
+        {attachment.name}
+        <span className="ml-1 text-caption opacity-70">
+          {formatAttachmentSize(attachment.size)}
+        </span>
+      </a>
+      {/* S5-B4：docx/xlsx 生成物预览入口（pptx 等不渲染，见组件内白名单） */}
+      <GeneratedFilePreview fileId={attachment.file_id} name={attachment.name} />
+    </>
   );
 }
 
