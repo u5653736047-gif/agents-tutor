@@ -8,6 +8,7 @@
 - Supervisor、助教、助学、评价四个同构 Agent
 - “模型决策 → 工具执行 → 结果观察”ReAct 循环
 - 生产链路以 Supervisor 为主智能体，通过 `ask_*` 工具等待专业 Agent 完成并整合结果
+- tool 模式任务计划：复杂请求可由 Supervisor 调用 `create_task_plan` 建立有序计划，核心层确定性门控逐步执行（乱序拒绝、失败策略 abort/continue/retry、重试预算有界），计划与逐步结果经响应字段与回放接口可见
 - SSE 原生 token 流，以及思考摘要、工具调用和子代理阶段输出
 - “思考”仅展示可审计的执行摘要，不公开模型原始推理文本或工具参数/结果正文
 - 兼容原有 `handoff` / 人工审批编排模式（非生产默认）
@@ -62,6 +63,9 @@ npm install
 | `API_KNOWLEDGE_REWRITE` | 可选，LLM 查询改写开关：`auto`（默认，已配置 `DEEPSEEK_API_KEY` 时启用——把一个查询改写成多个检索变体联合检索提升召回）或 `off`（强制关闭）；未配置 key 时 `auto` 自动跳过。 |
 | `API_KNOWLEDGE_RERANK` | 可选，Cross-Encoder 重排开关：`auto`（默认，fastembed 可用时装配 bge-reranker，对初检候选精排；构造失败自动降级为不重排）或 `off`（强制关闭）。 |
 | `API_RERANK_MODEL` | 可选，重排模型名；默认 `BAAI/bge-reranker-base`（首次启用需联网下载模型约 280MB，之后离线）。 |
+| `API_PDF_TABLE_MODE` | 可选，PDF 表格结构化提取：`auto`（默认，已安装 `pdf-table` 依赖组时启用——附件与入库两条链路的表格转 GFM Markdown）或 `off`；未装依赖时自动回退 pypdf 纯文本。存量知识库需 `--force` 重入库才能获得表格增强。 |
+| `API_VISION_MODE` | 可选，图片理解视觉端点：`auto`（默认，三项视觉 env 均配置才启用，作为三级降级链第一级：VLM → OCR → 友好提示）或 `off`。DeepSeek 主站不支持图片输入，面向自选 OpenAI 兼容端点（如 Qwen-VL）。 |
+| `API_VISION_BASE_URL` / `API_VISION_MODEL` / `API_VISION_API_KEY` | 可选，视觉端点三元组；调用预算 timeout=10s / max_retries=0 / max_tokens=512。 |
 | `API_WORKSPACE_ROOT` | 可选，新会话的默认主工作区；启动脚本默认绑定当前仓库根。用户可在创建会话时选择其他目录。 |
 | `API_WORKSPACE_ALLOWED_ROOTS` | 可选，部署侧允许用户选择的目录边界；多个根用系统 PATH 分隔符分隔（Windows `;`、Linux/macOS `:`）。未设置时本地模式允许明确选择任意现有目录；生产部署建议必设。 |
 | `API_OFFICECLI_ENABLED` | 可选，默认 `0`（不注册 office 工具、不探测二进制）；显式设 `1` 才启用，启用时启动自检失败会中止启动。 |

@@ -23,9 +23,10 @@
 | 上下文预算 | API_MAX_CONTEXT_TOKENS / API_MAX_CONTEXT_MESSAGES | 524288 / 200 | 背后模型 1M 窗口，512K 为护栏上限而非填充目标；内置保守估算器（中文 1 字符≈1 token） |
 | 自适应检索 | API_RETRIEVAL_THRESHOLD | 0.01 | 启发式必要性策略 + 相关性阈值 + 零 LLM 启发式精化器（1 轮） |
 | 检索增强（S5） | API_KNOWLEDGE_REWRITE / API_KNOWLEDGE_RERANK / API_RERANK_MODEL | auto / auto / bge-reranker-base | LLM 查询改写（多变体联合检索，未配置 key 自动跳过）+ Cross-Encoder 重排（fastembed 复用 embedding 依赖组，只改顺序不改分数，构造失败自动降级） |
+| tool 模式任务计划（S5-A） | 无需配置（tool 模式默认可用） | — | Supervisor 可 `create_task_plan` 建立有序计划，核心层确定性门控逐步执行：乱序/跳步 ask_* 工具层拒绝、失败策略 abort/continue/retry（每计划重试预算 1 次）、ACTIVE 计划禁止覆盖；计划与结果经 ChatResponse/SessionProcess 既有字段可见（前端零改动点亮） | test_tool_mode_planning.py |
 | 学习记录库 | API_LEARNING_DB_PATH | data/learning.db | SQLite WAL；复合唯一键 (source_tool_call_id, question_id) 防重放重复入库 |
 | OCR | API_OCR_MODE / uv sync --extra ocr | auto | rapidocr-onnxruntime（PP-OCR 同源）；依赖缺失自动降级为友好提示 |
-| 附件提取护栏 | API_ATTACHMENT_MAX_CHARS / API_ATTACHMENTS_TOTAL_MAX_CHARS | 30000 / 100000 | 超限截断并附标注 |
+| 附件提取护栏 | API_ATTACHMENT_MAX_CHARS / API_ATTACHMENTS_TOTAL_MAX_CHARS | 30000 / 100000 | 超限截断并附标注；PDF 表格结构化（API_PDF_TABLE_MODE，pdfplumber 可选组，表格转 GFM Markdown）与图片理解三级降级链（API_VISION_*，VLM → OCR → 友好提示） |
 
 ## 三、剩余人工动作（不阻塞代码交付）
 
