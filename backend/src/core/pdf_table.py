@@ -10,9 +10,11 @@
    让下游（模型上下文 / 分块检索）看到结构化的行列关系。
 
 2. 选型与依赖口径
-   pdfplumber：纯 Python（pdfminer.six 系）、Windows pip 可装、无原生
-   依赖——作为可选依赖组 `pdf-table`（pyproject）提供，未安装时调用方
-   按「可用才开」哲学降级为 pypdf 纯文本，行为与安装前逐项一致。
+   pdfplumber：pdfminer.six 系、Windows pip 可装；依赖 pypdfium2 的
+   预编译 wheel（PDFium 二进制，覆盖主流平台——冷门平台部署前需
+   自行确认可用性）——作为可选依赖组 `pdf-table`（pyproject）提供，
+   未安装时调用方按「可用才开」哲学降级为 pypdf 纯文本，行为与
+   安装前逐项一致。
 
 3. 降级语义（与 core/ocr.py 同一约定）
    - API_PDF_TABLE_MODE=off：强制关闭，不探测不构造；
@@ -29,6 +31,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Self
 
@@ -128,6 +131,22 @@ class PdfTableExtractor:
         self.close()
 
 
+def resolve_pdf_table_mode() -> str:
+    """读取并校验 API_PDF_TABLE_MODE（缺省 auto；非法值 ValueError）。
+
+    校验单一来源：装配方（api/app.py lifespan）在启动期调用一次——
+    配置拼写错误在部署时暴露，而不是首个带附件请求才 500；附件提取
+    链路请求期复用同一函数，两处口径天然一致。
+    """
+    raw = os.getenv("API_PDF_TABLE_MODE")
+    if raw is None or not raw.strip():
+        return "auto"
+    value = raw.strip()
+    if value not in {"auto", "off"}:
+        raise ValueError("API_PDF_TABLE_MODE 只支持 auto 或 off")
+    return value
+
+
 def open_pdf_table_extractor(
     source: Path,
     *,
@@ -153,4 +172,8 @@ def open_pdf_table_extractor(
         return None
 
 
-__all__ = ["PdfTableExtractor", "open_pdf_table_extractor"]
+__all__ = [
+    "PdfTableExtractor",
+    "open_pdf_table_extractor",
+    "resolve_pdf_table_mode",
+]

@@ -23,6 +23,10 @@ import { sanitizeGeneratedHtml } from "@/lib/sanitize-html";
 // 支持预览的扩展名白名单；pptx 明确不支持（UI 不显示预览入口）。
 const PREVIEWABLE_EXTENSIONS = new Set([".docx", ".xlsx"]);
 
+// 预览大小护栏：超过上限不拉取、不进浏览器内存解析，提示走下载。
+// 生成文件来自 officecli 通常远小于该值，属廉价防御而非常规路径。
+export const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
+
 export function canPreview(name: string): boolean {
   const dot = name.lastIndexOf(".");
   if (dot === -1) {
@@ -58,6 +62,7 @@ type PreviewState =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "ready"; html: string }
+  | { kind: "oversize" }
   | { kind: "error" };
 
 export function GeneratedFilePreview({
@@ -92,7 +97,22 @@ export function GeneratedFilePreview({
       if (!response.ok) {
         throw new Error(`file fetch failed: ${response.status}`);
       }
+      if (!response.ok) {
+        throw new Error(`file fetch failed: ${response.status}`);
+      }
+      // 大小护栏双层检查：content-length 预检在 blob() 之前（超限时
+      // 连下载都省掉）；blob.size 兑底（header 缺失、谎报或 gzip 压缩
+      // 尺寸偏差时仍受保护——压缩尺寸偏小由兑底拦，偏大属保守拒绝）。
+      const declared = Number(response.headers.get("content-length") ?? "0");
+      if (declared > MAX_PREVIEW_BYTES) {
+        setState({ kind: "oversize" });
+        return;
+      }
       const blob = await response.blob();
+      if (blob.size > MAX_PREVIEW_BYTES) {
+        setState({ kind: "oversize" });
+        return;
+      }
       const rawHtml = name.toLowerCase().endsWith(".docx")
         ? await parseDocxToHtml(blob)
         : await parseXlsxToHtml(blob);
@@ -122,6 +142,12 @@ export function GeneratedFilePreview({
       {state.kind === "error" ? (
         <p className="text-caption text-destructive">
           预览失败（文件可能损坏或格式异常）
+        </p>
+      ) : null}
+      {state.kind === "oversize" ? (
+        <p className="text-caption text-muted-foreground">
+          文件较大（超过 {Math.round(MAX_PREVIEW_BYTES / 1024 / 1024)}MB），
+          请下载后查看
         </p>
       ) : null}
       {state.kind === "ready" ? (

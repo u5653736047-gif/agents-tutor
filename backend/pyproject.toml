@@ -25,9 +25,10 @@ embedding = [
     "fastembed>=0.8.0",
 ]
 # PDF 表格结构化提取可选依赖组（S5-B1/B2）：附件链路与入库链路的
-# PDF 表格转 Markdown。pdfplumber：纯 Python（pdfminer.six 系）、
-# Windows pip 可装、无原生依赖；未安装时 API_PDF_TABLE_MODE=auto
-# 自动回退 pypdf 纯文本，行为与现状逐项一致。
+# PDF 表格转 Markdown。pdfplumber：pdfminer.six 系、Windows pip 可装；
+# 依赖 pypdfium2 的预编译 wheel（覆盖主流平台，冷门平台部署前需自行
+# 确认可用性）。未安装时 API_PDF_TABLE_MODE=auto 自动回退 pypdf 纯文本，
+# 行为与现状逐项一致。
 pdf-table = [
     "pdfplumber>=0.11",
 ]

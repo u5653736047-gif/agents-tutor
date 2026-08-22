@@ -99,3 +99,10 @@ test("parseDocxToHtml rejects non-docx payloads (error state semantics)", async 
     () => previewModule.parseDocxToHtml(new Blob([new Uint8Array([1, 2, 3])])),
   );
 });
+
+test("MAX_PREVIEW_BYTES guard contract", async () => {
+  const { MAX_PREVIEW_BYTES } = await import(previewModuleUrl);
+
+  // 20MB 护栏：廉价防御而非常规路径（生成文件通常远小于该值）。
+  assert.equal(MAX_PREVIEW_BYTES, 20 * 1024 * 1024);
+});

@@ -31,7 +31,11 @@ from pypdf import PdfReader
 from api.files import _is_safe_segment, _sanitize_user_key, _uploads_root
 from api.schemas import Attachment
 from core.ocr import OcrProvider
-from core.pdf_table import PdfTableExtractor, open_pdf_table_extractor
+from core.pdf_table import (
+    PdfTableExtractor,
+    open_pdf_table_extractor,
+    resolve_pdf_table_mode,
+)
 from core.vision import VisionProvider
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,10 +49,6 @@ DEFAULT_ATTACHMENTS_TOTAL_MAX_CHARS = 100000
 DEFAULT_MAX_ATTACHMENTS = 10
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
-_OCR_UNAVAILABLE_HINT = (
-    "当前部署未启用图片识别，请上传 txt/pdf 或让管理员启用 OCR"
-    "（uv sync --extra ocr）"
-)
 _VISION_UNAVAILABLE_HINT = (
     "当前部署未启用图片理解，且图片中未识别出文本；"
     "如需图片内容分析请联系管理员配置视觉端点"
@@ -95,16 +95,12 @@ def _resolve_attachment_path(file_id: str, user_id: str | None) -> Path | None:
 def _pdf_table_mode() -> str:
     """PDF 表格提取模式（env API_PDF_TABLE_MODE，auto|off）。
 
-    在进入单附件提取的宽容 try 之前调用并校验：配置拼写错误要暴露
-    （ValueError 直接上抛），不能被吞成「附件内容提取失败」。
+    校验逻辑单一来源在 core 层（resolve_pdf_table_mode）；app.py
+    lifespan 启动期预检同一函数，配置拼写错误在部署时暴露而非首个
+    带附件请求。此处仍保持在宽容 try 之外调用：即使启动预检被绕过
+    （如直接调 compose 的测试），请求期也会暴露而非静默吞错。
     """
-    raw = os.getenv("API_PDF_TABLE_MODE")
-    if raw is None or not raw.strip():
-        return "auto"
-    value = raw.strip()
-    if value not in {"auto", "off"}:
-        raise ValueError("API_PDF_TABLE_MODE 只支持 auto 或 off")
-    return value
+    return resolve_pdf_table_mode()
 
 
 def _extract_image_text(

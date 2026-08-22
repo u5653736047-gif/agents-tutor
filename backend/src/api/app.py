@@ -60,6 +60,7 @@ from core.learning import LearningRecordStore
 from core.models import DeepSeekSettings, create_deepseek_model
 from core.nodes.react_agent import ChatModel
 from core.ocr import OcrProvider, create_ocr_provider
+from core.pdf_table import resolve_pdf_table_mode
 from core.persistence import open_sqlite_checkpointer
 from core.sessions import SessionStore
 from core.state import AgentRole
@@ -572,6 +573,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     vision_provider = create_vision_provider(
         os.getenv("API_VISION_MODE", "auto")
     )
+    # S5-B1：PDF 表格模式启动期预检（与 API_VISION_MODE 同一口径——
+    # 配置拼写错误在部署时暴露，而不是首个带附件请求才失败）。
+    resolve_pdf_table_mode()
     # officecli 集成（计划 3.5）：默认禁用（ENABLED=0 时完全不注册工具、
     # 不做任何二进制探测，保证无 officecli 的 CI/评委环境不受影响）；
     # 显式开启时解析二进制并启动自检，失败 fail-fast。

@@ -69,11 +69,13 @@ def iter_pdf_pages(
     # S5-B2：表格结构化提取（可选增强）。API_PDF_TABLE_MODE=off 或
     # 未装 pdfplumber 时 extractor 为 None → 行为与现状逐项一致；
     # 模式值非法在此处直接抛 ValueError（离线脚本场景配置错误要暴露）。
-    from ..pdf_table import open_pdf_table_extractor
+    from ..pdf_table import open_pdf_table_extractor, resolve_pdf_table_mode
 
     source = Path(path)
     public_source = _public_source(source, source_label)
-    table_mode = os.getenv("API_PDF_TABLE_MODE", "auto").strip() or "auto"
+    # 校验单一来源：与 api 层同一 resolve（非法值 ValueError 在离线
+    # 脚本场景直接暴露）。
+    table_mode = resolve_pdf_table_mode()
     extractor = open_pdf_table_extractor(source, mode=table_mode)
     try:
         try:
