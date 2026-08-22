@@ -1347,6 +1347,31 @@ class CollaborativeAgentGraph:
                 else message
                 for message in cast(list[BaseMessage], updates.get("messages", []))
             ]
+            # ── S5-A1：intent 提前求值 + UNCLEAR 违约的簿记作废标志 ──
+            # 为什么在这里解析：审批暂停早退分支（下方）位于原 intent 解析
+            # 位置之前，而它的计划簿记写回同样必须服从 UNCLEAR 拦截语义。
+            # _intent_from_results 是只读纯函数，前移安全；INTENT_DETECTED
+            # 事件与 state["intent"] 写入仍留在原位，语义零漂移。
+            #
+            # 作废条件（三者同时成立才 void 本轮簿记）：
+            # 1. 模型自报 UNCLEAR——违背「不明即只追问」约定；
+            # 2. Supervisor 轮（tool 模式计划只存在于 Supervisor）；
+            # 3. 计划为本轮新建（身份比较）：审批恢复轮从 checkpoint 重建的
+            #    存量计划是系统此前认可的进度，void 会制造新的账实分离；
+            #    该场景下二次分派已被置空 new_plan 拦截，簿记保留。
+            # 不要求「确有分派尝试」：UNCLEAR 下新建计划本身就是违约。
+            # tool 模式下该条件与拦截命中（new_plan 非空）等价：handoff
+            # 工具未注册使 target 恒为 None，而门控拒绝使恢复轮新建的
+            # 计划不会替换 holder 执行对象。
+            intent = _intent_from_results(
+                cast(list[ToolResult], updates.get("tool_results", []))
+            )
+            void_plan_bookkeeping = (
+                intent is Intent.UNCLEAR
+                and agent.role is AgentRole.SUPERVISOR
+                and executed_plan is not None
+                and executed_plan is not initial_tool_execution
+            )
             if updates.get("pending_tool_approval") is not None:
                 # The AI tool-call message is now checkpointed.  Route to a
                 # separate interrupt node before any terminal-answer or handoff
@@ -1366,13 +1391,16 @@ class CollaborativeAgentGraph:
                 # 写回条件不依赖 dirty：「本轮新建了计划但尚未执行任何
                 # 步骤即暂停」时 dirty 为 False，但计划本身必须入库，
                 # 否则恢复后门控与记账静默失效（验收发现的边界缺口）。
+                # 已知残余边角：intent 在轮末才从 tool_results 解析，此处
+                # UNCLEAR 拦截经上方前移的 void 标志覆盖本分支：
+                # 「违约建计划后立即调 shell 暂停」的簿记同样不入库。
                 plan_created_this_round = (
                     executed_plan is not None
                     and executed_plan is not initial_tool_execution
                 )
                 if executed_plan is not None and (
                     executed_plan.dirty or plan_created_this_round
-                ):
+                ) and not void_plan_bookkeeping:
                     updates["task_plan"] = executed_plan.plan
                     updates["task_results"] = executed_plan.results
                     approval_events = cast(
@@ -1472,7 +1500,12 @@ class CollaborativeAgentGraph:
             #   REACT_ITERATION_LIMIT 失败路径（fail 分支），不会无限循环；
             # - 兼容旧行为：不调用 detect_intent 的模型（如历史测试替身）拿到
             #   intent=None，不触发拦截，行为与 S2-T1 之前完全一致。
-            intent = _intent_from_results(tool_results)
+            # S5-A1：UNCLEAR 拦截的作废范围延伸到计划簿记——命中时轮末
+            # 写回跳过本轮新建计划的持久化（void 标志已在上方审批分支之前
+            # 统一计算），与 handoff 模式「拦截完全作废分派动作」语义对齐；
+            # 否则已执行步骤的簿记照常入库，UI 会展示本该被拦截的计划。
+            # 已执行的 ask_* 子代理事件仍经 traces 留在审计流中：执行事实
+            # 不可撤销，作废的是计划语义而非运行记录。
             if (
                 intent is Intent.UNCLEAR
                 and agent.role is AgentRole.SUPERVISOR
@@ -1622,7 +1655,16 @@ class CollaborativeAgentGraph:
                     agent.role.value,
                     content=str(len(new_plan.steps)),
                 )
-            if executed_plan is not None and executed_plan.dirty:
+            if (
+                executed_plan is not None
+                and executed_plan.dirty
+                and not void_plan_bookkeeping
+            ):
+                # 被 UNCLEAR 拦截作废的本轮计划整块跳过写回：计划与步骤结果
+                # 都不入库，下一用户轮由 _new_run_state 自然清空；已执行的
+                # ask_* 子代理事件仍经 traces 留在审计流中（执行事实不可撤销，
+                # 作废的是计划语义而非运行记录）。此时 TASK_PLAN_CREATED 因
+                # new_plan 被置空同样不发，事件流保持自洽（无创建即无归档）。
                 updates["task_plan"] = executed_plan.plan
                 updates["task_results"] = executed_plan.results
                 plan = executed_plan.plan

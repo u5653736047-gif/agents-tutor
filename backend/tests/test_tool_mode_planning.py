@@ -182,6 +182,55 @@ def test_tool_mode_gate_rejects_out_of_order_ask_then_recovers() -> None:
     assert [item.success for item in results] == [True, True]
 
 
+def test_unclear_intent_voids_same_round_plan_and_steps() -> None:
+    """审查 🟡 回归：自报 UNCLEAR 却建计划并执行步骤 → 全部作废。
+
+    与 handoff 模式「拦截完全作废分派动作」语义对齐：计划不入库、
+    步骤结果不入库、TASK_PLAN_CREATED/TASK_RESULT_ARCHIVED 均不发
+    （无创建即无归档，事件流自洽），UI 不展示被拦截的计划。
+    """
+    model = ScriptedModel(
+        [
+            # 违约序列：自报 UNCLEAR 后仍建计划并执行一步。
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "detect_intent",
+                        "args": {"intent": "unclear", "reason": "不确定"},
+                        "id": "intent-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            ask_response("ask_learning_assistant", "讲解"),
+            AIMessage(content="学习助手讲解"),
+            AIMessage(content="抱歉，不确定你的问题，请补充说明。"),
+        ]
+    )
+    graph = CollaborativeAgentGraph(model=model, orchestration_mode="tool")
+
+    state = graph.run("随便什么", session_id="unclear-void")
+
+    # 计划与步骤结果均不入库（下一用户轮由 _new_run_state 清空）。
+    assert state.get("task_plan") is None
+    assert state.get("task_results") == []
+    # 事件流自洽：无创建、无归档、无聚合；ask_* 的执行事实仍留在审计流。
+    event_types = [event.event_type for event in state["events"]]
+    assert EventType.TASK_PLAN_CREATED not in event_types
+    assert EventType.TASK_RESULT_ARCHIVED not in event_types
+    assert EventType.TASK_RESULTS_AGGREGATED not in event_types
+    assert EventType.RUN_COMPLETED in event_types
+    # Supervisor 以澄清作答收口（拦截后不再有计划语义）。
+    assert state["messages"][-1].content == "抱歉，不确定你的问题，请补充说明。"
+
+
 def test_tool_mode_rejects_second_plan_while_active() -> None:
     """同轮重复创建被拒（一轮一计划），原计划继续可用。
 
@@ -634,6 +683,53 @@ def test_approval_pause_with_zero_progress_still_persists_plan(tmp_path: Path) -
     assert plan.current_step_index == 0
     event_types = [event.event_type for event in paused["events"]]
     assert EventType.TASK_PLAN_CREATED in event_types
+
+
+def test_unclear_void_survives_approval_pause(tmp_path: Path) -> None:
+    """验收建议：UNCLEAR 违约建计划后立即 shell 暂停，簿记同样不入库。
+
+    审批早退写回受同一 void 标志约束：暂停时（intent 已前移解析）
+    即判定违约，计划与创建事件都不入库。
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "detect_intent",
+                        "args": {"intent": "unclear", "reason": "不确定"},
+                        "id": "intent-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            create_plan_response(
+                [
+                    plan_step(1, "learning_assistant", "讲解"),
+                    plan_step(2, "teaching_assistant", "出题"),
+                ]
+            ),
+            # 未执行任何 ask_* 直接调 shell → 触发审批暂停。
+            shell_response(),
+        ]
+    )
+    graph = CollaborativeAgentGraph(
+        model=model,
+        tools=[create_shell_tool(WorkspaceFileSystem(workspace))],
+        tool_permissions={"shell": {AgentRole.SUPERVISOR}},
+        checkpointer=InMemorySaver(),
+        orchestration_mode="tool",
+    )
+
+    paused = graph.run("查资料", session_id="unclear-pause", workspace_root=str(workspace))
+
+    assert paused["pending_tool_approval"] is not None
+    assert paused.get("task_plan") is None
+    event_types = [event.event_type for event in paused["events"]]
+    assert EventType.TASK_PLAN_CREATED not in event_types
 
 
 def test_tool_mode_active_plan_does_not_dispatch_workers() -> None:
