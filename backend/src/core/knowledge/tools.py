@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
@@ -10,6 +11,15 @@ from pydantic import BaseModel, Field, field_validator
 from .policy import RetrievalPolicy
 from .retrieval import QueryRefiner
 from .service import KnowledgeService
+
+# S5-C1 决策 4：会话绑定的知识空间（模型不可见不可控——工具参数面不
+# 暴露空间，防跨空间伪造检索）。由 graph_builder._wrap 按 learning_scope
+# 先例从 AgentState.extra["knowledge_namespace"] 注入；None = 未绑定，
+# 检索层按「单路 public 过滤」处理（见 service.search 的 namespace 语义）。
+knowledge_scope: ContextVar[str | None] = ContextVar(
+    "knowledge_scope",
+    default=None,
+)
 
 
 class _SearchKnowledgeInput(BaseModel):
@@ -126,11 +136,15 @@ def create_search_knowledge_tool(
         # P0-3（pi 审查 🔴2）：过滤参数组装后在两个分支同步透传——
         # service 层会在其上叠加默认 frontmatter 抑制（_apply_suppression）。
         metadata_filter = _metadata_filter_from_input(source, difficulty)
+        # S5-C1 决策 4：空间由 scope 注入而非模型参数（模型不可见不可控）。
+        namespace = knowledge_scope.get()
         if not adaptive_enabled:
             # 未启用自适应：原路径原样保留（零回归，见上方注释）——
             # 输出不含 metadata 键，旧消费者（引用收集、评价证据、
             # 事件转换）全部无感。
-            hits = service.search(query, top_k, metadata_filter=metadata_filter)
+            hits = service.search(
+                query, top_k, metadata_filter=metadata_filter, namespace=namespace
+            )
             if not hits:
                 return {
                     "found": False,
@@ -158,6 +172,7 @@ def create_search_knowledge_tool(
             policy=policy,
             relevance_threshold=relevance_threshold,
             refiner=refiner,
+            namespace=namespace,
         )
         meta = result.metadata
         # metadata 字段语义（面向初学者）：

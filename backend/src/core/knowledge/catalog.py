@@ -25,11 +25,22 @@ import sqlite3
 import threading
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
 from .models import _validate_logical_source
+
+
+class NamespaceInfo(BaseModel):
+    """一个知识空间的聚合信息（只读）。
+
+    - namespace：空间标识（"public" 为保留值，见计划 C1 决策 1）；
+    - document_count：该空间内的文档数（按 document_id 去重）。
+    """
+
+    namespace: str
+    document_count: int
 
 
 class KnowledgeDocumentInfo(BaseModel):
@@ -61,6 +72,37 @@ class KnowledgeDocumentInfo(BaseModel):
         self.source = _validate_logical_source(self.source)
 
 
+class KnowledgeTreeSection(BaseModel):
+    """知识树小节节点：section 编号 + 该节 chunk 数与概念标签汇总。"""
+
+    section: str
+    chunk_count: int = 0
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeTreeChapter(BaseModel):
+    """知识树章节点：chapter 标识 + 小节列表与自身 chunk 计数。
+
+    chunk_count 含直接挂在章上（无 section 归属）的 chunk。
+    """
+
+    chapter: str
+    chunk_count: int = 0
+    sections: list[KnowledgeTreeSection] = Field(default_factory=list)
+
+
+class KnowledgeDocumentTree(BaseModel):
+    """文档结构树响应（S5-C2）：tree=有章节层级；flat=无结构按页平铺。
+
+    判别字段 kind 决定 chapters 与 flat_pages 哪个字段有效。
+    """
+
+    kind: Literal["tree", "flat"]
+    document_id: str
+    chapters: list[KnowledgeTreeChapter] = Field(default_factory=list)
+    flat_pages: list[int] = Field(default_factory=list)
+
+
 class KnowledgeBaseStats(BaseModel):
     """知识库语料统计（教师端总览卡数据源）。
 
@@ -82,13 +124,37 @@ class KnowledgeCatalog(Protocol):
     向量库）或换实现（如接 manifest 元数据）不需要改调用方。
     """
 
+    def list_namespaces(self) -> list[NamespaceInfo]:
+        """聚合全部知识空间及各空间的文档数（按 namespace 排序稳定）。"""
+        ...
+
     def list_documents(self) -> list[KnowledgeDocumentInfo]:
         """返回全部文档的元数据清单（顺序稳定：按 document_id）。"""
+        ...
+
+    def document_tree(self, document_id: str) -> KnowledgeDocumentTree:
+        """聚合单篇文档的章节层级树（无结构文档回退按页平铺）。"""
         ...
 
     def document_stats(self) -> KnowledgeBaseStats:
         """返回语料统计（文档数 / 分块数 / 页数 / frontmatter 分块数）。"""
         ...
+
+
+class _TreeBucket:
+    """树聚合中间态：一个挂载点（章或节）的 chunk 计数与标签去重列表。"""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.tags: list[str] = []
+
+    def add(self, tags: object) -> None:
+        self.count += 1
+        if not isinstance(tags, list):
+            return
+        for tag in tags:
+            if isinstance(tag, str) and tag not in self.tags:
+                self.tags.append(tag)
 
 
 class SqliteKnowledgeCatalog:
@@ -124,17 +190,126 @@ class SqliteKnowledgeCatalog:
             ).fetchone()
         return bool(row and row[0] == 2)
 
+    def list_namespaces(self) -> list[NamespaceInfo]:
+        """聚合全部知识空间及各空间的文档数（按 namespace 排序稳定）。
+
+        数据源与 list_documents 相同（chunks 表 metadata_json 的
+        namespace 键；C1 决策 3 的回填迁移保证存量行均有该键）。
+        空库返回空列表。
+        """
+        if not self._tables_exist:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT COALESCE(json_extract(metadata_json, '$.namespace'), 'public') "
+                "AS namespace, COUNT(DISTINCT document_id) "
+                "FROM chunks GROUP BY namespace ORDER BY namespace"
+            ).fetchall()
+        return [
+            NamespaceInfo(namespace=namespace, document_count=int(count))
+            for namespace, count in rows
+        ]
+
+    def document_tree(self, document_id: str) -> KnowledgeDocumentTree:
+        """聚合单篇文档的章→节两级树；无章节时回退按页平铺（S5-C2）。
+
+        数据源为 chunks.metadata_json 的 chapter/section/tags 键
+        （chunking.py 标题行规则提取）。判定规则：任一 chunk 带 chapter
+        或 section 即按树形态聚合；否则回退 flat 页列表。文档不存在或
+        无 chunk 时返回空树（kind="flat"、flat_pages 为空——调用方据此
+        渲染「无内容」占位而非报错）。
+        """
+        if not self._tables_exist:
+            return KnowledgeDocumentTree(
+                kind="flat", document_id=document_id, flat_pages=[]
+            )
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT page, metadata_json FROM chunks "
+                "WHERE document_id = ? ORDER BY chunk_id",
+                (document_id,),
+            ).fetchall()
+
+        chapters: dict[str, dict[str, _TreeBucket]] = {}
+        chapter_order: list[str] = []
+        section_order: dict[str, list[str]] = {}
+        pages_without_structure: list[int] = []
+        has_structure = False
+        for page, metadata_json in rows:
+            meta = json.loads(metadata_json) if metadata_json else {}
+            chapter = meta.get("chapter")
+            section = meta.get("section")
+            if (isinstance(chapter, str) and chapter.strip()) or (
+                isinstance(section, str) and section.strip()
+            ):
+                has_structure = True
+            else:
+                # txt 上传件无页概念（page=None）：不进 flat 页列表，
+                # 该文档回退为空 flat 形态（前端渲染无内容占位）。
+                if page is not None:
+                    pages_without_structure.append(int(page))
+                continue
+            ch_key = chapter.strip() if isinstance(chapter, str) else ""
+            sec_key = section.strip() if isinstance(section, str) else ""
+            if ch_key not in chapters:
+                chapters[ch_key] = {}
+                chapter_order.append(ch_key)
+                section_order[ch_key] = []
+            if sec_key and sec_key not in section_order[ch_key]:
+                section_order[ch_key].append(sec_key)
+            mount_key = sec_key if sec_key else "_direct"
+            chapters[ch_key].setdefault(mount_key, _TreeBucket()).add(
+                meta.get("tags")
+            )
+
+        # 无任何结构标记 → 按页平铺回退（去重升序）。
+        if not has_structure:
+            return KnowledgeDocumentTree(
+                kind="flat",
+                document_id=document_id,
+                flat_pages=sorted(set(pages_without_structure)),
+            )
+
+        tree_chapters: list[KnowledgeTreeChapter] = []
+        for ch_key in chapter_order:
+            bucket = chapters[ch_key]
+            direct = bucket.get("_direct", _TreeBucket())
+            chapter_count = direct.count
+            sections: list[KnowledgeTreeSection] = []
+            for sec_key in section_order[ch_key]:
+                entry = bucket[sec_key]
+                chapter_count += entry.count
+                sections.append(
+                    KnowledgeTreeSection(
+                        section=sec_key,
+                        chunk_count=entry.count,
+                        tags=entry.tags,
+                    )
+                )
+            tree_chapters.append(
+                KnowledgeTreeChapter(
+                    chapter=ch_key if ch_key else "未分章",
+                    chunk_count=chapter_count,
+                    sections=sections,
+                )
+            )
+        return KnowledgeDocumentTree(
+            kind="tree",
+            document_id=document_id,
+            chapters=tree_chapters,
+        )
+
     def list_documents(self) -> list[KnowledgeDocumentInfo]:
         """聚合全部文档元数据，按 document_id 排序（顺序稳定）。"""
         if not self._tables_exist:
             return []
         with self._lock:
             chunk_rows = self._conn.execute(
-                "SELECT source, COUNT(*), COUNT(DISTINCT page), "
+                "SELECT document_id, MIN(source), COUNT(*), COUNT(DISTINCT page), "
                 "SUM(CASE WHEN json_extract(metadata_json, '$.chunk_class') = "
                 "'frontmatter' THEN 1 ELSE 0 END), "
                 "MIN(metadata_json) "
-                "FROM chunks GROUP BY source ORDER BY source"
+                "FROM chunks GROUP BY document_id ORDER BY document_id"
             ).fetchall()
             mark_rows = {
                 document_id: completed_at
@@ -144,6 +319,7 @@ class SqliteKnowledgeCatalog:
             }
         documents: list[KnowledgeDocumentInfo] = []
         for (
+            document_id,
             source,
             chunk_count,
             page_count,
@@ -156,14 +332,17 @@ class SqliteKnowledgeCatalog:
             difficulty = metadata.get("difficulty")
             documents.append(
                 KnowledgeDocumentInfo(
-                    document_id=source,
+                    document_id=document_id,
+                    # source 展示值取 MIN(source)：脚本书目两者相等零变化；
+                    # 非 public 上传（source=文件名、document_id 带前缀）
+                    # 不再与同名其他空间条目错误合并。
                     source=source,
                     title=str(title) if title is not None else None,
                     page_count=int(page_count) if page_count else None,
                     chunk_count=int(chunk_count),
                     subjects=_split_subjects(subject),
                     difficulty=str(difficulty) if difficulty is not None else None,
-                    ingested_at=mark_rows.get(source),
+                    ingested_at=mark_rows.get(document_id),
                 )
             )
         return documents
@@ -233,6 +412,7 @@ __all__ = [
     "KnowledgeBaseStats",
     "KnowledgeCatalog",
     "KnowledgeDocumentInfo",
+    "NamespaceInfo",
     "SqliteKnowledgeCatalog",
     "merge_uploaded_catalog",
 ]

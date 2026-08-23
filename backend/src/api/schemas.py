@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
@@ -119,6 +120,9 @@ class Session(ContractModel):
     workspace_root: str
     additional_workspace_roots: list[str] = Field(default_factory=list)
     workspace_access: WorkspaceAccess = WorkspaceAccess.READ_ONLY
+    # S5-C1 决策 2：会话绑定的知识空间；None = 未绑定（检索按单路
+    # public 过滤处理）。
+    knowledge_namespace: str | None = None
 
 
 class CreateSessionRequest(ContractModel):
@@ -126,6 +130,10 @@ class CreateSessionRequest(ContractModel):
 
     session_id: str | None = None
     workspace_root: str | None = None
+    # S5-C1 决策 1/2：会话绑定的知识空间（可选；小写标识规则同 manifest
+    # 的 source 标识——小写字母开头，只含小写字母/数字/连字符）。None =
+    # 未绑定（检索按单路 public 过滤处理）。
+    knowledge_namespace: str | None = None
 
     @field_validator("workspace_root")
     @classmethod
@@ -133,6 +141,22 @@ class CreateSessionRequest(ContractModel):
         if value is not None and not value.strip():
             raise ValueError("workspace_root must not be blank")
         return value
+
+    @field_validator("knowledge_namespace")
+    @classmethod
+    def validate_knowledge_namespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", stripped):
+            raise ValueError(
+                "knowledge_namespace must start with a lowercase letter and "
+                "contain only lowercase letters or digits, with single inner "
+                "hyphens (no leading/trailing or consecutive hyphens)"
+            )
+        return stripped
 
 
 class AddWorkspaceRootRequest(ContractModel):
@@ -509,6 +533,8 @@ class KnowledgeDocumentUploadResponse(ContractModel):
     source: str
     page_count: int | None = None
     chunk_count: int | None = None
+    # S5-C3 上传语义补齐:true=本次上传替换了同名旧文档(false=首次新建)。
+    replaced: bool = False
 
 
 class KnowledgeDocumentListResponse(ContractModel):
@@ -533,6 +559,49 @@ class KnowledgeDocumentInfoDto(ContractModel):
     subjects: list[str] = Field(default_factory=list)
     difficulty: str | None = None
     ingested_at: str | None = None
+
+
+class NamespaceUsageDto(ContractModel):
+    """一个知识空间的聚合信息（S5-C1 决策 6，只读）。"""
+
+    namespace: str
+    document_count: int
+
+
+class KnowledgeTreeSectionDto(ContractModel):
+    """知识树小节节点（S5-C2）。"""
+
+    section: str
+    chunk_count: int = 0
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeTreeChapterDto(ContractModel):
+    """知识树章节点（S5-C2）：含章直属 chunk 与小节列表。"""
+
+    chapter: str
+    chunk_count: int = 0
+    sections: list[KnowledgeTreeSectionDto] = Field(default_factory=list)
+
+
+class KnowledgeDocumentTreeResponse(ContractModel):
+    """文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。
+
+    - kind="tree"：chapters 有效（教材类有标题行结构）；
+    - kind="flat"：flat_pages 有效（无结构文档按页平铺；空列表 =
+      文档不存在或无内容）。
+    """
+
+    kind: Literal["tree", "flat"]
+    document_id: str
+    chapters: list[KnowledgeTreeChapterDto] = Field(default_factory=list)
+    flat_pages: list[int] = Field(default_factory=list)
+
+
+class NamespaceListResponse(ContractModel):
+    """知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。"""
+
+    namespaces: list[NamespaceUsageDto] = Field(default_factory=list)
 
 
 class KnowledgeBaseStatsDto(ContractModel):
@@ -767,6 +836,9 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     KnowledgeDocumentListResponse,
     KnowledgeDocumentInfoDto,
     KnowledgeBaseStatsDto,
+    KnowledgeTreeChapterDto,
+    KnowledgeTreeSectionDto,
+    KnowledgeDocumentTreeResponse,
     KnowledgeOverviewResponse,
     ChunkDetailResponse,
     ChunkListEntry,

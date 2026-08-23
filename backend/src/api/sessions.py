@@ -83,6 +83,7 @@ def _session_response(record: SessionRecord) -> Session:
         title=record.title,
         workspace_root=record.workspace_root,
         additional_workspace_roots=list(record.additional_workspace_roots),
+        knowledge_namespace=record.knowledge_namespace,
     )
 
 
@@ -231,6 +232,9 @@ def create_session(
         )
     session_store = _session_store(request)
     requested_workspace = payload.workspace_root if payload is not None else None
+    requested_namespace = (
+        payload.knowledge_namespace if payload is not None else None
+    )
     try:
         workspace_root = session_store.resolve_workspace_root(requested_workspace)
     except ValueError:
@@ -244,8 +248,11 @@ def create_session(
             session_id,
             user_id=user_id,
             workspace_root=workspace_root,
+            knowledge_namespace=requested_namespace,
         )
     except ValueError:
+        # 会话重复用 409 表达（namespace 格式错误由请求模型的 pydantic
+        # 校验在更早处拦截，不会到达 store 层）。
         _raise_error(
             status.HTTP_409_CONFLICT,
             ApiErrorCode.SESSION_ALREADY_EXISTS,

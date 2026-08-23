@@ -704,3 +704,103 @@ def test_session_response_carries_nullable_title(tmp_path: Path) -> None:
     assert created.json()["updated_at"] == created.json()["created_at"]
     assert created.json()["title"] is None
     assert [session["title"] for session in listed.json()] == ["什么是注意力机制"]
+
+
+# ── S5-C1 知识空间绑定 ─────────────────────────────────────────────
+
+
+def test_session_create_round_trips_knowledge_namespace(tmp_path: Path) -> None:
+    """创建会话携带 knowledge_namespace → 响应、清单与存储往返该值。"""
+    app, store = _session_app(tmp_path)
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/sessions",
+                headers=headers,
+                json={"session_id": "s-ns", "knowledge_namespace": "course-a"},
+            )
+        )
+        listed = asyncio.run(_request(app, "GET", "/sessions", headers=headers))
+        record = store.get_session("s-ns", user_id="user-1")
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert created.json()["knowledge_namespace"] == "course-a"
+    assert listed.status_code == 200
+    assert listed.json()[0]["knowledge_namespace"] == "course-a"
+    assert record is not None
+    assert record.knowledge_namespace == "course-a"
+
+
+def test_session_create_rejects_invalid_knowledge_namespace(tmp_path: Path) -> None:
+    """非法空间标识（大写/空格/连字符边界）→ 422 invalid_request。
+
+    规则对齐 manifest 的 source 标识（ingest_books._SOURCE_PATTERN）：
+    小写字母开头，只含小写字母/数字，连字符只能单根内嵌——首尾或
+    连续连字符均拒绝。
+    """
+    app, store = _session_app(tmp_path)
+    headers = {"X-User-Id": "user-1"}
+    try:
+        for bad_namespace in ("Course A", "course-", "-course", "a--b"):
+            response = asyncio.run(
+                _request(
+                    app,
+                    "POST",
+                    "/sessions",
+                    headers=headers,
+                    json={"session_id": "s-bad", "knowledge_namespace": bad_namespace},
+                )
+            )
+            assert response.status_code == 422, bad_namespace
+            body = response.json()
+            assert body["detail"]["error_code"] == "invalid_request", bad_namespace
+    finally:
+        store.close()
+
+
+def test_session_create_accepts_single_inner_hyphen_namespace(
+    tmp_path: Path,
+) -> None:
+    """合法形态：单根内嵌连字符（course-a）通过；与 manifest 规则一致。"""
+    app, store = _session_app(tmp_path)
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/sessions",
+                headers=headers,
+                json={"session_id": "s-hyphen", "knowledge_namespace": "course-a"},
+            )
+        )
+        record = store.get_session("s-hyphen", user_id="user-1")
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert created.json()["knowledge_namespace"] == "course-a"
+    assert record is not None
+
+
+def test_session_create_defaults_to_unbound_namespace(tmp_path: Path) -> None:
+    """缺省创建 → knowledge_namespace 为 None（未绑定，检索走单路 public）。"""
+    app, store = _session_app(tmp_path)
+    headers = {"X-User-Id": "user-1"}
+    try:
+        created = asyncio.run(
+            _request(app, "POST", "/sessions", headers=headers, json={"session_id": "s-def"})
+        )
+        record = store.get_session("s-def", user_id="user-1")
+    finally:
+        store.close()
+
+    assert created.status_code == 201
+    assert created.json()["knowledge_namespace"] is None
+    assert record is not None
+    assert record.knowledge_namespace is None

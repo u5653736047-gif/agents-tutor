@@ -56,6 +56,7 @@ import math
 import sqlite3
 import struct
 import threading
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -65,6 +66,11 @@ from .models import Citation, KnowledgeChunk, SearchHit
 
 # H-T2：直接复用 index.py 的校验与匹配函数（含「!」排除语义，见
 # index.py 模块顶部契约注释的否定/排除语义段），不另写一份过滤逻辑。
+
+# S5-C1 决策 5：查询向量 LRU 缓存容量——命名空间合并检索会对同一
+# query 文本连续检索两腿（本空间 + public），无缓存则 embedding 双倍
+# 计算；容量覆盖改写变体场景（多变体 × 两腿），内存可忽略。
+_QUERY_VECTOR_CACHE_SIZE = 16
 
 
 def _normalize(vector: list[float]) -> list[float]:
@@ -178,6 +184,20 @@ class InMemoryVectorKnowledgeIndex:
         self._provider = provider
         self._chunks: dict[str, KnowledgeChunk] = {}
         self._vectors: dict[str, list[float]] = {}
+        # 查询向量缓存（见 _QUERY_VECTOR_CACHE_SIZE 注释）；单线程使用。
+        self._query_vector_cache: OrderedDict[str, list[float]] = OrderedDict()
+
+    def _query_vector(self, query: str) -> list[float]:
+        """归一化查询向量（带 LRU 缓存，命名空间两腿检索复用一次 embedding）。"""
+        cached = self._query_vector_cache.get(query)
+        if cached is not None:
+            self._query_vector_cache.move_to_end(query)
+            return cached
+        vector = _normalize(self._provider.embed([query])[0])
+        self._query_vector_cache[query] = vector
+        while len(self._query_vector_cache) > _QUERY_VECTOR_CACHE_SIZE:
+            self._query_vector_cache.popitem(last=False)
+        return vector
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
         """插入分块：批量 embed + 归一化后入内存，同 chunk_id 覆盖。"""
@@ -218,7 +238,7 @@ class InMemoryVectorKnowledgeIndex:
         """向量检索：query 归一化后与全部分块做余弦排序（含过滤）。"""
         if not query.strip() or top_k <= 0:
             return []
-        query_vector = _normalize(self._provider.embed([query])[0])
+        query_vector = self._query_vector(query)
         return _rank_hits(
             self._chunks,
             self._vectors,
@@ -260,6 +280,9 @@ class SqliteVectorKnowledgeIndex:
         self._provider = provider
         self._chunks: dict[str, KnowledgeChunk] = {}
         self._vectors: dict[str, list[float]] = {}
+        # 查询向量 LRU 缓存（见 _QUERY_VECTOR_CACHE_SIZE 注释）；缓存读改
+        # 写与内存矩阵同一把锁（线程安全约定见上方构造注释）。
+        self._query_vector_cache: OrderedDict[str, list[float]] = OrderedDict()
         try:
             # 建表与加载同属初始化阶段，统一纳入 try：任一失败都在
             # 下面关闭连接再重抛（防御不对称——建表失败同样会泄漏
@@ -290,6 +313,13 @@ class SqliteVectorKnowledgeIndex:
                     vector BLOB NOT NULL
                 )
                 """
+            )
+            # S5-C1 决策 3（主层）：存量行幂等回填 namespace="public"
+            # （与词法库同一迁移，两库 metadata 保持同源一致）。
+            self._conn.execute(
+                "UPDATE chunk_vectors SET metadata_json = "
+                "json_set(metadata_json, '$.namespace', 'public') "
+                "WHERE json_extract(metadata_json, '$.namespace') IS NULL"
             )
             self._conn.commit()
 
@@ -340,6 +370,23 @@ class SqliteVectorKnowledgeIndex:
                     metadata=json.loads(metadata_json),
                 )
                 self._vectors[chunk_id] = vector
+
+    def _query_vector(self, query: str) -> list[float]:
+        """归一化查询向量（带 LRU 缓存）：命名空间两腿检索复用同一次
+        embedding（计划 C1 决策 5）。与 InMemory 版语义一致，差异仅在
+        缓存读改写与共享状态同一把锁（本类线程安全约定）。
+        """
+        with self._lock:
+            cached = self._query_vector_cache.get(query)
+            if cached is not None:
+                self._query_vector_cache.move_to_end(query)
+                return cached
+        vector = _normalize(self._provider.embed([query])[0])
+        with self._lock:
+            self._query_vector_cache[query] = vector
+            while len(self._query_vector_cache) > _QUERY_VECTOR_CACHE_SIZE:
+                self._query_vector_cache.popitem(last=False)
+        return vector
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
         """插入分块：批量 embed → 归一化 → 写 BLOB 并同步内存，同 ID 覆盖。"""
@@ -408,7 +455,7 @@ class SqliteVectorKnowledgeIndex:
         """向量检索：与 InMemory 版共用同一套打分流程（内存矩阵）。"""
         if not query.strip() or top_k <= 0:
             return []
-        query_vector = _normalize(self._provider.embed([query])[0])
+        query_vector = self._query_vector(query)
         # 锁内浅拷贝内存矩阵快照后立即释放锁，打分在锁外：既防止并发
         # upsert/delete 修改字典导致迭代崩溃/读到半更新状态，又不持锁
         # 做全库打分循环（1.5 万条浅拷贝仅毫秒级，打分才是大头）。

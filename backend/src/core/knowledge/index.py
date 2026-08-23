@@ -3,18 +3,120 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class IngestMark:
+    """ingest_marks 行的只读快照（版本管理比对用）。"""
+
+    chunk_count: int
+    page_count: int
+    completed_at: str
+    content_hash: str | None = None
+    chunking: str | None = None
+from typing import Any, Protocol
 
 from .models import Citation, KnowledgeChunk, SearchHit
 
 _ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+")
 _CHINESE_RUN = re.compile(r"[\u4e00-\u9fff]+")
+
+# ── S5-C4：FTS5 候选预筛（词法路提速）───────────────────────────
+# 设计见 SqliteKnowledgeIndex._setup_fts 与模块级纯函数注释。核心不变量：
+# FTS 只圈定候选集合，打分/排序/平局规则仍在 Python 侧原样执行——候选集
+# 相对「打分 > 0」集合必须是超集（等价性的前提）。
+_LOGGER = logging.getLogger(__name__)
+_FTS_TERM_LIMIT = 64
+# S5-C4：候选数选择性路由阈值——MATCH 的 COUNT 探测成本远低于物化
+# 全部候选行；低选择性查询（候选占比过高，如含常见单字的中文查询）
+# 走全表扫描更便宜，路由后仅剩极小的 COUNT 开销。
+_FTS_CANDIDATE_LIMIT = 2000
+_CJK_RANGE = "\u4e00", "\u9fff"
+
+
+def _is_cjk(char: str) -> bool:
+    """单字符是否在 CJK 统一表意区（与 _CHINESE_RUN 同一范围）。"""
+    return _CJK_RANGE[0] <= char <= _CJK_RANGE[1]
+
+
+def _fts_transform(text: str) -> str:
+    """把文本变换为「CJK 逐字空格分隔、字母数字词保持原样」的副本。
+
+    为什么需要：FTS5 默认 unicode61 分词器把连续汉字并为单 token——
+    「机器学习」入索引是一个整体 token，查单字「器」永远匹配不到。
+    预变换后每个汉字都是独立 token，英文/数字词保持原样（unicode61 对
+    [A-Za-z0-9]+ 的切分与 _ENGLISH_WORD 一致），查询侧同一变换后即可
+    用短语精确对齐 bigram 的相邻语义（见 _fts_match_expression）。
+    入库侧与查询侧必须使用同一函数——两侧不一致即破坏等价性。
+    """
+    out: list[str] = []
+    for char in text:
+        if _is_cjk(char):
+            out.append(" ")
+            out.append(char)
+            out.append(" ")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _fts_escape_token(token: str) -> str:
+    """FTS5 字符串字面量转义：内部双引号加倍后整体加引号。
+
+    引号包裹的 token 内部不含空格时等价于裸 token，含 FTS 语法字符
+    （AND/OR/NOT/NEAR 等保留字、括号、运算符）时引号保证按字面处理。
+    """
+    escaped = token.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _fts_match_expression(terms: set[str]) -> str:
+    """从词项集合构造 OR 连接的 FTS5 MATCH 表达式。
+
+    词项分类（与 _lexical_terms 的产出规则对齐）：
+    - 单个 CJK 字 → 裸 token（预变换后每字独立）；
+    - 两个 CJK 字（bigram）→ 短语「c1 c2」（引号内空格分隔，精确对齐
+      相邻语义——非相邻不命中）；
+    - 英文/数字词 → 裸 token（小写已在 _lexical_terms 完成）。
+    返回 None 表示词项集为空（调用方应直接返回空结果）。
+    """
+    if not terms:
+        return ""
+    parts: list[str] = []
+    for term in sorted(terms):  # 排序仅为了表达式确定性（测试友好）
+        if len(term) == 2 and all(_is_cjk(char) for char in term):
+            # 双字词项 → 单引号串短语「c1 c2」：短语要求相邻，与 bigram
+            # 的相邻语义精确对齐（拆成两个引号 token 会变成隐式 AND，
+            # 非相邻也命中，破坏超集性质）。
+            parts.append(_fts_escape_token(f"{term[0]} {term[1]}"))
+        else:
+            parts.append(_fts_escape_token(term))
+    expression = " OR ".join(parts)
+    # 整体再包一层括号组：作为 AND 子条件与其他 WHERE 片段组合时不被
+    # 隐式 AND 抢结合性。
+    return f"({expression})" if len(parts) > 1 else expression
+
+
+def _fts5_supported(conn: sqlite3.Connection) -> bool:
+    """探测运行环境 SQLite 是否编译了 FTS5（极少见的缺失场景兜底用）。"""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp._fts5_probe USING fts5(x)")
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        try:
+            conn.execute("DROP TABLE IF EXISTS temp._fts5_probe")
+        except sqlite3.OperationalError:
+            pass
+    return True
 # metadata_filter 键名白名单：只允许简单标识符（同时防 SQL 注入——
 # 键名会拼进 json_each 的 JSON path，非法字符直接拒绝）。
 _METADATA_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -42,6 +144,14 @@ _METADATA_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # - 典型用法：检索侧默认抑制前言/目录类噪音 chunk——service 层自动
 #   合并 {"chunk_class": "!frontmatter"}（见 service.py 的
 #   suppress_frontmatter），词法/向量/混合三路语义一致。
+#
+# namespace 保留键（S5-C1 决策 3，读时归一防御层）：
+# - 键 "namespace" 缺失 ≡ 值 "public"（存量 chunk 无该键，语义上
+#   全部属公共库）；两实现（InMemory/SQLite）对正向与排除两种语义
+#   都按此归一，与回填迁移（主层，见 SqliteKnowledgeIndex 打开逻辑）
+#   互为冗余防御；
+# - 主层回填后所有行都有键，本归一只覆盖未经回填的数据路径
+#   （外部灌库、旧库拷贝）。
 
 
 def _validate_metadata_filter(
@@ -97,6 +207,12 @@ def _matches_metadata_filter(
             matched = chunk.source == wanted
         else:
             meta_value = chunk.metadata.get(key)
+            if key == "namespace" and meta_value is None:
+                # S5-C1 决策 3（读时归一）：namespace 键缺失 ≡ "public"
+                # ——存量 chunk 无该键，语义上全部属公共库。排除语义下
+                # 同样成立：缺键 chunk 对 "!x" 通过（public ≠ x）、对
+                # "!public" 被排除（它就是 public）。
+                meta_value = "public"
             if isinstance(meta_value, list):
                 matched = any(str(item) == wanted for item in meta_value)
             elif meta_value is None:
@@ -150,6 +266,14 @@ def _metadata_where_clause(
     clauses: list[str] = []
     params: list[object] = []
     for key, value in metadata_filter.items():
+        # S5-C1 决策 3（读时归一，SQLite 版）：namespace 键缺失 ≡
+        # "public"——用 COALESCE 把缺键行的提取值归一为 public，正向
+        # 与排除两个分支都基于归一后的值构建（与 InMemory 版同步）。
+        value_expr = (
+            f"COALESCE(json_extract(metadata_json, '$.{key}'), 'public')"
+            if key == "namespace"
+            else f"json_extract(metadata_json, '$.{key}')"
+        )
         if value.startswith("!"):
             # H-T2 排除语义：wanted 是排除值，命中它即被剔除。
             wanted = value[1:]
@@ -158,11 +282,12 @@ def _metadata_where_clause(
                 clauses.append("source != ?")
                 params.append(wanted)
                 continue
-            # JSON1 三条件（语义见 docstring 第 3 点）：键不存在通过，
+            # JSON1 三条件（语义见 docstring 第 3 点）：键不存在通过
+            # （namespace 键经 COALESCE 归一为 public 后按值判定），
             # 值/列表不含排除值通过，等于/含排除值则被排除。
             clauses.append(
-                f"(json_extract(metadata_json, '$.{key}') IS NULL OR "
-                f"(json_extract(metadata_json, '$.{key}') != ? AND "
+                f"({value_expr} IS NULL OR "
+                f"({value_expr} != ? AND "
                 f"NOT EXISTS (SELECT 1 FROM json_each(metadata_json, '$.{key}') "
                 "WHERE json_each.value = ?)))"
             )
@@ -175,7 +300,7 @@ def _metadata_where_clause(
             params.append(value)
             continue
         clauses.append(
-            f"(json_extract(metadata_json, '$.{key}') = ? OR "
+            f"({value_expr} = ? OR "
             f"EXISTS (SELECT 1 FROM json_each(metadata_json, '$.{key}') "
             "WHERE json_each.value = ?))"
         )
@@ -337,7 +462,11 @@ class SqliteKnowledgeIndex:
         with self._lock:
             # WAL 模式下读操作不阻塞写操作，对脚本与后续检索并发更友好。
             self._conn.execute("PRAGMA journal_mode=WAL")
+        # S5-C4：FTS5 可用性先置 False，_setup_fts 探测/建表后按实际
+        # 结果置位——False 时 search 走既有全表扫描路径，零回归。
+        self._fts_enabled = False
         self._create_tables()
+        self._setup_fts()
 
     def _create_tables(self) -> None:
         # 访问 self._conn，加锁串行化（原因见 __init__ 的线程安全说明）。
@@ -368,7 +497,93 @@ class SqliteKnowledgeIndex:
                 )
                 """
             )
+            # S5-C3 版本管理增量迁移（沿用 sessions.py 的 PRAGMA 先例）：
+            # 旧库的 ingest_marks 没有 content_hash/chunking 两列，补齐后
+            # 「源文件变更检测」与「分块策略记录」才可用；幂等——列已存在
+            # 时跳过。
+            existing_mark_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(ingest_marks)")
+            }
+            for column in ("content_hash", "chunking"):
+                if column not in existing_mark_columns:
+                    self._conn.execute(
+                        f"ALTER TABLE ingest_marks ADD COLUMN {column} TEXT"
+                    )
             self._conn.commit()
+            # S5-C1 决策 3（主层）：存量行幂等回填 namespace="public"。
+            # 存量 chunk 无该键而正向过滤严格匹配——不回填则 C1 上线即
+            # 全部隐身。json_set 只补缺失键，已有值（含非 public 空间）
+            # 不动；重复打开零行受影响，幂等。
+            self._conn.execute(
+                "UPDATE chunks SET metadata_json = "
+                "json_set(metadata_json, '$.namespace', 'public') "
+                "WHERE json_extract(metadata_json, '$.namespace') IS NULL"
+            )
+            self._conn.commit()
+
+    def _setup_fts(self) -> None:
+        """S5-C4：探测并启用 FTS5 候选预筛（失败只告警回退，不阻断）。
+
+        三道闸门任一不过即置 _fts_enabled=False 回退全表扫描：
+        1. 环境无 FTS5 编译（极少见）；
+        2. chunks_fts 表缺失（旧库未重建——不在启动期自动重建，大库
+           重建会造成意外长启动阻塞；用 ingest_books.py --rebuild-fts）;
+        3. 行数漂移（chunks 与 chunks_fts 行数不一致，说明同步写入被
+           外部中断或库被外部改动）。
+        """
+        with self._lock:
+            if not _fts5_supported(self._conn):
+                _LOGGER.warning(
+                    "FTS5 不可用：词法检索回退全表扫描（功能不受影响）"
+                )
+                return
+            try:
+                self._conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING "
+                    "fts5(content, chunk_id UNINDEXED)"
+                )
+            except sqlite3.OperationalError as exc:
+                _LOGGER.warning("FTS5 建表失败：%s；回退全表扫描", exc)
+                return
+            counts = self._conn.execute(
+                "SELECT (SELECT COUNT(*) FROM chunks), "
+                "(SELECT COUNT(*) FROM chunks_fts)"
+            ).fetchone()
+            if counts[0] != counts[1]:
+                _LOGGER.warning(
+                    "FTS 表行数漂移（chunks=%s, chunks_fts=%s）："
+                    "词法检索回退全表扫描；可用 ingest_books.py --rebuild-fts 重建",
+                    counts[0],
+                    counts[1],
+                )
+                return
+            self._fts_enabled = True
+
+    def rebuild_fts(self) -> int:
+        """显式重建 FTS 预筛表（管理动作，非自动触发）。
+
+        清空后从 chunks 表全量重写预变换副本。返回重建的行数；大库
+        重建为秒级～十秒级线性操作（纯文本变换 + 批量插入），文档已
+        写明预期成本。
+        """
+        with self._lock:
+            if not _fts5_supported(self._conn):
+                raise RuntimeError("当前 SQLite 环境不支持 FTS5，无法重建")
+            self._conn.execute("DROP TABLE IF EXISTS chunks_fts")
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE chunks_fts USING "
+                "fts5(content, chunk_id UNINDEXED)"
+            )
+            rows = self._conn.execute(
+                "SELECT chunk_id, content FROM chunks"
+            ).fetchall()
+            self._conn.executemany(
+                "INSERT INTO chunks_fts(chunk_id, content) VALUES (?, ?)",
+                [(chunk_id, _fts_transform(content)) for chunk_id, content in rows],
+            )
+            self._conn.commit()
+            self._fts_enabled = True
+            return len(rows)
 
     def upsert(self, chunks: Iterable[KnowledgeChunk]) -> None:
         """插入分块：同 chunk_id 直接覆盖（INSERT OR REPLACE），单事务原子提交。"""
@@ -394,11 +609,40 @@ class SqliteKnowledgeIndex:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            # S5-C4：FTS 预变换副本与 chunks 同事务写入（同一 commit），
+            # 保证「检索候选集」与「打分语料」永不漂移。先删后插实现
+            # 同 chunk_id 覆盖（FTS 无 UNINDEXED 主键语义）。
+            if self._fts_enabled:
+                fts_ids = [(row[0],) for row in rows]
+                self._conn.executemany(
+                    "DELETE FROM chunks_fts WHERE chunk_id = ?", fts_ids
+                )
+                self._conn.executemany(
+                    "INSERT INTO chunks_fts(chunk_id, content) VALUES (?, ?)",
+                    [
+                        (row[0], _fts_transform(row[2]))
+                        for row in rows
+                    ],
+                )
             self._conn.commit()
 
     def delete_document(self, document_id: str) -> None:
         """删除某个 document_id 的全部 chunk（整文档替换语义的删除半段）。"""
         with self._lock:
+            # S5-C4：FTS 行与 chunks 同事务同步删除——先按 document_id
+            # 圈出待删 chunk_id（删 chunks 行之前），再删 FTS 对应行。
+            if self._fts_enabled:
+                fts_ids = [
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT chunk_id FROM chunks WHERE document_id = ?",
+                        (document_id,),
+                    ).fetchall()
+                ]
+                self._conn.executemany(
+                    "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                    [(chunk_id,) for chunk_id in fts_ids],
+                )
             self._conn.execute(
                 "DELETE FROM chunks WHERE document_id = ?", (document_id,)
             )
@@ -464,18 +708,7 @@ class SqliteKnowledgeIndex:
         # 取出数据快照后立即释放锁，打分排序在锁外进行——既保证同一连接
         # 不被并发操作（迭代途中别的线程写库会出错），又不持锁做长循环。
         with self._lock:
-            if normalized:
-                where, params = _metadata_where_clause(normalized)
-                rows = self._conn.execute(
-                    "SELECT chunk_id, document_id, content, source, page, start, end, "
-                    f"metadata_json FROM chunks WHERE {where}",
-                    params,
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT chunk_id, document_id, content, source, page, start, end, "
-                    "metadata_json FROM chunks"
-                ).fetchall()
+            rows = self._fetch_search_rows(query, query_terms, normalized)
 
         scored: list[tuple[float, str, KnowledgeChunk]] = []
         for row in rows:
@@ -526,6 +759,74 @@ class SqliteKnowledgeIndex:
             for score, _, chunk in scored[:top_k]
         ]
 
+    def _fetch_search_rows(
+        self,
+        query: str,
+        query_terms: set[str],
+        normalized: dict[str, str],
+    ) -> list[Any]:
+        """取出参与打分的 chunk 行：FTS 候选预筛或全表扫描。
+
+        S5-C4 路由规则（按序）：
+        1. FTS 未启用（环境不支持 / 表缺失 / 行数漂移）→ 全表扫描；
+        2. 词项数超过 _FTS_TERM_LIMIT → 全表扫描（截断 MATCH 会静默
+           破坏超集性质，见计划决策 3）；
+        3. FTS 可用 → MATCH 圈定候选 chunk_id，再取回候选行打分；
+           候选数超过 _FTS_CANDIDATE_PARAM_LIMIT → 全表扫描（IN 参数
+           数上限 + 区分度过低的保守信号）。
+        返回行形态与全表扫描完全一致，下游打分/排序/截断零感知。
+        """
+        if (
+            not self._fts_enabled
+            or len(query_terms) > _FTS_TERM_LIMIT
+        ):
+            return self._full_scan_rows(normalized)
+        expression = _fts_match_expression(query_terms)
+        with self._lock:
+            # 选择性路由：COUNT 只走 FTS 索引（不物化行），毫秒级；
+            # 候选过多说明查询含高频单字（中文查询常态），物化全部候选
+            # 再逐行打分并不比全表扫描便宜——此时直接回退，把开销压到
+            # 一次 COUNT。等价性不受影响（两条路径返回相同结果集）。
+            candidate_count = self._conn.execute(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+                (expression,),
+            ).fetchone()[0]
+            if candidate_count > _FTS_CANDIDATE_LIMIT:
+                return self._full_scan_rows(normalized)
+        with self._lock:
+            # JOIN 在 SQLite 内部（C 速度）完成：MATCH 圈定候选后按
+            # chunk_id 主键回表，无 Python 端参数列表（低区分度查询命中
+            # 数万候选也不会触发变量数上限）。metadata 过滤以 AND 追加，
+            # 裸列名解析到 chunks 表。
+            sql = (
+                "SELECT chunks.chunk_id, chunks.document_id, chunks.content, "
+                "chunks.source, chunks.page, chunks.start, chunks.end, "
+                "chunks.metadata_json "
+                "FROM chunks JOIN chunks_fts ON chunks.chunk_id = chunks_fts.chunk_id "
+                "WHERE chunks_fts MATCH ?"
+            )
+            params: list[object] = [expression]
+            if normalized:
+                where, filter_params = _metadata_where_clause(normalized)
+                sql += f" AND ({where})"
+                params.extend(filter_params)
+            return self._conn.execute(sql, params).fetchall()
+
+    def _full_scan_rows(self, normalized: dict[str, str]) -> list[Any]:
+        """既有全表扫描路径原样保留（FTS 回退时的唯一数据来源）。"""
+        with self._lock:
+            if normalized:
+                where, params = _metadata_where_clause(normalized)
+                return self._conn.execute(
+                    "SELECT chunk_id, document_id, content, source, page, start, end, "
+                    f"metadata_json FROM chunks WHERE {where}",
+                    params,
+                ).fetchall()
+            return self._conn.execute(
+                "SELECT chunk_id, document_id, content, source, page, start, end, "
+                "metadata_json FROM chunks"
+            ).fetchall()
+
     # ── 入库完成标记（供批量入库脚本实现「已入库跳过 / 失败续跑」）──
 
     def is_document_complete(self, document_id: str) -> bool:
@@ -536,23 +837,54 @@ class SqliteKnowledgeIndex:
             ).fetchone()
         return row is not None
 
+    def document_mark(self, document_id: str) -> IngestMark | None:
+        """读取完成标记内容（S5-C3 版本管理：--check-updates 比对用）。
+
+        无标记返回 None；content_hash/chunking 在旧库迁移前列可为 None。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT chunk_count, page_count, completed_at, content_hash, chunking "
+                "FROM ingest_marks WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return IngestMark(
+            chunk_count=row[0],
+            page_count=row[1],
+            completed_at=row[2],
+            content_hash=row[3],
+            chunking=row[4],
+        )
+
     def mark_document_complete(
         self,
         document_id: str,
         *,
         chunk_count: int,
         page_count: int,
+        content_hash: str | None = None,
+        chunking: str | None = None,
     ) -> None:
-        """写入完成标记（幂等：重复调用直接覆盖旧标记）。"""
+        """写入完成标记（幂等：重复调用直接覆盖旧标记）。
+
+        content_hash/chunking（S5-C3 版本管理）：源文件 sha256 与入库时
+        分块策略，供 --check-updates 检测内容变更与策略漂移；None 时落
+        NULL（兼容既有调用方与旧数据）。
+        """
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO ingest_marks "
-                "(document_id, chunk_count, page_count, completed_at) VALUES (?, ?, ?, ?)",
+                "(document_id, chunk_count, page_count, completed_at, content_hash, chunking) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     document_id,
                     chunk_count,
                     page_count,
                     datetime.now(UTC).isoformat(),
+                    content_hash,
+                    chunking,
                 ),
             )
             self._conn.commit()

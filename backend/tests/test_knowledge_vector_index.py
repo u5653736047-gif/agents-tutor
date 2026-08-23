@@ -276,6 +276,8 @@ def test_sqlite_vector_index_persists_after_reopen(tmp_path: Path) -> None:
         assert hits[0].chunk.metadata == {
             "subject": "农业",
             "difficulty": "beginner",
+            # C1 决策 3 回填迁移：打开时给缺键 chunk 补 namespace=public。
+            "namespace": "public",
         }
         # 重载后仍支持过滤与删除（内存矩阵与 SQLite 数据一致）。
         assert (

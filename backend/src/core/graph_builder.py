@@ -37,6 +37,7 @@ from .context import MessageTokenCounter
 from .events import ErrorCode, EventType, RunError, RunEvent
 from .filesystem import workspace_scope
 from .knowledge.models import Citation
+from .knowledge.tools import knowledge_scope
 from .learning import LEARNING_OUTCOMES, LearningRecordStore, learning_scope
 from .nodes import ReActAgentNode, create_agent_nodes
 from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
@@ -1302,9 +1303,17 @@ class CollaborativeAgentGraph:
                     "session_id": run_state.get("session_id"),
                 }
             )
+            # S5-C1 决策 4：知识空间 scope 与 learning_scope 同位注入——
+            # 会话绑定的 namespace 在 run 入口写入 AgentState.extra，此处
+            # 读取后供 search_knowledge 工具透传给 service（模型参数面不
+            # 暴露空间）。None = 未绑定（检索层按单路 public 过滤处理）。
+            knowledge_scope_token = knowledge_scope.set(
+                cast(str | None, run_state.get("extra", {}).get("knowledge_namespace"))
+            )
             try:
                 result = agent.run(run_state)
             finally:
+                knowledge_scope.reset(knowledge_scope_token)
                 learning_scope.reset(learning_scope_token)
                 _SUBAGENT_EVENT_TRACES.reset(trace_token)
                 _ACTIVE_PARENT_STATE.reset(parent_state_token)
@@ -2537,8 +2546,16 @@ class CollaborativeAgentGraph:
         run_id: str | None = None,
         workspace_root: str | None = None,
         additional_workspace_roots: Sequence[str] = (),
+        knowledge_namespace: str | None = None,
     ) -> AgentState:
         """为 invoke/stream 共用地构造本轮输入，避免两条入口语义漂移。"""
+        # S5-C1 决策 4：会话绑定的知识空间经 extra 通道进入图，_wrap 按
+        # learning_scope 先例注入 knowledge_scope（None = 未绑定）。
+        namespace_extras = (
+            {"knowledge_namespace": knowledge_namespace}
+            if knowledge_namespace is not None
+            else {}
+        )
         active_run_id = run_id or str(uuid4())
         if persisted_values:
             return cast(
@@ -2548,6 +2565,7 @@ class CollaborativeAgentGraph:
                     "run_id": active_run_id,
                     "workspace_root": workspace_root,
                     "additional_workspace_roots": list(additional_workspace_roots),
+                    **({"extra": dict(namespace_extras)} if namespace_extras else {}),
                     "next_agent": None,
                     "pending_handoff": None,
                     "pending_tool_approval": None,
@@ -2585,6 +2603,7 @@ class CollaborativeAgentGraph:
         run_id: str | None = None,
         workspace_root: str | None = None,
         additional_workspace_roots: Sequence[str] = (),
+        knowledge_namespace: str | None = None,
     ) -> Iterator[tuple[str, Any]]:
         """直接转发 LangGraph messages/custom 流，供 API 实时消费。"""
         self._user_key(user_id)
@@ -2598,6 +2617,7 @@ class CollaborativeAgentGraph:
                 run_id=run_id,
                 workspace_root=workspace_root,
                 additional_workspace_roots=additional_workspace_roots,
+                knowledge_namespace=knowledge_namespace,
             )
             yield from cast(
                 Iterator[tuple[str, Any]],
@@ -2630,6 +2650,7 @@ class CollaborativeAgentGraph:
                 run_id=run_id,
                 workspace_root=workspace_root,
                 additional_workspace_roots=additional_workspace_roots,
+                knowledge_namespace=knowledge_namespace,
             )
             yield from cast(
                 Iterator[tuple[str, Any]],
@@ -2648,6 +2669,7 @@ class CollaborativeAgentGraph:
         run_id: str | None = None,
         workspace_root: str | None = None,
         additional_workspace_roots: Sequence[str] = (),
+        knowledge_namespace: str | None = None,
     ) -> AgentState:
         """从一条用户消息启动协作图。"""
         self._user_key(user_id)
@@ -2661,6 +2683,7 @@ class CollaborativeAgentGraph:
                 run_id=run_id,
                 workspace_root=workspace_root,
                 additional_workspace_roots=additional_workspace_roots,
+                knowledge_namespace=knowledge_namespace,
             )
             return cast(AgentState, app.invoke(state))
 
@@ -2689,6 +2712,7 @@ class CollaborativeAgentGraph:
                 run_id=run_id,
                 workspace_root=workspace_root,
                 additional_workspace_roots=additional_workspace_roots,
+                knowledge_namespace=knowledge_namespace,
             )
             return cast(AgentState, app.invoke(state, config=config))
 

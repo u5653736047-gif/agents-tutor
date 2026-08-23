@@ -201,3 +201,94 @@ def test_document_info_rejects_filesystem_path_source() -> None:
             document_id="bad",
             source=r"C:\Users\runner\secret.txt",
         )
+
+
+# ── S5-C2：document_tree 章节树 / 扁平回退 ──────────────────────────
+
+
+def test_document_tree_two_level_chapters_with_tags(tmp_path: Path) -> None:
+    """有 chapter/section 元数据的 chunks 聚合出两级树：计数与 tags 正确。"""
+    index = SqliteKnowledgeIndex(tmp_path / "tree.db")
+    index.upsert(
+        [
+            _chunk(
+                "t-1",
+                "第1章 概述。",
+                document_id="book-a",
+                page=1,
+                metadata={"chapter": "第1章", "tags": ["概述"]},
+            ),
+            _chunk(
+                "t-2",
+                "1.1 背景。",
+                document_id="book-a",
+                page=1,
+                metadata={"chapter": "第1章", "section": "1.1", "tags": ["背景", "历史"]},
+            ),
+            _chunk(
+                "t-3",
+                "1.2 目标（标签与 1.1 部分重叠，验证去重）。",
+                document_id="book-a",
+                page=2,
+                metadata={"chapter": "第1章", "section": "1.2", "tags": ["目标", "背景"]},
+            ),
+            _chunk(
+                "t-4",
+                "第2章 方法（直接挂章、无 section）。",
+                document_id="book-a",
+                page=3,
+                metadata={"chapter": "第2章"},
+            ),
+        ]
+    )
+    catalog = SqliteKnowledgeCatalog(tmp_path / "tree.db")
+    try:
+        tree = catalog.document_tree("book-a")
+    finally:
+        catalog.close()
+
+    assert tree.kind == "tree"
+    assert [chapter.chapter for chapter in tree.chapters] == ["第1章", "第2章"]
+    first = tree.chapters[0]
+    # 第1章 = 直接挂章 1 + 两个小节各 1。
+    assert first.chunk_count == 3
+    assert [(s.section, s.chunk_count) for s in first.sections] == [("1.1", 1), ("1.2", 1)]
+    # tags 去重汇总：按节各自去重（1.1 与 1.2 的「背景」不跨节合并）。
+    assert first.sections[0].tags == ["背景", "历史"]
+    assert first.sections[1].tags == ["目标", "背景"]
+    assert tree.chapters[1].chunk_count == 1
+    assert tree.chapters[1].sections == []
+
+
+def test_document_tree_flat_fallback_without_structure(tmp_path: Path) -> None:
+    """无任何 chapter/section 的文档回退 flat 页列表（去重升序）。"""
+    index = SqliteKnowledgeIndex(tmp_path / "flat.db")
+    index.upsert(
+        [
+            _chunk("f-1", "纯文本一。", document_id="upload-doc", page=3),
+            _chunk("f-2", "纯文本二。", document_id="upload-doc", page=1),
+            _chunk("f-3", "同页第二块。", document_id="upload-doc", page=1),
+        ]
+    )
+    catalog = SqliteKnowledgeCatalog(tmp_path / "flat.db")
+    try:
+        tree = catalog.document_tree("upload-doc")
+    finally:
+        catalog.close()
+
+    assert tree.kind == "flat"
+    assert tree.flat_pages == [1, 3]
+    assert tree.chapters == []
+
+
+def test_document_tree_unknown_document_returns_empty_flat(tmp_path: Path) -> None:
+    """不存在的 document_id → 空 flat 形态（前端渲染无内容占位）。"""
+    SqliteKnowledgeIndex(tmp_path / "empty.db")  # 建表（空 chunks）即满足前提。
+    catalog = SqliteKnowledgeCatalog(tmp_path / "empty.db")
+    try:
+        tree = catalog.document_tree("missing")
+    finally:
+        catalog.close()
+
+    assert tree.kind == "flat"
+    assert tree.flat_pages == []

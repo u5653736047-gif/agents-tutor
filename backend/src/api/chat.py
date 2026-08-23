@@ -441,6 +441,13 @@ def _workspace_call_kwargs(
         kwargs["workspace_root"] = session.workspace_root
     if "additional_workspace_roots" in parameters:
         kwargs["additional_workspace_roots"] = session.additional_workspace_roots
+    # S5-C1 决策 2：会话绑定的知识空间经图入口写入 extra（未绑定 =
+    # "public"，单路 public 过滤检索）。按方法签名门控传递：测试替身
+    # 的 run/stream 未声明该参数时不传（零回归）。
+    if "knowledge_namespace" in parameters:
+        kwargs["knowledge_namespace"] = (
+            session.knowledge_namespace or "public"
+        )
     return kwargs
 
 

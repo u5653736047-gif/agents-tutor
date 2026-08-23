@@ -33,6 +33,9 @@ class SessionRecord:
     # 手工构造的旧 SessionRecord；SessionStore 返回的记录始终有主目录。
     workspace_root: str | None = None
     additional_workspace_roots: tuple[str, ...] = ()
+    # S5-C1 决策 2：会话绑定的知识空间（None = 未绑定，检索按单路
+    # public 过滤处理）；老数据为 None。
+    knowledge_namespace: str | None = None
 
 
 class SessionStore:
@@ -99,6 +102,12 @@ class SessionStore:
                         "ALTER TABLE sessions ADD COLUMN additional_workspace_roots "
                         "TEXT NOT NULL DEFAULT '[]'"
                     )
+                if "knowledge_namespace" not in columns:
+                    # S5-C1 决策 2：可空列——NULL 即「未绑定」，检索按单路
+                    # public 过滤处理（决策 3 回填后对存量语料零回归）。
+                    connection.execute(
+                        "ALTER TABLE sessions ADD COLUMN knowledge_namespace TEXT"
+                    )
                 connection.execute(
                     "UPDATE sessions SET workspace_root = ? "
                     "WHERE workspace_root IS NULL OR TRIM(workspace_root) = ''",
@@ -116,6 +125,7 @@ class SessionStore:
         user_id: str | None = None,
         *,
         workspace_root: str | Path | None = None,
+        knowledge_namespace: str | None = None,
     ) -> SessionRecord:
         """Create and return a session metadata record."""
         if not session_id.strip():
@@ -128,6 +138,7 @@ class SessionStore:
             created_at=now,
             updated_at=now,
             workspace_root=resolved_workspace,
+            knowledge_namespace=knowledge_namespace,
         )
         try:
             with self._lock, self._connection:
@@ -135,9 +146,9 @@ class SessionStore:
                     """
                     INSERT INTO sessions (
                         user_key, user_id, session_id, created_at, updated_at, archived,
-                        workspace_root, additional_workspace_roots
+                        workspace_root, additional_workspace_roots, knowledge_namespace
                     )
-                    VALUES (?, ?, ?, ?, ?, 0, ?, '[]')
+                    VALUES (?, ?, ?, ?, ?, 0, ?, '[]', ?)
                     """,
                     (
                         self._user_key(user_id),
@@ -146,6 +157,7 @@ class SessionStore:
                         record.created_at.isoformat(),
                         record.updated_at.isoformat(),
                         resolved_workspace,
+                        knowledge_namespace,
                     ),
                 )
         # 主键冲突 = 同用户重复创建同一会话，转成业务错误抛出
@@ -169,7 +181,7 @@ class SessionStore:
         """List one user's sessions by most recent conversation activity."""
         query = """
             SELECT session_id, user_id, created_at, updated_at, archived, title,
-                   workspace_root, additional_workspace_roots
+                   workspace_root, additional_workspace_roots, knowledge_namespace
             FROM sessions
             WHERE user_key = ?
         """
@@ -192,7 +204,7 @@ class SessionStore:
             row = self._connection.execute(
                 """
                 SELECT session_id, user_id, created_at, updated_at, archived, title,
-                       workspace_root, additional_workspace_roots
+                       workspace_root, additional_workspace_roots, knowledge_namespace
                 FROM sessions
                 WHERE user_key = ? AND session_id = ?
                 """,
@@ -212,7 +224,7 @@ class SessionStore:
             row = self._connection.execute(
                 """
                 SELECT session_id, user_id, created_at, updated_at, archived, title,
-                       workspace_root, additional_workspace_roots
+                       workspace_root, additional_workspace_roots, knowledge_namespace
                 FROM sessions
                 WHERE user_key = ? AND session_id = ?
                 """,
@@ -392,6 +404,7 @@ class SessionStore:
             title=cast(str | None, row["title"]),
             workspace_root=cast(str | None, row["workspace_root"]),
             additional_workspace_roots=additional,
+            knowledge_namespace=cast(str | None, row["knowledge_namespace"]),
         )
 
     @staticmethod

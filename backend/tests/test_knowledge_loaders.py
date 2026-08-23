@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from core.knowledge.loaders import load_pdf, load_text
+from core.knowledge.loaders import iter_pdf_pages, load_pdf, load_text
+from tests.test_pdf_table import _build_table_pdf
 
 
 def _write_pdf(path: Path, page_texts: list[str | None]) -> None:
@@ -164,3 +165,114 @@ def test_load_pdf_wraps_reader_error_with_filename(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="broken.pdf"):
         load_pdf(source)
+
+
+# ── S5-C3：扫描页 OCR 兜底 ────────────────────────────────────────
+
+
+def _build_no_text_pdf(path: Path) -> None:
+    """构造无文本层的 PDF（空内容流页）：模拟扫描版书页。"""
+    objs = [
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R>>endobj",
+        b"4 0 obj<</Length 0>>stream\n\nendstream endobj",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for obj in objs:
+        offsets.append(len(out))
+        out += obj + b"\n"
+    xref_pos = len(out)
+    out += b"xref\n0 " + str(len(objs) + 1).encode() + b"\n0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        b"trailer<</Size " + str(len(objs) + 1).encode() + b"/Root 1 0 R>>\n"
+        b"startxref\n" + str(xref_pos).encode() + b"\n%%EOF"
+    )
+    path.write_bytes(out)
+
+
+class _FakeOcr:
+    """OCR 替身：固定返回识别文本，可注入异常。"""
+
+    def __init__(self, text: str = "OCR 识别的条件随机场", error: Exception | None = None):
+        self.text = text
+        self.error = error
+        self.calls: list[bytes] = []
+
+    def extract_text(self, image_bytes: bytes) -> str:
+        self.calls.append(image_bytes)
+        if self.error is not None:
+            raise self.error
+        return self.text
+
+
+def test_iter_pdf_pages_ocr_fallback_marks_extraction(tmp_path: Path) -> None:
+    # 渲染半段依赖真实 pypdfium2（pdf-table extra 的传递依赖）：纯 dev
+    # 最小环境跳过而非红（与 test_pdf_table.py 的守卫先例一致）。
+    pytest.importorskip("pypdfium2")
+    """无文本层页经 OCR 兜底产出文档，metadata 携带 extraction=ocr 标记。"""
+    pdf = tmp_path / "scanned.pdf"
+    _build_no_text_pdf(pdf)
+    ocr = _FakeOcr()
+
+    docs = list(
+        iter_pdf_pages(pdf, document_id="scan", source_label="scan.pdf", ocr_provider=ocr)
+    )
+
+    assert len(docs) == 1
+    assert docs[0].content == "OCR 识别的条件随机场"
+    assert docs[0].metadata == {"extraction": "ocr"}
+    assert docs[0].page == 1
+    # 渲染出的 PNG 字节确实交给了 provider。
+    assert ocr.calls and ocr.calls[0].startswith(b"\x89PNG")
+
+
+def test_iter_pdf_pages_ocr_failure_skips_page_without_error(tmp_path: Path) -> None:
+    """OCR 抛异常 → 该页按无文本现状跳过；全书零文本时抛既有 ValueError。"""
+    pdf = tmp_path / "scanned.pdf"
+    _build_no_text_pdf(pdf)
+    ocr = _FakeOcr(error=RuntimeError("engine down"))
+
+    with pytest.raises(ValueError, match="no extractable text"):
+        list(
+            iter_pdf_pages(
+                pdf, document_id="scan", source_label="scan.pdf", ocr_provider=ocr
+            )
+        )
+
+
+def test_iter_pdf_pages_ocr_unavailable_import_falls_back_to_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pypdfium2 导入失败 → 等价于无 OCR：页面静默跳过，不抛 ImportError。"""
+    import sys
+
+    pdf = tmp_path / "scanned.pdf"
+    _build_no_text_pdf(pdf)
+    monkeypatch.setitem(sys.modules, "pypdfium2", None)
+
+    with pytest.raises(ValueError, match="no extractable text"):
+        list(
+            iter_pdf_pages(
+                pdf,
+                document_id="scan",
+                source_label="scan.pdf",
+                ocr_provider=_FakeOcr(),
+            )
+        )
+
+
+def test_iter_pdf_pages_with_text_layer_never_invokes_ocr(tmp_path: Path) -> None:
+    """有文本层的页面不触发 OCR（零回归保障）。"""
+    pdf = tmp_path / "text.pdf"
+    _build_table_pdf(pdf)
+    ocr = _FakeOcr()
+
+    docs = list(
+        iter_pdf_pages(pdf, document_id="t", source_label="t.pdf", ocr_provider=ocr)
+    )
+
+    assert docs and ocr.calls == []
