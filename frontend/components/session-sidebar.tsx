@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { NamespaceSelector } from "@/components/namespace-selector";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { errorMessageFor } from "@/lib/error-messages";
@@ -81,7 +82,8 @@ const GROUP_ORDER: SessionGroup[] = ["today", "recent", "older"];
 type SessionSidebarContentProps = {
   archiveSession: (sessionId: string) => void;
   collapsed?: boolean;
-  createSession: () => void;
+  // S5-C1：签名扩展可选 knowledgeNamespace——会话创建时绑定课程空间。
+  createSession: (workspaceRoot?: string, knowledgeNamespace?: string) => void;
   currentSessionId: string | null;
   isLoadingSessions: boolean;
   loadCurrentSessionMessages: () => void;
@@ -119,6 +121,8 @@ export function SessionSidebarContent({
   // D4-T1:搜索防抖——query 即时更新(输入框受控值),debounced 延迟
   // 200ms 生效用于过滤;清空输入时立即恢复全列表(不等防抖)。
   const [query, setQuery] = useState("");
+  // S5-C1：新会话绑定的课程空间（未选择时 undefined → 单路 public 检索）。
+  const [newSessionNamespace, setNewSessionNamespace] = useState<string | undefined>(undefined);
   const [debounced, setDebounced] = useState("");
 
   useEffect(() => {
@@ -215,10 +219,17 @@ export function SessionSidebarContent({
             </button>
           ) : null}
         </div>
+        <div className="mt-4" data-slot="session-namespace-selector">
+          <p className="mb-1 text-caption font-medium text-muted-foreground">课程空间</p>
+          <NamespaceSelector
+            onChange={setNewSessionNamespace}
+            value={newSessionNamespace ?? "public"}
+          />
+        </div>
         <Button
           aria-label="新建会话"
           className="mt-4 w-full gap-2"
-          onClick={() => void createSession()}
+          onClick={() => void createSession(undefined, newSessionNamespace)}
           size="sm"
           type="button"
         >

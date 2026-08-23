@@ -84,7 +84,10 @@ export type ChatStore = {
   cancelStreaming(): void;
   clearConversationState(): void;
   clearRequestError(): void;
-  createSession(workspaceRoot?: string): Promise<Session | null>;
+  createSession(
+    workspaceRoot?: string,
+    knowledgeNamespace?: string,
+  ): Promise<Session | null>;
   currentAgent: AgentRole | null;
   currentSessionId: string | null;
   // D2-T3:审批决策——决定(确认/拒绝/修改)与状态字段
@@ -417,14 +420,19 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     cancelStreaming: () => {
       activeStreamController?.abort();
     },
-    createSession: async (workspaceRoot) => {
+    createSession: async (workspaceRoot, knowledgeNamespace) => {
       // D4-T3 review 修正:新建会话同样中止旧流(见 archiveSession 注释)。
       activeStreamController?.abort();
       set({ requestError: null });
       try {
-        const session = await client.createSession(
-          workspaceRoot === undefined ? {} : { workspace_root: workspaceRoot },
-        );
+        const session = await client.createSession({
+          ...(workspaceRoot !== undefined
+            ? { workspace_root: workspaceRoot }
+            : {}),
+          ...(knowledgeNamespace !== undefined
+            ? { knowledge_namespace: knowledgeNamespace }
+            : {}),
+        });
         set((state) => ({
           ...emptyConversationState(),
           currentSessionId: session.session_id,
