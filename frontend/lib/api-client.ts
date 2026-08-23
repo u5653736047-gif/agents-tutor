@@ -125,10 +125,17 @@ export type ApiClient = {
   uploadDocument(
     file: File,
     onProgress?: (fraction: number) => void,
+    knowledgeNamespace?: string,
   ): Promise<KnowledgeDocumentUploadResponse>;
   // D6-T7:学习进度基础统计(只读聚合)——独立接口,不进入主会话 store
   // (与 searchKnowledge 同一隔离哲学)。GET /stats/overview,响应
   // 直接透传契约 StatsOverview;错误归一为 ApiClientError。
+  getDocumentTree(
+    documentId: string,
+  ): Promise<components["schemas"]["KnowledgeDocumentTreeResponse"]>;
+  listNamespaces(): Promise<
+    components["schemas"]["NamespaceUsageDto"][]
+  >;
   getStatsOverview(): Promise<StatsOverview>;
   // D7-T2:聊天附件——uploadFile 走 multipart/form-data(field 名
   // "file",与 uploadDocument 同一 FormData 通道,错误归一为
@@ -367,11 +374,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // FormData 不设 Content-Type(见 request 注释),由浏览器自动带
     // multipart boundary。onProgress 仅 0/1 里程碑(成功 1、失败回 0),
     // 页面以「上传中…」禁用态表达进度,不依赖进度回调。
-    uploadDocument: async (file, onProgress) => {
+    uploadDocument: async (file, onProgress, knowledgeNamespace) => {
       onProgress?.(0);
       try {
         const body = new FormData();
         body.append("file", file);
+        // S5-C1 决策 1：目标空间随表单上传（缺省 public，由后端校验）。
+        if (knowledgeNamespace !== undefined && knowledgeNamespace !== "public") {
+          body.append("knowledge_namespace", knowledgeNamespace);
+        }
         const response = await request<KnowledgeDocumentUploadResponse>(
           config,
           "/knowledge/documents",
@@ -396,6 +407,16 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       ),
     // D6-T7:学习进度——GET /stats/overview,响应直接透传契约字段
     // (snake_case 原样,与 listDocuments 等先例一致)。
+    getDocumentTree: (documentId) =>
+      request<components["schemas"]["KnowledgeDocumentTreeResponse"]>(
+        config,
+        `/knowledge/documents/${encodeURIComponent(documentId)}/tree`,
+      ),
+    listNamespaces: () =>
+      request<{ namespaces?: components["schemas"]["NamespaceUsageDto"][] }>(
+        config,
+        "/knowledge/namespaces",
+      ).then((res) => res.namespaces ?? []),
     getStatsOverview: () => request<StatsOverview>(config, "/stats/overview"),
     // D7-T2:附件上传——与 uploadDocument 同一 FormData 模式(field 名
     // "file",request() 对 FormData 不设 Content-Type,浏览器自动带

@@ -284,6 +284,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/knowledge/documents/{document_id}/tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Document Tree
+         * @description 返回单篇文档的章→节结构树（S5-C2，只读）。
+         *
+         *     - 教材类文档：kind="tree"，chapters 含每章/节 chunk 计数与标签汇总；
+         *     - 无结构文档（如无标题 API 上传件）：kind="flat"，flat_pages 按页
+         *       升序；文档不存在时 flat_pages 为空列表（前端渲染「无内容」占位）；
+         *     - catalog 未装配时同样降级为空 flat 形态，不报错。
+         */
+        get: operations["get_document_tree_knowledge_documents__document_id__tree_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Namespaces
+         * @description 列出全部知识空间及各空间文档数（S5-C1 决策 6）。
+         *
+         *     会话创建对话框与上传表单的空间选择器数据源；空库返回空列表。
+         */
+        get: operations["list_namespaces_knowledge_namespaces_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/knowledge/overview": {
         parameters: {
             query?: never;
@@ -640,6 +687,12 @@ export interface components {
         Body_upload_document_knowledge_documents_post: {
             /** File */
             file: string;
+            /**
+             * Knowledge Namespace
+             * @description 目标知识空间；public 为保留的公共库空间
+             * @default public
+             */
+            knowledge_namespace?: string;
         };
         /** Body_upload_file_files_post */
         Body_upload_file_files_post: {
@@ -780,6 +833,11 @@ export interface components {
          * @description Optional client-selected ID for a new session.
          */
         CreateSessionRequest: {
+            /**
+             * Knowledge Namespace
+             * @default null
+             */
+            knowledge_namespace?: string | null;
             /**
              * Session Id
              * @default null
@@ -1115,6 +1173,27 @@ export interface components {
             documents: components["schemas"]["KnowledgeDocumentListEntry"][];
         };
         /**
+         * KnowledgeDocumentTreeResponse
+         * @description 文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。
+         *
+         *     - kind="tree"：chapters 有效（教材类有标题行结构）；
+         *     - kind="flat"：flat_pages 有效（无结构文档按页平铺；空列表 =
+         *       文档不存在或无内容）。
+         */
+        KnowledgeDocumentTreeResponse: {
+            /** Chapters */
+            chapters?: components["schemas"]["KnowledgeTreeChapterDto"][];
+            /** Document Id */
+            document_id: string;
+            /** Flat Pages */
+            flat_pages?: number[];
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "tree" | "flat";
+        };
+        /**
          * KnowledgeDocumentUploadResponse
          * @description 上传解析结果:文档已入库(幂等替换)后的元数据回执。
          */
@@ -1131,6 +1210,11 @@ export interface components {
              * @default null
              */
             page_count?: number | null;
+            /**
+             * Replaced
+             * @default false
+             */
+            replaced?: boolean;
             /** Source */
             source: string;
         };
@@ -1173,6 +1257,36 @@ export interface components {
             hits: components["schemas"]["SearchHitDto"][];
         };
         /**
+         * KnowledgeTreeChapterDto
+         * @description 知识树章节点（S5-C2）：含章直属 chunk 与小节列表。
+         */
+        KnowledgeTreeChapterDto: {
+            /** Chapter */
+            chapter: string;
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /** Sections */
+            sections?: components["schemas"]["KnowledgeTreeSectionDto"][];
+        };
+        /**
+         * KnowledgeTreeSectionDto
+         * @description 知识树小节节点（S5-C2）。
+         */
+        KnowledgeTreeSectionDto: {
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /** Section */
+            section: string;
+            /** Tags */
+            tags?: string[];
+        };
+        /**
          * Message
          * @description A safe user or assistant message.
          */
@@ -1201,6 +1315,24 @@ export interface components {
          * @enum {string}
          */
         MessageRole: "user" | "assistant";
+        /**
+         * NamespaceListResponse
+         * @description 知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。
+         */
+        NamespaceListResponse: {
+            /** Namespaces */
+            namespaces?: components["schemas"]["NamespaceUsageDto"][];
+        };
+        /**
+         * NamespaceUsageDto
+         * @description 一个知识空间的聚合信息（S5-C1 决策 6，只读）。
+         */
+        NamespaceUsageDto: {
+            /** Document Count */
+            document_count: number;
+            /** Namespace */
+            namespace: string;
+        };
         /**
          * PendingHandoff
          * @description A handoff paused for a future confirmation or rejection.
@@ -1361,6 +1493,11 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /**
+             * Knowledge Namespace
+             * @default null
+             */
+            knowledge_namespace?: string | null;
             /** Session Id */
             session_id: string;
             /**
@@ -1976,7 +2113,10 @@ export interface operations {
     };
     list_documents_knowledge_documents_get: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description 按知识空间过滤 */
+                namespace?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2140,6 +2280,102 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChunkListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_document_tree_knowledge_documents__document_id__tree_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentTreeResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_namespaces_knowledge_namespaces_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceListResponse"];
                 };
             };
             /** @description Unprocessable Entity */

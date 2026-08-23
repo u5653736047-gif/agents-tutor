@@ -91,6 +91,12 @@
             "contentMediaType": "application/octet-stream",
             "title": "File",
             "type": "string"
+          },
+          "knowledge_namespace": {
+            "default": "public",
+            "description": "目标知识空间；public 为保留的公共库空间",
+            "title": "Knowledge Namespace",
+            "type": "string"
           }
         },
         "required": [
@@ -423,6 +429,18 @@
         "additionalProperties": false,
         "description": "Optional client-selected ID for a new session.",
         "properties": {
+          "knowledge_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Namespace"
+          },
           "session_id": {
             "anyOf": [
               {
@@ -1093,6 +1111,44 @@
         "title": "KnowledgeDocumentListResponse",
         "type": "object"
       },
+      "KnowledgeDocumentTreeResponse": {
+        "additionalProperties": false,
+        "description": "文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。\n\n- kind=\"tree\"：chapters 有效（教材类有标题行结构）；\n- kind=\"flat\"：flat_pages 有效（无结构文档按页平铺；空列表 =\n  文档不存在或无内容）。",
+        "properties": {
+          "chapters": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeTreeChapterDto"
+            },
+            "title": "Chapters",
+            "type": "array"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "flat_pages": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Flat Pages",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "tree",
+              "flat"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "document_id"
+        ],
+        "title": "KnowledgeDocumentTreeResponse",
+        "type": "object"
+      },
       "KnowledgeDocumentUploadResponse": {
         "additionalProperties": false,
         "description": "上传解析结果:文档已入库(幂等替换)后的元数据回执。",
@@ -1124,6 +1180,11 @@
             ],
             "default": null,
             "title": "Page Count"
+          },
+          "replaced": {
+            "default": false,
+            "title": "Replaced",
+            "type": "boolean"
           },
           "source": {
             "title": "Source",
@@ -1199,6 +1260,60 @@
           "hits"
         ],
         "title": "KnowledgeSearchResponse",
+        "type": "object"
+      },
+      "KnowledgeTreeChapterDto": {
+        "additionalProperties": false,
+        "description": "知识树章节点（S5-C2）：含章直属 chunk 与小节列表。",
+        "properties": {
+          "chapter": {
+            "title": "Chapter",
+            "type": "string"
+          },
+          "chunk_count": {
+            "default": 0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeTreeSectionDto"
+            },
+            "title": "Sections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chapter"
+        ],
+        "title": "KnowledgeTreeChapterDto",
+        "type": "object"
+      },
+      "KnowledgeTreeSectionDto": {
+        "additionalProperties": false,
+        "description": "知识树小节节点（S5-C2）。",
+        "properties": {
+          "chunk_count": {
+            "default": 0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          }
+        },
+        "required": [
+          "section"
+        ],
+        "title": "KnowledgeTreeSectionDto",
         "type": "object"
       },
       "Message": {
@@ -1278,6 +1393,41 @@
         ],
         "title": "MessageRole",
         "type": "string"
+      },
+      "NamespaceListResponse": {
+        "additionalProperties": false,
+        "description": "知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。",
+        "properties": {
+          "namespaces": {
+            "items": {
+              "$ref": "#/components/schemas/NamespaceUsageDto"
+            },
+            "title": "Namespaces",
+            "type": "array"
+          }
+        },
+        "title": "NamespaceListResponse",
+        "type": "object"
+      },
+      "NamespaceUsageDto": {
+        "additionalProperties": false,
+        "description": "一个知识空间的聚合信息（S5-C1 决策 6，只读）。",
+        "properties": {
+          "document_count": {
+            "title": "Document Count",
+            "type": "integer"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "document_count"
+        ],
+        "title": "NamespaceUsageDto",
+        "type": "object"
       },
       "PendingHandoff": {
         "additionalProperties": false,
@@ -1677,6 +1827,18 @@
             "format": "date-time",
             "title": "Created At",
             "type": "string"
+          },
+          "knowledge_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Namespace"
           },
           "session_id": {
             "title": "Session Id",
@@ -2898,6 +3060,26 @@
       "get": {
         "description": "列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。\n\nI1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库\n的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API\n可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表\n(app.state.knowledge_documents)只作为「未落库条目」的防御性兜底\n合并(理论上不触发,保留以兼容极端时序)。",
         "operationId": "list_documents_knowledge_documents_get",
+        "parameters": [
+          {
+            "description": "按知识空间过滤",
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "按知识空间过滤",
+              "title": "Namespace"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3143,6 +3325,121 @@
           }
         },
         "summary": "List Document Chunks",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/documents/{document_id}/tree": {
+      "get": {
+        "description": "返回单篇文档的章→节结构树（S5-C2，只读）。\n\n- 教材类文档：kind=\"tree\"，chapters 含每章/节 chunk 计数与标签汇总；\n- 无结构文档（如无标题 API 上传件）：kind=\"flat\"，flat_pages 按页\n  升序；文档不存在时 flat_pages 为空列表（前端渲染「无内容」占位）；\n- catalog 未装配时同样降级为空 flat 形态，不报错。",
+        "operationId": "get_document_tree_knowledge_documents__document_id__tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeDocumentTreeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Get Document Tree",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/namespaces": {
+      "get": {
+        "description": "列出全部知识空间及各空间文档数（S5-C1 决策 6）。\n\n会话创建对话框与上传表单的空间选择器数据源；空库返回空列表。",
+        "operationId": "list_namespaces_knowledge_namespaces_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespaceListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "List Namespaces",
         "tags": [
           "knowledge"
         ]
