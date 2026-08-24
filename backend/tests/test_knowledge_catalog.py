@@ -292,3 +292,48 @@ def test_document_tree_unknown_document_returns_empty_flat(tmp_path: Path) -> No
 
     assert tree.kind == "flat"
     assert tree.flat_pages == []
+
+
+def test_document_tree_orders_chapters_by_page_not_chunk_id(
+    tmp_path: Path,
+) -> None:
+    """回归测试（评审 🔴）：章节顺序必须按页码数值序，而非 chunk_id
+    字典序——chunk_id 形如「book:10:0:9」，无零填充的页号在字典序下
+    排在「book:2:0:9」之前，会让第 10 页起的章错误地排在第 2 页的章前。"""
+    index = SqliteKnowledgeIndex(tmp_path / "order.db")
+    index.upsert(
+        [
+            # 第一章仅出现在第 2 页；第二章从第 10 页开始。
+            _chunk(
+                "big:2:0:9",
+                "第一章内容",
+                document_id="big",
+                page=2,
+                metadata={"chapter": "第一章"},
+            ),
+            _chunk(
+                "big:10:0:9",
+                "第二章开篇",
+                document_id="big",
+                page=10,
+                metadata={"chapter": "第二章"},
+            ),
+            _chunk(
+                "big:11:0:9",
+                "第二章续",
+                document_id="big",
+                page=11,
+                metadata={"chapter": "第二章"},
+            ),
+        ]
+    )
+    catalog = SqliteKnowledgeCatalog(tmp_path / "order.db")
+    try:
+        tree = catalog.document_tree("big")
+    finally:
+        catalog.close()
+
+    assert tree.kind == "tree"
+    # 字典序会给出 ["第二章", "第一章"]（10 < 2）；按页码应为阅读顺序。
+    assert [chapter.chapter for chapter in tree.chapters] == ["第一章", "第二章"]
+    assert tree.chapters[1].chunk_count == 2

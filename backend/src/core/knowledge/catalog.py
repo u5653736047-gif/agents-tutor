@@ -224,9 +224,12 @@ class SqliteKnowledgeCatalog:
                 kind="flat", document_id=document_id, flat_pages=[]
             )
         with self._lock:
+            # 章节顺序 = 文档阅读顺序：page/start/end 均为 INTEGER 列，
+            # 数值排序正确；不能用 chunk_id（{document_id}:{page}:{start}:
+            # {end} 的文本字典序会把第 10 页排到第 2 页前——页号无零填充）。
             rows = self._conn.execute(
                 "SELECT page, metadata_json FROM chunks "
-                "WHERE document_id = ? ORDER BY chunk_id",
+                "WHERE document_id = ? ORDER BY page, start, end",
                 (document_id,),
             ).fetchall()
 
