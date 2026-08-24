@@ -793,9 +793,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.rebuild_fts:
         # S5-C4 显式管理动作：清空并从 chunks 全量重写 FTS 预筛表，
         # 不执行入库流程。大库预期成本：秒级～十秒级线性操作。
-        index = SqliteKnowledgeIndex(args.db)
+        # 复用上方已打开的 index 连接（评审修正：此前重复构造了第二个
+        # SqliteKnowledgeIndex 且第一个未关闭）。
         rebuilt = index.rebuild_fts()
         print(f"FTS5 预筛表已重建：{rebuilt} 行")
+        index.close()
         return 0
 
     if args.check_updates:
