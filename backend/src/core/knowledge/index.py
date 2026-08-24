@@ -11,6 +11,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Protocol
+
+from .models import Citation, KnowledgeChunk, SearchHit
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,9 +25,7 @@ class IngestMark:
     completed_at: str
     content_hash: str | None = None
     chunking: str | None = None
-from typing import Any, Protocol
 
-from .models import Citation, KnowledgeChunk, SearchHit
 
 _ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+")
 _CHINESE_RUN = re.compile(r"[\u4e00-\u9fff]+")
@@ -86,7 +87,8 @@ def _fts_match_expression(terms: set[str]) -> str:
     - 两个 CJK 字（bigram）→ 短语「c1 c2」（引号内空格分隔，精确对齐
       相邻语义——非相邻不命中）；
     - 英文/数字词 → 裸 token（小写已在 _lexical_terms 完成）。
-    返回 None 表示词项集为空（调用方应直接返回空结果）。
+    词项集为空时返回空串（search 入口对空词项集已提前返回 []，此处
+    仅为防御——调用方不应把空串交给 MATCH）。
     """
     if not terms:
         return ""
