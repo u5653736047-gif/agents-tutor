@@ -15,7 +15,8 @@ from .service import KnowledgeService
 # S5-C1 决策 4：会话绑定的知识空间（模型不可见不可控——工具参数面不
 # 暴露空间，防跨空间伪造检索）。由 graph_builder._wrap 按 learning_scope
 # 先例从 AgentState.extra["knowledge_namespace"] 注入；None = 未绑定，
-# 检索层按「单路 public 过滤」处理（见 service.search 的 namespace 语义）。
+# 工具层兜底为 "public"（单路 public 过滤——见 search_knowledge 内注释；
+# chat.py 入口的 `or "public"` 与此互为冗余防御）。
 knowledge_scope: ContextVar[str | None] = ContextVar(
     "knowledge_scope",
     default=None,
@@ -137,7 +138,11 @@ def create_search_knowledge_tool(
         # service 层会在其上叠加默认 frontmatter 抑制（_apply_suppression）。
         metadata_filter = _metadata_filter_from_input(source, difficulty)
         # S5-C1 决策 4：空间由 scope 注入而非模型参数（模型不可见不可控）。
-        namespace = knowledge_scope.get()
+        # 未绑定（scope 为 None）在此兜底为 "public"——「未绑定 = 单路
+        # public 过滤」的不变式在工具层成立，任何图入口漏传 extra 都不会
+        # 退化成跨空间无过滤检索；service 层的 namespace=None 保持
+        # 「不过滤」语义仅供非工具调用方（管理面/既有测试）使用。
+        namespace = knowledge_scope.get() or "public"
         if not adaptive_enabled:
             # 未启用自适应：原路径原样保留（零回归，见上方注释）——
             # 输出不含 metadata 键，旧消费者（引用收集、评价证据、

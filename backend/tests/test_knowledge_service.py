@@ -318,6 +318,33 @@ def test_merge_namespace_legs_deduplicates_taking_max_score() -> None:
     assert scores["shared"] == 3.0  # 取最大分
 
 
+def test_scope_namespace_overrides_forged_filter_key() -> None:
+    """S5-C1 决策 4（防参数伪造）：调用方在 metadata_filter 里伪造
+    namespace 键也会被注入的 scope 值覆盖——检索范围恒为
+    「绑定空间 ∪ public」，不因过滤参数而扩大。"""
+    index = InMemoryKnowledgeIndex()
+    index.upsert(
+        [
+            _ns_chunk("x-hit", "梯度下降算法详解", "x"),
+            _ns_chunk("pub-hit", "梯度下降算法原理", "public"),
+            _ns_chunk("forged-hit", "梯度下降入门", "third"),
+        ]
+    )
+    service = KnowledgeService(index)
+
+    hits = service.search(
+        "梯度下降",
+        top_k=10,
+        metadata_filter={"namespace": "third"},  # 伪造：想看第三空间
+        namespace="x",  # scope 注入的真实绑定
+    )
+
+    hit_ids = [hit.chunk.chunk_id for hit in hits]
+    assert hit_ids  # 查询本身有命中，排除「空结果假阳性」
+    assert set(hit_ids) == {"x-hit", "pub-hit"}
+    assert "forged-hit" not in hit_ids
+
+
 # ── S5-C1 决策 5：阈值单调性与 embedding 复用 ─────────────────────
 
 

@@ -825,6 +825,20 @@ def test_search_knowledge_threads_bound_namespace_from_scope() -> None:
     assert spy.namespaces == ["course-a"]
 
 
+def test_search_knowledge_defaults_unbound_scope_to_public() -> None:
+    """S5-C1 决策 4（兜底不变式）：scope 未注入（None = 未绑定）时工具
+    兜底传 "public"——任何图入口漏传 extra 都不会退化成跨空间无过滤
+    检索（评审修复：该保证原依赖 chat.py 入口映射，现下沉到工具层）。"""
+    from core.knowledge.tools import create_search_knowledge_tool
+
+    spy = _NamespaceSpyService()
+    tool = create_search_knowledge_tool(spy)  # type: ignore[arg-type]
+    # 不设置 knowledge_scope（ContextVar 默认 None = 未绑定）。
+    tool.invoke({"query": "任何内容"})
+
+    assert spy.namespaces == ["public"]
+
+
 # ── S5-C1/C2：命名空间上传、空间聚合与树端点（含冒号 ID 编码往返）──────
 
 
