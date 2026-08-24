@@ -118,7 +118,7 @@ export function NamespaceSelector({
             onChange={(event) => onChange(event.target.value)}
             value={value}
           >
-            {!options.includes(value) ? (
+            {!known ? (
               <option value={value}>{value}</option>
             ) : null}
             {options.map((ns) => (
