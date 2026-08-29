@@ -261,6 +261,10 @@ class KnowledgeService:
         # - 其他值：命名空间 ∪ 公共库两路合并（按 score 每 chunk_id 取
         #   最大、chunk_id 升序平局、截断 top_k——与多变体 max 合并同
         #   一哲学）。
+        # P1-1 性能契约：两路检索复用同一次 query embedding——向量索引
+        # 的 LRU 查询向量缓存（vector_index._QUERY_VECTOR_CACHE_SIZE=16）
+        # 使第二腿命中缓存零重复计算；Hybrid 的 lexical 路本就不走
+        # embedding，实测复用已由 cache 保证（见 test 向量缓存单测）。
         if namespace is None or namespace == "public":
             effective = (
                 self._with_namespace(metadata_filter, namespace)

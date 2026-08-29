@@ -57,12 +57,22 @@ def _fts_transform(text: str) -> str:
     [A-Za-z0-9]+ 的切分与 _ENGLISH_WORD 一致），查询侧同一变换后即可
     用短语精确对齐 bigram 的相邻语义（见 _fts_match_expression）。
     入库侧与查询侧必须使用同一函数——两侧不一致即破坏等价性。
+
+    非 ASCII 拉丁字符（如 café/naïve/Über 中的 é/ï/Ü）按空格切分：
+    _ENGLISH_WORD 仅捕获 [A-Za-z0-9]，而 FTS 的 unicode61 会把 café
+    当单 token，二者不一致导致词项失配、FTS 候选集非超集。此处把
+    非 ASCII 且非 CJK 的字母归一为空格，使索引 token 与打分侧切分对齐
+    （café → "caf é"），保证 FTS 候选集仍是「打分 > 0」集合的超集。
     """
     out: list[str] = []
     for char in text:
         if _is_cjk(char):
             out.append(" ")
             out.append(char)
+            out.append(" ")
+        elif not char.isascii() and char.isalpha():
+            # 非 ASCII 拉丁字母（如 é/ï/Ü）：按空格切分，对齐
+            # _ENGLISH_WORD 的 ASCII 切分（见模块顶部 C4 决策）。
             out.append(" ")
         else:
             out.append(char)

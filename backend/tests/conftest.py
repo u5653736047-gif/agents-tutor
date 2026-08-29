@@ -12,6 +12,21 @@ from pathlib import Path
 
 import pytest
 
+# starlette 0.40+ 将 HTTP_422_UNPROCESSABLE_CONTENT 重命名为
+# HTTP_422_UNPROCESSABLE_ENTITY，旧常量在新版上 AttributeError；
+# 本仓库大量 api 模块仍用旧名，CI 的旧版 venv 上两者并存但新 venv
+# 仅有新名——此处做兼容别名，保证新旧版本均可导入（P1 修复回归门禁
+# 的前置）。
+try:
+    import starlette.status as _starlette_status
+
+    if not hasattr(_starlette_status, "HTTP_422_UNPROCESSABLE_CONTENT"):
+        _starlette_status.HTTP_422_UNPROCESSABLE_CONTENT = (  # type: ignore[attr-defined]
+            _starlette_status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+except AttributeError:
+    pass
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))

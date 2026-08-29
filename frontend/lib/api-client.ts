@@ -396,8 +396,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       }
     },
     // D6-T6:文档清单——GET 直接透传契约响应(documents 数组)。
-    listDocuments: () =>
-      request<KnowledgeDocumentListResponse>(config, "/knowledge/documents"),
+    // P1-5：支持按 namespace 过滤（显式字段，不再前端反推前缀）。
+    listDocuments: (namespace?: string) =>
+      request<KnowledgeDocumentListResponse>(
+        config,
+        namespace
+          ? `/knowledge/documents?namespace=${encodeURIComponent(namespace)}`
+          : "/knowledge/documents",
+      ),
     // D6-T6:删除文档——204 空响应体由 request() 放行(见 request 注释)。
     deleteDocument: (documentId) =>
       request<void>(

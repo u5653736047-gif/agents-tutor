@@ -26,6 +26,7 @@ D6-T5 新增文档管理端点(错误码约定同上):
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -85,8 +86,11 @@ class _DocumentEntry(TypedDict):
     source: str
     page_count: int | None
     chunk_count: int | None
+    namespace: str
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _knowledge_db_path() -> Path:
@@ -466,6 +470,7 @@ async def upload_document(
         "source": documents[0].source,
         "page_count": response.page_count,
         "chunk_count": response.chunk_count,
+        "namespace": namespace,
     }
     return response
 
@@ -497,6 +502,7 @@ async def list_documents(
                 source=entry["source"],
                 page_count=entry["page_count"],
                 chunk_count=entry["chunk_count"] or 0,
+                namespace=entry.get("namespace", "public"),
             )
             for entry in _document_registry(request).values()
         ]
@@ -515,24 +521,15 @@ async def list_documents(
             source=entry["source"],
             page_count=entry["page_count"],
             chunk_count=entry["chunk_count"] or 0,
+            namespace=entry.get("namespace", "public"),
         )
         for entry in _document_registry(request).values()
     ]
     merged = merge_uploaded_catalog(catalog_docs, registry_docs)
     if namespace is not None:
-        # S5-C1 决策 7：空间的自然推导——非 public 文档的 document_id
-        # 带 "{namespace}:" 前缀，public 为裸 ID。按前缀过滤即可覆盖
-        # 两种形态（catalog 无需暴露额外字段）。
-        prefix = f"{namespace}:"
-        merged = [
-            doc
-            for doc in merged
-            if (
-                doc.document_id.startswith(prefix)
-                if namespace != "public"
-                else ":" not in doc.document_id
-            )
-        ]
+        # P1-5：按显式 namespace 字段过滤，不再对 document_id 前缀反推
+        # （注册表兜底条目同样携带 namespace，见下；catalog 已显式聚合）。
+        merged = [doc for doc in merged if doc.namespace == namespace]
     return KnowledgeDocumentListResponse(
         documents=[_to_document_dto(doc) for doc in merged]
     )
@@ -545,6 +542,7 @@ def _to_document_dto(doc: KnowledgeDocumentInfo) -> KnowledgeDocumentListEntry:
         source=doc.source,
         page_count=doc.page_count,
         chunk_count=doc.chunk_count,
+        namespace=doc.namespace,
     )
 
 
@@ -596,6 +594,7 @@ def _overview_snapshot(
             subjects=doc.subjects,
             difficulty=doc.difficulty,
             ingested_at=doc.ingested_at,
+            namespace=doc.namespace,
         )
         for doc in catalog.list_documents()
     ]
@@ -627,6 +626,7 @@ def get_knowledge_catalog(request: Request) -> SqliteKnowledgeCatalog | None:
     "/documents/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses=ERROR_RESPONSES,
+    response_model=None,
 )
 async def delete_document(
     document_id: str,
@@ -640,9 +640,55 @@ async def delete_document(
     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
     404 区分。注册表同步移除该条目。
+    P1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留
+    （删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再
+    误判为已入库）。
     """
     await run_in_threadpool(service.delete_document, document_id)
     _document_registry(request).pop(document_id, None)
+    # P1-3：清理完成标记（幂等，文档不存在时 0 行受影响不报错）。
+    # 走独立短生命周期连接（与上传标记写入同一路径约定）；删除是
+    # 低频操作，临时开闭可接受，且不依赖 service 内部索引类型
+    # （Hybrid 场景下 service._index 可能是混合索引）。
+    # 删除已成功，标记清理为 best-effort：异常仅告警，不影响 204。
+    def _clear_mark() -> None:
+        # best-effort: 删除已成功，标记清理任何异常仅告警，不阻断 204
+        index = None  # type: ignore[assignment]
+        try:
+            index = SqliteKnowledgeIndex(_knowledge_db_path())
+            try:
+                index.clear_document_complete(document_id)
+            except Exception as exc:  # noqa: BLE001 - best-effort 清理不阻断已成功的删除
+                _LOGGER.warning(
+                    "清理文档完成标记失败 document_id=%s: %s",
+                    document_id,
+                    exc,
+                )
+        except Exception as exc:  # noqa: BLE001 - 建连/路径异常同样 best-effort
+            _LOGGER.warning(
+                "清理文档完成标记失败 document_id=%s: %s",
+                document_id,
+                exc,
+            )
+        finally:
+            if index is not None:
+                try:
+                    index.close()
+                except Exception as exc:  # noqa: BLE001 - close best-effort
+                    _LOGGER.warning(
+                        "清理文档完成标记失败 document_id=%s: %s",
+                        document_id,
+                        exc,
+                    )
+
+    try:
+        await run_in_threadpool(_clear_mark)
+    except Exception as exc:  # noqa: BLE001 - 防御性兜底，任何未捕获异常不影响已成功的删除
+        _LOGGER.warning(
+            "清理文档完成标记失败 document_id=%s: %s",
+            document_id,
+            exc,
+        )
 
 
 @router.get(

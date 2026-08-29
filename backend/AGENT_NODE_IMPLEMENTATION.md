@@ -1,3 +1,5 @@
+> ⚠️ 已冻结 2026-08-26 — 本文件为 2026-08-02 版历史归档，与 `backend/src/core/graph_builder.py:336 tool 模式` 脱节；图编排权威见 `graph_builder.py` tool 模式 + `docs/SIX_FEATURES_COMPETITION_MAPPING.md`
+
 # 统一 ReAct Agent 实现
 
 四个角色共用 `ReActAgentNode`，仅角色标识和 Prompt 不同。

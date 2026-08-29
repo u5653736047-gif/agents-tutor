@@ -11,7 +11,7 @@ core/learning/store.py）——LLM 叙述只出现在对话内诊断报告，本
 - 本端点的 `student_id` 查询参数供教师视角查询指定学生——REST 层
   入参，不违背工具层「user_id 模型不可控」红线（对话内工具仍只能用
   scope 注入的当前用户）；
-- v1 无认证体系（TASK_BREAKDOWN 3.1.3 未立项）：student_id 查询在
+- v1 无认证体系（SIX_FEATURES §三 / TASKS_STAGE_3_DETAILS §八 单独立项）：student_id 查询在
   演示环境为可信声明，生产部署需待认证落地后加角色授权；
 - store 未注入（未配置 learning.db 的部署）→ 返回空报告 200 而非
   报错（降级红线，与「空数据返回空报告」同一口径）。

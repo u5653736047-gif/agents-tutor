@@ -139,12 +139,12 @@ export default function KnowledgePage() {
     [],
   );
 
-  // 按空间分组(从 document_id 前缀推导:非 public 前缀为空间名)。
+  // P1-5：按显式 namespace 字段分组（不再对 document_id 前缀反推）。
   const groupedDocuments = (() => {
     const groups = new Map<string, KnowledgeDocumentEntry[]>();
     for (const doc of documents) {
-      const colon = doc.document_id.indexOf(":");
-      const ns = colon > 0 ? doc.document_id.slice(0, colon) : "public";
+      // 后端显式返回 namespace，缺省兼容旧契约回退为 public
+      const ns = (doc as { namespace?: string }).namespace ?? "public";
       const bucket = groups.get(ns) ?? [];
       bucket.push(doc);
       groups.set(ns, bucket);

@@ -757,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
         "--check-updates",
         action="store_true",
         help="S5-C3 只读检测模式：比对源文件 sha256 与完成标记，报告内容"
-        "变更与分块策略漂移；不写库、不解析 PDF",
+        "变更与分块策略漂移；不解析 PDF（首次打开旧库会幂等回填 namespace 字段，仅此一次写入）",
     )
     parser.add_argument(
         "--relabel-frontmatter",
@@ -801,7 +801,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.check_updates:
-        # S5-C3 只读检测模式：绝不写库、不解析 PDF。
+        # S5-C3 只读检测模式：比对源文件 sha256 与完成标记，不解析 PDF。
+        # 首次打开旧库会幂等回填 namespace 字段（SqliteKnowledgeIndex
+        # 构造时的存量迁移），除此之外不写业务数据。
         issues = 0
         for book in books:
             pdf_path = args.books_dir / book.file
@@ -833,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[一致] {label}")
         print(
             f"检测完成：{issues}/{len(books)} 本书需要关注"
-            f"（--check-updates 为只读模式，未写入任何数据）"
+            f"（--check-updates 不解析 PDF；除首次打开旧库的幂等回填外未写入业务数据）"
         )
         index.close()
         return 0

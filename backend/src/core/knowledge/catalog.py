@@ -54,6 +54,8 @@ class KnowledgeDocumentInfo(BaseModel):
     - difficulty：难度（metadata 注入）；
     - ingested_at：入库完成时间（来自 ingest_marks 表；无标记的
       API 上传文档为 None）。
+    - namespace：所属知识空间（P1-5 显式化，替代前端对 document_id
+      前缀的反推；public 为公共库，其余为课程空间）。
     """
 
     document_id: str
@@ -64,6 +66,10 @@ class KnowledgeDocumentInfo(BaseModel):
     subjects: list[str] = Field(default_factory=list)
     difficulty: str | None = None
     ingested_at: str | None = None
+    # P1-5：显式空间字段，避免前端对 `:` 前缀的脆弱反推
+    # （公共文档 document_id 不含冒号，课程文档含 `{ns}:` 前缀；
+    #  若 stem 本身含冒号的极端输入，前缀反推会误判）。
+    namespace: str = "public"
 
     def __init__(self, **data: object) -> None:
         # source 复用 models._validate_logical_source 的脱敏校验：
@@ -311,7 +317,9 @@ class SqliteKnowledgeCatalog:
                 "SELECT document_id, MIN(source), COUNT(*), COUNT(DISTINCT page), "
                 "SUM(CASE WHEN json_extract(metadata_json, '$.chunk_class') = "
                 "'frontmatter' THEN 1 ELSE 0 END), "
-                "MIN(metadata_json) "
+                "MIN(metadata_json), "
+                # P1-5：显式聚合 namespace，避免前端反推 `:` 前缀
+                "COALESCE(MIN(json_extract(metadata_json, '$.namespace')), 'public') "
                 "FROM chunks GROUP BY document_id ORDER BY document_id"
             ).fetchall()
             mark_rows = {
@@ -328,11 +336,26 @@ class SqliteKnowledgeCatalog:
             page_count,
             _frontmatter_count,
             metadata_json,
+            namespace_val,
         ) in chunk_rows:
             metadata = json.loads(metadata_json) if metadata_json else {}
             title = metadata.get("title")
             subject = metadata.get("subject")
             difficulty = metadata.get("difficulty")
+            # P1-5：优先取聚合列的 namespace，若为 public 且 document_id
+            # 含前缀则以后者为准（覆盖旧库回填前的极端不一致）。
+            raw_ns = str(namespace_val) if namespace_val else "public"
+            if ":" in document_id and raw_ns == "public":
+                # 仅当聚合值为 public 但 ID 明示非 public 前缀时，
+                # 以 ID 前缀为准（防御旧库中 metadata 缺键但 ID 已前缀化
+                # 的过渡态；正常库两者一致）。
+                prefix_ns = document_id.split(":", 1)[0]
+                if prefix_ns and ":" not in prefix_ns:
+                    # 前缀需符合小写标识形态才采信，否则仍以聚合值为准
+                    import re as _re
+
+                    if _re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", prefix_ns):
+                        raw_ns = prefix_ns
             documents.append(
                 KnowledgeDocumentInfo(
                     document_id=document_id,
@@ -346,6 +369,7 @@ class SqliteKnowledgeCatalog:
                     subjects=_split_subjects(subject),
                     difficulty=str(difficulty) if difficulty is not None else None,
                     ingested_at=mark_rows.get(document_id),
+                    namespace=raw_ns,
                 )
             )
         return documents

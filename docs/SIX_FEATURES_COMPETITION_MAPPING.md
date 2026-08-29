@@ -1,6 +1,6 @@
 # 六大核心功能与赛题要求对照表
 
-> 更新时间：2026-08-20（审查修复轮）
+> 更新时间：2026-08-26（自 2026-08-26 起为范围权威）
 > 赛题：XH-202620 面向一流学科建设的学科垂类大模型与创新应用开发（docs/pdf_content.txt）
 > 学科定位：人工智能学科（机器学习/深度学习）
 > 实施方案来源：《六大教学功能实现计划》（经 pi agent 三轮审查修订）
@@ -27,6 +27,8 @@
 | 学习记录库 | API_LEARNING_DB_PATH | data/learning.db | SQLite WAL；复合唯一键 (source_tool_call_id, question_id) 防重放重复入库 |
 | OCR | API_OCR_MODE / uv sync --extra ocr | auto | rapidocr-onnxruntime（PP-OCR 同源）；依赖缺失自动降级为友好提示 |
 | 附件提取护栏 | API_ATTACHMENT_MAX_CHARS / API_ATTACHMENTS_TOTAL_MAX_CHARS | 30000 / 100000 | 超限截断并附标注；PDF 表格结构化（API_PDF_TABLE_MODE，pdfplumber 可选组，表格转 GFM Markdown）与图片理解三级降级链（API_VISION_*，VLM → OCR → 友好提示） |
+| 知识空间/命名空间/FTS预滤/知识树（f9628b3/33867a2） | API_KNOWLEDGE_DB_PATH 等 | — | 命名空间隔离 + FTS5 预滤 + 知识树/空间选择器（`frontend/app/knowledge/page.tsx` 空间选择器一致，`backend/src/core/knowledge/catalog.py` + `service.py`）；低选择性回退阈值 0.97x，见 `docs/perf-evidence/fts-benchmark-2026-08-23.md` |
+| FTS 低选择性回退 | — | 0.97x 阈值 | `fts-benchmark-2026-08-23` 实测低选择性查询回退，基准见同名报告；向量/FTS 混合链路已落地 `vector_index.py`/`hybrid.py` 一致 |
 
 ## 三、剩余人工动作（不阻塞代码交付）
 
@@ -35,7 +37,7 @@
 3. **真实模型冒烟**：配置 DEEPSEEK_API_KEY 后跑 `uv run python scripts/verify_deepseek_react.py`，并为六大功能各补一条真实模型端到端冒烟记录（演示证据）。
 4. **效果验证报告素材**（赛题 06 材料）：≥2 名真实目标用户试用记录、前后对比数据——依赖真实用户，代码侧已就绪（feedback.jsonl + 诊断端点可出数据）。
 
-## 四、质量门禁现状（2026-08-20，含审查修复轮）
+## 四、质量门禁现状（2026-08-26，含审查修复轮）
 
 - 后端：1074 pytest 全绿（+1 OCR 真实引擎用例在未装 ocr extra 的环境自动跳过）+ ruff 全绿 + mypy strict 全绿（54 源文件）
 - 前端：327 测试全绿（含新增 grading-card 组件测试）+ typecheck 全绿（lint 仅 2 个既有 useVirtualizer 兼容性 warning）

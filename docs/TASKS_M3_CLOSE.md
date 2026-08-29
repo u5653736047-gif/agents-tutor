@@ -146,15 +146,15 @@ Supervisor 路由/分解 → 助教/助学 Worker 检索教材作答 → 评价 
 - **D6-T3 有既有完成备注**（该文件 727 行起）：KnowledgeService 装配与
   `search_knowledge` 注入已完成，本次只做检索端点本身，不要重复装配。
 - 每个任务完成后勾选该文件对应项；M3 出口检查（第十节）全过后，按其
-  同步约定更新 `docs/TASK_BREAKDOWN_v2.md` 阶段三各项。
+  同步约定核对阶段三各项（已迁移，不再回写冻结文件 `TASK_BREAKDOWN_v2.md`）。
 - 前端类型只从 OpenAPI 重新生成，不手写重复定义。
 
-## Sprint 5：阶段一二收尾项（可选填充）
+## Sprint 5：阶段一二收尾项（可选填充，已冻结 — 见 SIX_FEATURES）
 
 执行 `docs/TASKS_STAGE_1_2.md` 第 620 行起的 S5-T1～S5-T9（教案生成、
 水平建模/错题分析、进度/审计报表、代码沙箱、LaTeX 渲染、学习记录工具、
 工具动态加载、摘要压缩、PostgreSQL checkpointer）。全部为可选深化项，
-优先级低于 H 与 D 系列，可插入任意间隙，门禁与执行规则相同。
+优先级低于 H 与 D 系列，可插入任意间隙，门禁与执行规则相同。**S5 已被 `SIX_FEATURES` + `officecli-integration-plan` + `EMBEDDING_SELECTION 5.2` 替代，范围权威见 `SIX_FEATURES`，本段仅历史保留。**
 
 ---
 

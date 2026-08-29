@@ -25,7 +25,7 @@
 维护点（M-3）：涉及词法检索得分/排序的断言（test_same_document_
 multiple_chunks_merged 的 short-doc 4 分 vs long-doc 3 分等）依赖
 InMemoryKnowledgeIndex 词法索引的确定性，Sprint 3 换向量索引后需
-复核（与 S2-T4 test_references.py 同一维护点，见 TASKS_STAGE_1_2.md
+复核（与 S2-T4 test_references.py 同一维护点，见 TASKS_M3_CLOSE Sprint5 / SIX_FEATURES §二
 S2-T4 备注）。
 """
 

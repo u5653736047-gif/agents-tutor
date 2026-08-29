@@ -38,3 +38,10 @@ docs/.trae-html-share-packages/
 docs/agent-plug-and-play-ui-research/
 docs/agent-streaming-ui-research/
 docs/ui-review-shots/13-assistant-ui-final-verify.png
+
+# Temporary analysis artifacts (local-only, not versioned)
+diff_summary.json
+log_numstat.txt
+
+# 工作流产物区（运行时生成，按 run_id 隔离）
+.workflow-artifacts/
