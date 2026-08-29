@@ -40,6 +40,7 @@ from ..filesystem import (
     WorkspaceFileSystem,
     active_workspace_filesystem,
 )
+from .artifact_scope import artifact_auto_approval_roots
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -305,6 +306,57 @@ def approved_office_execution() -> Iterator[None]:
         _APPROVED_OFFICE.reset(token)
 
 
+# 工作流产物区自动授权（lesson-workflow-design §五）：ContextVar 通道
+# 与上下文管理器在 artifact_scope（react_agent 写、executor 读）；此处
+# 只消费。门检查据此放行「全部涉文件都在产物根内」的写命令；目录外
+# 照旧拒绝。
+
+
+def _within_any_root(path: Path | str, roots: Sequence[str]) -> bool:
+    """绝对路径是否落在任一授权根内（resolve 后前缀比较，防 .. 逃逸）。"""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    for root in roots:
+        try:
+            if resolved.is_relative_to(Path(root).resolve()):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+# 无活动工作区时的占位默认：office_targets_within_roots 的真实调用路径
+# （react_agent 豁免检查分支）恒处于 workspace_scope 内，占位实例不会被
+# 用到；无 scope 时解析落在占位根下、产物根判定失败 → 不豁免（fail-closed）。
+_FALLBACK_WORKSPACE = WorkspaceFileSystem(Path.cwd())
+
+
+def office_targets_within_roots(
+    command: Sequence[str],
+    roots: Sequence[str],
+) -> bool:
+    """判定 officecli_edit 命令涉及的全部文件是否都落在授权根内。
+
+    复用 `_normalize_office_command` 做权威解析（动词白名单/位置参数/
+    路径解析同一套逻辑，不另写简化版）；解析失败视为不豁免（走人工
+    审批，由审批准备阶段给出准确的稳定错误）。工作区解析依赖调用方
+    处于 workspace_scope 上下文（与执行路径同一前提）。
+    """
+    try:
+        normalized = _normalize_office_command(
+            list(command),
+            active_workspace_filesystem(_FALLBACK_WORKSPACE),
+            writable=True,
+        )
+    except Exception:  # noqa: BLE001 - 解析失败一律不豁免，走人工审批
+        return False
+    if not normalized.files:
+        return False
+    return all(_within_any_root(path, roots) for path in normalized.files)
+
+
 def officecli_enabled() -> bool:
     """读取 API_OFFICECLI_ENABLED：默认 0（完全不注册工具），显式开启才装配。"""
     return os.getenv(ENV_OFFICECLI_ENABLED, "0").strip().lower() in {
@@ -516,14 +568,28 @@ def create_office_tools(
           JSON 对象）生成文档。
         """
         # 运行时审批门（高危 H3）：即使图装配缺陷或新增执行入口绕过审批
-        # 节点，未批准上下文中的调用也无法写文件。
-        if not _APPROVED_OFFICE.get():
-            raise PermissionError("officecli_edit requires an explicit user approval")
+        # 节点，未批准上下文中的调用也无法写文件。唯一例外是工作流产物
+        # 区自动授权（lesson-workflow-design §五）：命令涉及的全部文件
+        # 都落在登记的产物目录内时免人工审批——产物目录是本工作流运行
+        # 新建的隔离目录，不触用户既有文件；目录外写操作照旧硬拒绝。
         active = current()
         try:
             normalized = _normalize_office_command(command, active, writable=True)
         except (_OfficeCommandError, WorkspaceFileError) as error:
             return _command_error_result(error)
+        if not _APPROVED_OFFICE.get():
+            auto_roots = artifact_auto_approval_roots.get()
+            if (
+                auto_roots is None
+                or not normalized.files
+                or not all(
+                    _within_any_root(path, auto_roots)
+                    for path in normalized.files
+                )
+            ):
+                raise PermissionError(
+                    "officecli_edit requires an explicit user approval"
+                )
         with _locked_files(normalized.files):
             result = _run_officecli(
                 settings.binary,

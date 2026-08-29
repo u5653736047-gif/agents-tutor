@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Collection, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
+from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -39,8 +40,8 @@ from .filesystem import workspace_scope
 from .knowledge.models import Citation
 from .knowledge.tools import knowledge_scope
 from .learning import LEARNING_OUTCOMES, LearningRecordStore, learning_scope
-from .nodes import ReActAgentNode, create_agent_nodes
-from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
+from .nodes import ReActAgentNode, ReActResult, create_agent_nodes
+from .nodes.prompts import TOOL_ORCHESTRATION_SUPERVISOR_PROMPT, WORKFLOW_SUPERVISOR_CLAUSE
 from .nodes.react_agent import ChatModel, tool_output_summary
 from .state import (
     REFERENCES_METADATA_KEY,
@@ -68,6 +69,9 @@ from .state import (
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolResult,
+    WorkflowState,
+    WorkflowStatus,
+    WorkflowStepStatus,
     create_initial_state,
     message_references,
     with_agent_role,
@@ -78,6 +82,12 @@ from .state import (
 from .tools import DEFAULT_TOOL_TIMEOUT_SECONDS, ToolRegistry
 from .tools.office_tools import GENERATED_FILES_RESULT_KEY, approved_office_execution
 from .tools.shell_tool import approved_shell_execution, shell_output_scope
+from .workflows import (
+    WorkflowDefinition,
+    get_workflow,
+    registered_workflow_ids,
+    sanitize_artifact_filename,
+)
 
 WorkerRole = Literal["teaching_assistant", "learning_assistant", "evaluator"]
 OrchestrationMode = Literal["handoff", "tool"]
@@ -85,6 +95,9 @@ CompiledAgentGraph = CompiledStateGraph[AgentState, None, AgentState, AgentState
 _HANDOFF_APPROVAL_NODE = "handoff_approval"
 _TOOL_APPROVAL_NODE = "tool_approval"
 _TASK_PLAN_DISPATCH_NODE = "task_plan_dispatch"
+# 固定工作流确定性调度节点（lesson-workflow-design §二）：仅 tool 模式
+# 且 enable_workflows 时可达；handoff 编译图不注册该路由目标。
+_WORKFLOW_DISPATCH_NODE = "workflow_dispatch"
 _TASK_RESULTS_MARKER = "[TASK_RESULTS]"
 _SUBAGENT_TOOL_NAMES: dict[AgentRole, str] = {
     AgentRole.TEACHING_ASSISTANT: "ask_teaching_assistant",
@@ -688,6 +701,11 @@ class CollaborativeAgentGraph:
         interrupt_before_handoff: bool = False,
         orchestration_mode: OrchestrationMode = "handoff",
         learning_store: LearningRecordStore | None = None,
+        # 固定工作流开关（lesson-workflow-design §九）：仅 tool 模式可
+        # 启用——工作流走图节点确定性调度，与 handoff 的 next_agent 路由
+        # 语义冲突；关闭时不注册 start_workflow 工具、_route 分支对
+        # workflow=None 恒假，行为与未引入该特性逐字节等价。
+        enable_workflows: bool = False,
     ) -> None:
         # 参数校验：尽早拒绝非法组合，避免图运行期才暴露配置错误
         approval_tool_names = frozenset(
@@ -711,6 +729,8 @@ class CollaborativeAgentGraph:
             raise ValueError("approval-gated tools require a configured checkpointer")
         if orchestration_mode not in {"handoff", "tool"}:
             raise ValueError("orchestration_mode must be 'handoff' or 'tool'")
+        if enable_workflows and orchestration_mode != "tool":
+            raise ValueError("enable_workflows requires orchestration_mode='tool'")
         if orchestration_mode == "tool" and interrupt_before_handoff:
             raise ValueError(
                 "tool orchestration does not support interrupt_before_handoff"
@@ -757,6 +777,14 @@ class CollaborativeAgentGraph:
                 create_task_plan_tool_mode,
                 allowed_roles={AgentRole.SUPERVISOR},
             )
+            # 固定工作流触发工具（lesson-workflow-design §二）：仅
+            # enable_workflows 时注册——未启用时工具不存在，模型无从
+            # 触发，路由分支对 workflow=None 恒假，零行为差异。
+            if enable_workflows:
+                registry.register(
+                    self._create_start_workflow_tool(),
+                    allowed_roles={AgentRole.SUPERVISOR},
+                )
         # S2-T1 意图识别：detect_intent 仅 Supervisor 可用，
         # 与 handoff / create_task_plan 一样由模型在 ReAct 循环中调用。
         registry.register(
@@ -769,6 +797,40 @@ class CollaborativeAgentGraph:
             detect_level,
             allowed_roles={AgentRole.SUPERVISOR},
         )
+        # ── 固定工作流确定性导出工具（2026-08-29 探索结论）──
+        # 仅 enable_workflows 且装配了 officecli 时注册：教案正文经
+        # step_outputs 暂存，由本工具确定性写入 docx 并自验——模型不搬
+        # 运正文（CLI 转义/长度/迭代预算三重脆弱，真实冒烟两次空文件）。
+        if enable_workflows:
+            _office_edit = next(
+                (
+                    business_tool
+                    for business_tool in tools
+                    if getattr(business_tool, "name", "") == "officecli_edit"
+                ),
+                None,
+            )
+            _office_inspect = next(
+                (
+                    business_tool
+                    for business_tool in tools
+                    if getattr(business_tool, "name", "")
+                    == "officecli_inspect"
+                ),
+                None,
+            )
+            if _office_edit is not None and _office_inspect is not None:
+                registry.register(
+                    self._create_export_workflow_docx_tool(
+                        _office_edit,
+                        _office_inspect,
+                    ),
+                    allowed_roles={
+                        AgentRole.TEACHING_ASSISTANT,
+                        AgentRole.LEARNING_ASSISTANT,
+                        AgentRole.EVALUATOR,
+                    },
+                )
         # S2-T3 基础评价规则：submit_evaluation 仅 evaluator 可用，
         # 由评价 Agent 在 ReAct 循环中基于最终回答与检索证据调用
         # （prompt 约定，见 ROLE_PROMPTS[EVALUATOR]），结果经 _wrap
@@ -825,6 +887,9 @@ class CollaborativeAgentGraph:
         self._approval_tool_names = approval_tool_names
         self.max_handoffs = max_handoffs
         self.max_agent_switches = max_agent_switches
+        # 固定工作流（lesson-workflow-design）：注册表来自 core.workflows，
+        # 启用前提已在参数校验段保证（仅 tool 模式）。
+        self.enable_workflows = enable_workflows
         self.checkpointer = checkpointer
         self.interrupt_before_handoff = interrupt_before_handoff
         self._persistence_lock = RLock()
@@ -850,6 +915,11 @@ class CollaborativeAgentGraph:
                 {
                     AgentRole.SUPERVISOR: (
                         TOOL_ORCHESTRATION_SUPERVISOR_PROMPT
+                        + (
+                            WORKFLOW_SUPERVISOR_CLAUSE
+                            if enable_workflows
+                            else ""
+                        )
                     )
                 }
                 if orchestration_mode == "tool"
@@ -906,6 +976,251 @@ class CollaborativeAgentGraph:
             ),
             extras={"subagent": True},
         )(invoke_subagent)
+
+    def _create_start_workflow_tool(self) -> BaseTool:
+        """创建固定工作流触发工具（lesson-workflow-design §二）。
+
+        模型只负责确认意图与填参数（topic/grade_level），步骤顺序、
+        预算、失败策略全部来自注册表定义——模型不可自造。返回值是
+        WorkflowState 的 JSON：_wrap 在轮末解析写回 state["workflow"]
+        （与 create_task_plan 的结果回传-轮末解析机制同一模式），本轮
+        结束后路由进 _workflow_dispatch 确定性调度。
+        """
+
+        class _StartWorkflowInput(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
+            workflow_id: str = Field(min_length=1, max_length=60)
+            topic: str = Field(min_length=1, max_length=120)
+            grade_level: str | None = Field(default=None, max_length=60)
+
+        def start_workflow(
+            workflow_id: str,
+            topic: str,
+            grade_level: str | None = None,
+        ) -> str:
+            definition = get_workflow(workflow_id)
+            if definition is None:
+                return json.dumps(
+                    {
+                        "error": "未知的工作流 id，请使用已注册工作流",
+                        "registered": registered_workflow_ids(),
+                    },
+                    ensure_ascii=False,
+                )
+            parent = _ACTIVE_PARENT_STATE.get()
+            workspace_root = (
+                None if parent is None else parent.get("workspace_root")
+            )
+            if not isinstance(workspace_root, str) or not workspace_root.strip():
+                return json.dumps(
+                    {
+                        "error": (
+                            "当前会话未绑定工作区，无法创建产物目录；"
+                            "请先确认会话工作区后再启动工作流"
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            # 同轮重复启动防御：_ACTIVE_PARENT_STATE 是轮首快照，_wrap
+            # 的写回发生在轮末——工具内读到的 workflow 恒为轮首值
+            # （正常为 None）。真正的同轮去重靠 _wrap 只采纳最后一个
+            # 解析结果 + 空 run_id 目录隔离，双启动只浪费一个空目录。
+            run_id = None if parent is None else parent.get("run_id")
+            artifact_root = Path(workspace_root) / ".workflow-artifacts" / str(
+                run_id or uuid4()
+            )
+            try:
+                artifact_root.mkdir(parents=True, exist_ok=True)
+                params: dict[str, str] = {
+                    "topic": topic.strip(),
+                    "grade_hint": (
+                        f"（对象：{grade_level.strip()}）"
+                        if grade_level and grade_level.strip()
+                        else ""
+                    ),
+                }
+                workflow_state = definition.build_state(
+                    params,
+                    artifact_root=str(artifact_root),
+                )
+            except ValueError as exc:
+                return json.dumps(
+                    {"error": f"工作流参数不合法：{exc}"},
+                    ensure_ascii=False,
+                )
+            # 返回值 = WorkflowState JSON + 行为指令。指令放工具结果里
+            # 而不是只放角色卡：模型对「工具结果内的指令」遵循度显著更
+            # 高（真实模型冒烟：仅角色卡约束时，模型启动工作流后继续
+            # 反复调工具直至迭代超限）。JSON 解析由 _workflow_from_results
+            # 的宽容读取兼容（raw_decode 取首个 JSON 对象）。
+            return (
+                workflow_state.model_dump_json()
+                + "\n[系统] 工作流已启动，步骤将由系统按序自动执行。"
+                "请立即输出一句简短确认（告知用户工作流已开始与包含的"
+                "步骤），然后结束本轮；不要再调用任何工具，重复启动会被"
+                "系统拒绝。"
+            )
+
+        return tool(
+            "start_workflow",
+            args_schema=_StartWorkflowInput,
+            description=(
+                "启动一个注册过的固定工作流（如教案制作）。步骤顺序由系统"
+                "确定性执行：启动后各专业 Agent 将按序自动完成，无需再调用"
+                " ask_*；你只需在全部步骤完成后整合结果作答。"
+            ),
+        )(start_workflow)
+
+    def _create_export_workflow_docx_tool(
+        self,
+        office_edit: BaseTool,
+        office_inspect: BaseTool,
+    ) -> BaseTool:
+        """工作流产物确定性导出工具（2026-08-29 探索结论）。
+
+        为什么存在：让模型把整篇正文经 CLI 参数搬运进 officecli 是三重
+        脆弱设计——语法发现耗迭代（load_skill 技能名不匹配）、命令长度
+        受 MAX_COMMAND_TOKENS 限制、预算耗尽后模型谎报完成（真实冒烟两
+        次产出空 docx）。本工具把写入变成确定性代码路径：
+
+        1. 从 state.workflow.step_outputs 读取暂存的教案全文（模型不搬
+           运正文，工具无内容参数）；
+        2. 暂存文本落盘 draft.md，再以代码构造的命令
+           `create docx` + `add --type markdown --prop src=draft.md`
+           写入（正文从文件读取，officecli 的 markdown 元素原生渲染
+           标题/段落/列表）；
+        3. 写入后强制自验（view stats 段落数为 0 即报错），杜绝谎报。
+
+        写入以 approved_office_execution 上下文执行：这是工作流自身的
+        确定性产物写入（产物区边界由构造保证），不是模型发起的写操作。
+        """
+        from .tools.office_tools import approved_office_execution
+
+        class _ExportInput(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
+            filename: str | None = Field(default=None, max_length=120)
+
+        def export_workflow_docx(filename: str | None = None) -> str:
+            parent = _ACTIVE_PARENT_STATE.get()
+            raw_workflow = None if parent is None else parent.get("workflow")
+            workflow: WorkflowState | None = None
+            if raw_workflow is not None:
+                try:
+                    workflow = WorkflowState.model_validate(raw_workflow)
+                except ValidationError:
+                    workflow = None
+            if (
+                workflow is None
+                or not workflow.artifact_root
+                or not workflow.step_outputs.get("draft", "").strip()
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "暂存区没有教案全文（draft 步骤输出为空或无产物"
+                            "目录），无法导出"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            root = Path(workflow.artifact_root)
+            draft_text = workflow.step_outputs["draft"]
+            md_path = root / "draft.md"
+            md_path.write_text(draft_text, encoding="utf-8")
+            topic = workflow.params.get("topic", "教案")
+            raw_name = filename or f"教案-{topic}.docx"
+            docx_path = root / sanitize_artifact_filename(raw_name)
+
+            def _invoke(tool: BaseTool, command: list[str]) -> dict[str, Any]:
+                raw = tool.invoke({"command": command})
+                parsed: Any = raw
+                if isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except ValueError:
+                        parsed = {"ok": False, "message": raw[:300]}
+                return cast(dict[str, Any], parsed)
+
+            with approved_office_execution():
+                created = _invoke(office_edit, ["create", str(docx_path)])
+                # create 目标已存在等场景：视为可继续（幂等写入）
+                if not created.get("ok") and "exists" not in str(
+                    created.get("message", "")
+                ).lower():
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"创建文档失败：{str(created)[:300]}",
+                        },
+                        ensure_ascii=False,
+                    )
+                written = _invoke(
+                    office_edit,
+                    [
+                        "add",
+                        str(docx_path),
+                        # add 命令需要 <parent> 位置参数（正文挂载点，
+                        # 见 officecli help docx add：Paths: /body）——
+                        # 真实冒烟取证：缺它整条命令报
+                        # "Required argument missing"，写入静默失败。
+                        "/body",
+                        "--type",
+                        "markdown",
+                        "--prop",
+                        f"src={md_path}",
+                    ],
+                )
+            if not written.get("ok"):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"写入教案内容失败：{str(written)[:300]}",
+                    },
+                    ensure_ascii=False,
+                )
+            stats = _invoke(
+                office_inspect,
+                ["view", str(docx_path), "stats"],
+            )
+            paragraphs = 0
+            match = re.search(
+                r"Paragraphs:\s*(\d+)", str(stats.get("stdout", "")), re.DOTALL
+            )
+            if match is not None:
+                paragraphs = int(match.group(1))
+            if paragraphs <= 0:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "写入自验失败：文档段落数为 0，正文未写入；"
+                            "请勿声称导出成功"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "ok": True,
+                    "docx": str(docx_path),
+                    "paragraphs": paragraphs,
+                    "draft_chars": len(draft_text),
+                },
+                ensure_ascii=False,
+            )
+
+        return tool(
+            "export_workflow_docx",
+            args_schema=_ExportInput,
+            description=(
+                "把暂存的教案全文（draft 步骤产出）确定性导出为产物目录内"
+                "的 docx 文件并自动验证段落数。无需提供正文参数；调用成功"
+                "后报告返回值中的文件路径与段落数即可。"
+            ),
+        )(export_workflow_docx)
 
     def _create_record_learning_outcome_tool(self) -> BaseTool:
         """创建学习结果记录工具（P0-5 闭包工具，捕获 store 实例）。
@@ -1086,6 +1401,11 @@ class CollaborativeAgentGraph:
             routes[_HANDOFF_APPROVAL_NODE] = _HANDOFF_APPROVAL_NODE
         if self._approval_tool_names:
             routes[_TOOL_APPROVAL_NODE] = _TOOL_APPROVAL_NODE
+        # 固定工作流调度节点（lesson-workflow-design §二）：仅启用时
+        # 注册——关闭时 _route 分支不可达（workflow 恒 None），图结构
+        # 与引入前完全一致。
+        if self.enable_workflows:
+            routes[_WORKFLOW_DISPATCH_NODE] = _WORKFLOW_DISPATCH_NODE
 
         # 路由函数绑定本图的编排模式（S5-A1：tool 模式活动计划不走分派
         # 节点，见 _route 注释）；lambda 保持 LangGraph 期望的 fn(state) 签名。
@@ -1101,6 +1421,13 @@ class CollaborativeAgentGraph:
             route_fn,
             routes,
         )
+        if self.enable_workflows:
+            graph.add_node(_WORKFLOW_DISPATCH_NODE, self._workflow_dispatch)
+            graph.add_conditional_edges(
+                _WORKFLOW_DISPATCH_NODE,
+                route_fn,
+                routes,
+            )
 
         if self.interrupt_before_handoff:
             graph.add_node(_HANDOFF_APPROVAL_NODE, self._approve_handoff)
@@ -1454,6 +1781,27 @@ class CollaborativeAgentGraph:
                             )
                         )
                     updates["events"] = approval_events
+                # ── 固定工作流：审批暂停标记（lesson-workflow-design §二）──
+                # 与计划簿记同一闸口：工作流 Worker 触发审批时把 status
+                # 拨到 PAUSED_APPROVAL（API/前端可见的暂停态）；恢复后
+                # Worker 终态经 _workflow_worker_updates 落账并拨回
+                # RUNNING。真实冒烟教训：此处不标记则暂停语义只在
+                # pending_tool_approval 上可见，工作流状态机脱节。
+                paused_workflow = _workflow_from_state(state)
+                if (
+                    paused_workflow is not None
+                    and paused_workflow.status is WorkflowStatus.RUNNING
+                ):
+                    pause_steps = paused_workflow.steps
+                    pause_index = paused_workflow.current_step_index
+                    if (
+                        pause_index < len(pause_steps)
+                        and pause_steps[pause_index].worker_role.value
+                        == agent.role.value
+                    ):
+                        updates["workflow"] = paused_workflow.model_copy(
+                            update={"status": WorkflowStatus.PAUSED_APPROVAL}
+                        )
                 return cast(AgentState, updates)
             tool_results = cast(list[ToolResult], updates.get("tool_results", []))
             # ── S2-T4 结构化引用：把本轮检索命中挂到终端回答 ──
@@ -1491,6 +1839,10 @@ class CollaborativeAgentGraph:
                 updates["generated_files"] = []
             target = _handoff_target(tool_results)  # 本轮模型请求的转交目标
             new_plan = _task_plan_from_results(tool_results)  # 本轮模型新建的计划
+            # 固定工作流启动解析（lesson-workflow-design §二）：与计划同一
+            # 「工具回 JSON → 轮末解析写回」机制；同轮多次启动只采纳最后
+            # 一次（宽容读取，解析失败视为无启动而非崩溃）。
+            new_workflow = _workflow_from_results(tool_results)
             existing_plan = _task_plan_from_state(state)  # 已持久化的活动计划
             # ── S2-T1 意图识别：解析模型分类，并对「意图不明」做分派拦截 ──
             # 原理：detect_intent 是 Supervisor 决策前的必备工具（prompt 约定），
@@ -1518,10 +1870,17 @@ class CollaborativeAgentGraph:
             if (
                 intent is Intent.UNCLEAR
                 and agent.role is AgentRole.SUPERVISOR
-                and (target is not None or new_plan is not None)
+                and (
+                    target is not None
+                    or new_plan is not None
+                    or new_workflow is not None
+                )
             ):
                 target = None
                 new_plan = None
+                # 工作流启动同受 UNCLEAR 拦截：意图不明却启动工作流，
+                # 作废启动（产物目录只是空壳，不产生语义副作用）。
+                new_workflow = None
             # ── S2-T2 学生水平画像：解析模型识别的水平并写入 state ──
             # 与 intent 的生命周期语义相反（这是本任务的关键设计）：
             # - intent 每轮重置、只属于「本轮」（run() 重置列表含 intent）；
@@ -1571,6 +1930,14 @@ class CollaborativeAgentGraph:
             if new_plan is not None and existing_plan is None:
                 updates["task_plan"] = new_plan
                 updates["task_results"] = []  # 新计划从零收集子任务结果
+            # 固定工作流采纳（lesson-workflow-design §二）：workflow 通道
+            # 每用户轮重置，正常轮首恒 None；adopted 标志供事件发射使用。
+            existing_workflow = _workflow_from_state(state)
+            workflow_adopted = (
+                new_workflow is not None and existing_workflow is None
+            )
+            if workflow_adopted and new_workflow is not None:
+                updates["workflow"] = new_workflow
             events = cast(list[RunEvent], updates.get("events", []))
             if subagent_traces:
                 events = _interleave_subagent_traces(
@@ -1616,6 +1983,11 @@ class CollaborativeAgentGraph:
                 retrieval_rounds: int | None = None,
                 retrieval_hit_count: int | None = None,
                 retrieval_top_score: float | None = None,
+                # 固定工作流事件字段（lesson-workflow-design §七）
+                workflow_id: str | None = None,
+                workflow_step_id: str | None = None,
+                workflow_step_index: int | None = None,
+                auto_approved: bool | None = None,
             ) -> None:
                 nonlocal sequence
                 sequence += 1
@@ -1644,6 +2016,10 @@ class CollaborativeAgentGraph:
                         retrieval_rounds=retrieval_rounds,
                         retrieval_hit_count=retrieval_hit_count,
                         retrieval_top_score=retrieval_top_score,
+                        workflow_id=workflow_id,
+                        workflow_step_id=workflow_step_id,
+                        workflow_step_index=workflow_step_index,
+                        auto_approved=auto_approved,
                     )
                 )
 
@@ -1663,6 +2039,15 @@ class CollaborativeAgentGraph:
                     EventType.TASK_PLAN_CREATED,
                     agent.role.value,
                     content=str(len(new_plan.steps)),
+                )
+            if workflow_adopted and new_workflow is not None:
+                # 脱敏：事件只记步骤数与注册 id（content/workflow_id），
+                # 参数与产物路径在 state["workflow"] 随 checkpoint 持久化。
+                emit(
+                    EventType.WORKFLOW_STARTED,
+                    agent.role.value,
+                    content=str(len(new_workflow.steps)),
+                    workflow_id=new_workflow.workflow_id,
                 )
             if (
                 executed_plan is not None
@@ -2093,6 +2478,24 @@ class CollaborativeAgentGraph:
                         )
                     emit(EventType.RUN_COMPLETED, agent.role.value)
             else:
+                # ── 固定工作流 Worker 轮簿记（lesson-workflow-design §二）──
+                # 先于计划簿记：工作流运行中且本 Worker 是当前步骤目标时，
+                # 终态直接落步骤状态并提前返回（路由交 _route 的 workflow
+                # 分支 → 调度节点），不走计划/切换计数——工作流预算自成
+                # 体系（lesson-workflow-design §八）。审批暂停只翻工作流
+                # 状态、步骤保持 RUNNING；恢复后 Worker 携批准结果重跑。
+                workflow_updates = self._workflow_worker_updates(
+                    state,
+                    agent,
+                    result,
+                    emit,
+                )
+                if workflow_updates is not None:
+                    updates.update(workflow_updates)
+                    updates["events"] = events
+                    updates["handoff_count"] = handoff_count
+                    updates["agent_switch_count"] = switch_count
+                    return cast(AgentState, updates)
                 # Worker 轮：按活动计划记录本步骤结果并推进游标，完成后交回 Supervisor
                 if plan is not None and plan.status is TaskPlanStatus.ACTIVE:
                     step = plan.steps[plan.current_step_index]
@@ -2269,6 +2672,369 @@ class CollaborativeAgentGraph:
                 )
             ]
         return cast(AgentState, updates)
+
+    def _workflow_worker_updates(
+        self,
+        state: AgentState,
+        agent: ReActAgentNode,
+        result: ReActResult,
+        emit: Callable[..., None],
+    ) -> dict[str, Any] | None:
+        """工作流 Worker 轮终态 → 步骤状态更新（lesson-workflow-design §二）。
+
+        返回 None 表示本轮不归工作流管（无工作流 / 终态 / 角色与当前
+        步骤不符——后者交回既有逻辑兜底）。步骤 attempts 在分派时由
+        调度节点递增，这里只落终态与有界摘要；重试/回退决策全部在
+        调度节点（_workflow_dispatch），保持「记录」与「决策」分离。
+        """
+        workflow = _workflow_from_state(state)
+        # RUNNING 之外的合法入口：PAUSED_APPROVAL——审批恢复后 Worker 携
+        # 批准结果重跑，终态在这里落账并把工作流拨回 RUNNING（真实冒烟
+        # 发现：只认 RUNNING 会让恢复后的簿记被跳过，步骤卡 RUNNING、
+        # 调度节点防御性 raise、整轮图异常终止）。
+        if workflow is None or workflow.status not in {
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.PAUSED_APPROVAL,
+        }:
+            return None
+        resumed_from_pause = workflow.status is WorkflowStatus.PAUSED_APPROVAL
+        steps = list(workflow.steps)
+        index = workflow.current_step_index
+        if index >= len(steps):
+            return None
+        step = steps[index]
+        if step.worker_role.value != agent.role.value:
+            return None
+        if result.updates.get("pending_tool_approval") is not None:
+            # 产物区外写操作触发审批门：步骤保持 RUNNING，工作流进入
+            # 暂停态供 API/前端展示；批准恢复后 Worker 携工具结果重跑
+            # 并最终落终态（见 _approve_tool 的 next_agent 回指）。
+            return {
+                "workflow": workflow.model_copy(
+                    update={"status": WorkflowStatus.PAUSED_APPROVAL}
+                ),
+            }
+        output = (
+            None if result.error is not None else _terminal_agent_output(
+                result.messages
+            )
+        )
+        failure_code = (
+            result.error.error_code if result.error is not None else None
+        )
+        if failure_code is None and output is None:
+            failure_code = ErrorCode.AGENT_OUTPUT_INVALID
+        updated_step = step.model_copy(
+            update={
+                "status": (
+                    WorkflowStepStatus.COMPLETED
+                    if failure_code is None
+                    else WorkflowStepStatus.FAILED
+                ),
+                "summary": _bounded_workflow_summary(output, failure_code),
+            }
+        )
+        # 产物暂存（lesson-workflow-design 2026-08-29 探索结论）：成功
+        # 步骤的终端输出按 step_id 存入 step_outputs——draft 的教案全文
+        # 由此交给确定性导出工具，模型不通过 CLI 参数搬运长正文。
+        new_outputs = dict(workflow.step_outputs)
+        if failure_code is None and output:
+            new_outputs[step.step_id] = output[:60_000]
+        # 产物登记（lesson-workflow-design §五）：本步 officecli_edit 生成
+        # 的文件回执 → workflow.artifacts（相对 artifact_root 的 POSIX 相
+        # 对路径）。产物根外的写操作须人工审批（不经此处），故此处仅
+        # 登记产物区内文件；越界文件跳过（宽容读取）。
+        new_artifacts = list(workflow.artifacts)
+        if workflow.artifact_root:
+            for generated in _generated_files_from_tool_results(
+                cast(
+                    Sequence[ToolResult],
+                    result.updates.get("tool_results", []),
+                )
+            ):
+                try:
+                    relative = (
+                        Path(generated.path)
+                        .resolve()
+                        .relative_to(Path(workflow.artifact_root).resolve())
+                        .as_posix()
+                    )
+                except ValueError:
+                    continue
+                if relative not in new_artifacts:
+                    new_artifacts.append(relative)
+        emit(
+            EventType.WORKFLOW_STEP_COMPLETED,
+            agent.role.value,
+            success=failure_code is None,
+            error_code=failure_code,
+            workflow_id=workflow.workflow_id,
+            workflow_step_id=step.step_id,
+            workflow_step_index=index + 1,
+        )
+        return {
+            "workflow": workflow.model_copy(
+                update={
+                    "steps": [
+                        *steps[:index],
+                        updated_step,
+                        *steps[index + 1 :],
+                    ],
+                    "artifacts": new_artifacts,
+                    "step_outputs": new_outputs,
+                    # 审批恢复后的终态落账同时把工作流拨回 RUNNING：
+                    # 调度节点的失败策略/回退判定以 RUNNING 为前提。
+                    "status": (
+                        WorkflowStatus.RUNNING if resumed_from_pause else workflow.status
+                    ),
+                }
+            ),
+        }
+
+    def _workflow_dispatch(self, state: AgentState) -> AgentState:
+        """固定工作流确定性调度：按 current_step_index 分派下一个 Worker。
+
+        决策全部来自注册表定义（步骤顺序/指令模板/预算/失败策略），
+        模型零参与。终态步骤的失败策略与 revise 回退在此统一处置；
+        分派总是产出 next_agent（Worker 或收口 Supervisor），不会自环。
+        """
+        workflow = _workflow_from_state(state)
+        if workflow is None:
+            raise RuntimeError("workflow dispatch requires a workflow state")
+        definition = get_workflow(workflow.workflow_id)
+        if definition is None:
+            raise RuntimeError(
+                f"workflow definition missing: {workflow.workflow_id}"
+            )
+        sequence = max(
+            (event.sequence for event in state.get("events", [])),
+            default=-1,
+        )
+        emitted: list[RunEvent] = []
+
+        def emit_local(event_type: EventType, agent_value: str, **values: Any) -> None:
+            nonlocal sequence
+            sequence += 1
+            emitted.append(
+                RunEvent(
+                    event_type=event_type,
+                    sequence=sequence,
+                    session_id=state.get("session_id"),
+                    run_id=state.get("run_id"),
+                    agent=agent_value,
+                    **values,
+                )
+            )
+
+        steps = list(workflow.steps)
+        index = workflow.current_step_index
+
+        # 预算守卫：每步每轮至多分派 2 次（首发 + 重试 1），轮数上限 =
+        # max_revise_rounds + 1；超界说明调度缺陷而非模型行为，熔断为
+        # WORKFLOW_BUDGET_EXCEEDED。
+        attempt_budget = len(steps) * 2 * (definition.max_revise_rounds + 1)
+        if sum(step.attempts for step in steps) > attempt_budget:
+            return self._workflow_failed_updates(
+                state,
+                workflow,
+                definition,
+                ErrorCode.WORKFLOW_BUDGET_EXCEEDED,
+                sequence,
+            )
+
+        # 阶段 1：刚完成步骤的 revise 回退检查（COMPLETED 且策略命中时，
+        # 将 [fallback, index] 重置 PENDING 并计一轮 revise）。
+        if index < len(steps):
+            step = steps[index]
+            if (
+                step.status is WorkflowStepStatus.COMPLETED
+                and definition.revise_policy is not None
+                and workflow.attempts < definition.max_revise_rounds
+            ):
+                fallback_index = definition.revise_policy(
+                    index,
+                    step.summary,
+                )
+                if fallback_index is not None and 0 <= fallback_index < index:
+                    for reset in range(fallback_index, index + 1):
+                        steps[reset] = steps[reset].model_copy(
+                            update={
+                                "status": WorkflowStepStatus.PENDING,
+                                # 回退轮重新计预算：重做的成稿/生成步骤
+                                # 保留完整首发+重试额度（总量由上方
+                                # attempt_budget 守卫兜底）。
+                                "attempts": 0,
+                            }
+                        )
+                    workflow = workflow.model_copy(
+                        update={
+                            "steps": steps,
+                            "attempts": workflow.attempts + 1,
+                        }
+                    )
+                    emit_local(
+                        EventType.WORKFLOW_STEP_RETRY,
+                        AgentRole.SUPERVISOR.value,
+                        workflow_id=workflow.workflow_id,
+                        workflow_step_id=steps[fallback_index].step_id,
+                        workflow_step_index=fallback_index + 1,
+                    )
+                    index = fallback_index
+
+        # 阶段 2：失败策略处置（每轮至多一个 FAILED，处理后的推进由
+        # 阶段 3 完成——重试落回 PENDING，continue 落 SKIPPED）。
+        if index < len(steps):
+            step = steps[index]
+            if step.status is WorkflowStepStatus.FAILED:
+                step_definition = definition.steps[index]
+                if step_definition.on_failure == "retry" and step.attempts < 2:
+                    steps[index] = step.model_copy(
+                        update={"status": WorkflowStepStatus.PENDING}
+                    )
+                    emit_local(
+                        EventType.WORKFLOW_STEP_RETRY,
+                        AgentRole.SUPERVISOR.value,
+                        workflow_id=workflow.workflow_id,
+                        workflow_step_id=step.step_id,
+                        workflow_step_index=index + 1,
+                    )
+                elif step_definition.on_failure == "continue":
+                    steps[index] = step.model_copy(
+                        update={"status": WorkflowStepStatus.SKIPPED}
+                    )
+                else:
+                    return self._workflow_failed_updates(
+                        state,
+                        workflow.model_copy(update={"steps": steps}),
+                        definition,
+                        ErrorCode.WORKFLOW_BUDGET_EXCEEDED,
+                        sequence,
+                    )
+
+        # 阶段 3：推进越过全部终态步骤（revise 回退已把目标段重置，
+        # 不会越过它）。
+        while index < len(steps) and steps[index].status in {
+            WorkflowStepStatus.COMPLETED,
+            WorkflowStepStatus.SKIPPED,
+        }:
+            index += 1
+
+        # 收口：全部步骤终态 → 回 Supervisor 整合作答
+        if index >= len(steps):
+            completed = workflow.model_copy(
+                update={
+                    "steps": steps,
+                    "current_step_index": index,
+                    "status": WorkflowStatus.COMPLETED,
+                }
+            )
+            emit_local(
+                EventType.WORKFLOW_COMPLETED,
+                AgentRole.SUPERVISOR.value,
+                workflow_id=workflow.workflow_id,
+            )
+            return cast(
+                AgentState,
+                {
+                    "current_agent": AgentRole.SUPERVISOR.value,
+                    "next_agent": AgentRole.SUPERVISOR.value,
+                    "workflow": completed,
+                    "iteration_budget": None,
+                    "pending_tool_approval": None,
+                    "run_error": None,
+                    "handoff_count": state.get("handoff_count", 0),
+                    "agent_switch_count": state.get("agent_switch_count", 0),
+                    "events": emitted,
+                },
+            )
+
+        # 分派步骤。RUNNING 到达此处（审批恢复后簿记前调度先到等边界
+        # 场景）按重入语义处理：保留 RUNNING、attempts 递增、重新分派——
+        # Worker 携共享历史重跑即可续上，不做响亮失败（真实冒烟教训：
+        # 防御性 raise 会把可恢复状态变成整轮图异常终止）。
+        step = steps[index]
+        step_definition = definition.steps[index]
+        instruction = definition.format_instruction(
+            step_definition,
+            workflow.params,
+            artifact_dir=workflow.artifact_root,
+        )
+        steps[index] = step.model_copy(
+            update={
+                "status": WorkflowStepStatus.RUNNING,
+                "attempts": step.attempts + 1,
+            }
+        )
+        emit_local(
+            EventType.WORKFLOW_STEP_STARTED,
+            step.worker_role,
+            workflow_id=workflow.workflow_id,
+            workflow_step_id=step.step_id,
+            workflow_step_index=index + 1,
+        )
+        emit_local(
+            EventType.AGENT_SWITCHED,
+            AgentRole.SUPERVISOR.value,
+            content=step.worker_role,
+        )
+        return cast(
+            AgentState,
+            {
+                "current_agent": AgentRole.SUPERVISOR.value,
+                "next_agent": step.worker_role,
+                "messages": [HumanMessage(content=instruction)],
+                "iteration_budget": step_definition.iteration_budget,
+                "workflow": workflow.model_copy(
+                    update={"steps": steps, "current_step_index": index}
+                ),
+                "pending_tool_approval": None,
+                "run_error": None,
+                "handoff_count": state.get("handoff_count", 0),
+                "agent_switch_count": state.get("agent_switch_count", 0),
+                "events": emitted,
+            },
+        )
+
+    def _workflow_failed_updates(
+        self,
+        state: AgentState,
+        workflow: WorkflowState,
+        definition: WorkflowDefinition,
+        error_code: ErrorCode,
+        sequence: int,
+    ) -> AgentState:
+        """工作流终局失败收口：FAILED 状态 + RUN_FAILED，路由判死。"""
+        return cast(
+            AgentState,
+            {
+                "current_agent": AgentRole.SUPERVISOR.value,
+                "next_agent": None,
+                "workflow": workflow.model_copy(
+                    update={
+                        "status": WorkflowStatus.FAILED,
+                        "error_code": error_code,
+                    }
+                ),
+                "pending_tool_approval": None,
+                "run_error": RunError(
+                    error_code=error_code,
+                    message=f"工作流 {definition.title} 终止：{error_code.value}",
+                    agent=AgentRole.SUPERVISOR.value,
+                ),
+                "events": [
+                    RunEvent(
+                        event_type=EventType.WORKFLOW_FAILED,
+                        sequence=sequence + 1,
+                        session_id=state.get("session_id"),
+                        run_id=state.get("run_id"),
+                        agent=AgentRole.SUPERVISOR.value,
+                        success=False,
+                        error_code=error_code,
+                        workflow_id=workflow.workflow_id,
+                    )
+                ],
+            },
+        )
 
     def _approve_tool(self, state: AgentState) -> AgentState:
         """Pause before an exact side-effecting call, then execute only that call.
@@ -2520,6 +3286,18 @@ class CollaborativeAgentGraph:
         next_agent = state.get("next_agent")
         if next_agent in {role.value for role in AgentRole}:
             return next_agent  # 模型指定了合法目标：直接转交
+        # 固定工作流分支（lesson-workflow-design §二）：RUNNING/
+        # PAUSED_APPROVAL 且无待分派动作时进调度节点。Worker 完成
+        # （current=worker）与 Supervisor 触发后（current=supervisor）
+        # 都汇聚于此；调度节点总是给出 next_agent（Worker 或收口
+        # Supervisor），因此不会自环。收口 Supervisor 轮结束后工作流
+        # 已 COMPLETED，分支不再命中，走下方既有收口逻辑。
+        workflow = _workflow_from_state(state)
+        if workflow is not None and workflow.status in {
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.PAUSED_APPROVAL,
+        }:
+            return _WORKFLOW_DISPATCH_NODE
         plan = _task_plan_from_state(state)
         # 活动计划交调度节点分派——这是 handoff 模式的专属路径。tool 模式
         # 的计划在 Supervisor 的 ReAct 循环内经 ask_* 同步执行（S5-A1），
@@ -2577,6 +3355,13 @@ class CollaborativeAgentGraph:
                     "reference_verification": None,
                     "task_plan": None,
                     "task_results": [],
+                    # 固定工作流不跨用户轮存活（排队语义见
+                    # lesson-workflow-design §六）：新一轮不继承上一轮的
+                    # 工作流进度；进行中的恢复只经审批暂停的同一 run。
+                    "workflow": None,
+                    # 步骤级 ReAct 预算随工作流一起每轮重置（调度节点
+                    # 分派时再写入）
+                    "iteration_budget": None,
                     # T5-3：生成文件回执按用户轮次重置（跨轮不累积，
                     # 新一轮回答不重复携带旧轮次的下载入口）
                     "generated_files": [],
@@ -3633,6 +4418,59 @@ def _retrieval_decisions_from_results(
             }
         )
     return decisions
+
+
+def _workflow_from_results(tool_results: Sequence[ToolResult]) -> WorkflowState | None:
+    """只解析本轮 Supervisor 经 start_workflow 启动的最后一个工作流。
+
+    宽容读取与 _task_plan_from_results 同一哲学：冲突拒绝提示（非
+    WorkflowState JSON）解析失败视为「本轮无启动」而不是崩溃。
+    """
+    for result in reversed(tool_results):
+        if result.tool_name != "start_workflow" or not result.success:
+            continue
+        output = result.output or ""
+        try:
+            return WorkflowState.model_validate_json(output)
+        except ValidationError:
+            pass
+        # 宽容回退：返回值尾部可能附着行为指令文本，取首个 JSON 对象
+        decoder = json.JSONDecoder()
+        try:
+            _, offset = decoder.raw_decode(output.lstrip())
+        except ValueError:
+            continue
+        try:
+            parsed = json.loads(output.lstrip()[:offset])
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            try:
+                return WorkflowState.model_validate(parsed)
+            except ValidationError:
+                continue
+    return None
+
+
+def _workflow_from_state(state: AgentState) -> WorkflowState | None:
+    """宽容读取持久化工作流：checkpoint 反序列化后可能是 dict。"""
+    raw_workflow = state.get("workflow")
+    return None if raw_workflow is None else WorkflowState.model_validate(raw_workflow)
+
+
+def _bounded_workflow_summary(
+    output: str | None,
+    error_code: ErrorCode | None,
+) -> str | None:
+    """步骤终态的有界摘要：成功取终端输出前缀，失败记稳定错误码。"""
+    if error_code is not None:
+        return f"步骤失败：{error_code.value}"
+    if output is None:
+        return None
+    limit = 400
+    if len(output) <= limit:
+        return output
+    return f"{output[: limit - 3]}..."
 
 
 def _task_plan_from_results(tool_results: Sequence[ToolResult]) -> TaskPlan | None:

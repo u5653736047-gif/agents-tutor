@@ -290,6 +290,17 @@
             ],
             "default": null,
             "title": "Task Results"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -579,6 +590,7 @@
           "graph_switch_limit",
           "graph_invalid_target",
           "graph_aggregation_invalid",
+          "workflow_budget_exceeded",
           "agent_output_invalid"
         ],
         "title": "ErrorCode",
@@ -971,7 +983,7 @@
       },
       "KnowledgeDocumentInfoDto": {
         "additionalProperties": false,
-        "description": "文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。\n\ntitle / subjects / difficulty / ingested_at 可空:脚本入库的教材\n由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks\n时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。",
+        "description": "文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。\n\ntitle / subjects / difficulty / ingested_at 可空:脚本入库的教材\n由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks\n时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。\nnamespace 显式化（P1-5）。",
         "properties": {
           "chunk_count": {
             "default": 0,
@@ -1005,6 +1017,11 @@
             ],
             "default": null,
             "title": "Ingested At"
+          },
+          "namespace": {
+            "default": "public",
+            "title": "Namespace",
+            "type": "string"
           },
           "page_count": {
             "anyOf": [
@@ -1051,7 +1068,7 @@
       },
       "KnowledgeDocumentListEntry": {
         "additionalProperties": false,
-        "description": "知识库文档列表条目(只读元数据,不含内容)。\n\npage_count / chunk_count 可空:txt 无页概念、core 未来接入清单\n能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。",
+        "description": "知识库文档列表条目(只读元数据,不含内容)。\n\npage_count / chunk_count 可空:txt 无页概念、core 未来接入清单\n能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。\nnamespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，\n公共库为 \"public\"。",
         "properties": {
           "chunk_count": {
             "anyOf": [
@@ -1067,6 +1084,11 @@
           },
           "document_id": {
             "title": "Document Id",
+            "type": "string"
+          },
+          "namespace": {
+            "default": "public",
+            "title": "Namespace",
             "type": "string"
           },
           "page_count": {
@@ -1962,6 +1984,17 @@
             ],
             "default": null,
             "title": "Task Results"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "title": "SessionProcess",
@@ -2515,6 +2548,123 @@
           "evaluator"
         ],
         "title": "WorkerAgentRole",
+        "type": "string"
+      },
+      "WorkflowProgress": {
+        "additionalProperties": false,
+        "description": "Workflow run progress exposed to chat/process consumers.\n\n与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与\nbudget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一\n不泄露路径原则）；artifacts 保持相对路径。",
+        "properties": {
+          "artifacts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "current_step_index": {
+            "minimum": 0,
+            "title": "Current Step Index",
+            "type": "integer"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "minItems": 1,
+            "title": "Steps",
+            "type": "array"
+          },
+          "workflow_id": {
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id",
+          "status",
+          "steps",
+          "current_step_index"
+        ],
+        "title": "WorkflowProgress",
+        "type": "object"
+      },
+      "WorkflowStatus": {
+        "description": "Public workflow run status values (lesson-workflow-design §七).",
+        "enum": [
+          "running",
+          "paused_approval",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "title": "WorkflowStatus",
+        "type": "string"
+      },
+      "WorkflowStep": {
+        "additionalProperties": false,
+        "description": "One workflow step's persisted progress entry.",
+        "properties": {
+          "attempts": {
+            "minimum": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStepStatus"
+          },
+          "step_id": {
+            "title": "Step Id",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Summary"
+          },
+          "worker_role": {
+            "$ref": "#/components/schemas/WorkerAgentRole"
+          }
+        },
+        "required": [
+          "step_id",
+          "worker_role",
+          "status",
+          "attempts"
+        ],
+        "title": "WorkflowStep",
+        "type": "object"
+      },
+      "WorkflowStepStatus": {
+        "description": "Public workflow step status values.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "skipped"
+        ],
+        "title": "WorkflowStepStatus",
         "type": "string"
       },
       "WorkspaceAccess": {
@@ -3190,7 +3340,7 @@
     },
     "/knowledge/documents/{document_id}": {
       "delete": {
-        "description": "删除文档(幂等:文档不存在也返回 204,不报 404)。\n\ncore 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),\n且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法\n区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——\n重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加\n404 区分。注册表同步移除该条目。",
+        "description": "删除文档(幂等:文档不存在也返回 204,不报 404)。\n\ncore 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),\n且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法\n区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——\n重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加\n404 区分。注册表同步移除该条目。\nP1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留\n（删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再\n误判为已入库）。",
         "operationId": "delete_document_knowledge_documents__document_id__delete",
         "parameters": [
           {

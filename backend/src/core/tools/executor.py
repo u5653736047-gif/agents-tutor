@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..events import ErrorCode
 from ..state import AgentRole, ToolResult
+from .office_tools import office_targets_within_roots
 from .registry import ToolRegistry
 
 UNKNOWN_TOOL_NAME = "unknown_tool"
@@ -116,6 +117,34 @@ class ToolExecutor:
         tool = self.registry.get(str(tool_call.get("name") or ""))
         extras = None if tool is None else getattr(tool, "extras", None)
         return isinstance(extras, Mapping) and extras.get("requires_approval") is True
+
+    def artifact_auto_approval_root(
+        self,
+        tool_call: Mapping[str, Any],
+        roots: Sequence[str],
+    ) -> str | None:
+        """工作流产物区自动授权判定（lesson-workflow-design §五）。
+
+        仅 officecli_edit 参与豁免（shell 永不豁免：工作区授权不是系统级
+        命令沙箱）；豁免条件是命令涉及的全部文件都落在产物根内。调用方
+        （react_agent）须处于 workspace_scope 上下文——与执行路径同一前
+        提。返回命中的产物根（执行时据此进入自动授权上下文），不豁免
+        返回 None。roots 由调用方从 state.workflow 显式传入（检查发生在
+        作用域建立之前，不走 ContextVar）。
+        """
+        tool = self.registry.get(str(tool_call.get("name") or ""))
+        if tool is None or tool.name != "officecli_edit":
+            return None
+        if not roots:
+            return None
+        args = tool_call.get("args", {})
+        command = args.get("command") if isinstance(args, Mapping) else None
+        if not isinstance(command, list):
+            return None
+        tokens = [str(token) for token in command]
+        if office_targets_within_roots(tokens, roots):
+            return roots[0]
+        return None
 
     def prepare_approval(
         self,

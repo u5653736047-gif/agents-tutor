@@ -75,6 +75,7 @@ class ErrorCode(str, Enum):
     GRAPH_SWITCH_LIMIT = "graph_switch_limit"
     GRAPH_INVALID_TARGET = "graph_invalid_target"
     GRAPH_AGGREGATION_INVALID = "graph_aggregation_invalid"
+    WORKFLOW_BUDGET_EXCEEDED = "workflow_budget_exceeded"
     AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
 
@@ -98,6 +99,52 @@ class TaskPlanStatus(str, Enum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+class WorkflowStatus(str, Enum):
+    """Public workflow run status values (lesson-workflow-design §七)."""
+
+    RUNNING = "running"
+    PAUSED_APPROVAL = "paused_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowStepStatus(str, Enum):
+    """Public workflow step status values."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class WorkflowStep(ContractModel):
+    """One workflow step's persisted progress entry."""
+
+    step_id: str
+    worker_role: WorkerAgentRole
+    status: WorkflowStepStatus
+    attempts: int = Field(ge=0)
+    summary: str | None = None
+
+
+class WorkflowProgress(ContractModel):
+    """Workflow run progress exposed to chat/process consumers.
+
+    与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与
+    budget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一
+    不泄露路径原则）；artifacts 保持相对路径。
+    """
+
+    workflow_id: str
+    status: WorkflowStatus
+    steps: list[WorkflowStep] = Field(min_length=1)
+    current_step_index: int = Field(ge=0)
+    artifacts: list[str] = Field(default_factory=list)
+    error_code: ErrorCode | None = None
 
 
 class WorkspaceAccess(str, Enum):
@@ -518,12 +565,15 @@ class KnowledgeDocumentListEntry(ContractModel):
 
     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
-    """
+    namespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，
+    公共库为 "public"。"""
 
     document_id: str
     source: str
     page_count: int | None = None
     chunk_count: int | None = None
+    # P1-5：显式空间字段，替代前端前缀反推
+    namespace: str = "public"
 
 
 class KnowledgeDocumentUploadResponse(ContractModel):
@@ -549,6 +599,7 @@ class KnowledgeDocumentInfoDto(ContractModel):
     title / subjects / difficulty / ingested_at 可空:脚本入库的教材
     由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
     时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+    namespace 显式化（P1-5）。
     """
 
     document_id: str
@@ -559,6 +610,8 @@ class KnowledgeDocumentInfoDto(ContractModel):
     subjects: list[str] = Field(default_factory=list)
     difficulty: str | None = None
     ingested_at: str | None = None
+    # P1-5：显式空间字段
+    namespace: str = "public"
 
 
 class NamespaceUsageDto(ContractModel):
@@ -743,6 +796,7 @@ class ChatResponse(ContractModel):
     grading: GradingResultDto | None = None
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
+    workflow: WorkflowProgress | None = None
     current_agent: AgentRole | None = None
 
 
@@ -753,6 +807,7 @@ class SessionProcess(ContractModel):
     events: list[RunEvent] = Field(default_factory=list)
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
+    workflow: WorkflowProgress | None = None
     current_agent: AgentRole | None = None
     pending_tool_approval: PendingToolApproval | None = None
 
@@ -823,6 +878,8 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     TaskPlanStep,
     TaskPlan,
     TaskResult,
+    WorkflowStep,
+    WorkflowProgress,
     ChatResponse,
     SessionProcess,
     FeedbackRequest,

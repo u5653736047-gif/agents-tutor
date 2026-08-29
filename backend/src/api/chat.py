@@ -37,6 +37,10 @@ from api.schemas import (
     TaskResult,
     ToolApprovalRequest,
     WorkerAgentRole,
+    WorkflowProgress,
+    WorkflowStatus,
+    WorkflowStep,
+    WorkflowStepStatus,
 )
 from api.schemas import (
     ErrorCode as ApiRunErrorCode,
@@ -52,6 +56,7 @@ from core.state import GradingResult as CoreGradingResult
 from core.state import PendingToolApproval as CorePendingToolApproval
 from core.state import TaskPlan as CoreTaskPlan
 from core.state import TaskStepResult as CoreTaskStepResult
+from core.state import WorkflowState as CoreWorkflowState
 from core.state import message_grading as core_message_grading
 from core.state import message_references as core_message_references
 
@@ -160,6 +165,39 @@ def _public_task_results(results: object) -> list[TaskResult] | None:
             )
         )
     return public or None
+
+
+def _public_workflow(workflow: object) -> WorkflowProgress | None:
+    """core WorkflowState → 公开契约 WorkflowProgress（类型不符 → None）。
+
+    投影边界（lesson-workflow-design §七）：不携带 artifact_root 绝对
+    路径与 budget_used 内部计数，artifacts 保持注册时登记的相对路径；
+    其余字段与 core 同名同义、按值转换枚举（core StrEnum 与 api Enum
+    值一致，与 _public_task_plan 同一策略，不做字段级降级）。
+    """
+    if not isinstance(workflow, CoreWorkflowState):
+        return None
+    return WorkflowProgress(
+        workflow_id=workflow.workflow_id,
+        status=WorkflowStatus(workflow.status.value),
+        steps=[
+            WorkflowStep(
+                step_id=step.step_id,
+                worker_role=WorkerAgentRole(step.worker_role.value),
+                status=WorkflowStepStatus(step.status.value),
+                attempts=step.attempts,
+                summary=step.summary,
+            )
+            for step in workflow.steps
+        ],
+        current_step_index=workflow.current_step_index,
+        artifacts=list(workflow.artifacts),
+        error_code=(
+            ApiRunErrorCode(workflow.error_code.value)
+            if workflow.error_code is not None
+            else None
+        ),
+    )
 
 
 def _safe_created_at(message: BaseMessage) -> datetime | None:
@@ -444,10 +482,16 @@ def _workspace_call_kwargs(
     # S5-C1 决策 2：会话绑定的知识空间经图入口写入 extra（未绑定 =
     # "public"，单路 public 过滤检索）。按方法签名门控传递：测试替身
     # 的 run/stream 未声明该参数时不传（零回归）。
+    # P1-2 显性化兜底：空串/空白与 None 同归 public，避免 `or` 的隐式
+    # 真值语义掩盖空串边界；与 tools.py `knowledge_scope.get() or "public"`
+    # 互为冗余防御但此处显式分支更可审计。
     if "knowledge_namespace" in parameters:
-        kwargs["knowledge_namespace"] = (
-            session.knowledge_namespace or "public"
-        )
+        raw_ns = session.knowledge_namespace
+        if isinstance(raw_ns, str):
+            stripped = raw_ns.strip()
+            kwargs["knowledge_namespace"] = stripped if stripped else "public"
+        else:
+            kwargs["knowledge_namespace"] = raw_ns if raw_ns else "public"
     return kwargs
 
 
@@ -535,6 +579,7 @@ async def chat_response_for_state(
         grading=_public_grading(state.get("grading")),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),
+        workflow=_public_workflow(state.get("workflow")),
         events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
         run_error=_public_run_error(state.get("run_error")),
         pending_handoff=await pending_handoff_for_session(graph, session_id, user_id),

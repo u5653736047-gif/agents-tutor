@@ -121,6 +121,11 @@ DEFAULT_OCR_MODE = "auto"
 # - API_RERANK_MODEL：重排模型名（默认 bge-reranker-base）。
 DEFAULT_REWRITE_MODE = "auto"
 DEFAULT_RERANK_MODE = "auto"
+# ── 固定工作流开关（lesson-workflow-design §九）──────────────
+# API_WORKFLOW_MODE：off（默认，start_workflow 不注册、图结构与引入
+# 前一致）| auto（启用注册表工作流：意图识别为备课 → 教案工作流）。
+# 灰度开关：验收前切 auto，出现回归随时回退 off。
+DEFAULT_WORKFLOW_MODE = "off"
 # ── 上下文预算默认值（六大功能计划 P0-1）───────────────────
 # 背后模型为 1M 窗口，512K 是**护栏上限而非目标填充量**：批改整份
 # PDF 作业正文 + 评分依据检索 + 多轮历史才可能逼近，普通对话远达
@@ -129,7 +134,7 @@ DEFAULT_RERANK_MODE = "auto"
 # 每轮 model.invoke 全量重放历史（react_agent.py），极端长会话的输入
 # 成本与 prefill 延迟随历史增长，按 extra["context_token_count"]
 # 埋点观测，必要时环境变量下调。附带收益：大窗口 + 裁剪护栏已覆盖
-# 长对话，TASK_BREAKDOWN 1.3.2 的「长对话摘要压缩」可继续不做。
+# 长对话，SIX_FEATURES §二（上下文预算 512K 护栏已覆盖，长对话摘要压缩可继续不做，见 TASKS_M3_CLOSE Sprint5）。
 DEFAULT_MAX_CONTEXT_TOKENS = 524288
 DEFAULT_MAX_CONTEXT_MESSAGES = 200
 # 自适应检索相关性阈值（六大功能计划 P0-2）：量纲跟随索引分数——
@@ -199,6 +204,23 @@ _OFFICE_TOOL_PERMISSIONS: dict[str, Collection[AgentRole]] = {
 }
 REQUEST_LOGGER = logging.getLogger("api.request")
 _LOGGER = logging.getLogger("api.app")
+
+
+def _workflow_mode_enabled() -> bool:
+    """解析 API_WORKFLOW_MODE（off|auto）；非法值回退 off 并告警。
+
+    与上下文预算同一处置取舍：能力开关解析失败回退保守默认不阻断
+    启动，但警告日志让运维发现拼写错误。
+    """
+    raw = os.getenv("API_WORKFLOW_MODE", DEFAULT_WORKFLOW_MODE).strip().lower()
+    if raw in {"", "off", "0", "false"}:
+        return False
+    if raw in {"auto", "on", "1", "true"}:
+        return True
+    _LOGGER.warning(
+        "API_WORKFLOW_MODE=%s 不合法（应为 off|auto），回退 off", raw
+    )
+    return False
 RequestHandler = Callable[[Request], Awaitable[Response]]
 
 
@@ -669,6 +691,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # 的工具调用，结果返回 supervisor 后由其整合本轮答案。
                 # 不在委派处 interrupt，避免请求在子代理响应前提前结束。
                 orchestration_mode="tool",
+                # 固定工作流开关（lesson-workflow-design §九）：off 时
+                # start_workflow 工具不注册、调度节点不进图，行为与
+                # 引入前逐字节等价；出问题可随时回退。
+                enable_workflows=_workflow_mode_enabled(),
                 # P0-1 上下文预算（默认值依据与权衡见
                 # DEFAULT_MAX_CONTEXT_TOKENS 注释）：护栏上限而非目标
                 # 填充量，env 可随时调整；裁剪设施 context.py 已就绪，

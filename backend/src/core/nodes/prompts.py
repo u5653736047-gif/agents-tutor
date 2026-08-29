@@ -163,6 +163,20 @@ TOOL_ORCHESTRATION_SUPERVISOR_PROMPT = (
     f"{_OFFICE_EDIT_RULE}"
 )
 
+# 固定工作流触发约定（lesson-workflow-design §二）：仅 enable_workflows
+# 时追加到 Supervisor 角色卡之后——未启用时工具不存在，条款也不能出现，
+# 否则等于向模型描述一个不存在的动作。
+WORKFLOW_SUPERVISOR_CLAUSE = (
+    "\n[固定工作流]备课类请求（用户要教案/教学设计）优先调用 "
+    "start_workflow 启动教案制作工作流：先调用 detect_intent 识别为 "
+    "lesson_prep 后，从请求中提取课题（topic，必填）与授课对象"
+    "（grade_level，可选）填入参数并调用一次；步骤由系统按序自动执行，"
+    "调用成功后，你的下一轮必须直接输出一句简短确认并结束本轮——不得再调用任何工具（重复启动会被系统拒绝）。全部步骤完成后你会看到各步"
+    "结果与产物，由你核对并向用户输出一段简短说明（产物路径与内容概要，"
+    "不要复述教案全文）。简单备课咨询（只要思路、不要成稿文件）仍走 "
+    "ask_teaching_assistant。"
+)
+
 # ─────────────────────────────────────────────
 # S2-T2 学生水平分层讲解策略（动态部分）
 # ─────────────────────────────────────────────
@@ -267,5 +281,6 @@ def learning_assistant_system_prompt(
 __all__ = [
     "ROLE_PROMPTS",
     "TOOL_ORCHESTRATION_SUPERVISOR_PROMPT",
+    "WORKFLOW_SUPERVISOR_CLAUSE",
     "learning_assistant_system_prompt",
 ]

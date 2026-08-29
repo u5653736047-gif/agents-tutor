@@ -389,6 +389,7 @@ def get_session_process(
         _public_pending_tool_approval,
         _public_task_plan,
         _public_task_results,
+        _public_workflow,
     )
 
     graph = _graph(request)
@@ -406,6 +407,7 @@ def get_session_process(
         events=_public_events(_latest_run_events(state), -1),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),
+        workflow=_public_workflow(state.get("workflow")),
         current_agent=_public_agent(state.get("current_agent")),
         pending_tool_approval=pending_tool_approval,
     )

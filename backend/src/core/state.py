@@ -434,6 +434,44 @@ class TaskPlanStatus(StrEnum):
     FAILED = "failed"
 
 
+# 工作流步骤级 ReAct 迭代预算的硬上限（lesson-workflow-design §四）：
+# 调度节点写入 iteration_budget 时的截断上界——预算是性能参数不是安全
+# 边界，但硬上限保证单一调度缺陷不会放大为无界循环；工具调用预算仍由
+# ReActAgentNode.max_tool_calls 兜底。
+WORKFLOW_ITERATION_HARD_CAP = 12
+
+# 步骤产出暂存的单条上限：教案全文量级（数千字）远达不到；截断只为
+# 防御异常超长输出撑爆 checkpoint。
+_WORKFLOW_STEP_OUTPUT_MAX_CHARS = 60_000
+
+
+class WorkflowStatus(StrEnum):
+    """代码化固定工作流（lesson-workflow-design §三）的运行状态。
+
+    - running：调度器按 current_step_index 推进 Worker 图节点；
+    - paused_approval：步骤内触发了产物区外的审批门控写操作，等待
+      顶层审批门恢复（与 pending_tool_approval 同一暂停语义）；
+    - completed / failed / cancelled：终态，分别对应全部步骤完成、
+      步骤失败策略耗尽（abort 或 retry 用尽）、用户/系统主动取消。
+    """
+
+    RUNNING = "running"
+    PAUSED_APPROVAL = "paused_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowStepStatus(StrEnum):
+    """工作流单步骤的执行状态（WorkflowStepState.status）。"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class HandoffApprovalAction(StrEnum):
     """人工对 Supervisor 分派提案的处理动作。"""
 
@@ -583,6 +621,117 @@ class TaskStepResult(BaseModel):
             ErrorCode.AGENT_OUTPUT_INVALID,
         }:
             raise ValueError("task result error_code is not locally recoverable")
+        return self
+
+
+class WorkflowStepState(BaseModel):
+    """一个工作流步骤的持久化执行状态（lesson-workflow-design §三）。
+
+    与 TaskStepResult 的区别：TaskStepResult 只在步骤终态落账（成功
+    output / 失败 error_code 二选一），本模型是「进行中可见」的进度
+    状态——steps 整表随 AgentState.workflow 持久化，前端按步骤展示
+    N/M 进度；summary 是有界产出摘要，不是完整产物正文（正文在
+    messages 通道）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1)
+    # AgentRole + 运行时 worker 校验：StrEnum 成员与字符串等值，pydantic
+    # 收敛为枚举成员；用 Literal[成员,...] 会让裸构造（枚举入参）在
+    # mypy 下不兼容，统一收敛点放在校验器。
+    worker_role: AgentRole
+    status: WorkflowStepStatus = WorkflowStepStatus.PENDING
+    attempts: int = Field(default=0, ge=0)
+    summary: str | None = None
+
+    @field_validator("step_id")
+    @classmethod
+    def step_id_must_not_be_blank(cls, step_id: str) -> str:
+        if not step_id.strip():
+            raise ValueError("workflow step_id must not be blank")
+        return step_id.strip()
+
+    @field_validator("worker_role")
+    @classmethod
+    def worker_role_must_be_worker(cls, worker_role: AgentRole) -> AgentRole:
+        if worker_role is AgentRole.SUPERVISOR:
+            raise ValueError("workflow worker_role must be a worker agent")
+        return worker_role
+
+
+class WorkflowState(BaseModel):
+    """一个固定工作流运行的持久化进度（lesson-workflow-design §三）。
+
+    不变量（model_validator 强制）：
+    - steps 由注册表定义生成，sequence 由列表位置隐含（1 起连续）；
+    - running 状态下 current_step_index 必须指向 pending/running 步骤，
+      全部步骤终态时必须脱离 running；
+    - completed 必须消费全部步骤且无 failed；failed/cancelled 不要求
+      步骤全部终态（abort 即冻结现场，供续跑/审计）。
+    调度权在 _workflow_dispatch 确定性节点，本模型不含「下一步做什么」
+    的模型可写字段——模型只能经 start_workflow 以注册表 id 触发。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: str = Field(min_length=1)
+    status: WorkflowStatus = WorkflowStatus.RUNNING
+    steps: list[WorkflowStepState] = Field(min_length=1)
+    current_step_index: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0)
+    summary: str | None = None
+    # 产物区授权边界（lesson-workflow-design §五）：会话工作区内
+    # `.workflow-artifacts/<run_id>/` 的绝对路径；None = 本工作流无
+    # 产物区（纯检索/成稿类）。工具层据此做审批豁免判定。
+    artifact_root: str | None = None
+    # 已登记产物（相对 artifact_root 的 POSIX 相对路径），生成即登记，
+    # 供回执链与审计；不存绝对路径，避免 checkpoint 泄露机器布局。
+    artifacts: list[str] = Field(default_factory=list)
+    # 触发参数（如课题/年级），步骤指令模板的格式化来源与审计凭据；
+    # 值有界（单值 ≤200 字符），模型经 start_workflow 的 args_schema 提供。
+    params: dict[str, str] = Field(default_factory=dict)
+    # 步骤产出暂存（lesson-workflow-design 2026-08-29 探索结论）：步骤
+    # COMPLETED 时其终端输出按 step_id 暂存于此——下游步骤与确定性导出
+    # 工具（export_workflow_docx）直接读取，模型不搬运长正文。值为有界
+    # 终端输出（_WORKFLOW_STEP_OUTPUT_MAX_CHARS 截断）。
+    step_outputs: dict[str, str] = Field(default_factory=dict)
+    budget_used: dict[str, int] = Field(default_factory=dict)
+    error_code: ErrorCode | None = None
+
+    @field_validator("workflow_id")
+    @classmethod
+    def workflow_id_must_not_be_blank(cls, workflow_id: str) -> str:
+        if not workflow_id.strip():
+            raise ValueError("workflow_id must not be blank")
+        return workflow_id.strip()
+
+    @field_validator("artifacts")
+    @classmethod
+    def artifacts_must_be_relative_posix(cls, artifacts: list[str]) -> list[str]:
+        for artifact in artifacts:
+            if not artifact or artifact.startswith("/") or "\\" in artifact or ".." in artifact:
+                raise ValueError(
+                    "workflow artifacts must be relative POSIX paths "
+                    f"without traversal: {artifact!r}"
+                )
+        return artifacts
+
+    @model_validator(mode="after")
+    def progress_must_match_status(self) -> WorkflowState:
+        step_count = len(self.steps)
+        if self.current_step_index > step_count:
+            raise ValueError("current_step_index exceeds workflow length")
+        if self.status is WorkflowStatus.RUNNING:
+            if step_count and self.current_step_index == step_count:
+                raise ValueError("running workflow must have a pending step")
+            if self.error_code is not None:
+                raise ValueError("running workflow cannot carry error_code")
+        if self.status is WorkflowStatus.COMPLETED:
+            if self.current_step_index != step_count:
+                raise ValueError("completed workflow must consume every step")
+            if any(step.status is WorkflowStepStatus.FAILED for step in self.steps):
+                raise ValueError("completed workflow cannot contain failed steps")
         return self
 
 
@@ -1077,6 +1226,19 @@ class AgentState(TypedDict, total=False):
 
     # 当前计划的终态步骤结果；串行执行时整表原子替换，避免重放追加重复项。
     task_results: Annotated[list[TaskStepResult], _replace]
+
+    # 当前运行中的固定工作流进度（lesson-workflow-design §三）。None =
+    # 本轮无工作流（嵌套 ask 短任务路径不变）。调度节点整表原子替换；
+    # 轮次开始由 _new_run_state 重置为 None（工作流不跨用户轮存活，
+    # 恢复走 checkpoint 而不是新轮继承）。
+    workflow: Annotated[WorkflowState | None, _replace]
+
+    # --- 工作流步骤级 ReAct 预算（lesson-workflow-design §四）---
+    # 由 _workflow_dispatch 在分派每步前写入，react_agent.run 读取：
+    # None = 用节点构造时的默认 max_iterations；有值时在 [1,
+    # WORKFLOW_ITERATION_HARD_CAP] 内截断。只有调度节点（我方代码）
+    # 会写入，模型不可控；每用户轮由 _new_run_state 重置为 None。
+    iteration_budget: Annotated[int | None, _replace]
 
     # --- 工具调用结果 ---
     # 追加式累积，保留完整调用历史供审计

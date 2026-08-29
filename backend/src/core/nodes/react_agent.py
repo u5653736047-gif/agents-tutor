@@ -19,8 +19,17 @@ from ..context import (
 )
 from ..events import ErrorCode, EventType, RunError, RunEvent
 from ..filesystem import workspace_scope
-from ..state import AgentRole, AgentState, ToolApprovalRequest, ToolResult
+from ..state import (
+    WORKFLOW_ITERATION_HARD_CAP,
+    AgentRole,
+    AgentState,
+    ToolApprovalRequest,
+    ToolResult,
+    WorkflowState,
+    WorkflowStatus,
+)
 from ..tools import PreparedToolApproval, ToolExecution, ToolExecutor
+from ..tools.artifact_scope import artifact_auto_approval
 
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 _REASONING_BLOCK_TYPES = {
@@ -231,6 +240,27 @@ class ReActAgentNode:
         )
         system_message = SystemMessage(content=system_prompt)
 
+        # 工作流产物根（lesson-workflow-design §五）：仅工作流运行且登记
+        # 了产物目录时参与自动授权；解析失败视为无产物区（宽容读取，
+        # checkpoint 反序列化可能是 dict）。
+        auto_approval_roots: tuple[str, ...] = ()
+        raw_workflow = state.get("workflow")
+        if raw_workflow is not None:
+            try:
+                workflow_model = (
+                    raw_workflow
+                    if isinstance(raw_workflow, WorkflowState)
+                    else WorkflowState.model_validate(raw_workflow)
+                )
+            except Exception:  # noqa: BLE001 - 脏工作流状态不阻断工具执行
+                workflow_model = None
+            if (
+                workflow_model is not None
+                and workflow_model.status is WorkflowStatus.RUNNING
+                and workflow_model.artifact_root
+            ):
+                auto_approval_roots = (workflow_model.artifact_root,)
+
         def model_context() -> list[BaseMessage]:
             # 组装本轮模型上下文：会话历史 + 本轮新增，超预算时裁剪，统计信息写进 extra。
             combined = [*persisted_history, *generated]
@@ -287,8 +317,17 @@ class ReActAgentNode:
 
         emit(EventType.AGENT_STARTED)
 
+        # 工作流步骤级迭代预算（lesson-workflow-design §四）：调度节点
+        # 分派每步前写入 iteration_budget；None = 用构造默认。预算在
+        # [1, WORKFLOW_ITERATION_HARD_CAP] 截断，异常值按默认处理——
+        # 预算只由我方调度代码写入，此处防御不为模型开口子。
+        iteration_budget = self.max_iterations
+        raw_budget = state.get("iteration_budget")
+        if isinstance(raw_budget, int) and not isinstance(raw_budget, bool):
+            iteration_budget = max(1, min(raw_budget, WORKFLOW_ITERATION_HARD_CAP))
+
         # ReAct 主循环：模型决策 → 工具执行 → 结果观察，直到模型直接回答或用尽轮数。
-        for iteration in range(1, self.max_iterations + 1):
+        for iteration in range(1, iteration_budget + 1):
             messages = model_context()
             try:
                 response = self.model.invoke(messages)  # 模型决策：可能给最终回答，也可能请求调用工具
@@ -383,6 +422,7 @@ class ReActAgentNode:
                     str(tool_call_id) if tool_call_id is not None else None
                 )
                 execution: ToolExecution | None = None
+                auto_approved_call = False
                 try:
                     fingerprint = (
                         public_name,
@@ -410,7 +450,45 @@ class ReActAgentNode:
                     else:
                         tool_call_count += 1
                         seen_tool_calls.add(fingerprint)
-                        if self.tool_executor.requires_approval(tool_call):
+                        # 产物区自动授权判定（lesson-workflow-design §五）：
+                        # 仅 officecli_edit 且命令全部落在工作流产物根内时
+                        # 免人工审批（shell 等其余门控工具不参与）。判定
+                        # 需要工作区上下文解析相对路径，与执行同一前提。
+                        needs_approval = self.tool_executor.requires_approval(
+                            tool_call
+                        )
+                        auto_root: str | None = None
+                        if needs_approval and auto_approval_roots:
+                            with workspace_scope(
+                                state.get("workspace_root"),
+                                additional_roots=state.get(
+                                    "additional_workspace_roots",
+                                    [],
+                                ),
+                            ):
+                                auto_root = (
+                                    self.tool_executor.artifact_auto_approval_root(
+                                        tool_call,
+                                        auto_approval_roots,
+                                    )
+                                )
+                        if auto_root is not None:
+                            with (
+                                workspace_scope(
+                                    state.get("workspace_root"),
+                                    additional_roots=state.get(
+                                        "additional_workspace_roots",
+                                        [],
+                                    ),
+                                ),
+                                artifact_auto_approval((auto_root,)),
+                            ):
+                                execution = self.tool_executor.execute(
+                                    tool_call,
+                                    self.role,
+                                )
+                            auto_approved_call = True
+                        elif needs_approval:
                             prepared = self.tool_executor.prepare_approval(
                                 tool_call,
                                 self.role,
@@ -456,6 +534,7 @@ class ReActAgentNode:
                     success=execution.result.success,
                     duration_ms=execution.result.duration_ms,
                     error_code=execution.result.error_code,
+                    auto_approved=True if auto_approved_call else None,
                 )
 
             if pending_tool_approval is not None:
@@ -471,7 +550,7 @@ class ReActAgentNode:
         # 兜底：轮数用尽仍未给出最终回答，按迭代上限错误结束。
         error = RunError(
             error_code=ErrorCode.REACT_ITERATION_LIMIT,
-            message=f"ReAct 循环达到最大轮数：{self.max_iterations}",
+            message=f"ReAct 循环达到最大轮数：{iteration_budget}",
             agent=self.role.value,
         )
         emit(
@@ -484,7 +563,7 @@ class ReActAgentNode:
             generated,
             tool_results,
             events,
-            self.max_iterations,
+            iteration_budget,
             extra,
             error,
         )

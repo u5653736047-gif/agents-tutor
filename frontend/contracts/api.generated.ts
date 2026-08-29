@@ -241,6 +241,9 @@ export interface paths {
          *     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
          *     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
          *     404 区分。注册表同步移除该条目。
+         *     P1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留
+         *     （删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再
+         *     误判为已入库）。
          */
         delete: operations["delete_document_knowledge_documents__document_id__delete"];
         options?: never;
@@ -752,6 +755,8 @@ export interface components {
              * @default null
              */
             task_results?: components["schemas"]["TaskResult"][] | null;
+            /** @default null */
+            workflow?: components["schemas"]["WorkflowProgress"] | null;
         };
         /**
          * ChunkDetailResponse
@@ -902,7 +907,7 @@ export interface components {
          * @description Stable API error codes aligned with the current Core classification.
          * @enum {string}
          */
-        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "tool_no_progress" | "tool_budget_exceeded" | "tool_approval_rejected" | "tool_approval_queue_limit" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "agent_output_invalid";
+        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "tool_no_progress" | "tool_budget_exceeded" | "tool_approval_rejected" | "tool_approval_queue_limit" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "workflow_budget_exceeded" | "agent_output_invalid";
         /**
          * ErrorDetail
          * @description A sanitized stable API error.
@@ -1107,6 +1112,7 @@ export interface components {
          *     title / subjects / difficulty / ingested_at 可空:脚本入库的教材
          *     由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
          *     时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+         *     namespace 显式化（P1-5）。
          */
         KnowledgeDocumentInfoDto: {
             /**
@@ -1126,6 +1132,11 @@ export interface components {
              * @default null
              */
             ingested_at?: string | null;
+            /**
+             * Namespace
+             * @default public
+             */
+            namespace?: string;
             /**
              * Page Count
              * @default null
@@ -1147,6 +1158,8 @@ export interface components {
          *
          *     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
          *     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+         *     namespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，
+         *     公共库为 "public"。
          */
         KnowledgeDocumentListEntry: {
             /**
@@ -1156,6 +1169,11 @@ export interface components {
             chunk_count?: number | null;
             /** Document Id */
             document_id: string;
+            /**
+             * Namespace
+             * @default public
+             */
+            namespace?: string;
             /**
              * Page Count
              * @default null
@@ -1540,6 +1558,8 @@ export interface components {
              * @default null
              */
             task_results?: components["schemas"]["TaskResult"][] | null;
+            /** @default null */
+            workflow?: components["schemas"]["WorkflowProgress"] | null;
         };
         /**
          * StatsOverview
@@ -1764,6 +1784,56 @@ export interface components {
          * @enum {string}
          */
         WorkerAgentRole: "teaching_assistant" | "learning_assistant" | "evaluator";
+        /**
+         * WorkflowProgress
+         * @description Workflow run progress exposed to chat/process consumers.
+         *
+         *     与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与
+         *     budget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一
+         *     不泄露路径原则）；artifacts 保持相对路径。
+         */
+        WorkflowProgress: {
+            /** Artifacts */
+            artifacts?: string[];
+            /** Current Step Index */
+            current_step_index: number;
+            /** @default null */
+            error_code?: components["schemas"]["ErrorCode"] | null;
+            status: components["schemas"]["WorkflowStatus"];
+            /** Steps */
+            steps: components["schemas"]["WorkflowStep"][];
+            /** Workflow Id */
+            workflow_id: string;
+        };
+        /**
+         * WorkflowStatus
+         * @description Public workflow run status values (lesson-workflow-design §七).
+         * @enum {string}
+         */
+        WorkflowStatus: "running" | "paused_approval" | "completed" | "failed" | "cancelled";
+        /**
+         * WorkflowStep
+         * @description One workflow step's persisted progress entry.
+         */
+        WorkflowStep: {
+            /** Attempts */
+            attempts: number;
+            status: components["schemas"]["WorkflowStepStatus"];
+            /** Step Id */
+            step_id: string;
+            /**
+             * Summary
+             * @default null
+             */
+            summary?: string | null;
+            worker_role: components["schemas"]["WorkerAgentRole"];
+        };
+        /**
+         * WorkflowStepStatus
+         * @description Public workflow step status values.
+         * @enum {string}
+         */
+        WorkflowStepStatus: "pending" | "running" | "completed" | "failed" | "skipped";
         /**
          * WorkspaceAccess
          * @description Access level granted to Agent filesystem tools for a session.

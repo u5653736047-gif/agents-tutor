@@ -79,6 +79,12 @@ def test_run_event_serializes_replayable_process_fields() -> None:
         "retrieval_top_score",
         "retrieval_needed",
         "retrieval_need_reason",
+        # 固定工作流事件族字段（WORKFLOW_* 事件携带）与产物区自动授权
+        # 标记（TOOL_COMPLETED 附属），默认 None 向后兼容
+        "workflow_id",
+        "workflow_step_id",
+        "workflow_step_index",
+        "auto_approved",
     }
 
 

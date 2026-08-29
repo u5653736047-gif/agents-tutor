@@ -58,6 +58,19 @@ class EventType(StrEnum):
     TASK_RESULT_ARCHIVED = "task_result_archived"
     # 任务计划结果聚合动作发生（成功或失败都会发出）
     TASK_RESULTS_AGGREGATED = "task_results_aggregated"
+    # ── 固定工作流事件族（lesson-workflow-design §七）──
+    # 与 TASK_* 家族的边界：TASK_* 只服务 tool 模式嵌套 ask 的计划门控
+    # 账本；WORKFLOW_* 服务图节点确定性调度路径。脱敏原则一致：事件只记
+    # 枚举/计数/step_id（workflow_id、workflow_step_index 专有字段），
+    # 步骤指令与产出正文在 messages、进度权威在 state["workflow"]。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射时安全跳过。
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_STEP_STARTED = "workflow_step_started"
+    WORKFLOW_STEP_COMPLETED = "workflow_step_completed"
+    WORKFLOW_STEP_RETRY = "workflow_step_retry"
+    WORKFLOW_COMPLETED = "workflow_completed"
+    WORKFLOW_FAILED = "workflow_failed"
+    WORKFLOW_INPUT_QUEUED = "workflow_input_queued"
     # 整个 run 正常结束
     RUN_COMPLETED = "run_completed"
     # 整个 run 以失败结束（配合 state["run_error"]）
@@ -85,6 +98,9 @@ class ErrorCode(StrEnum):
     GRAPH_SWITCH_LIMIT = "graph_switch_limit"
     GRAPH_INVALID_TARGET = "graph_invalid_target"
     GRAPH_AGGREGATION_INVALID = "graph_aggregation_invalid"
+    # 固定工作流预算耗尽（lesson-workflow-design §八）：步骤数×重试或
+    # 工具调用预算用尽仍未完成，区别于单角色 ReAct 迭代上限。
+    WORKFLOW_BUDGET_EXCEEDED = "workflow_budget_exceeded"
     # 模型输出不符合 Agent 的 schema 校验
     AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
@@ -153,6 +169,18 @@ class RunEvent(BaseModel):
     retrieval_top_score: float | None = Field(default=None, ge=0)
     retrieval_needed: bool | None = None
     retrieval_need_reason: str | None = None
+    # ── 固定工作流字段（WORKFLOW_* 事件族携带）──
+    # 仿 plan_step_sequence 先例：workflow_step_index 为 1 起步骤序号，
+    # workflow_step_id 为注册表 step_id（如 "collect"）。脱敏原则：不记
+    # 步骤指令与产出正文。全部默认 None 向后兼容：旧事件与非工作流轮次
+    # 不携带。
+    workflow_id: str | None = None
+    workflow_step_id: str | None = None
+    workflow_step_index: int | None = Field(default=None, ge=1)
+    # TOOL_COMPLETED 附属标记（lesson-workflow-design §五）：本次写操作
+    # 经产物区自动授权执行（未经人工审批）。审计可见性要求该事实随事件
+    # 持久化，消费方未映射时安全跳过。
+    auto_approved: bool | None = None
 
 
 class RunError(BaseModel):

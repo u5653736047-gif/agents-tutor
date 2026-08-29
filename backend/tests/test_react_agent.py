@@ -534,6 +534,12 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "retrieval_top_score",
         "retrieval_needed",
         "retrieval_need_reason",
+        # 固定工作流事件族字段（WORKFLOW_* 事件携带）与产物区自动授权
+        # 标记（TOOL_COMPLETED 附属），默认 None 向后兼容
+        "workflow_id",
+        "workflow_step_id",
+        "workflow_step_index",
+        "auto_approved",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
 
