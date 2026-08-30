@@ -245,7 +245,10 @@ _PPT_SLIDES = WorkflowDefinition(
             step_id="review",
             worker_role=AgentRole.EVALUATOR,
             instruction_template=_REVIEW_INSTRUCTION,
-            iteration_budget=5,
+            # 与教案 review 同一暴露面：读重步骤需要多次 inspect 检视
+            # + 结论一轮，5 次预算边界过紧（真实冒烟触顶过），放宽到
+            # 8（硬帽 12 内）；on_failure=continue 仍是兜底。
+            iteration_budget=8,
             on_failure="continue",
         ),
     ),

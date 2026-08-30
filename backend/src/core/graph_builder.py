@@ -2385,8 +2385,25 @@ class CollaborativeAgentGraph:
                 and plan is not None
                 and plan.status is TaskPlanStatus.ACTIVE
             )
+            # 固定工作流当前步骤 Worker 同样豁免：错误交工作流簿记落
+            # FAILED → 调度节点执行 on_failure 策略。稳定性冒烟 2026-08-30
+            # 根因：工作流 Worker 迭代超限在这道闸被提前判死，步骤永远
+            # 停在 RUNNING，on_failure（retry/continue）从未执行——
+            # 4 条教案冒烟 3 条冻结在 review（events 以
+            # react_iteration_limit 收尾）。
+            workflow_step_worker = self._workflow_current_step_worker(
+                state, agent.role
+            )
             recoverable_planned_error = (
                 planned_worker
+                and result.error is not None
+                and result.error.error_code
+                in {
+                    ErrorCode.MODEL_CALL_FAILED,
+                    ErrorCode.REACT_ITERATION_LIMIT,
+                }
+            ) or (
+                workflow_step_worker
                 and result.error is not None
                 and result.error.error_code
                 in {
@@ -2708,6 +2725,26 @@ class CollaborativeAgentGraph:
                 )
             ]
         return cast(AgentState, updates)
+
+    @staticmethod
+    def _workflow_current_step_worker(state: AgentState, role: AgentRole) -> bool:
+        """工作流运行中且当前步骤的目标角色就是该角色。
+
+        供 Worker 轮错误处置分流用：命中时模型调用失败/迭代超限不判死
+        整轮，交 _workflow_worker_updates 落步骤 FAILED，由调度节点按
+        on_failure 策略处置（与 _workflow_worker_updates 的合法入口
+        条件保持一致：RUNNING / PAUSED_APPROVAL）。
+        """
+        workflow = _workflow_from_state(state)
+        if workflow is None or workflow.status not in {
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.PAUSED_APPROVAL,
+        }:
+            return False
+        index = workflow.current_step_index
+        if index >= len(workflow.steps):
+            return False
+        return workflow.steps[index].worker_role == role
 
     def _workflow_worker_updates(
         self,

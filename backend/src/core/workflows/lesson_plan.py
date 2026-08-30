@@ -135,7 +135,12 @@ _LESSON_PLAN = WorkflowDefinition(
             step_id="review",
             worker_role=AgentRole.EVALUATOR,
             instruction_template=_REVIEW_INSTRUCTION,
-            iteration_budget=4,
+            # 读重步骤：officecli_inspect 多项检视（outline/text/stats/
+            # validate）+ 结论一轮，4 次预算被真实冒烟证实必触顶
+            # （稳定性冒烟 2026-08-30：4 条教案 3 条 review 在第 4 轮
+            # 触发 react_iteration_limit）；放宽到 8（硬帽 12 内），
+            # on_failure=continue 仍是兜底。
+            iteration_budget=8,
             on_failure="continue",
         ),
     ),

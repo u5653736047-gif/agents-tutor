@@ -19,11 +19,12 @@ import json
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from core.events import ErrorCode, EventType
 from core.graph_builder import _ACTIVE_PARENT_STATE, CollaborativeAgentGraph
 from core.state import (
+    create_initial_state,
     AgentRole,
     WorkflowState,
     WorkflowStatus,
@@ -565,3 +566,128 @@ def test_worker_updates_ignore_other_roles() -> None:
     )
     assert updates is None
     assert events == []
+
+
+# ── 6. Worker 轮可恢复错误路由（稳定性冒烟 2026-08-30 回归锁） ──────
+# 根因：工作流 Worker 迭代超限/模型调用失败曾在这道闸被提前判死
+# （整轮 run_error），步骤永远停在 RUNNING，on_failure 策略从未执行
+# ——真实冒烟 4 条教案 3 条冻结在 review。修复后：错误交工作流簿记
+# 落 FAILED → 调度节点执行 retry/continue。
+
+
+def _workflow_at_review_step() -> WorkflowState:
+    definition = get_workflow(LESSON_PLAN_WORKFLOW_ID)
+    assert definition is not None
+    workflow = definition.build_state({"topic": "t", "grade_hint": ""})
+    return workflow.model_copy(
+        update={
+            "steps": [
+                workflow.steps[i].model_copy(
+                    update={"status": WorkflowStepStatus.COMPLETED, "attempts": 1}
+                )
+                for i in range(3)
+            ]
+            + [
+                workflow.steps[3].model_copy(
+                    update={"status": WorkflowStepStatus.RUNNING, "attempts": 1}
+                )
+            ],
+            "current_step_index": 3,
+        }
+    )
+
+
+def _worker_error_state(workflow: WorkflowState, role: AgentRole) -> dict:
+    state = create_initial_state(
+        session_id="s", user_id="u", run_id="r", workspace_root="w"
+    )
+    state["messages"] = [HumanMessage(content="开始工作流")]
+    state["current_agent"] = role.value
+    state["next_agent"] = role.value
+    state["workflow"] = workflow
+    return state
+
+
+def test_workflow_worker_iteration_limit_lands_step_failed_then_skipped() -> None:
+    from tests.test_task_aggregation import StubWorker
+
+    graph = _graph()
+    worker = StubWorker(AgentRole.EVALUATOR, error=ErrorCode.REACT_ITERATION_LIMIT)
+    result = graph._wrap(worker).invoke(
+        _worker_error_state(_workflow_at_review_step(), AgentRole.EVALUATOR)
+    )  # type: ignore[arg-type]
+
+    # 不再整轮判死：错误落步骤 FAILED，交调度节点执行 on_failure
+    assert result["run_error"] is None
+    workflow = WorkflowState.model_validate(result["workflow"])
+    assert workflow.status is WorkflowStatus.RUNNING
+    assert workflow.steps[3].status is WorkflowStepStatus.FAILED
+
+    # review on_failure=continue → SKIPPED → 工作流照常收口
+    updates = graph._workflow_dispatch(
+        {"session_id": "s", "run_id": "r", "events": [], "workflow": workflow}
+    )
+    closed = WorkflowState.model_validate(updates["workflow"])
+    assert closed.status is WorkflowStatus.COMPLETED
+    assert closed.steps[3].status is WorkflowStepStatus.SKIPPED
+    assert updates["next_agent"] == "supervisor"
+
+
+def test_workflow_worker_model_failure_on_retryable_step_redispatches() -> None:
+    from tests.test_task_aggregation import StubWorker
+
+    graph = _graph()
+    definition = get_workflow(LESSON_PLAN_WORKFLOW_ID)
+    assert definition is not None
+    workflow = definition.build_state({"topic": "t", "grade_hint": ""})
+    workflow = workflow.model_copy(
+        update={
+            "steps": [
+                workflow.steps[0].model_copy(
+                    update={"status": WorkflowStepStatus.COMPLETED, "attempts": 1}
+                ),
+                workflow.steps[1].model_copy(
+                    update={"status": WorkflowStepStatus.RUNNING, "attempts": 1}
+                ),
+                *workflow.steps[2:],
+            ],
+            "current_step_index": 1,
+        }
+    )
+    worker = StubWorker(
+        AgentRole.TEACHING_ASSISTANT, error=ErrorCode.MODEL_CALL_FAILED
+    )
+    result = graph._wrap(worker).invoke(
+        _worker_error_state(workflow, AgentRole.TEACHING_ASSISTANT)
+    )  # type: ignore[arg-type]
+
+    assert result["run_error"] is None
+    failed = WorkflowState.model_validate(result["workflow"])
+    assert failed.steps[1].status is WorkflowStepStatus.FAILED
+
+    # draft on_failure=retry → 重试重新分派（调度节点落回 RUNNING、
+    # attempts 递增到 2，与既有 test_dispatch_retries_failed_step_once 同口径）
+    updates = graph._workflow_dispatch(
+        {"session_id": "s", "run_id": "r", "events": [], "workflow": failed}
+    )
+    redispatched = WorkflowState.model_validate(updates["workflow"])
+    assert redispatched.steps[1].status is WorkflowStepStatus.RUNNING
+    assert redispatched.steps[1].attempts == 2
+    assert updates["next_agent"] == "teaching_assistant"
+
+
+def test_workflow_error_exemption_scoped_to_current_step_worker() -> None:
+    from tests.test_task_aggregation import StubWorker
+
+    graph = _graph()
+    # review 在跑，但出错的是 teaching_assistant（非当前步骤 Worker）
+    # → 不豁免，保持整轮判死（豁免范围不放大）
+    worker = StubWorker(
+        AgentRole.TEACHING_ASSISTANT, error=ErrorCode.REACT_ITERATION_LIMIT
+    )
+    result = graph._wrap(worker).invoke(
+        _worker_error_state(_workflow_at_review_step(), AgentRole.TEACHING_ASSISTANT)
+    )  # type: ignore[arg-type]
+
+    assert result["run_error"] is not None
+    assert result["run_error"].error_code is ErrorCode.REACT_ITERATION_LIMIT
