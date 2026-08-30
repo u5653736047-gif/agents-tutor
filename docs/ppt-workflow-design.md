@@ -343,3 +343,23 @@ API / 前端 / 契约层：**无改动**（复用教案工作流既有面）。
 2. **前端进度块是两工作流共同前置**：本稿 §十称「复用既有工作流进度块」，但该进度块属 M4 待办（queued_messages + 进度块 + 下载入口）尚未实现——`ppt_slides` 的 P4 冒烟可以先行，**用户可见交付**（下载入口 + 步骤进度）应与 M4 合并验收，里程碑里宜显式标注该依赖。
 
 另确认一处框架一致性：`requires_artifact` 的磁盘判定与 `WorkflowState.artifacts` 登记是两条独立事实（前者管步骤成败、后者管交付清单），实现时不要互相替代。
+
+---
+
+## 十七、模板主题化路线（2026-08-30 实施，任务清单 `docs/ppt-template-theme-plan.md`）
+
+**决策记录（为何不用 ppt-master 资产原文）**：hugohe3/ppt-master（MIT）的设计方法论（design spec 先行、色板/字体/页型语言逐版式落地）被采纳为设计参考，但其资产针对 python-pptx 逐页手绘路线，与本项目「确定性导出 + officecli」管线不兼容；且逐页手绘属非目标（§一）。故资产全部自制——构建脚本 `backend/scripts/build_ppt_templates.py` 用 officecli 命令序列把设计烤进 0 页纯母版，幂等重建、自验 fail-fast（README 见 `backend/assets/ppt-templates/`）。
+
+**冒烟取证五条（2026-08-30，真实命令）**：
+
+1. `set /theme --prop accentN/dk*/lt*/headingFont[.ea]/bodyFont[.ea]` 设主题色板与中西文字体，绑定页占位符经 effective.* 继承；
+2. `set /slidelayout[N] --prop background=C1-C2-角度`（渐变）与纯色，传播到所有绑定页；
+3. `add /slidelayout[N] --type shape` 装饰形状（accent 条/色带/细线）传播到所有绑定页；
+4. `add / --type slide --prop layout=...` 新页绑定版式即继承背景与装饰；
+5. 默认模板版式清单（错误信息取证）：`Blank / Title Slide / Title and Content / Two Content / Title Only`。
+
+**实施期新增取证（占位符继承链，构建脚本的关键机制）**：页面 `title`/`text` prop 自动实例化的占位符是 `type=title` / `type=body idx=1`，与默认版式的 `ctrTitle` / `subTitle` **不匹配**，文字颜色不随版式继承（直接 `set /slidelayout[N]/shape[1] --prop color` 落在段落 defRPr 上，只作用于版式自身空段落）。构建脚本用 `raw-set` 做占位符手术：`ctrTitle→title`、移除 `subTitle`（同为 idx=1，不移除会遮蔽 body donor 的匹配）、注入带白色 `<a:lstStyle><a:lvl1pPr>`（含 `buClr`，bullet 独立取色链）的 body donor。注意 `lvl1pPr` 在 lstStyle 内只能出现一次（buClr 与 defRPr 必须合并，拆两个违反 Schema，raw-set 自验拦截）。
+
+**降级语义**：`style_hint` 关键词未命中/空值 → 默认主题（edu）；模板资产缺失/复制失败 → 回退空白 `create` 流程，回执 `template: "none(degraded)"`。两条降级都**永不失败**；版式映射在两种路径下共用同一份（资产与默认模板都有同五版式）。回执新增 `template` 字段（审计可见，收口轮可报）。
+
+**视觉验收**：两套主题（edu 教育青 / academic 学术藏蓝）四类页型（封面渐变+accent 条 / 章节深底+侧色带 / 内容白底+顶部细条+页脚线 / 小结同封面）经 officecli 渲染截图核对：渐变方向、中文渲染、文字安全区无遮挡、深浅背景对比度全部达标；构建后自验锁定 0 页 / validate / 五版式名 / 背景与白字手术落点。

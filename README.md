@@ -128,7 +128,7 @@ Supervisor 调用 `start_workflow`，各专业 Agent 作为图节点按序执行
 | workflow_id | 步骤 | 产物 |
 | --- | --- | --- |
 | `lesson_plan` | collect → draft → generate → review | `教案-{topic}.docx`（六段教学设计，Markdown 渲染标题层级） |
-| `ppt_slides` | collect → outline → generate → review | `课件-{topic}.pptx`（≥10 页，JSON 大纲收敛 + batch 分块写入 + 页数自验） |
+| `ppt_slides` | collect → outline → generate → review | `课件-{topic}.pptx`（≥10 页，JSON 大纲收敛 + batch 分块写入 + 页数自验；主题选择：style_hint（教育风/学术风，缺省教育风），模板资产缺失自动降级） |
 
 开关：`API_WORKFLOW_MODE=off|auto`（默认 off；off 时 `start_workflow` 不注册、
 图结构与引入前一致）。步骤失败策略（abort/continue/retry）与 revise 回退均
