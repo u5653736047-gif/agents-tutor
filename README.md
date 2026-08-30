@@ -117,6 +117,23 @@ embedding_provider=FastEmbedProvider vector_dimension=512`）或
 最后切换或刷新页面验证权威全文仍在历史中，再归档会话。模型或编排失败时，对话区应
 显示稳定错误提示，不能只结束加载状态而没有回答。
 
+## 固定工作流（长任务确定性管线，可选）
+
+长任务（教案、课件）由代码定义步骤顺序的固定工作流执行：意图识别命中后
+Supervisor 调用 `start_workflow`，各专业 Agent 作为图节点按序执行，正文经
+`step_outputs` 暂存、产物由确定性导出工具写入并自验（段落数/页数），全程
+零人工审批（产物区自动授权，见 `.workflow-artifacts/<运行id>/`）。设计详见
+`docs/lesson-workflow-design.md`（教案）与 `docs/ppt-workflow-design.md`（PPT）。
+
+| workflow_id | 步骤 | 产物 |
+| --- | --- | --- |
+| `lesson_plan` | collect → draft → generate → review | `教案-{topic}.docx`（六段教学设计，Markdown 渲染标题层级） |
+| `ppt_slides` | collect → outline → generate → review | `课件-{topic}.pptx`（≥10 页，JSON 大纲收敛 + batch 分块写入 + 页数自验） |
+
+开关：`API_WORKFLOW_MODE=off|auto`（默认 off；off 时 `start_workflow` 不注册、
+图结构与引入前一致）。步骤失败策略（abort/continue/retry）与 revise 回退均
+有界，超限熔断 `workflow_budget_exceeded`。
+
 ## Office 文档工具（officecli，可选）
 
 以 CLI 子进程方式集成 officecli，为四个角色提供
