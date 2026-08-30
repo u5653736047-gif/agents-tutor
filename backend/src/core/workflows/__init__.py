@@ -19,6 +19,11 @@ from core.workflows.lesson_plan import (
     lesson_plan_workflow,
     parse_review_verdict,
 )
+from core.workflows.ppt_slides import (
+    PPT_SLIDES_WORKFLOW_ID,
+    parse_deck_outline,
+    ppt_slides_workflow,
+)
 
 _WORKFLOWS: dict[str, WorkflowDefinition] = {}
 
@@ -39,15 +44,18 @@ def registered_workflow_ids() -> list[str]:
 
 
 register_workflow(lesson_plan_workflow())
+register_workflow(ppt_slides_workflow())
 
 __all__ = [
     "LESSON_PLAN_REVISE_ROUNDS",
     "LESSON_PLAN_WORKFLOW_ID",
+    "PPT_SLIDES_WORKFLOW_ID",
     "StepFailurePolicy",
     "WorkflowDefinition",
     "WorkflowStepDefinition",
     "get_workflow",
     "lesson_plan_workflow",
+    "parse_deck_outline",
     "parse_review_verdict",
     "register_workflow",
     "registered_workflow_ids",

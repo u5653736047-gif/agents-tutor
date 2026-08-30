@@ -56,6 +56,17 @@ class WorkflowStepDefinition:
     iteration_budget: int = 5
     on_failure: StepFailurePolicy = "abort"
     artifact_filename_template: str | None = None
+    # 步骤输出结构门禁（ppt-workflow-design §五-1）：声明后，
+    # _workflow_worker_updates 在暂存前以终端输出调用；返回 False 该步
+    # 按 AGENT_OUTPUT_INVALID 判 FAILED（不进暂存、触发 on_failure）。
+    # 自由正文步骤（如教案 draft）不声明即行为不变。
+    output_validator: Callable[[str], bool] | None = None
+    # 产物落盘闸（ppt-workflow-design §五-2）：声明 True 的步骤落终态前
+    # 做**磁盘存在性**判定——artifact_root/期望文件名（模板按 params 格式
+    # 化 + sanitize）存在且非空才允许 COMPLETED，否则 FAILED
+    # （AGENT_OUTPUT_INVALID）触发 on_failure retry。防「模型谎报完成」
+    # 的机械闸：不信任模型输出，也不只信任回执登记。
+    requires_artifact: bool = False
 
     def __post_init__(self) -> None:
         if not self.step_id.strip():
@@ -87,6 +98,14 @@ class WorkflowDefinition:
     revise_policy: (
         Callable[[int, str | None], int | None] | None
     ) = None
+    # 模型可经 start_workflow 提供的额外参数键白名单
+    # （ppt-workflow-design §五-3）：未声明的键在启动时结构化拒绝。
+    # 模板占位符即可引用这些键（如 {page_count}）。
+    extra_params: frozenset[str] = frozenset()
+    # 参数规整钩子（确定性，代码侧）：start_workflow 在校验后、写状态前
+    # 调用，返回规整后的参数（如 page_count 非数字→"12"、越界截断）。
+    # 模型无法把非法值注入指令模板。
+    param_normalizer: Callable[[dict[str, str]], dict[str, str]] | None = None
 
     def __post_init__(self) -> None:
         if not self.workflow_id.strip():
@@ -103,9 +122,21 @@ class WorkflowDefinition:
         *,
         artifact_root: str | None = None,
     ) -> WorkflowState:
-        """按定义生成一份全新的运行进度（PENDING 全表）。"""
-        if not self.params_valid(params):
-            missing = sorted(set(self.required_params()) - params.keys())
+        """按定义生成一份全新的运行进度（PENDING 全表）。
+
+        参数管道：未声明键拒绝（required ∪ extra_params 之外）→
+        param_normalizer 确定性规整 → 必填键校验。模型只能提供声明过的
+        键，且写进状态前已过规整钩子。
+        """
+        declared = self.required_params() | set(self.extra_params)
+        unknown = sorted(set(params.keys()) - declared)
+        if unknown:
+            raise ValueError(f"undeclared workflow params: {unknown}")
+        normalized = (
+            self.param_normalizer(dict(params)) if self.param_normalizer else dict(params)
+        )
+        if not self.params_valid(normalized):
+            missing = sorted(set(self.required_params()) - normalized.keys())
             raise ValueError(f"missing workflow params: {missing}")
         return WorkflowState(
             workflow_id=self.workflow_id,
@@ -118,7 +149,7 @@ class WorkflowDefinition:
                 for step in self.steps
             ],
             artifact_root=artifact_root,
-            params=dict(params),
+            params=normalized,
         )
 
     def required_params(self) -> set[str]:

@@ -84,6 +84,7 @@ from .tools.office_tools import GENERATED_FILES_RESULT_KEY, approved_office_exec
 from .tools.shell_tool import approved_shell_execution, shell_output_scope
 from .workflows import (
     WorkflowDefinition,
+    WorkflowStepDefinition,
     get_workflow,
     registered_workflow_ids,
     sanitize_artifact_filename,
@@ -831,6 +832,22 @@ class CollaborativeAgentGraph:
                         AgentRole.EVALUATOR,
                     },
                 )
+                from .workflows.ppt_export import (
+                    create_export_workflow_pptx_tool,
+                )
+
+                registry.register(
+                    create_export_workflow_pptx_tool(
+                        _office_edit,
+                        _office_inspect,
+                        parent_state=_ACTIVE_PARENT_STATE,
+                    ),
+                    allowed_roles={
+                        AgentRole.TEACHING_ASSISTANT,
+                        AgentRole.LEARNING_ASSISTANT,
+                        AgentRole.EVALUATOR,
+                    },
+                )
         # S2-T3 基础评价规则：submit_evaluation 仅 evaluator 可用，
         # 由评价 Agent 在 ReAct 循环中基于最终回答与检索证据调用
         # （prompt 约定，见 ROLE_PROMPTS[EVALUATOR]），结果经 _wrap
@@ -993,11 +1010,16 @@ class CollaborativeAgentGraph:
             workflow_id: str = Field(min_length=1, max_length=60)
             topic: str = Field(min_length=1, max_length=120)
             grade_level: str | None = Field(default=None, max_length=60)
+            # 工作流声明的额外参数（ppt-workflow-design §五-3）：键必须
+            # 在定义的 extra_params 白名单内（build_state 拒绝未声明键），
+            # 值 ≤200 字符；写状态前经定义的 param_normalizer 确定性规整。
+            params: dict[str, str] | None = Field(default=None)
 
         def start_workflow(
             workflow_id: str,
             topic: str,
             grade_level: str | None = None,
+            params: dict[str, str] | None = None,
         ) -> str:
             definition = get_workflow(workflow_id)
             if definition is None:
@@ -1032,7 +1054,7 @@ class CollaborativeAgentGraph:
             )
             try:
                 artifact_root.mkdir(parents=True, exist_ok=True)
-                params: dict[str, str] = {
+                params_merged: dict[str, str] = {
                     "topic": topic.strip(),
                     "grade_hint": (
                         f"（对象：{grade_level.strip()}）"
@@ -1040,8 +1062,22 @@ class CollaborativeAgentGraph:
                         else ""
                     ),
                 }
+                for key, value in (params or {}).items():
+                    key = key.strip()
+                    value = str(value).strip()
+                    if not key or len(value) > 200:
+                        return json.dumps(
+                            {
+                                "error": (
+                                    f"工作流参数不合法：键 {key!r} 为空或"
+                                    "值超过 200 字符"
+                                )
+                            },
+                            ensure_ascii=False,
+                        )
+                    params_merged[key] = value
                 workflow_state = definition.build_state(
-                    params,
+                    params_merged,
                     artifact_root=str(artifact_root),
                 )
             except ValueError as exc:
@@ -2724,6 +2760,39 @@ class CollaborativeAgentGraph:
         )
         if failure_code is None and output is None:
             failure_code = ErrorCode.AGENT_OUTPUT_INVALID
+        # ── 结构门禁（ppt-workflow-design §五-1）──
+        # 声明 output_validator 的步骤：终端输出未通过结构校验 → 按
+        # AGENT_OUTPUT_INVALID 判 FAILED，不进暂存、由 on_failure 处置
+        # （outline 坏 JSON 不能等导出工具读到垃圾才失败）。
+        step_definition: WorkflowStepDefinition | None = None
+        workflow_definition = get_workflow(workflow.workflow_id)
+        if workflow_definition is not None and index < len(
+            workflow_definition.steps
+        ):
+            step_definition = workflow_definition.steps[index]
+        if (
+            failure_code is None
+            and step_definition is not None
+            and step_definition.output_validator is not None
+            and output is not None
+            and not step_definition.output_validator(output)
+        ):
+            failure_code = ErrorCode.AGENT_OUTPUT_INVALID
+        # ── 产物落盘闸（ppt-workflow-design §五-2）──
+        # 声明 requires_artifact 的步骤：磁盘上存在「期望文件名且非空」
+        # 才允许 COMPLETED——不信任模型输出与回执登记，防谎报完成。
+        if (
+            failure_code is None
+            and step_definition is not None
+            and step_definition.requires_artifact
+        ):
+            expected = _expected_artifact_path(workflow, step_definition)
+            if (
+                expected is None
+                or not expected.is_file()
+                or expected.stat().st_size == 0
+            ):
+                failure_code = ErrorCode.AGENT_OUTPUT_INVALID
         updated_step = step.model_copy(
             update={
                 "status": (
@@ -2763,6 +2832,40 @@ class CollaborativeAgentGraph:
                     continue
                 if relative not in new_artifacts:
                     new_artifacts.append(relative)
+        # 导出工具回执登记（ppt-workflow-design §十六评审补充-1）：
+        # export_workflow_docx / export_workflow_pptx 在 core 侧直接调用
+        # officecli，产物不经模型 tool_results 的 generated_files 通道——
+        # 这里从导出回执解析产物路径并显式登记（两工作流统一收尾）。
+        for export_result in cast(
+            Sequence[ToolResult], result.updates.get("tool_results", [])
+        ):
+            if export_result.tool_name not in {
+                "export_workflow_docx",
+                "export_workflow_pptx",
+            } or not export_result.success:
+                continue
+            try:
+                receipt = json.loads(export_result.output)
+            except ValueError:
+                continue
+            produced = (
+                receipt.get("pptx") or receipt.get("docx")
+                if isinstance(receipt, dict)
+                else None
+            )
+            if not produced or not workflow.artifact_root:
+                continue
+            try:
+                relative = (
+                    Path(str(produced))
+                    .resolve()
+                    .relative_to(Path(workflow.artifact_root).resolve())
+                    .as_posix()
+                )
+            except (ValueError, OSError):
+                continue
+            if relative not in new_artifacts:
+                new_artifacts.append(relative)
         emit(
             EventType.WORKFLOW_STEP_COMPLETED,
             agent.role.value,
@@ -2959,6 +3062,14 @@ class CollaborativeAgentGraph:
             workflow.params,
             artifact_dir=workflow.artifact_root,
         )
+        if step.attempts > 0:
+            # 重试提示注入（ppt-workflow-design §五-4）：重试分派的是同一
+            # 模板，模型只能从历史自行归因；一行显式提示显著提高重试
+            # 成功率（结构校验失败/落盘闸未过均适用）。
+            instruction += (
+                "\n[系统] 这是重试：上一次输出未通过结构校验或未产出"
+                "有效产物，请严格遵循本步格式要求。"
+            )
         steps[index] = step.model_copy(
             update={
                 "status": WorkflowStepStatus.RUNNING,
@@ -4418,6 +4529,31 @@ def _retrieval_decisions_from_results(
             }
         )
     return decisions
+
+
+def _expected_artifact_path(
+    workflow: WorkflowState,
+    step_definition: WorkflowStepDefinition,
+) -> Path | None:
+    """requires_artifact 步骤的期望产物绝对路径（落盘闸判据）。
+
+    无产物模板 / 无产物根 / 模板格式化失败（缺参数键等）→ None，
+    判定按「未产出」处理（fail-closed）。
+    """
+    if (
+        step_definition.artifact_filename_template is None
+        or not workflow.artifact_root
+    ):
+        return None
+    try:
+        name = sanitize_artifact_filename(
+            step_definition.artifact_filename_template.format(
+                **workflow.params
+            )
+        )
+    except (KeyError, ValueError):
+        return None
+    return Path(workflow.artifact_root) / name
 
 
 def _workflow_from_results(tool_results: Sequence[ToolResult]) -> WorkflowState | None:
