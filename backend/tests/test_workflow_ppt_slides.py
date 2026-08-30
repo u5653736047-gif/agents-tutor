@@ -64,6 +64,15 @@ class TestParseDeckOutline:
         below = parse_deck_outline(_outline_json(PPT_PAGE_HARD_MIN - 1))
         assert below is None
 
+    def test_hard_fails_when_any_title_collapses_to_empty(self) -> None:
+        # 空标题硬失败（ppt-template-theme-plan 2.5）：任一页 title 收敛
+        # 后为空 → 整体 None，outline 步 retry 内解决，不进暂存
+        payload = json.loads(_outline_json(10))
+        payload["slides"][4]["title"] = "   "
+        assert parse_deck_outline(json.dumps(payload, ensure_ascii=False)) is None
+        payload["slides"][4] = {"layout": "content", "points": ["要点一"]}
+        assert parse_deck_outline(json.dumps(payload, ensure_ascii=False)) is None
+
     def test_truncates_pages_over_hard_max(self) -> None:
         parsed = parse_deck_outline(_outline_json(PPT_PAGE_HARD_MAX + 5))
         assert parsed is not None

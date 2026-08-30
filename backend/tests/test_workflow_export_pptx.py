@@ -1,7 +1,9 @@
 """export_workflow_pptx 测试（ppt-workflow-design P3 / §六）。
 
 假 office 工具捕获命令序列；覆盖：暂存缺失 fail-closed、分块批量
-（9 页 → 2 批）、页数自验失配删除产物、图片批 best-effort 与弃图计数。
+（9 页 → 2 批）、页数自验失配删除产物、图片批 best-effort 与弃图计数；
+模板主题化（ppt-template-theme-plan M4.2）：模板复制跳过 create、
+layout 取自模板 layout_map、回执标注主题、资产缺失降级。
 """
 
 from __future__ import annotations
@@ -65,6 +67,37 @@ def _outline(pages: int, with_notes: bool = True, image: str | None = None) -> s
     )
 
 
+def _outline_with_all_page_types(pages: int = 10) -> str:
+    """四类页型齐备的大纲：cover / section / content… / closing。"""
+    slides: list[dict[str, Any]] = []
+    for i in range(1, pages + 1):
+        layout = "content"
+        if i == 1:
+            layout = "cover"
+        elif i == 2:
+            layout = "section"
+        elif i == pages:
+            layout = "closing"
+        slides.append(
+            {
+                "layout": layout,
+                "title": f"第{i}页",
+                "points": ["要点一"],
+            }
+        )
+    return json.dumps(
+        {"deck_title": "测试课件", "audience": "", "slides": slides},
+        ensure_ascii=False,
+    )
+
+
+def _make_asset(assets: Path, filename: str, payload: bytes) -> Path:
+    assets.mkdir(parents=True, exist_ok=True)
+    asset = assets / filename
+    asset.write_bytes(payload)
+    return asset
+
+
 def _run_export(
     tmp_path: Path,
     staged: str | None,
@@ -72,15 +105,17 @@ def _run_export(
     inspect_responses: list[dict[str, Any]],
     *,
     image_on_disk: bool = False,
+    assets_root: Path | None = None,
+    style_hint: str | None = None,
 ):
     definition = get_workflow("ppt_slides")
     assert definition is not None
     zone = tmp_path / "zone"
     zone.mkdir(parents=True, exist_ok=True)
-    workflow = definition.build_state(
-        {"topic": "光合作用", "grade_hint": "", "page_count": "12"},
-        artifact_root=str(zone),
-    )
+    params: dict[str, str] = {"topic": "光合作用", "grade_hint": "", "page_count": "12"}
+    if style_hint is not None:
+        params["style_hint"] = style_hint
+    workflow = definition.build_state(params, artifact_root=str(zone))
     outputs = {"outline": staged} if staged is not None else {}
     workflow = workflow.model_copy(update={"step_outputs": outputs})
     if image_on_disk:
@@ -101,6 +136,7 @@ def _run_export(
         fake_edit,
         fake_inspect,
         parent_state=_ACTIVE_PARENT_STATE,
+        assets_root=assets_root,
     )
     token = _ACTIVE_PARENT_STATE.set(parent)
     try:
@@ -117,6 +153,7 @@ class TestExportWorkflowPptx:
             None,
             [],
             [],
+            assets_root=tmp_path / "assets-missing",
         )
         assert receipt["ok"] is False
         assert "暂存大纲" in receipt["error"]
@@ -135,14 +172,16 @@ class TestExportWorkflowPptx:
                 {"ok": True, "stdout": "Slides: 10 | Slides without title: 0"},
                 {"ok": True, "stdout": "Validation passed"},
             ],
+            assets_root=tmp_path / "assets-missing",
         )
         assert receipt["ok"] is True
         assert receipt["slides"] == 10
         assert receipt["notes_count"] == 9
         assert receipt["images_embedded"] == 0
-        # create + 2 批（10 页 → 8+2）
+        # 降级路径（无模板资产）：create + 2 批（10 页 → 8+2）
         assert len(edit_calls) == 3
         assert edit_calls[0]["command"][0] == "create"
+        assert receipt["template"] == "none(degraded)"
         batch_one = edit_calls[1]["command"]
         assert batch_one[0] == "batch"
         assert "--stop-on-error" in batch_one
@@ -174,6 +213,7 @@ class TestExportWorkflowPptx:
                 {"ok": True},
             ],
             [{"ok": True, "stdout": "Slides: 3"}],
+            assets_root=tmp_path / "assets-missing",
         )
         assert receipt["ok"] is False
         assert "实际页数 3" in receipt["error"]
@@ -196,6 +236,7 @@ class TestExportWorkflowPptx:
                 {"ok": True, "stdout": "Slides: 10"},
                 {"ok": True, "stdout": "Validation passed"},
             ],
+            assets_root=tmp_path / "assets-missing",
         )
         assert receipt["ok"] is True
         assert receipt["images_skipped"] == 1
@@ -220,6 +261,7 @@ class TestExportWorkflowPptx:
                 {"ok": True, "stdout": "Validation passed"},
             ],
             image_on_disk=True,
+            assets_root=tmp_path / "assets-missing",
         )
         assert receipt["ok"] is True
         assert receipt["images_embedded"] == 1
@@ -231,3 +273,92 @@ class TestExportWorkflowPptx:
         )
         assert image_commands[0]["type"] == "picture"
         assert image_commands[0]["parent"] == "/slide[3]"
+
+
+class TestTemplateThemedExport:
+    """模板主题化（ppt-template-theme-plan M4.2）：假资产注入 assets_root。"""
+
+    def test_template_copy_skips_create_and_stamps_receipt(
+        self, tmp_path: Path
+    ) -> None:
+        assets = tmp_path / "assets"
+        _make_asset(assets, "edu-theme.pptx", b"EDU-FAKE-ASSET")
+        receipt, edit_calls, _i, zone = _run_export(
+            tmp_path,
+            _outline_with_all_page_types(10),
+            [{"ok": True}, {"ok": True}],
+            [
+                {"ok": True, "stdout": "Slides: 10"},
+                {"ok": True, "stdout": "Validation passed"},
+            ],
+            assets_root=assets,
+        )
+        assert receipt["ok"] is True
+        assert receipt["template"] == "edu"
+        # 目标文件即模板资产字节（复制而非 create）
+        assert (zone / "课件-光合作用.pptx").read_bytes() == b"EDU-FAKE-ASSET"
+        # 无 create 调用：edit 序列就是 2 个文字批
+        assert len(edit_calls) == 2
+        assert edit_calls[0]["command"][0] == "batch"
+        batch_one = json.loads(
+            edit_calls[0]["command"][edit_calls[0]["command"].index("--commands") + 1]
+        )
+        # layout 取自模板 layout_map：cover → Title Slide，section → Title Only
+        assert batch_one[0]["props"]["layout"] == "Title Slide"
+        assert batch_one[1]["props"]["layout"] == "Title Only"
+        assert batch_one[2]["props"]["layout"] == "Title and Content"
+
+    def test_style_hint_selects_academic_asset(self, tmp_path: Path) -> None:
+        assets = tmp_path / "assets"
+        _make_asset(assets, "academic-theme.pptx", b"ACADEMIC-FAKE-ASSET")
+        receipt, _e, _i, zone = _run_export(
+            tmp_path,
+            _outline(10),
+            [{"ok": True}, {"ok": True}],
+            [
+                {"ok": True, "stdout": "Slides: 10"},
+                {"ok": True, "stdout": "Validation passed"},
+            ],
+            assets_root=assets,
+            style_hint="学术风，要严谨",
+        )
+        assert receipt["ok"] is True
+        assert receipt["template"] == "academic"
+        assert (zone / "课件-光合作用.pptx").read_bytes() == b"ACADEMIC-FAKE-ASSET"
+
+    def test_missing_asset_degrades_to_create(self, tmp_path: Path) -> None:
+        receipt, edit_calls, _i, _z = _run_export(
+            tmp_path,
+            _outline(10),
+            [
+                {"ok": True, "message": "created"},
+                {"ok": True},
+                {"ok": True},
+            ],
+            [
+                {"ok": True, "stdout": "Slides: 10"},
+                {"ok": True, "stdout": "Validation passed"},
+            ],
+            assets_root=tmp_path / "assets-missing",
+        )
+        assert receipt["ok"] is True
+        assert receipt["template"] == "none(degraded)"
+        # 降级路径：第一个 edit 调用是 create
+        assert edit_calls[0]["command"][0] == "create"
+
+    def test_default_assets_root_uses_bundled_template(
+        self, tmp_path: Path
+    ) -> None:
+        # 不注入 assets_root（生产路径）：默认根解析到入库资产 → 无 create
+        receipt, edit_calls, _i, _z = _run_export(
+            tmp_path,
+            _outline(10),
+            [{"ok": True}, {"ok": True}],
+            [
+                {"ok": True, "stdout": "Slides: 10"},
+                {"ok": True, "stdout": "Validation passed"},
+            ],
+        )
+        assert receipt["ok"] is True
+        assert receipt["template"] == "edu"
+        assert all(call["command"][0] == "batch" for call in edit_calls)

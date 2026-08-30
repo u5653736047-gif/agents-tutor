@@ -10,7 +10,9 @@
 - 页数硬边界 [10, 16]：<10 判失败、>16 截断；机械门禁只认硬边界，
   ±2 页容差不构成失败（防回退环空转）；
 - 单页字段确定性截断（永不失败）：title[:40]、points[:6]×60 字、
-  notes[:150]；layout 非法归一 content；image 仅 content 页保留。
+  notes[:150]；layout 非法归一 content；image 仅 content 页保留；
+- 例外：任一页 title 收敛后为空 → 整体返回 None（硬失败交 retry）——
+  空标题页 review 必判 revise，不如本步重出（ppt-template-theme-plan 2.5）。
 """
 
 from __future__ import annotations
@@ -71,6 +73,11 @@ def parse_deck_outline(text: str | None) -> dict[str, Any] | None:
     if len(raw_slides) < PPT_PAGE_HARD_MIN:
         return None
     slides = [_converge_slide(item) for item in raw_slides[:PPT_PAGE_HARD_MAX]]
+    # 空标题硬失败（ppt-template-theme-plan 2.5，评估遗留 🟡）：空标题页
+    # 在 stats 里记「Slides without title」，review 清单第 3 条必然判
+    # revise；不如在本步就 retry 重出（title 必填已在指令中声明）。
+    if any(not slide["title"] for slide in slides):
+        return None
     return {
         "deck_title": _clean_str(raw.get("deck_title"), _OUTLINE_TITLE_MAX),
         "audience": _clean_str(raw.get("audience"), _OUTLINE_AUDIENCE_MAX),
@@ -158,7 +165,7 @@ _GENERATE_INSTRUCTION = (
     "确定性写入产物目录的 pptx 并自动验证页数（产物区自动授权，无需"
     "审批）。\n"
     "返回 ok=false 时如实说明错误原因，不声称成功；成功后最终回答只"
-    "报告：文件路径 + 页数。"
+    "报告：文件路径 + 页数 + 主题风格（取返回值 template 字段）。"
 )
 
 _REVIEW_INSTRUCTION = (

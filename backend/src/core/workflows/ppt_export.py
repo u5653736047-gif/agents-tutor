@@ -1,21 +1,24 @@
 """`export_workflow_pptx` 确定性导出工厂（ppt-workflow-design §六）。
 
 五阶段流水线：读暂存（parse_deck_outline 再解析防御）→ 删旧建新
-（resident 锁官方惯用法，幂等重入）→ 分页批量（≤8 页/批，batch 原子，
-讲稿紧随本页同批）→ 图片批（best-effort，失败不阻断）→ 双重自验
-（页数精确相等 + validate）。任一自验不过：删除产物、返回 ok=false——
-`requires_artifact` 落盘闸据此判定 generate 步骤成败，模型零正文参数、
-零命令构造。
+（resident 锁官方惯用法，幂等重入；有模板资产时改为**复制模板**跳过
+create，缺失/损坏降级回 create）→ 分页批量（≤8 页/批，batch 原子，
+讲稿紧随本页同批；版式取自所选模板的 layout_map）→ 图片批
+（best-effort，失败不阻断）→ 双重自验（页数精确相等 + validate）。
+任一自验不过：删除产物、返回 ok=false——`requires_artifact` 落盘闸
+据此判定 generate 步骤成败，模型零正文参数、零命令构造。
 
-本模块只依赖 tools.office_tools 与 workflows.definition；graph_builder
-通过 `create_export_workflow_pptx_tool(parent_state=...)` 注入父状态
-ContextVar（避免 workflows → graph_builder 反向依赖）。
+本模块只依赖 tools.office_tools 与 workflows.definition / workflows
+.ppt_templates；graph_builder 通过 `create_export_workflow_pptx_tool(
+parent_state=...)` 注入父状态 ContextVar（避免 workflows →
+graph_builder 反向依赖）。
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
@@ -27,6 +30,11 @@ from core.state import AgentState, WorkflowState
 
 from .definition import sanitize_artifact_filename
 from .ppt_slides import parse_deck_outline
+from .ppt_templates import (
+    DEFAULT_LAYOUT_MAP,
+    resolve_template_path,
+    select_template,
+)
 
 # batch 硬约束推导见 ppt-workflow-design §六-1：单 token ≤32768 字符、
 # 子项 ≤64；单页子项 ≈ 500~700 字符，8 页/批留 4 倍以上余量。
@@ -34,16 +42,13 @@ _PPT_EXPORT_CHUNK_SIZE = 8
 # 图片增强项阈值：任何图片失败不得阻断课件导出（超限静默弃图并计数）。
 _PPT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _PPT_IMAGE_MAX_COUNT = 6
-# 版式映射写死（ppt-workflow-design §六-3）：不信任模型选择。
-# 实测默认模板可用版式：Blank / Title Slide / Title and Content /
-# Two Content / Title Only（Section Header 不存在——真实冒烟取证，
-# 错误信息列出全部可用版式）。section 页用 Title Only（语义最接近）。
-_PPT_LAYOUT_MAP = {
-    "cover": "Title Slide",
-    "closing": "Title Slide",
-    "section": "Title Only",
-    "content": "Title and Content",
-}
+# 版式映射写死（ppt-workflow-design §六-3）：不信任模型选择。现在由
+# ppt_templates.DEFAULT_LAYOUT_MAP 承载（模板资产与默认空白模板都有
+# 这五个版式，降级路径下同一份映射依然成立）；保留模块级别名作为
+# 默认值来源（ppt-template-theme-plan 2.3）。
+_PPT_LAYOUT_MAP = DEFAULT_LAYOUT_MAP
+# 降级（模板缺失/复制失败）时回执里的 template 标注。
+_DEGRADED_TEMPLATE_LABEL = "none(degraded)"
 
 
 def create_export_workflow_pptx_tool(
@@ -51,8 +56,13 @@ def create_export_workflow_pptx_tool(
     office_inspect: BaseTool,
     *,
     parent_state: ContextVar[AgentState | None],
+    assets_root: Path | None = None,
 ) -> BaseTool:
-    """构造 export_workflow_pptx 工具（注册为 Worker 可用，无正文参数）。"""
+    """构造 export_workflow_pptx 工具（注册为 Worker 可用，无正文参数）。
+
+    assets_root 供测试注入假资产目录；生产默认按模块位置解析
+    backend/assets/ppt-templates/。
+    """
 
     class _ExportPptxInput(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -97,13 +107,32 @@ def create_export_workflow_pptx_tool(
                 {"ok": False, "error": message}, ensure_ascii=False
             )
 
+        # 模板选择（ppt-template-theme-plan 2.2）：关键词命中选主题，
+        # 未命中走默认主题；资产缺失 → 降级空白 create，永不失败。
+        template = select_template(workflow.params.get("style_hint", ""))
+        template_path = resolve_template_path(template, assets_root)
+        template_label = template.template_id
+        if template_path is None:
+            template_label = _DEGRADED_TEMPLATE_LABEL
+
         with approved_office_execution():
             # 阶段 1：删旧建新（resident 持有时 create 报 file_locked，
-            # 「unlink → create 自动顶掉锁」为官方惯用法；幂等重入）
+            # 「unlink → create 自动顶掉锁」为官方惯用法；幂等重入）。
+            # 有模板资产时跳过 create，直接复制 0 页纯母版（纯 Python
+            # 文件操作，不经 officecli、不触碰授权白名单）；复制失败
+            # 降级回 create。
             target.unlink(missing_ok=True)
-            created = _invoke(office_edit, ["create", str(target)])
-            if not created.get("ok"):
-                return _fail(f"创建演示文稿失败：{str(created)[:300]}")
+            if template_path is not None:
+                try:
+                    shutil.copyfile(template_path, target)
+                except OSError:
+                    target.unlink(missing_ok=True)
+                    template_path = None
+                    template_label = _DEGRADED_TEMPLATE_LABEL
+            if template_path is None:
+                created = _invoke(office_edit, ["create", str(target)])
+                if not created.get("ok"):
+                    return _fail(f"创建演示文稿失败：{str(created)[:300]}")
             # 阶段 2：分页批量（≤8 页/批，原子；讲稿紧随本页同批，
             # 页号 = 批起始序号 + 批内位置，批内顺序执行索引确定）
             slides = outline["slides"]
@@ -115,9 +144,11 @@ def create_export_workflow_pptx_tool(
                 for offset, slide in enumerate(chunk):
                     page_number = chunk_start + offset + 1
                     props: dict[str, Any] = {
-                        "layout": _PPT_LAYOUT_MAP.get(
+                        # 版式取自所选模板的 layout_map（ppt-template-
+                        # theme-plan 2.3）；降级时同一份映射依然成立。
+                        "layout": template.layout_map.get(
                             str(slide.get("layout")),
-                            _PPT_LAYOUT_MAP["content"],
+                            template.layout_map["content"],
                         ),
                         "title": slide.get("title", ""),
                     }
@@ -250,6 +281,7 @@ def create_export_workflow_pptx_tool(
                 "pptx": str(target),
                 "slides": len(slides),
                 "deck_title": outline.get("deck_title", ""),
+                "template": template_label,
                 "notes_count": sum(
                     1 for slide in slides if slide.get("notes")
                 ),
