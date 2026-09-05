@@ -65,6 +65,10 @@ export type AttachmentInput = components["schemas"]["Attachment"];
 // last_activity_at(ISO 时间戳或 null,无活动为 null)。响应字段是
 // 契约 snake_case,request() 不做转换,页面按 snake_case 直接读取。
 export type StatsOverview = components["schemas"]["StatsOverview"];
+// 赛前可视化增强：学情诊断摘要与洞察摘要（学习进度页薄弱点/
+// 错题归因/正确率趋势/路径回显卡的数据源），同样直接透传契约。
+export type DiagnosisSummary = components["schemas"]["DiagnosisSummary"];
+export type LearningInsights = components["schemas"]["LearningInsights"];
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -137,6 +141,11 @@ export type ApiClient = {
     components["schemas"]["NamespaceUsageDto"][]
   >;
   getStatsOverview(): Promise<StatsOverview>;
+  // 赛前可视化增强：学情诊断与洞察只读聚合——与 getStatsOverview 同一
+  // 隔离哲学（不进入主会话 store）；错误归一为 ApiClientError，调用方
+  // 决定降级呈现（学习进度页：洞察拉取失败不击穿基础统计卡）。
+  getDiagnosisSummary(): Promise<DiagnosisSummary>;
+  getLearningInsights(): Promise<LearningInsights>;
   // D7-T2:聊天附件——uploadFile 走 multipart/form-data(field 名
   // "file",与 uploadDocument 同一 FormData 通道,错误归一为
   // ApiClientError);getFileUrl 纯字符串拼接(不 fetch),供
@@ -424,6 +433,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         "/knowledge/namespaces",
       ).then((res) => res.namespaces ?? []),
     getStatsOverview: () => request<StatsOverview>(config, "/stats/overview"),
+    getDiagnosisSummary: () =>
+      request<DiagnosisSummary>(config, "/learning/diagnosis/summary"),
+    getLearningInsights: () =>
+      request<LearningInsights>(config, "/learning/insights/summary"),
     // D7-T2:附件上传——与 uploadDocument 同一 FormData 模式(field 名
     // "file",request() 对 FormData 不设 Content-Type,浏览器自动带
     // multipart boundary)。无进度回调:上传中态由组件 pendingFiles

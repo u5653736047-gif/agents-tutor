@@ -300,6 +300,41 @@ class DiagnosisSummary(ContractModel):
     weak_points: list[str] = Field(default_factory=list)
 
 
+class DailyAccuracyPoint(ContractModel):
+    """学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。
+
+    加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见
+    core/learning/store.py insights），确定性聚合、可复现。
+    """
+
+    date: str = Field(min_length=1)
+    attempts: int = Field(ge=1)
+    accuracy: float = Field(ge=0, le=1)
+
+
+class PathPlanRecordDto(ContractModel):
+    """学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。"""
+
+    knowledge_point: str | None = None
+    created_at: str | None = None
+
+
+class LearningInsights(ContractModel):
+    """学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。
+
+    与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），
+    本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；
+    数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、
+    路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。
+    """
+
+    user_id: str | None = None
+    total_wrong: int = Field(default=0, ge=0)
+    error_tag_counts: dict[str, int] = Field(default_factory=dict)
+    daily_accuracy: list[DailyAccuracyPoint] = Field(default_factory=list)
+    recent_path_plans: list[PathPlanRecordDto] = Field(default_factory=list)
+
+
 class GradingItemDto(ContractModel):
     """一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。"""
 

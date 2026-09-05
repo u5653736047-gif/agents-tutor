@@ -531,6 +531,70 @@ test("getStatsOverview GETs /stats/overview with the user header and passes the 
   assert.equal(overview.last_activity_at, "2026-08-03T10:00:00+00:00");
 });
 
+// 赛前可视化增强:学情诊断与洞察客户端 —————————————————————————
+test("getDiagnosisSummary GETs /learning/diagnosis/summary with the user header", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        knowledge_points: [
+          {
+            accuracy: 0.333,
+            attempts: 3,
+            correct: 1,
+            knowledge_point: "梯度下降",
+            last_at: "2026-08-30T08:00:00+00:00",
+          },
+        ],
+        total_attempts: 5,
+        uncategorized_attempts: 0,
+        user_id: "demo-user",
+        weak_points: ["梯度下降"],
+      });
+    },
+  });
+
+  const summary = await client.getDiagnosisSummary();
+
+  assert.equal(requests[0]?.url, "https://api.example/learning/diagnosis/summary");
+  assert.equal(requests[0]?.init?.method, undefined);
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.equal(summary.total_attempts, 5);
+  assert.deepEqual(summary.weak_points, ["梯度下降"]);
+});
+
+test("getLearningInsights GETs /learning/insights/summary and passes the contract through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        daily_accuracy: [{ accuracy: 0.75, attempts: 4, date: "2026-08-30" }],
+        error_tag_counts: { "概念不清": 2, "计算失误": 1 },
+        recent_path_plans: [
+          { created_at: "2026-08-30T09:00:00+00:00", knowledge_point: "链式法则" },
+        ],
+        total_wrong: 3,
+        user_id: "demo-user",
+      });
+    },
+  });
+
+  const insights = await client.getLearningInsights();
+
+  assert.equal(requests[0]?.url, "https://api.example/learning/insights/summary");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.equal(insights.total_wrong, 3);
+  assert.deepEqual(insights.error_tag_counts, { "概念不清": 2, "计算失误": 1 });
+  assert.equal(insights.daily_accuracy[0]?.accuracy, 0.75);
+  assert.equal(insights.recent_path_plans[0]?.knowledge_point, "链式法则");
+});
+
 test("getStatsOverview normalizes stats errors like other endpoints", async () => {
   const { ApiClientError, createApiClient } = await loadApiClient();
   const client = createApiClient({

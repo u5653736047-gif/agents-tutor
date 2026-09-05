@@ -1,10 +1,13 @@
-"""学情诊断端点（六大功能计划 P3-15）。
+"""学情诊断与洞察端点（六大功能计划 P3-15 + 赛前可视化增强）。
 
 `GET /learning/diagnosis/summary`：按用户聚合学习记录（learning.db），
 返回知识点作答明细与预警列表。数据源是 P2-10 批改落库与 P0-5 对话
 记录的确定性 SQL 聚合（预警规则 attempts≥2 且加权正确率<0.6，见
 core/learning/store.py）——LLM 叙述只出现在对话内诊断报告，本端点
 是纯数据视图，可复现、可审计。
+
+`GET /learning/insights/summary`：错题归因分布/正确率趋势/路径存档
+回显（学习进度页可视化数据源），同为确定性聚合，降级红线与诊断端点一致。
 
 产品边界显式声明（pi 审查 🟡7）：
 - 对话内诊断 = 当前用户自助诊断（学生视角，evaluator 角色卡约定）；
@@ -24,7 +27,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from api.schemas import DiagnosisKnowledgePoint, DiagnosisSummary
+from api.schemas import (
+    DailyAccuracyPoint,
+    DiagnosisKnowledgePoint,
+    DiagnosisSummary,
+    LearningInsights,
+    PathPlanRecordDto,
+)
 from api.sessions import current_user_id
 from core.learning import LearningRecordStore
 
@@ -39,6 +48,24 @@ def _learning_store(request: Request) -> LearningRecordStore | None:
     不跑 lifespan 时属性不存在，返回 None 走空报告降级而非 500。
     """
     return getattr(request.app.state, "learning_store", None)
+
+
+def _resolve_target_user(
+    user_id: str | None,
+    student_id: str | None,
+) -> str | None:
+    """确定查询目标：教师视角显式 student_id 优先，学生视角用当前 X-User-Id。
+
+    横向读取他人学情的行为审计留痕（脱敏：只记标识与动作，不记聚合数据本身）
+    ——v1 无认证下可追溯，认证落地后升级为角色校验。
+    """
+    if student_id is not None and student_id != user_id:
+        _LOGGER.warning(
+            "学情数据教师视角查询：accessor=%s target_student=%s",
+            user_id,
+            student_id,
+        )
+    return student_id if student_id else user_id
 
 
 def _empty_summary(user_id: str | None) -> DiagnosisSummary:
@@ -61,15 +88,7 @@ async def diagnosis_summary(
     """
     store = _learning_store(request)
     # 教师视角：显式 student_id 优先；学生视角：当前 X-User-Id。
-    target_user = student_id if student_id else user_id
-    if student_id is not None and student_id != user_id:
-        # 审计留痕（脱敏：只记标识与动作，不记聚合数据本身）——
-        # v1 无认证下横向读取可追溯，认证落地后升级为角色校验。
-        _LOGGER.warning(
-            "学情诊断教师视角查询：accessor=%s target_student=%s",
-            user_id,
-            student_id,
-        )
+    target_user = _resolve_target_user(user_id, student_id)
     if store is None or target_user is None:
         return _empty_summary(target_user)
     summary = store.summarize(target_user)
@@ -88,6 +107,48 @@ async def diagnosis_summary(
         ],
         uncategorized_attempts=int(summary["uncategorized"]["attempts"]),
         weak_points=list(summary["weak_points"]),
+    )
+
+
+@router.get("/insights/summary", response_model=LearningInsights)
+async def learning_insights(
+    request: Request,
+    user_id: Annotated[str | None, Depends(current_user_id)],
+    # 与诊断端点同一产品边界：教师视角查询参数，审计留痕在 _resolve_target_user。
+    student_id: Annotated[str | None, Query(max_length=64)] = None,
+) -> LearningInsights:
+    """返回学情洞察摘要（错题归因/正确率趋势/路径存档回显）。
+
+    降级红线与诊断端点一致：store 缺失或空数据返回空报告 200。
+    数据窗口有界（趋势近 30 日、路径近 20 条，见 core/learning/store.py）。
+    """
+    store = _learning_store(request)
+    target_user = _resolve_target_user(user_id, student_id)
+    if store is None or target_user is None:
+        return LearningInsights(user_id=target_user)
+    data = store.insights(target_user)
+    return LearningInsights(
+        user_id=target_user,
+        total_wrong=int(data["total_wrong"]),
+        error_tag_counts={
+            str(tag): int(count)
+            for tag, count in data["error_tag_counts"].items()
+        },
+        daily_accuracy=[
+            DailyAccuracyPoint(
+                date=str(point["date"]),
+                attempts=int(point["attempts"]),
+                accuracy=float(point["accuracy"]),
+            )
+            for point in data["daily_accuracy"]
+        ],
+        recent_path_plans=[
+            PathPlanRecordDto(
+                knowledge_point=plan["knowledge_point"],
+                created_at=plan["created_at"],
+            )
+            for plan in data["recent_path_plans"]
+        ],
     )
 
 

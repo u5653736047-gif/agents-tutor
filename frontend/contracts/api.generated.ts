@@ -409,6 +409,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/learning/insights/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Learning Insights
+         * @description 返回学情洞察摘要（错题归因/正确率趋势/路径存档回显）。
+         *
+         *     降级红线与诊断端点一致：store 缺失或空数据返回空报告 200。
+         *     数据窗口有界（趋势近 30 日、路径近 20 条，见 core/learning/store.py）。
+         */
+        get: operations["learning_insights_learning_insights_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions": {
         parameters: {
             query?: never;
@@ -853,6 +876,21 @@ export interface components {
              * @default null
              */
             workspace_root?: string | null;
+        };
+        /**
+         * DailyAccuracyPoint
+         * @description 学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。
+         *
+         *     加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见
+         *     core/learning/store.py insights），确定性聚合、可复现。
+         */
+        DailyAccuracyPoint: {
+            /** Accuracy */
+            accuracy: number;
+            /** Attempts */
+            attempts: number;
+            /** Date */
+            date: string;
         };
         /**
          * DiagnosisKnowledgePoint
@@ -1305,6 +1343,32 @@ export interface components {
             tags?: string[];
         };
         /**
+         * LearningInsights
+         * @description 学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。
+         *
+         *     与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），
+         *     本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；
+         *     数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、
+         *     路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。
+         */
+        LearningInsights: {
+            /** Daily Accuracy */
+            daily_accuracy?: components["schemas"]["DailyAccuracyPoint"][];
+            /** Error Tag Counts */
+            error_tag_counts?: {
+                [key: string]: number;
+            };
+            /** Recent Path Plans */
+            recent_path_plans?: components["schemas"]["PathPlanRecordDto"][];
+            /**
+             * Total Wrong
+             * @default 0
+             */
+            total_wrong?: number;
+            /** User Id */
+            user_id?: string | null;
+        };
+        /**
          * Message
          * @description A safe user or assistant message.
          */
@@ -1350,6 +1414,16 @@ export interface components {
             document_count: number;
             /** Namespace */
             namespace: string;
+        };
+        /**
+         * PathPlanRecordDto
+         * @description 学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。
+         */
+        PathPlanRecordDto: {
+            /** Created At */
+            created_at?: string | null;
+            /** Knowledge Point */
+            knowledge_point?: string | null;
         };
         /**
          * PendingHandoff
@@ -2595,6 +2669,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiagnosisSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    learning_insights_learning_insights_summary_get: {
+        parameters: {
+            query?: {
+                student_id?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearningInsights"];
                 };
             };
             /** @description Validation Error */

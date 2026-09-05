@@ -61,6 +61,12 @@ LEARNING_RECORD_KINDS = frozenset({"answer", "grading", "diagnosis", "path_plan"
 _WEAK_MIN_ATTEMPTS = 2
 _WEAK_ACCURACY_THRESHOLD = 0.6
 
+# 学情洞察聚合的有界窗口（赛前可视化增强）：正确率趋势最多回看
+# 30 个 UTC 日、路径存档最多回显 20 条——教学项目数据规模小，窗口
+# 只为防御异常数据量撑爆契约，与 step_outputs 截断同一「有界」哲学。
+_INSIGHTS_MAX_DAYS = 30
+_INSIGHTS_MAX_PATH_PLANS = 20
+
 
 def _outcome_from_score(score: float, max_score: float) -> str:
     """批改落库的 outcome 推导（确定性规则，P2-10）。
@@ -270,6 +276,101 @@ class LearningRecordStore:
             "knowledge_points": points,
             "uncategorized": uncategorized,
             "weak_points": weak_points,
+        }
+
+    def insights(self, user_id: str) -> dict[str, Any]:
+        """学情洞察聚合（前端学习进度页可视化的数据源）。
+
+        与 summarize 的分工：summarize 面向「知识点掌握与预警」（诊断），
+        本方法面向「错题归因 / 正确率趋势 / 路径存档回显」（展示）。全部是
+        确定性 SQL 聚合，可单测、可复现。
+
+        返回结构（全 JSON 原生类型）：
+        - total_wrong：错答/部分正确记录总量（kind 限 answer/grading）；
+        - error_tag_counts：错因标签分布（仅统计 outcome 非 correct 且
+          error_tag 非空的记录；同 summarize 只计 answer/grading 两类）；
+        - daily_accuracy：按 UTC 日聚合的加权正确率（升序，最多近 30 日，
+          与 summarize 同一加权口径：correct×1 + partial×0.5）；
+        - recent_path_plans：最近的路径存档记录（倒序，最多 20 条）——
+          脱敏口径不变：只有知识点与时间，无路径正文。
+        """
+        with self._lock:
+            wrong_total_row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM learning_records
+                WHERE user_id = ?
+                    AND kind IN ('answer', 'grading')
+                    AND outcome != 'correct'
+                """,
+                (user_id,),
+            ).fetchone()
+            tag_rows = self._connection.execute(
+                """
+                SELECT error_tag, COUNT(*) AS count
+                FROM learning_records
+                WHERE user_id = ?
+                    AND kind IN ('answer', 'grading')
+                    AND outcome != 'correct'
+                    AND error_tag IS NOT NULL
+                GROUP BY error_tag
+                ORDER BY count DESC, error_tag ASC
+                """,
+                (user_id,),
+            ).fetchall()
+            day_rows = self._connection.execute(
+                """
+                SELECT
+                    substr(created_at, 1, 10) AS day,
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN outcome = 'correct' THEN 1 ELSE 0 END) AS correct,
+                    SUM(CASE WHEN outcome = 'partial' THEN 1 ELSE 0 END) AS partial
+                FROM learning_records
+                WHERE user_id = ? AND kind IN ('answer', 'grading')
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT ?
+                """,
+                (user_id, _INSIGHTS_MAX_DAYS),
+            ).fetchall()
+            plan_rows = self._connection.execute(
+                """
+                SELECT knowledge_point, created_at
+                FROM learning_records
+                WHERE user_id = ? AND kind = 'path_plan'
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, _INSIGHTS_MAX_PATH_PLANS),
+            ).fetchall()
+        daily: list[dict[str, Any]] = []
+        for row in reversed(day_rows):
+            attempts = int(row["attempts"])
+            accuracy = (
+                (int(row["correct"]) + 0.5 * int(row["partial"])) / attempts
+                if attempts > 0
+                else 0.0
+            )
+            daily.append(
+                {
+                    "date": str(row["day"]),
+                    "attempts": attempts,
+                    "accuracy": round(accuracy, 3),
+                }
+            )
+        return {
+            "total_wrong": int(wrong_total_row["total"]) if wrong_total_row else 0,
+            "error_tag_counts": {
+                str(row["error_tag"]): int(row["count"]) for row in tag_rows
+            },
+            "daily_accuracy": daily,
+            "recent_path_plans": [
+                {
+                    "knowledge_point": row["knowledge_point"],
+                    "created_at": row["created_at"],
+                }
+                for row in plan_rows
+            ],
         }
 
     def close(self) -> None:

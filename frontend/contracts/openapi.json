@@ -480,6 +480,35 @@
         "title": "CreateSessionRequest",
         "type": "object"
       },
+      "DailyAccuracyPoint": {
+        "additionalProperties": false,
+        "description": "学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。\n\n加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见\ncore/learning/store.py insights），确定性聚合、可复现。",
+        "properties": {
+          "accuracy": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Accuracy",
+            "type": "number"
+          },
+          "attempts": {
+            "minimum": 1.0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "date": {
+            "minLength": 1,
+            "title": "Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date",
+          "attempts",
+          "accuracy"
+        ],
+        "title": "DailyAccuracyPoint",
+        "type": "object"
+      },
       "DiagnosisKnowledgePoint": {
         "additionalProperties": false,
         "description": "学情诊断：一个知识点的作答聚合（六大功能 P3-15）。",
@@ -1338,6 +1367,52 @@
         "title": "KnowledgeTreeSectionDto",
         "type": "object"
       },
+      "LearningInsights": {
+        "additionalProperties": false,
+        "description": "学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。\n\n与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），\n本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；\n数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、\n路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。",
+        "properties": {
+          "daily_accuracy": {
+            "items": {
+              "$ref": "#/components/schemas/DailyAccuracyPoint"
+            },
+            "title": "Daily Accuracy",
+            "type": "array"
+          },
+          "error_tag_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Error Tag Counts",
+            "type": "object"
+          },
+          "recent_path_plans": {
+            "items": {
+              "$ref": "#/components/schemas/PathPlanRecordDto"
+            },
+            "title": "Recent Path Plans",
+            "type": "array"
+          },
+          "total_wrong": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Wrong",
+            "type": "integer"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "title": "LearningInsights",
+        "type": "object"
+      },
       "Message": {
         "additionalProperties": false,
         "description": "A safe user or assistant message.",
@@ -1449,6 +1524,36 @@
           "document_count"
         ],
         "title": "NamespaceUsageDto",
+        "type": "object"
+      },
+      "PathPlanRecordDto": {
+        "additionalProperties": false,
+        "description": "学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "knowledge_point": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge Point"
+          }
+        },
+        "title": "PathPlanRecordDto",
         "type": "object"
       },
       "PendingHandoff": {
@@ -3771,6 +3876,73 @@
           }
         },
         "summary": "Diagnosis Summary",
+        "tags": [
+          "learning"
+        ]
+      }
+    },
+    "/learning/insights/summary": {
+      "get": {
+        "description": "返回学情洞察摘要（错题归因/正确率趋势/路径存档回显）。\n\n降级红线与诊断端点一致：store 缺失或空数据返回空报告 200。\n数据窗口有界（趋势近 30 日、路径近 20 条，见 core/learning/store.py）。",
+        "operationId": "learning_insights_learning_insights_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "student_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Student Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearningInsights"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Learning Insights",
         "tags": [
           "learning"
         ]
