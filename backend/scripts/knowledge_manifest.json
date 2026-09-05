@@ -94,6 +94,78 @@
       ]
     },
     {
+      "source": "ml-islr",
+      "file": "ISLR-statistical-learning-intro.pdf",
+      "title": "An Introduction to Statistical Learning (with Applications in R)",
+      "authors": ["Gareth James", "Daniela Witten", "Trevor Hastie", "Robert Tibshirani"],
+      "subjects": ["机器学习", "统计学习"],
+      "difficulty": "beginner",
+      "verify": [
+        {
+          "query": "linear regression residual standard error",
+          "expected_source": "ml-islr"
+        },
+        {
+          "query": "bagging random forest variance reduction",
+          "expected_source": "ml-islr"
+        }
+      ]
+    },
+    {
+      "source": "ml-uml",
+      "file": "UML-machine-learning-theory.pdf",
+      "title": "Understanding Machine Learning: From Theory to Algorithms",
+      "authors": ["Shai Shalev-Shwartz", "Shai Ben-David"],
+      "subjects": ["机器学习", "学习理论"],
+      "difficulty": "advanced",
+      "verify": [
+        {
+          "query": "VC dimension sample complexity",
+          "expected_source": "ml-uml"
+        },
+        {
+          "query": "no free lunch theorem",
+          "expected_source": "ml-uml"
+        }
+      ]
+    },
+    {
+      "source": "rl-sutton",
+      "file": "RL-introduction-sutton.pdf",
+      "title": "Reinforcement Learning: An Introduction (Second Edition)",
+      "authors": ["Richard S. Sutton", "Andrew G. Barto"],
+      "subjects": ["强化学习"],
+      "difficulty": "intermediate",
+      "verify": [
+        {
+          "query": "SARSA on-policy control algorithm",
+          "expected_source": "rl-sutton"
+        },
+        {
+          "query": "multi-armed bandit exploration exploitation",
+          "expected_source": "rl-sutton"
+        }
+      ]
+    },
+    {
+      "source": "nlp-jurafsky",
+      "file": "SLPL-nlp-jurafsky.pdf",
+      "title": "Speech and Language Processing (3rd ed. draft)：N-gram Language Models",
+      "authors": ["Daniel Jurafsky", "James H. Martin"],
+      "subjects": ["自然语言处理"],
+      "difficulty": "intermediate",
+      "verify": [
+        {
+          "query": "n-gram language model perplexity",
+          "expected_source": "nlp-jurafsky"
+        },
+        {
+          "query": "smoothing backoff interpolation",
+          "expected_source": "nlp-jurafsky"
+        }
+      ]
+    },
+    {
       "source": "cs-ai-curriculum",
       "file": "人工智能学科课程标准.pdf",
       "title": "人工智能学科课程标准",

@@ -191,6 +191,24 @@ def test_load_manifest_rejects_missing_file(tmp_path: Path) -> None:
         load_manifest(manifest_path, books_dir=books_dir)
 
 
+def test_load_manifest_accepts_blocked_entry_with_missing_file(tmp_path: Path) -> None:
+    """blocked 条目语义是「数据源不可用」：文件缺失是常态，可加载；
+    入库与验证均按 blocked 跳过（如课标 PDF 尚未提供的场景）。
+    占位条目作者未知（空列表）同样不阻止清单加载。"""
+    entries = [
+        _book_entry("cs-x", file_name="not-provided.pdf", blocked="pdf-not-provided")
+    ]
+    entries[0]["authors"] = []
+    manifest_path, books_dir = _write_manifest(
+        tmp_path, entries, create_files=False
+    )
+
+    manifest = load_manifest(manifest_path, books_dir=books_dir)
+
+    assert manifest.books[0].blocked == "pdf-not-provided"
+    assert manifest.books[0].authors == []
+
+
 def test_load_manifest_rejects_unknown_difficulty(tmp_path: Path) -> None:
     entries = [_book_entry("ml-a", difficulty="expert")]
     manifest_path, books_dir = _write_manifest(tmp_path, entries)

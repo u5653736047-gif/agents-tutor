@@ -213,7 +213,15 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         file_name = str(entry.get("file", ""))
         if not file_name or "/" in file_name or "\\" in file_name:
             raise ValueError(f"{source}: file 必须是不含路径分隔符的文件名")
-        if not (books_dir_path / file_name).is_file():
+        # 文件存在性校验：blocked 条目的语义是「数据源不可用」（如课标
+        # PDF 尚未提供），此时文件缺失是常态而非配置错误——入库与验证均会
+        # 按 blocked 跳过，因此放宽为仅对未阻塞条目强校验；未阻塞条目缺文件
+        # 仍属配置错误，尽早失败。
+        raw_blocked_check = entry.get("blocked")
+        is_blocked_entry = isinstance(raw_blocked_check, str) and bool(
+            raw_blocked_check.strip()
+        )
+        if not is_blocked_entry and not (books_dir_path / file_name).is_file():
             raise ValueError(f"{source}: 文件不存在于 {books_dir_path}：{file_name}")
 
         title = str(entry.get("title", "")).strip()
@@ -222,7 +230,9 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         difficulty = str(entry.get("difficulty", ""))
         if not title:
             raise ValueError(f"{source}: title 不能为空")
-        if not authors:
+        # authors 必填仅对未阻塞条目强校验：blocked 占位条目（数据源未到位，
+        # 如课标）作者信息可能未知，不应阻止清单加载（与文件存在性放宽同一语义）。
+        if not is_blocked_entry and not authors:
             raise ValueError(f"{source}: authors 至少一个作者")
         if not subjects:
             raise ValueError(f"{source}: subjects 至少一个学科标签")

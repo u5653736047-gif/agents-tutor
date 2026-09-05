@@ -653,7 +653,7 @@ async def delete_document(
     # 删除已成功，标记清理为 best-effort：异常仅告警，不影响 204。
     def _clear_mark() -> None:
         # best-effort: 删除已成功，标记清理任何异常仅告警，不阻断 204
-        index = None  # type: ignore[assignment]
+        index = None
         try:
             index = SqliteKnowledgeIndex(_knowledge_db_path())
             try:
