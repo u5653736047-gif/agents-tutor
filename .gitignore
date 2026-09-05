@@ -42,6 +42,12 @@ docs/ui-review-shots/13-assistant-ui-final-verify.png
 # Temporary analysis artifacts (local-only, not versioned)
 diff_summary.json
 log_numstat.txt
+.pytest-tmp/
+.preview/
 
 # 工作流产物区（运行时生成，按 run_id 隔离）
 .workflow-artifacts/
+
+# 生成课件汇总与第三方比赛备赛材料（本地留存，不入版本库）
+ppt-产物汇总/
+比赛材料准备/
