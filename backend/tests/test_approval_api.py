@@ -303,6 +303,8 @@ def test_confirm_handoff_resumes_in_a_worker_and_returns_chat_response(tmp_path:
         "agent": "teaching_assistant",
         "created_at": None,
         "attachments": None,
+        # P2-12:无批改元数据时显式为 null（契约新增可选字段）
+        "grading": None,
     }
     assert [event["sequence"] for event in response.json()["events"]] == [1, 2]
     assert response.json()["pending_handoff"] is None

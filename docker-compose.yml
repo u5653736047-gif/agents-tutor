@@ -37,6 +37,9 @@ services:
       API_KNOWLEDGE_DB_PATH: /app/data/knowledge.db
       API_VECTOR_DB_PATH: /app/data/vector_knowledge.db
       API_FEEDBACK_STORE_PATH: /app/data/feedback.jsonl
+      # Agent 文件工具只能访问此容器内只读工作区，不能访问容器根目录。
+      API_WORKSPACE_ROOT: /workspace
+      API_WORKSPACE_ALLOWED_ROOTS: /workspace
       # embedding 模式透传,默认 auto(镜像已装 fastembed,即真实语义检索)
       API_KNOWLEDGE_EMBEDDING: ${API_KNOWLEDGE_EMBEDDING:-auto}
     ports:
@@ -49,6 +52,8 @@ services:
       # docker compose down 后数据保留(停止不丢数据);彻底删除卷用
       # docker compose down -v(慎用,会连同知识库一起删)。
       - ./data:/app/data
+      # 文件工具只读；审批后的 Shell 也无法修改此挂载中的仓库文件。
+      - ./:/workspace:ro
     healthcheck:
       # python:3.11-slim 镜像没有 curl/wget,用内置 urllib 探活 GET /healthz
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]

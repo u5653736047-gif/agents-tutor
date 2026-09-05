@@ -15,9 +15,11 @@ venv/
 .vscode/
 .reasonix/
 reasonix.toml
+.claude/settings.local.json
 .tools/
 *.swp
 *.swo
+.qoder/
 
 # OS
 Thumbs.db
@@ -28,3 +30,24 @@ Thumbs.db
 
 # Runtime data (knowledge source PDFs and SQLite stores stay out of git)
 data/
+
+# Archived research artifacts: kept locally under docs/ for reference,
+# intentionally not versioned (HTML share packages, UI research reports,
+# and ad-hoc review screenshots).
+docs/.trae-html-share-packages/
+docs/agent-plug-and-play-ui-research/
+docs/agent-streaming-ui-research/
+docs/ui-review-shots/13-assistant-ui-final-verify.png
+
+# Temporary analysis artifacts (local-only, not versioned)
+diff_summary.json
+log_numstat.txt
+.pytest-tmp/
+.preview/
+
+# 工作流产物区（运行时生成，按 run_id 隔离）
+.workflow-artifacts/
+
+# 生成课件汇总与第三方比赛备赛材料（本地留存，不入版本库）
+ppt-产物汇总/
+比赛材料准备/

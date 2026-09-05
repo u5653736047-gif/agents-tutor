@@ -6,11 +6,18 @@ import { useEffect, useRef, useState } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
+import { AiContentNotice } from "@/components/ai-content-notice";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
-import { CollaborationPanel } from "@/components/collaboration-panel";
+import { GeneratedFilePreview } from "@/components/generated-file-preview";
+import { GradingCard } from "@/components/grading-card";
+import {
+  CollaborationPanel,
+  type CollaborationPanelProps,
+} from "@/components/collaboration-panel";
 import { FeedbackButtons } from "@/components/feedback-buttons";
 import { HandoffCard } from "@/components/handoff-card";
+import { TerminalApprovalCard } from "@/components/terminal-approval-card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { AgentRole } from "@/lib/agent-roles";
@@ -54,7 +61,17 @@ function formatAttachmentSize(size: number): string {
 //   - 加载中显示骨架占位,失败显示降级文案(诚实降级,不破图)。
 // effect 内 await fetch 后 setState(异步回调,set-state-in-effect 只拦
 // 同步路径),SSR 首帧 url=null 渲染占位,无 hydration mismatch。
-function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["attachments"]>[number] }) {
+// assistant-ui 接入(T4):导出供新渲染路径的用户消息组件复用
+// (鉴权 Blob 加载链路单一实现,不接受第二份拷贝)
+export function AttachmentPreview({
+  attachment,
+  tone = "onPrimary",
+}: {
+  attachment: NonNullable<Message["attachments"]>[number];
+  // T5-3:链接配色按气泡底色区分——用户主色气泡用 onPrimary（默认，保持
+  // 既有视觉），助手浅色卡片用 primary（生成文件下载入口）。
+  tone?: "onPrimary" | "default";
+}) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const isImage = attachment.content_type?.startsWith("image/") ?? false;
@@ -119,17 +136,23 @@ function AttachmentPreview({ attachment }: { attachment: NonNullable<Message["at
       />
     </a>
   ) : (
-    <a
-      className="w-fit max-w-full truncate text-primary-foreground underline underline-offset-2"
-      data-slot="attachment-link"
-      download={attachment.name}
-      href={url}
-    >
-      {attachment.name}
-      <span className="ml-1 text-caption opacity-70">
-        {formatAttachmentSize(attachment.size)}
-      </span>
-    </a>
+    <>
+      <a
+        className={`w-fit max-w-full truncate underline underline-offset-2 ${
+          tone === "onPrimary" ? "text-primary-foreground" : "text-primary"
+        }`}
+        data-slot="attachment-link"
+        download={attachment.name}
+        href={url}
+      >
+        {attachment.name}
+        <span className="ml-1 text-caption opacity-70">
+          {formatAttachmentSize(attachment.size)}
+        </span>
+      </a>
+      {/* S5-B4：docx/xlsx 生成物预览入口（pptx 等不渲染，见组件内白名单） */}
+      <GeneratedFilePreview fileId={attachment.file_id} name={attachment.name} />
+    </>
   );
 }
 
@@ -189,18 +212,18 @@ export function MessageRow({
       <div
         className={
           isUser
-            ? "max-w-[80%] rounded-lg bg-primary px-4 py-3 text-body text-primary-foreground"
-            : "max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground"
+            ? "max-w-[85%] rounded-2xl rounded-br-md bg-primary px-4 py-3 text-body text-primary-foreground shadow-sm md:max-w-[75%]"
+            : "max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 text-body text-foreground shadow-sm md:max-w-[85%]"
         }
       >
         {!isUser ? <AssistantBadge agent={message.agent} /> : null}
         {isUser ? (
           <>
             <p className="whitespace-pre-wrap">{message.content}</p>
-            {/* D7-T3:附件区——仅用户消息且携带附件时渲染(文本之后);
+            {/* D7-T3:附件区——用户消息携带附件时渲染(文本之后);
                 无附件零渲染(data-slot 不出现):历史消息后端映射
-                attachments=null,自然降级;助手消息理论上不携带附件,
-                防御性不渲染(仅用户侧)。 */}
+                attachments=null,自然降级;助手消息的生成文件附件在
+                下方助手分支渲染(T5-3)。 */}
             {message.attachments && message.attachments.length > 0 ? (
               <div
                 className="mt-3 flex flex-col items-start gap-2"
@@ -218,6 +241,41 @@ export function MessageRow({
         ) : (
           <div className="mt-2">
             <AssistantMarkdown content={message.content} />
+            {/* T5-3:助手消息附件区——officecli 生成的文件经后端注册为
+                受控下载附件,这里呈现下载入口;无附件零渲染(与用户侧同一语义)。
+                附件即工作流/工具产物,附「文件由 AI 生成」标注(伦理合规)。 */}
+            {message.attachments && message.attachments.length > 0 ? (
+              <div
+                className="mt-3 flex flex-col items-start gap-2"
+                data-slot="message-attachments"
+              >
+                {message.attachments.map((attachment) => (
+                  <AttachmentPreview
+                    attachment={attachment}
+                    key={attachment.file_id}
+                    tone="default"
+                  />
+                ))}
+                <p
+                  className="text-caption text-muted-foreground/80"
+                  data-slot="generated-files-notice"
+                >
+                  文件由 AI 生成，请核对内容后使用
+                </p>
+              </div>
+            ) : null}
+            {/* P2-12(pi 审查 🟡4 + 审查 W7)：消息级批改卡——后端把
+                批改元数据挂在产出批改的作答消息上，刷新/切会话后经
+                history 端点恢复；无 grading 元数据时整段（含包装 div）
+                零渲染，不给每条助手消息添加空白与外边距（与附件区
+                同一条件渲染惯例） */}
+            {message.grading ? (
+              <div className="mt-3">
+                <GradingCard grading={message.grading} />
+              </div>
+            ) : null}
+            {/* 伦理合规:每条助手回答携带「AI 生成内容」常驻标识 */}
+            <AiContentNotice />
           </div>
         )}
       </div>
@@ -236,6 +294,7 @@ export function MessageRow({
 }
 
 type ConversationContentProps = {
+  collaboration?: CollaborationPanelProps;
   // UX-20260807#2:切换会话拉历史期间(isLoadingMessages && 无消息)渲染
   // 加载骨架,区分「正在加载」与「会话是空的」。可选:既有调用不传时
   // 零渲染,行为不变。
@@ -262,6 +321,7 @@ type ConversationContentProps = {
 };
 
 export function ConversationContent({
+  collaboration,
   isLoadingMessages = false,
   isSending,
   isStreaming,
@@ -307,7 +367,7 @@ export function ConversationContent({
               data-slot="history-skeleton"
               key={index}
             >
-              <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+              <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
                 <div className="flex items-center gap-2">
                   <Skeleton className="size-5 rounded-full" />
                   <Skeleton className="h-4 w-16" />
@@ -338,6 +398,13 @@ export function ConversationContent({
           ))
         : null}
 
+      {/* 当前轮执行轨迹与回答属于同一个视觉单元：在历史/用户消息后、
+          流式回答前展示。只在已有过程数据时挂载，普通闲置会话不占位。 */}
+      {collaboration &&
+      (collaboration.events.length > 0 || collaboration.taskPlan !== null) ? (
+        <CollaborationPanel {...collaboration} />
+      ) : null}
+
       {/* 流式气泡:isStreaming 期间渲染,或异常中断后保留已收到内容时继续展示 */}
       {isStreaming || streamingMessage ? (
         <article
@@ -347,7 +414,7 @@ export function ConversationContent({
           data-message-role="assistant"
           data-slot="streaming-message"
         >
-          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3 text-body text-foreground">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 text-body text-foreground shadow-sm md:max-w-[85%]">
             <AssistantBadge agent={streamingAgent} />
             <div className="mt-2">
               <AssistantMarkdown content={streamingMessage?.content ?? ""} />
@@ -475,7 +542,7 @@ export function ConversationContent({
           className="flex justify-start"
           data-slot="message-skeleton"
         >
-          <div className="max-w-[80%] rounded-lg border border-border bg-card px-4 py-3">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
             <div className="flex items-center gap-2">
               <Skeleton className="size-5 rounded-full" />
               <Skeleton className="h-4 w-16" />
@@ -492,21 +559,30 @@ export function ConversationContent({
 }
 
 export function ConversationPanel() {
-  // D2-T2:协作过程面板所需数据(计划、结果、事件、活跃 Agent)由这里订阅后传入
   const currentAgent = useChatStore((state) => state.currentAgent);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   // D2-T3:审批卡片数据(待审批项、决策中标记、决策错误、决策动作)
   const decideHandoff = useChatStore((state) => state.decideHandoff);
-  const events = useChatStore((state) => state.events);
+  const decideToolApproval = useChatStore((state) => state.decideToolApproval);
   const isDecidingHandoff = useChatStore((state) => state.isDecidingHandoff);
+  const isDecidingToolApproval = useChatStore(
+    (state) => state.isDecidingToolApproval,
+  );
   // UX-20260807#2:拉历史加载态——此前无组件订阅(「死状态」),切换会话
   // 期间消息区空白;现在驱动 ConversationContent 的加载骨架。
   const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);
   const isSending = useChatStore((state) => state.isSending);
   const isStreaming = useChatStore((state) => state.isStreaming);
+  const events = useChatStore((state) => state.events);
   const lastSentMessage = useChatStore((state) => state.lastSentMessage);
   const messages = useChatStore((state) => state.messages);
   const pendingHandoff = useChatStore((state) => state.pendingHandoff);
+  const pendingToolApproval = useChatStore(
+    (state) => state.pendingToolApproval,
+  );
+  // P2-12:本轮批改结论(store 从 ChatResponse.grading / StreamEvent
+  // grading 归一),null 时 GradingCard 零渲染
+  const grading = useChatStore((state) => state.grading);
   // D3-T4:本轮回答的引用列表(store 从 ChatResponse.references 归一),
   // null 时 CitationList 零渲染,无引用轮次不显示任何东西
   const references = useChatStore((state) => state.references);
@@ -515,11 +591,11 @@ export function ConversationPanel() {
   const runError = useChatStore((state) => state.runError);
   const streamingAgent = useChatStore((state) => state.streamingAgent);
   const streamingMessage = useChatStore((state) => state.streamingMessage);
+  const taskPlan = useChatStore((state) => state.taskPlan);
+  const taskResults = useChatStore((state) => state.taskResults);
   // D6-T2:反馈提交 action——与主对话流程解耦(不写 requestError),
   // 失败由 FeedbackButtons 组件内错误行呈现
   const submitFeedback = useChatStore((state) => state.submitFeedback);
-  const taskPlan = useChatStore((state) => state.taskPlan);
-  const taskResults = useChatStore((state) => state.taskResults);
   const endRef = useRef<HTMLDivElement>(null);
   // D4-T8:滚动容器 ref——既是 virtualizer 的 getScrollElement,
   // 也是 onScroll 贴底判定的目标元素
@@ -575,13 +651,15 @@ export function ConversationPanel() {
       endRef.current?.scrollIntoView({ block: "end" });
     }
   }, [
-    currentAgent,
-    events,
     isDecidingHandoff,
+    isDecidingToolApproval,
     isSending,
     isStreaming,
+    events,
+    grading,
     messages,
     pendingHandoff,
+    pendingToolApproval,
     references,
     runError,
     streamingAgent,
@@ -604,7 +682,7 @@ export function ConversationPanel() {
         onScroll={handleScroll}
         ref={parentRef}
       >
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-8 py-6">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-4 py-8 md:px-8">
           {/* D4-T8:虚拟化前 spacer——把首行推到估算位置(首帧未测量
               时为 0,随测量/滚动更新) */}
           {isVirtualized && virtualItems.length > 0 ? (
@@ -630,6 +708,7 @@ export function ConversationPanel() {
               })
             : null}
           <ConversationContent
+            collaboration={{ currentAgent, events, taskPlan, taskResults }}
             feedbackSessionId={currentSessionId ?? undefined}
             isLoadingMessages={isLoadingMessages}
             isSending={isSending}
@@ -645,14 +724,7 @@ export function ConversationPanel() {
             streamingMessage={streamingMessage}
             virtualItems={isVirtualized ? virtualItems : null}
           />
-          {/* D2-T2:协作过程面板——消息流与输入区之间,展示计划与事件 */}
-          <CollaborationPanel
-            currentAgent={currentAgent}
-            events={events}
-            taskPlan={taskPlan}
-            taskResults={taskResults}
-          />
-          {/* D2-T3:审批卡片——协作面板之后、输入区之前;错误文案只映射
+          {/* D2-T3:审批卡片——消息之后、输入区之前;错误文案只映射
               审批相关错误码,其它 requestError 仍由侧栏等现有路径处理。
               handoff_not_pending 不在此映射:store 收到该码会清除并刷新
               pending,卡片随之消失,错误行永远不会显示(死分支已删,
@@ -669,10 +741,25 @@ export function ConversationPanel() {
             }
             pending={pendingHandoff}
           />
+          <TerminalApprovalCard
+            errorMessage={
+              requestError?.code === "session_busy" ||
+              requestError?.code === "tool_approval_not_pending"
+                ? requestError.message
+                : null
+            }
+            isDeciding={isDecidingToolApproval}
+            onDecide={(action) => void decideToolApproval(action)}
+            pending={pendingToolApproval}
+          />
           {/* D3-T4:引用卡片——消息列表尾部(审批卡片之后),引用对应
-              最后一轮回答,跟随该轮的回答与协作过程一起展示;store
+              最后一轮回答,跟随该轮回答一起展示;store
               的 references 为 null 时组件零渲染,不占位 */}
           <CitationList citations={references} />
+          {/* P2-12:批改卡片——与引用卡片同位;grading 为 null 时零渲染。
+              历史轮次的批改卡由消息级 Message.grading 元数据承载
+              (刷新后经 history 端点恢复,后端契约已就绪) */}
+          <GradingCard grading={grading} />
           {/* D4-T8:虚拟化尾 spacer——补足未渲染行的估算高度,
               保证滚动条总高度与全量模式一致 */}
           {isVirtualized ? (
@@ -688,8 +775,11 @@ export function ConversationPanel() {
           <div data-slot="conversation-end" ref={endRef} />
         </div>
       </div>
-      <div className="border-t border-border px-8 py-4" data-slot="chat-input-area">
-        <div className="mx-auto w-full max-w-3xl">
+      <div
+        className="bg-gradient-to-t from-background via-background to-transparent px-4 pb-4 pt-6 md:px-8"
+        data-slot="chat-input-area"
+      >
+        <div className="mx-auto w-full max-w-4xl">
           <ChatInput />
         </div>
       </div>

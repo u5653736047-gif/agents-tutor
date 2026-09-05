@@ -115,7 +115,8 @@ test("the knowledge page confirms deletes, refreshes the list and loads document
   // 删除确认:window.confirm 只在点击事件回调(客户端)里执行,SSR 安全
   assert.match(source, /window\.confirm\("确认删除该文档\?删除后不可恢复。"\)/);
   // 上传成功后刷新列表(与删除成功共用 refreshDocuments)
-  assert.match(source, /await apiClient\.uploadDocument\(selectedFile\)/);
+  // S5-C1：上传调用携带目标空间（uploadNamespace state）。
+  assert.match(source, /await apiClient\.uploadDocument\(\s*selectedFile,\s*undefined,\s*uploadNamespace,/);
   assert.match(source, /await refreshDocuments\(\)/);
   // 挂载拉取:useEffect 内局部 async 函数 + void load()(setState 全部
   // 在 await 之后,符合 react-hooks「effect 内同步 setState」规则)

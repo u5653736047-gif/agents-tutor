@@ -3,7 +3,7 @@
 // D2-T2:协作过程面板。
 // 展示一次运行的两块信息:
 //   1. 计划步骤条(task_plan):后端规划的步骤,叠加 task_results 的执行结果;
-//   2. 事件时间线(events):thinking / tool_call / tool_result / agent_switch 摘要。
+//   2. 事件时间线(events):思考/工具摘要、Agent 切换与子代理阶段性输出。
 // 纯展示组件:所有数据由父组件(ConversationPanel)从 store 订阅后以 props 传入,
 // 自身不订阅 store,便于 SSR 渲染与组件测试。对 null / 空数组健壮。
 import { ChevronDown, ChevronUp } from "lucide-react";
@@ -43,8 +43,8 @@ const planStatusPresentation: Record<
   failed: { label: "失败", className: "border-destructive/30 bg-destructive/10 text-destructive" },
 };
 
-// content 字段只在 StreamEvent 上存在(thinking 的占位文本),
-// 用 in 操作符收窄联合类型后安全读取,RunEvent 返回 null。
+// RunEvent 与 StreamEvent 都可携带 reasoning / delta 内容；兼容旧契约
+// 数据时仍用 in 操作符宽容读取。
 function eventContent(event: RunEvent | StreamEvent): string | null {
   return "content" in event ? (event.content ?? null) : null;
 }
@@ -64,6 +64,22 @@ function summarize(text: string | null | undefined, maxLength = 40): string {
     return "";
   }
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+const toolActivityLabels: Record<string, string> = {
+  ask_evaluator: "调用评估助手",
+  ask_learning_assistant: "调用助学助手",
+  ask_teaching_assistant: "调用助教助手",
+  create_task_plan: "制定协作计划",
+  detect_intent: "识别学习意图",
+  detect_level: "判断学习阶段",
+  search_knowledge: "检索课程知识库",
+  submit_evaluation: "提交学习评估",
+  shell: "运行终端命令",
+};
+
+function toolActivityLabel(toolName: string): string {
+  return toolActivityLabels[toolName] ?? toolName;
 }
 
 // 计划步骤条:横向步骤列表,current_step_index 高亮,结果打勾/打叉
@@ -149,19 +165,45 @@ function EventTimeline({
 }) {
   // 传入顺序不保证有序,先按 sequence 升序排好再渲染
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
-  // 工具行展开状态:记录展开行在排序数组中的索引(而非 sequence)——
-  // sequence 每轮 run 从 1 起,跨 run 复用会撞号导致旧行意外展开
-  // (review 修正);索引在当次渲染的排序数组中稳定。
-  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  // 工具开始/结束是同一活动的两个状态，不应在时间线中占两行。
+  // 以稳定的 tool_call_id 配对；缺少 ID 的旧事件继续独立展示。
+  const toolCallIds = new Set(
+    sorted
+      .filter((event) => event.event_type === "tool_call" && event.tool_call_id)
+      .map((event) => event.tool_call_id as string),
+  );
+  const toolResultsById = new Map(
+    sorted
+      .filter((event) => event.event_type === "tool_result" && event.tool_call_id)
+      .map((event) => [event.tool_call_id as string, event] as const),
+  );
+  const toolOutputsById = new Map<string, (RunEvent | StreamEvent)[]>();
+  for (const event of sorted) {
+    if (event.event_type !== "tool_output" || !event.tool_call_id) {
+      continue;
+    }
+    const outputs = toolOutputsById.get(event.tool_call_id) ?? [];
+    outputs.push(event);
+    toolOutputsById.set(event.tool_call_id, outputs);
+  }
 
   return (
     <ol className="space-y-1 px-4 py-3" data-slot="event-timeline">
-      {sorted.map((event, sortedIndex) => {
+      {sorted.map((event) => {
+        if (
+          (event.event_type === "tool_result" ||
+            event.event_type === "tool_output") &&
+          event.tool_call_id &&
+          toolCallIds.has(event.tool_call_id)
+        ) {
+          return null;
+        }
         // 与当前活跃 Agent 相同的事件条目加高亮(加粗 + 前景色)
         const isActive = event.agent != null && event.agent === activeAgent;
         const activeProps = {
           "data-active": isActive ? "true" : undefined,
         };
+        const parentToolCallId = event.parent_tool_call_id ?? undefined;
 
         switch (event.event_type) {
           case "thinking": {
@@ -172,6 +214,7 @@ function EventTimeline({
                   "flex items-center gap-2 text-caption",
                   isActive ? "font-medium text-foreground" : "text-muted-foreground",
                 )}
+                data-parent-tool-call-id={parentToolCallId}
                 key={`thinking-${event.sequence}`}
                 {...activeProps}
               >
@@ -180,53 +223,144 @@ function EventTimeline({
               </li>
             );
           }
+          case "reasoning": {
+            const content = eventContent(event);
+            if (!content) {
+              return null;
+            }
+            return (
+              <li
+                className={cn(
+                  parentToolCallId && "ml-4 border-l border-border pl-3",
+                )}
+                data-parent-tool-call-id={parentToolCallId}
+                data-slot="reasoning-block"
+                key={`reasoning-${event.message_id ?? event.sequence}`}
+                {...activeProps}
+              >
+                <details open={event.is_delta === true}>
+                  <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-caption text-muted-foreground">
+                    <span aria-hidden>✨</span>
+                    {event.agent ? <AgentBadge agent={event.agent} /> : null}
+                    <span>{event.is_delta === true ? "模型思考中…" : "模型思考"}</span>
+                  </summary>
+                  <div className="ml-2 border-l-2 border-border pl-3 text-caption text-muted-foreground">
+                    <p className="whitespace-pre-wrap break-words">{content}</p>
+                  </div>
+                </details>
+              </li>
+            );
+          }
           case "tool_call":
           case "tool_result": {
-            // 工具行:只含工具名与成功与否等摘要,绝无参数/结果正文(安全红线)。
-            // 点击展开可看耗时与所属计划步骤;success 为 null 时不显示状态。
-            const toolName = event.tool_name ?? "未知工具";
-            const succeeded = event.success;
-            const isExpanded = expandedIndex === sortedIndex;
+            // 工具详情使用原生 details：输入/输出是后端生成的有界脱敏摘要。
+            // 有 call id 时把调用与结果合并为一张会随流更新的活动卡片。
+            const callEvent = event.event_type === "tool_call" ? event : null;
+            const resultEvent =
+              event.event_type === "tool_result"
+                ? event
+                : event.tool_call_id
+                  ? (toolResultsById.get(event.tool_call_id) ?? null)
+                  : null;
+            const toolName = callEvent?.tool_name ?? resultEvent?.tool_name ?? "未知工具";
+            const label = toolActivityLabel(toolName);
+            const succeeded = resultEvent?.success;
+            const toolCallId = callEvent?.tool_call_id ?? resultEvent?.tool_call_id ?? undefined;
+            const inputSummary = callEvent?.input_summary ?? resultEvent?.input_summary;
+            const outputSummary = resultEvent?.output_summary ?? callEvent?.output_summary;
+            const planStepSequence =
+              callEvent?.plan_step_sequence ?? resultEvent?.plan_step_sequence;
+            const durationMs = resultEvent?.duration_ms ?? callEvent?.duration_ms;
+            const terminalOutputs = toolCallId
+              ? (toolOutputsById.get(toolCallId) ?? [])
+              : [];
 
             return (
-              <li key={`${event.event_type}-${event.sequence}`}>
-                <button
-                  aria-expanded={isExpanded}
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-caption",
-                    isActive ? "font-medium text-foreground" : "text-muted-foreground",
-                  )}
-                  data-slot="tool-row"
-                  type="button"
-                  onClick={() =>
-                    setExpandedIndex(isExpanded ? null : sortedIndex)
-                  }
-                  {...activeProps}
-                >
-                  <span aria-hidden>
-                    {event.event_type === "tool_call"
-                      ? "🔧"
-                      : succeeded === true
-                        ? "✅"
-                        : succeeded === false
-                          ? "❌"
-                          : "🔧"}
-                  </span>
-                  <span className="truncate">{toolName}</span>
-                  <span className="ml-auto shrink-0">{isExpanded ? "收起" : "详情"}</span>
-                </button>
+              <li
+                className={cn(
+                  parentToolCallId && "ml-4 border-l border-border pl-3",
+                )}
+                data-parent-tool-call-id={parentToolCallId}
+                data-tool-call-id={toolCallId}
+                key={`tool-${toolCallId ?? event.sequence}`}
+              >
+                <details open={toolName === "shell" ? true : undefined} {...activeProps}>
+                  <summary
+                    className={cn(
+                      "flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1 text-caption",
+                      isActive ? "font-medium text-foreground" : "text-muted-foreground",
+                    )}
+                    data-slot="tool-row"
+                  >
+                    <span aria-hidden>
+                      {succeeded === true ? "✅" : succeeded === false ? "❌" : "🔧"}
+                    </span>
+                    <span className="truncate">{label}</span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {resultEvent
+                        ? succeeded === true
+                          ? "已完成"
+                          : succeeded === false
+                            ? "失败"
+                            : "已结束"
+                        : "运行中"}
+                    </span>
+                    <span className="ml-auto shrink-0">详情</span>
+                  </summary>
 
-                {isExpanded ? (
-                  <div className="ml-2 border-l border-border pl-3 text-caption text-muted-foreground">
-                    {event.plan_step_sequence != null ? (
-                      <p>所属计划步骤:{event.plan_step_sequence}</p>
+                  <div
+                    className="ml-2 space-y-2 border-l border-border py-1 pl-3 text-caption text-muted-foreground"
+                    data-slot="tool-details"
+                  >
+                    {inputSummary ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">工具输入</p>
+                        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
+                          {inputSummary}
+                        </pre>
+                      </div>
                     ) : null}
-                    {event.duration_ms != null ? <p>耗时:{event.duration_ms}ms</p> : null}
-                    {event.event_type === "tool_result" && succeeded != null ? (
+                    {outputSummary ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">工具输出</p>
+                        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2">
+                          {outputSummary}
+                        </pre>
+                      </div>
+                    ) : null}
+                    {terminalOutputs.length > 0 ? (
+                      <div>
+                        <p className="font-medium text-foreground/80">
+                          终端输出
+                        </p>
+                        <pre
+                          className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-neutral-950 p-2 font-mono text-[11px] text-neutral-100"
+                          data-slot="terminal-output"
+                        >
+                          {terminalOutputs.map((output) => (
+                            <span
+                              className={cn(
+                                output.output_stream === "stderr" &&
+                                  "text-red-300",
+                              )}
+                              data-output-stream={output.output_stream ?? "stdout"}
+                              key={`terminal-${output.sequence}`}
+                            >
+                              {eventContent(output)}
+                            </span>
+                          ))}
+                        </pre>
+                      </div>
+                    ) : null}
+                    {planStepSequence != null ? (
+                      <p>所属计划步骤:{planStepSequence}</p>
+                    ) : null}
+                    {durationMs != null ? <p>耗时:{durationMs}ms</p> : null}
+                    {resultEvent && succeeded != null ? (
                       <p>{succeeded ? "执行成功" : "执行失败"}</p>
                     ) : null}
                   </div>
-                ) : null}
+                </details>
               </li>
             );
           }
@@ -246,7 +380,34 @@ function EventTimeline({
               </li>
             );
           }
+          case "message_delta": {
+            // store 已按 message_id 合并 token；这里只展示专业 Agent 的
+            // 阶段性输出，Supervisor 正文由主消息气泡负责。
+            if (event.agent === "supervisor") {
+              return null;
+            }
+            return (
+              <li
+                className={cn(
+                  "rounded-md border border-border bg-muted/40 px-3 py-2 text-caption",
+                  isActive && "border-primary/40",
+                )}
+                data-slot="subagent-message"
+                key={`message_delta-${event.sequence}`}
+                {...activeProps}
+              >
+                <div className="flex items-center gap-2">
+                  {event.agent ? <AgentBadge agent={event.agent} /> : null}
+                  <span className="text-muted-foreground">阶段性结果</span>
+                </div>
+                <p className="mt-1 whitespace-pre-wrap text-foreground">
+                  {eventContent(event)}
+                </p>
+              </li>
+            );
+          }
           case "message_end":
+          case "tool_output":
           case "done":
           case "error":
             // 终态事件:由消息流与 runError 呈现,这里忽略
@@ -284,7 +445,12 @@ export function CollaborationPanel({
           expanded && "border-b border-border",
         )}
       >
-        <h3 className="text-caption font-medium text-foreground">协作过程</h3>
+        <div>
+          <h3 className="text-caption font-medium text-foreground">执行过程</h3>
+          <p className="text-[11px] text-muted-foreground">
+            思考摘要 · 工具调用 · 子代理
+          </p>
+        </div>
         <button
           aria-expanded={expanded}
           className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-muted-foreground hover:bg-muted hover:text-foreground"

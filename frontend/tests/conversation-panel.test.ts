@@ -49,6 +49,40 @@ test("the conversation panel keeps an end anchor for automatic scrolling", () =>
   assert.match(panel, /data-slot="conversation-end"/);
 });
 
+test("the conversation page renders the collaboration process for the active turn", async () => {
+  const { ConversationContent } = await loadConversationPanel();
+  const markup = renderToStaticMarkup(
+    createElement(ConversationContent, {
+      collaboration: {
+        currentAgent: "learning_assistant",
+        events: [
+          {
+            agent: "learning_assistant",
+            content: "正在梳理知识点",
+            event_type: "thinking",
+            sequence: 1,
+            session_id: "session-1",
+          },
+        ],
+        taskPlan: null,
+        taskResults: null,
+      },
+      isSending: false,
+      isStreaming: true,
+      messages: [{ agent: null, content: "请讲解", role: "user" }],
+      runError: null,
+      streamingAgent: "supervisor",
+      streamingMessage: null,
+    }),
+  );
+  const panel = readFileSync(panelPath, "utf8");
+
+  assert.match(markup, /data-slot="collaboration-panel"/);
+  assert.match(markup, /正在梳理知识点/);
+  assert.match(panel, /state\.events/);
+  assert.match(panel, /state\.taskPlan/);
+});
+
 // D2-T5:错误降级 UX——runError 分类渲染与重试按钮 ———————————————————
 test("the conversation panel renders a categorized run error with a retry button when onRetry is provided", async () => {
   const { ConversationContent } = await loadConversationPanel();
@@ -503,6 +537,54 @@ test("MessageRow renders feedback buttons only for assistant rows", async () => 
   assert.doesNotMatch(userMarkup, /data-slot="feedback-up"/);
 });
 
+// 伦理合规:「AI 生成内容」标识与生成文件标注 ——————————————————
+test("MessageRow renders the AI content notice only on assistant rows", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const assistantMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: { agent: "teaching_assistant", content: "回答", role: "assistant" },
+    }),
+  );
+  assert.match(assistantMarkup, /data-slot="ai-content-notice"/);
+  assert.match(assistantMarkup, /内容由 AI 生成/);
+  // 无附件时不渲染生成文件标注(附件区整体零渲染)
+  assert.doesNotMatch(assistantMarkup, /data-slot="generated-files-notice"/);
+
+  const userMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 1,
+      message: { agent: null, content: "问题", role: "user" },
+    }),
+  );
+  assert.doesNotMatch(userMarkup, /data-slot="ai-content-notice"/);
+});
+
+test("MessageRow marks assistant attachments as AI-generated files", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: {
+        agent: "teaching_assistant",
+        attachments: [
+          {
+            file_id: "f-1",
+            name: "教案-反向传播.docx",
+            size: 1024,
+          },
+        ],
+        content: "教案已生成",
+        role: "assistant",
+      },
+    }),
+  );
+  assert.match(markup, /data-slot="generated-files-notice"/);
+  assert.match(markup, /文件由 AI 生成/);
+});
+
 test("feedback wiring covers both full and virtualized message paths in source", () => {
   const panel = readFileSync(panelPath, "utf8");
 
@@ -589,7 +671,7 @@ test("message rows omit the attachment area when there are no attachments", asyn
   assert.doesNotMatch(markup, /data-slot="attachment-link"/);
 });
 
-test("assistant message rows never render attachments even if present", async () => {
+test("assistant message rows render generated-file attachments (T5-3)", async () => {
   const { MessageRow } = await loadConversationPanel();
 
   const markup = renderToStaticMarkup(
@@ -598,18 +680,25 @@ test("assistant message rows never render attachments even if present", async ()
       message: {
         agent: "supervisor",
         attachments: [
-          { content_type: "image/png", file_id: "x-1", name: "x.png", size: 1 },
+          {
+            content_type:
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_id: "gen-1.xlsx",
+            name: "成绩单.xlsx",
+            size: 4096,
+          },
         ],
-        content: "回答",
+        content: "已生成成绩单",
         role: "assistant",
       },
     }),
   );
 
-  // 仅用户侧渲染附件(助手理论上不携带;防御性零渲染,data-slot 不出现)
-  assert.doesNotMatch(markup, /data-slot="message-attachments"/);
-  assert.doesNotMatch(markup, /data-slot="attachment-image"/);
-  assert.doesNotMatch(markup, /data-slot="attachment-link"/);
+  // T5-3 行为变更(本测试由「助手永不渲染附件」反转而来):officecli 生成的
+  // 文件经后端注册为受控附件,助手消息必须渲染下载入口;SSR 首帧为加载
+  // 占位(与用户侧同一鉴权 Blob 链路),无附件时仍零渲染。
+  assert.match(markup, /data-slot="message-attachments"/);
+  assert.match(markup, /animate-pulse/);
 });
 
 test("attachment rendering lives inside MessageRow so both render paths share it", () => {
@@ -623,4 +712,35 @@ test("attachment rendering lives inside MessageRow so both render paths share it
   assert.match(panel, /getFileUrl\(attachment\.file_id\)/);
   // 仅用户消息渲染(守卫在 role 分支内)
   assert.match(panel, /isUser \? \(/);
+});
+
+test("message bubbles use a softer hierarchy for user and assistant content", async () => {
+  const { MessageRow } = await loadConversationPanel();
+  const userMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: { agent: null, content: "用户问题", role: "user" },
+    }),
+  );
+  const assistantMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 1,
+      message: { agent: "supervisor", content: "助手回答", role: "assistant" },
+    }),
+  );
+
+  assert.match(userMarkup, /rounded-2xl/);
+  assert.match(userMarkup, /rounded-br-md/);
+  assert.match(assistantMarkup, /rounded-2xl/);
+  assert.match(assistantMarkup, /bg-card\/80/);
+  assert.match(assistantMarkup, /shadow-sm/);
+});
+
+test("the conversation uses a wider reading rail and a soft composer transition", () => {
+  const panel = readFileSync(panelPath, "utf8");
+
+  assert.match(panel, /max-w-4xl/);
+  assert.match(panel, /data-slot="chat-input-area"/);
+  assert.match(panel, /bg-gradient-to-t/);
+  assert.doesNotMatch(panel, /className="border-t border-border px-8 py-4"/);
 });

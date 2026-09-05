@@ -58,3 +58,34 @@ def test_create_deepseek_model_uses_settings() -> None:
 
     assert model.model_name == "deepseek-chat"
     assert model.openai_api_base == "https://api.deepseek.com"
+
+
+def test_create_deepseek_model_default_limits_unchanged() -> None:
+    """默认参数与原行为逐项一致（零回归）：timeout=60 / max_retries=1 /
+    max_tokens=None（S5 可选覆盖参数的默认值锁定）。"""
+    settings = DeepSeekSettings(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+    )
+
+    model = create_deepseek_model(settings)
+
+    assert model.request_timeout == 60
+    assert model.max_retries == 1
+    assert model.max_tokens is None
+
+
+def test_create_deepseek_model_accepts_lightweight_overrides() -> None:
+    """S5 轻量实例：查询改写器等辅助链路用收紧的 timeout/max_tokens。"""
+    settings = DeepSeekSettings(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+    )
+
+    model = create_deepseek_model(settings, timeout=10, max_retries=0, max_tokens=128)
+
+    assert model.request_timeout == 10
+    assert model.max_retries == 0
+    assert model.max_tokens == 128

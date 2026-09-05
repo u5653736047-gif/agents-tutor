@@ -8,8 +8,8 @@ create_app() 不跑 lifespan,state 直接赋值即可),验证:
    done 收尾;
 2. run 异常 → error 事件(internal_error / session_busy),HTTP 仍 200;
 3. 会话忙 → 第二次请求立即返回 JSON session_busy(非 SSE 流);
-4. 工具事件(tool_call/tool_result)不含工具参数/结果正文;
-5. thinking 事件 content 为固定占位文本(非模型输出)。
+4. 工具事件(tool_call/tool_result)携带有界、脱敏的输入/输出摘要;
+5. provider 的 reasoning 字段作为独立增量事件流式输出。
 """
 
 from __future__ import annotations
@@ -23,13 +23,14 @@ from typing import Any
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from api.app import create_app
 from api.schemas import ChatRequest
 from api.stream import _stream_events
-from core.events import EventType, RunEvent
+from core.events import ErrorCode, EventType, RunError, RunEvent
 from core.sessions import SessionStore
+from core.state import AgentRole, PendingToolApproval, ToolApprovalRequest
 
 # ── 图替身:与 test_chat_api.ChatGraph 同构,但 get_state 返回
 #    「当前可见」状态(中间态 → 最终态),模拟 checkpoint 逐步落盘 ──
@@ -116,6 +117,162 @@ class BlockingStreamingChatGraph(StreamingChatGraph):
         if not self.release_run.wait(timeout=2):
             raise TimeoutError("test run was not released")
         return super().run(user_input, session_id, user_id)
+
+
+class NativeTokenStreamingChatGraph(StreamingChatGraph):
+    """直接产出 LangGraph messages/custom 流，模拟真实 token 到达。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            {
+                "messages": [
+                    HumanMessage(content="解释流式"),
+                    AIMessage(content="流式完成"),
+                ],
+                "events": [
+                    RunEvent(
+                        event_type=EventType.AGENT_STARTED,
+                        sequence=0,
+                        session_id="session-1",
+                        agent="supervisor",
+                    ),
+                    RunEvent(
+                        event_type=EventType.AGENT_COMPLETED,
+                        sequence=1,
+                        session_id="session-1",
+                        agent="supervisor",
+                        success=True,
+                    ),
+                    RunEvent(
+                        event_type=EventType.RUN_COMPLETED,
+                        sequence=2,
+                        session_id="session-1",
+                        agent="supervisor",
+                        success=True,
+                    ),
+                ],
+                "current_agent": "supervisor",
+            },
+            initial_state={"events": [], "messages": []},
+            run_delay=0.0,
+        )
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.stream_thread_id: int | None = None
+
+    def stream(
+        self,
+        user_input: str,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> object:
+        self.run_started.set()
+        self.stream_thread_id = threading.get_ident()
+        self.run_inputs.append((user_input, session_id, user_id))
+        started = RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=0,
+            session_id=session_id,
+            agent="supervisor",
+        )
+        yield (
+            "custom",
+            {"kind": "run_event", "event": started.model_dump(mode="json")},
+        )
+        # provider 显式返回的 reasoning_content 是独立过程通道，不混入正文。
+        yield (
+            "messages",
+            (
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={"reasoning_content": "先识别问题，再组织解释"},
+                    id="assistant-turn",
+                ),
+                {"agent_role": "supervisor"},
+            ),
+        )
+        yield (
+            "messages",
+            (
+                AIMessageChunk(content="流", id="assistant-turn"),
+                {"agent_role": "supervisor"},
+            ),
+        )
+        self.release.wait(timeout=2)
+        yield (
+            "messages",
+            (
+                AIMessageChunk(content="式", id="assistant-turn"),
+                {"agent_role": "supervisor"},
+            ),
+        )
+        self._visible_state = self._final_state
+        self.finished.set()
+
+
+class NativeTerminalStateChatGraph(StreamingChatGraph):
+    """原生流结束后只通过 checkpoint 暴露终态，模拟生产图收口。"""
+
+    def __init__(self, final_state: dict[str, Any]) -> None:
+        super().__init__(
+            final_state,
+            initial_state={"events": [], "messages": []},
+            run_delay=0.0,
+        )
+
+    def stream(
+        self,
+        user_input: str,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> object:
+        self.run_started.set()
+        self.run_inputs.append((user_input, session_id, user_id))
+        started = RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=0,
+            session_id=session_id,
+            agent="supervisor",
+        )
+        yield (
+            "custom",
+            {"kind": "run_event", "event": started.model_dump(mode="json")},
+        )
+        self._visible_state = self._final_state
+
+
+class NativePendingToolChatGraph(NativeTerminalStateChatGraph):
+    def __init__(self) -> None:
+        super().__init__(
+            {
+                "run_id": "run-shell-1",
+                "messages": [HumanMessage(content="inspect")],
+                "events": [],
+                "current_agent": "supervisor",
+                "pending_tool_approval": {
+                    "tool_call_id": "shell-1",
+                    "tool_name": "shell",
+                    "agent_role": "supervisor",
+                    "arguments": {"command": "git status", "cwd": "."},
+                },
+            }
+        )
+        self.pending = PendingToolApproval(
+            interrupt_id="interrupt-shell-1",
+            request=ToolApprovalRequest(
+                tool_call_id="shell-1",
+                tool_name="shell",
+                agent_role=AgentRole.SUPERVISOR,
+                arguments={"command": "git status", "cwd": "."},
+            ),
+        )
+
+    def get_pending_tool_approval(
+        self,
+        _session_id: str,
+        _user_id: str | None = None,
+    ) -> PendingToolApproval | None:
+        return self.pending if self.run_started.is_set() else None
 
 
 def _chat_app(tmp_path: Path, graph: StreamingChatGraph) -> tuple[FastAPI, SessionStore]:
@@ -266,9 +423,143 @@ def test_stream_events_arrive_in_sequence_and_end_with_message_end_then_done(
     assert message_end_frames[-1]["content"] == "评估完成"
     assert message_end_frames[-1]["message"]["content"] == "评估完成"
 
-    # thinking 事件 content 是固定占位文本(非模型输出)。
-    assert frames[0]["content"] == "supervisor 开始处理"
+    # thinking 是可审计的阶段摘要，不是模型隐藏推理原文。
+    assert frames[0]["content"] == "正在分析问题并规划协作"
     assert frames[0]["agent"] == "supervisor"
+
+
+def test_native_stream_yields_text_delta_before_the_graph_finishes(
+    tmp_path: Path,
+) -> None:
+    """reasoning 与正文 token 都在图结束前到达，且互不混入。"""
+    graph = NativeTokenStreamingChatGraph()
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    payload = ChatRequest(session_id="session-1", message="解释流式")
+
+    class _ConnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    async def scenario() -> list[dict[str, Any]]:
+        lock = asyncio.Lock()
+        generator = _stream_events(
+            graph,
+            store,
+            payload,
+            _ConnectedRequest(),  # type: ignore[arg-type] - 测试替身只实现所需方法
+            "user-1",
+            lock,
+        )
+        frames: list[dict[str, Any]] = []
+        try:
+            while not any(frame["event_type"] == "message_delta" for frame in frames):
+                raw = await asyncio.wait_for(anext(generator), timeout=1)
+                if raw.startswith("data: "):
+                    frames.append(json.loads(raw[len("data: "):]))
+            assert graph.finished.is_set() is False
+            assert frames[-1]["content"] == "流"
+            graph.release.set()
+            async for raw in generator:
+                if raw.startswith("data: "):
+                    frames.append(json.loads(raw[len("data: "):]))
+        finally:
+            graph.release.set()
+            await generator.aclose()
+        return frames
+
+    try:
+        caller_thread = threading.get_ident()
+        frames = asyncio.run(scenario())
+    finally:
+        store.close()
+
+    assert graph.stream_thread_id is not None
+    assert graph.stream_thread_id != caller_thread
+    assert [frame["event_type"] for frame in frames] == [
+        "thinking",
+        "reasoning",
+        "message_delta",
+        "message_delta",
+        "message_end",
+        "done",
+    ]
+    reasoning = next(frame for frame in frames if frame["event_type"] == "reasoning")
+    assert reasoning["content"] == "先识别问题，再组织解释"
+    assert reasoning["message_id"] == "assistant-turn"
+    assert reasoning["is_delta"] is True
+    assert all(
+        "先识别问题，再组织解释" not in (frame.get("content") or "")
+        for frame in frames
+        if frame["event_type"] in {"message_delta", "message_end"}
+    )
+
+
+def test_native_stream_exposes_checkpoint_run_error_instead_of_silent_done(
+    tmp_path: Path,
+) -> None:
+    """模型失败写入 run_error 时，SSE 必须显式报错，不能伪装成功结束。"""
+    graph = NativeTerminalStateChatGraph(
+        {
+            "messages": [HumanMessage(content="解释流式")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": RunError(
+                error_code=ErrorCode.MODEL_CALL_FAILED,
+                message="provider connection failed",
+                agent="supervisor",
+            ),
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream(
+                app,
+                {"session_id": "session-1", "message": "解释流式"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert [frame["event_type"] for frame in frames] == [
+        "thinking",
+        "error",
+        "done",
+    ]
+    assert frames[-2]["error_code"] == "model_call_failed"
+    assert frames[-2]["agent"] == "supervisor"
+    assert "provider connection failed" not in json.dumps(frames)
+
+
+def test_native_stream_without_answer_or_run_error_reports_internal_error(
+    tmp_path: Path,
+) -> None:
+    """成功终态必须有权威回答；空终态不能只发 done 吞掉异常。"""
+    graph = NativeTerminalStateChatGraph(
+        {
+            "messages": [HumanMessage(content="解释流式")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream(
+                app,
+                {"session_id": "session-1", "message": "解释流式"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert [frame["event_type"] for frame in frames] == [
+        "thinking",
+        "error",
+        "done",
+    ]
+    assert frames[-2]["error_code"] == "internal_error"
 
 
 def test_stream_reports_unexpected_run_errors_as_internal_error_events(
@@ -373,14 +664,10 @@ def test_stream_returns_session_busy_json_when_the_session_is_locked(
     assert first_frames[-1]["event_type"] == "done"
 
 
-def test_stream_tool_events_never_carry_tool_arguments_or_results(
+def test_stream_tool_events_carry_redacted_input_and_output_summaries(
     tmp_path: Path,
 ) -> None:
-    """tool_call/tool_result 事件只含摘要字段,绝不含参数/结果正文。
-
-    更强形式:所有 SSE 帧的键集合必须落在 StreamEvent 的公开字段内,
-    帧里出现 args/result/tool_input/output 等键即视为契约破坏。
-    """
+    """工具详情可展示，但只通过有界、脱敏的摘要字段公开。"""
     events = [
         RunEvent(
             event_type=EventType.TOOL_STARTED,
@@ -388,6 +675,8 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
             session_id="session-1",
             agent="learning_assistant",
             tool_name="search_knowledge",
+            tool_call_id="call-search-1",
+            input_summary='{"query":"反向传播","api_key":"[REDACTED]"}',
         ),
         RunEvent(
             event_type=EventType.TOOL_COMPLETED,
@@ -395,7 +684,9 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
             session_id="session-1",
             agent="learning_assistant",
             tool_name="search_knowledge",
+            tool_call_id="call-search-1",
             success=True,
+            output_summary='{"found":true,"hits":2}',
         ),
         RunEvent(
             event_type=EventType.AGENT_COMPLETED,
@@ -432,19 +723,30 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
 
     allowed_keys = {
         "event_type",
-        "sequence",
-        "session_id",
-        "agent",
+            "sequence",
+            "session_id",
+            "run_id",
+            "agent",
         "tool_name",
         "success",
         "duration_ms",
         "error_code",
         "plan_step_sequence",
         "content",
+        "message_id",
         "message",
         "citations",
+        # P2-12:批改结论（契约新增可选字段，非批改事件为 null/缺省）
+        "grading",
         "current_agent",
-    }
+        "tool_call_id",
+        "parent_tool_call_id",
+        "input_summary",
+            "output_summary",
+            "output_stream",
+            "is_delta",
+            "pending_tool_approval",
+        }
     for frame in frames:
         assert set(frame).issubset(allowed_keys)
     tool_frames = [
@@ -452,11 +754,13 @@ def test_stream_tool_events_never_carry_tool_arguments_or_results(
     ]
     assert len(tool_frames) == 2
     for frame in tool_frames:
-        assert "args" not in frame
-        assert "result" not in frame
-        assert "tool_input" not in frame
-        assert "output" not in frame
         assert frame["tool_name"] == "search_knowledge"
+        assert frame["tool_call_id"] == "call-search-1"
+    assert tool_frames[0]["input_summary"] == (
+        '{"query":"反向传播","api_key":"[REDACTED]"}'
+    )
+    assert tool_frames[1]["output_summary"] == '{"found":true,"hits":2}'
+    assert "secret" not in json.dumps(tool_frames)
 
 
 def test_stream_disconnect_waits_for_run_then_releases_lock(
@@ -551,8 +855,8 @@ def test_stream_replays_remaining_events_when_round_finished(
 
     回放分支在 _ensure_session 后立即执行、不启动 run:断言 graph.run
     未被调用(run_inputs 为空);推送的帧 sequence 全部大于 from_sequence,
-    终态映射事件(message_end/done 映射)被跳过,最后是合成的 done
-    (sequence 递增)——D1-T3 验收「重连后回放剩余事件并以 done 收尾」。
+    终态映射事件(message_end/done 映射)被跳过,最后补发权威全文与 done
+    (sequence 递增)——token 增量本身不落 checkpoint,重连不能只补 done。
     """
     final_events = [
         RunEvent(
@@ -596,6 +900,7 @@ def test_stream_replays_remaining_events_when_round_finished(
         run_delay=0.0,
     )
     app, store = _chat_app(tmp_path, graph)
+    existing = store.create_session("session-1", user_id="user-1")
     try:
         frames = asyncio.run(
             _post_stream_from(
@@ -604,29 +909,113 @@ def test_stream_replays_remaining_events_when_round_finished(
                 from_sequence=3,
             )
         )
+        replayed = store.list_sessions(user_id="user-1")[0]
     finally:
         store.close()
 
     # 回放不启动 run(断线重连避免整轮重复执行)。
     assert graph.run_inputs == []
+    assert replayed.updated_at == existing.updated_at
 
     # 只回放 sequence > 3 的公开事件;AGENT_COMPLETED(message_end 映射)
-    # 与 RUN_COMPLETED(done 映射)被跳过,最后是合成的 done。
-    assert [frame["event_type"] for frame in frames] == ["tool_call", "done"]
-    # 公开事件 4(TOOL_STARTED)先推;done 的 sequence 必须大于「真实
-    # 终态序列」(终态 RUN_COMPLETED 是 6,故 done = 7,review 修正:
+    # 与 RUN_COMPLETED(done 映射)被跳过,随后补权威 message_end + done。
+    assert [frame["event_type"] for frame in frames] == [
+        "tool_call",
+        "message_end",
+        "done",
+    ]
+    assert frames[-2]["content"] == "complete"
+    # 公开事件 4(TOOL_STARTED)先推;合成帧的 sequence 必须大于「真实
+    # 终态序列」(终态 RUN_COMPLETED 是 6,故 message_end = 7,done = 8):
     # 公开序列可能有间隙,用 last_sequence+1 会让 done 小于真实终态,
     # 调用方把 done 传回时下一条消息会被误判为回放)。
-    assert [frame["sequence"] for frame in frames] == [4, 7]
+    assert [frame["sequence"] for frame in frames] == [4, 7, 8]
     assert all(frame["sequence"] > 3 for frame in frames)
     assert frames[-1]["event_type"] == "done"
-    assert frames[-1]["sequence"] == 7
 
 
-def test_stream_from_sequence_ignored_when_round_not_finished(
+def test_native_stream_pauses_with_an_exact_tool_approval_instead_of_an_error(
     tmp_path: Path,
 ) -> None:
-    """重连时最近一轮未结束(最后事件非终态)→ from_sequence 被忽略,正常启动 run。"""
+    graph = NativePendingToolChatGraph()
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream(
+                app,
+                {"session_id": "session-1", "message": "inspect"},
+            )
+        )
+    finally:
+        store.close()
+
+    assert [frame["event_type"] for frame in frames] == [
+        "thinking",
+        "approval_required",
+        "done",
+    ]
+    approval = frames[1]["pending_tool_approval"]
+    assert approval["interrupt_id"] == "interrupt-shell-1"
+    assert approval["request"]["arguments"]["command"] == "git status"
+    assert all(frame["event_type"] != "error" for frame in frames)
+
+
+def test_stream_reconnect_with_token_sequence_above_checkpoint_does_not_rerun(
+    tmp_path: Path,
+) -> None:
+    """token 帧序号可高于 core 终态；重连仍应补全文而不是重跑代理。"""
+    final_events = [
+        RunEvent(
+            event_type=EventType.AGENT_STARTED,
+            sequence=0,
+            session_id="session-1",
+            agent="supervisor",
+        ),
+        RunEvent(
+            event_type=EventType.RUN_COMPLETED,
+            sequence=2,
+            session_id="session-1",
+            success=True,
+        ),
+    ]
+    final_state = {
+        "messages": [HumanMessage(content="解释"), AIMessage(content="权威完整回答")],
+        "events": final_events,
+        "current_agent": "supervisor",
+    }
+    graph = StreamingChatGraph(
+        final_state,
+        initial_state=final_state,
+        run_delay=0.0,
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        frames = asyncio.run(
+            _post_stream_from(
+                app,
+                {"session_id": "session-1", "message": "解释"},
+                from_sequence=40,
+            )
+        )
+    finally:
+        store.close()
+
+    assert graph.run_inputs == []
+    assert [frame["event_type"] for frame in frames] == ["message_end", "done"]
+    assert [frame["sequence"] for frame in frames] == [41, 42]
+    assert frames[0]["content"] == "权威完整回答"
+
+
+def test_stream_reconnect_never_reruns_when_round_not_finished(
+    tmp_path: Path,
+) -> None:
+    """重连时最近一轮未结束也不得重跑同一输入。
+
+    真实故障链路是：长任务仍在后台执行时浏览器断线，续传请求带正数
+    from_sequence 到达；此时 checkpoint 可能只落了中间事件。把它当成
+    新消息会让同一子代理任务执行两次。正数游标只表示续传，绝不具有
+    启动新 run 的权限；连接可无事件结束，由客户端稍后再次续传。
+    """
     final_events = [
         RunEvent(
             event_type=EventType.AGENT_STARTED,
@@ -675,16 +1064,8 @@ def test_stream_from_sequence_ignored_when_round_not_finished(
     finally:
         store.close()
 
-    # 最后事件不是终态 → 回放条件不成立 → 启动新 run,事件按新 run 推送。
-    assert graph.run_inputs == [("请检索", "session-1", "user-1")]
-    assert [frame["event_type"] for frame in frames] == [
-        "thinking",
-        "tool_call",
-        "tool_result",
-        "message_end",
-        "done",
-    ]
-    assert [frame["sequence"] for frame in frames] == [3, 4, 5, 6, 7]
+    assert graph.run_inputs == []
+    assert frames == []
 
 
 def test_stream_from_sequence_zero_starts_new_run_when_round_finished(
@@ -802,10 +1183,13 @@ def test_stream_replay_done_sequence_exceeds_real_terminal_with_public_gap(
     finally:
         store.close()
 
-    # 公开事件只有 4(TOOL_STARTED);done = 真实终态(6) + 1 = 7,
-    # 保证「把 done.sequence 传回」时回放条件必然不成立。
-    assert [frame["event_type"] for frame in frames] == ["tool_call", "done"]
-    assert [frame["sequence"] for frame in frames] == [4, 7]
+    # 公开事件只有 4(TOOL_STARTED);随后补权威全文与 done。
+    assert [frame["event_type"] for frame in frames] == [
+        "tool_call",
+        "message_end",
+        "done",
+    ]
+    assert [frame["sequence"] for frame in frames] == [4, 7, 8]
 
 def test_stream_message_end_carries_citations_when_final_message_has_them(
     tmp_path: Path,

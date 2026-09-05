@@ -35,15 +35,15 @@ export interface paths {
         put?: never;
         /**
          * Chat Stream
-         * @description SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。
+         * @description SSE 原生流式聊天(token + 安全运行事件)。
          *
          *     会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),
          *     不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。
          *
          *     from_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新
-         *     sequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端
-         *     回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新
-         *     消息,启动新 run。
+         *     sequence；若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发
+         *     权威 message_end + done；若仍是中间态则要求客户端继续等待，绝不
+         *     重跑。默认 0 表示发新消息并启动新 run。
          */
         post: operations["chat_stream_chat_stream_post"];
         delete?: never;
@@ -138,15 +138,43 @@ export interface paths {
         };
         /**
          * Healthz
-         * @description 存活探针；lifespan 装配后附带检索模式诊断（H-T1）。
+         * @description 存活探针；lifespan 装配后附带检索与 OCR 诊断（H-T1 / P0-6）。
          *
          *     - lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持
          *       {"status": "ok"} 现状，不破坏既有探针语义与测试；
          *     - lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /
-         *       vector_dimension），运维据此判断语义检索是否在线。诊断只含
-         *       这三个字段，绝不含任何文件路径。
+         *       vector_dimension）与 ocr 字段（enabled，P0-6：图片附件识别
+         *       能力是否在线），运维据此判断可选能力状态。诊断只含状态字段，
+         *       绝不含任何文件路径。
          */
         get: operations["healthz_healthz_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/chunks/{chunk_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Chunk
+         * @description 按 chunk_id 取回分块原文(I2 查看原文)。
+         *
+         *     - 未命中(不存在 / 空白 / 超长 chunk_id):404 chunk_not_found——
+         *       chunk_id 是引用凭证,引用指向不存在的分块属「资源不存在」,
+         *       与检索「空结果不报错」语义刻意不同(检索是查询,这里是定位);
+         *     - content 上限 CHUNK_CONTENT_MAX_LENGTH 截断(防撑爆响应体);
+         *     - 只暴露 chunk 文本 + 逻辑引用,不暴露文件路径(models 层
+         *       _validate_logical_source 保证)。
+         */
+        get: operations["get_chunk_knowledge_chunks__chunk_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -164,14 +192,13 @@ export interface paths {
         };
         /**
          * List Documents
-         * @description 列出通过 API 上传的文档元数据。
+         * @description 列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。
          *
-         *     core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
-         *     delete_document / search),因此 API 层维护进程内注册表
-         *     (_document_registry):只登记经 POST /knowledge/documents 上传的
-         *     文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
-         *     (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
-         *     app 生命周期,测试各 app 实例隔离)。
+         *     I1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库
+         *     的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API
+         *     可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表
+         *     (app.state.knowledge_documents)只作为「未落库条目」的防御性兜底
+         *     合并(理论上不触发,保留以兼容极端时序)。
          */
         get: operations["list_documents_knowledge_documents_get"];
         put?: never;
@@ -214,8 +241,120 @@ export interface paths {
          *     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
          *     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
          *     404 区分。注册表同步移除该条目。
+         *     P1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留
+         *     （删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再
+         *     误判为已入库）。
          */
         delete: operations["delete_document_knowledge_documents__document_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents/{document_id}/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Document Chunks
+         * @description 列出某文档的分块(I2 浏览):分页,只带定位信息与摘要。
+         *
+         *     - offset 从 0 起、limit 默认 20;limit 由 FastAPI Query 参数拦截
+         *       越界(offset>=0、1<=limit<=CHUNK_LIST_PAGE_SIZE_MAX,422),不
+         *       依赖 core 校验;
+         *     - chunks_of_document 按 (start, chunk_id) 排序(与 ingest 顺序一致),
+         *       分页截取稳定;
+         *     - 条目只带摘要(SUMMARY_MAX_LENGTH 截断),完整原文经
+         *       GET /knowledge/chunks/{chunk_id} 获取——列表页先看摘要、点开
+         *       再看全文;
+         *     - 文档不存在:空 items(分页在空集合上就是空),不报 404——与
+         *       删除端点「不存在幂等」同一哲学(见 delete_document 注释);
+         *     - 用服务层的 chunk 能力做「索引未实现 chunk 的兜底」:若索引
+         *       未实现 chunk(getter 缺失),列表仍可用 chunks_of_document 逻辑?
+         *       ——不:本端点直接依赖 chunks_of_document(索引实现本身),与
+         *       chunk 单条端点无关。分页在 Python 侧完成(全部取出后切片),
+         *       数据量(单文档最多数千 chunk)可接受。
+         */
+        get: operations["list_document_chunks_knowledge_documents__document_id__chunks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/documents/{document_id}/tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Document Tree
+         * @description 返回单篇文档的章→节结构树（S5-C2，只读）。
+         *
+         *     - 教材类文档：kind="tree"，chapters 含每章/节 chunk 计数与标签汇总；
+         *     - 无结构文档（如无标题 API 上传件）：kind="flat"，flat_pages 按页
+         *       升序；文档不存在时 flat_pages 为空列表（前端渲染「无内容」占位）；
+         *     - catalog 未装配时同样降级为空 flat 形态，不报错。
+         */
+        get: operations["get_document_tree_knowledge_documents__document_id__tree_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Namespaces
+         * @description 列出全部知识空间及各空间文档数（S5-C1 决策 6）。
+         *
+         *     会话创建对话框与上传表单的空间选择器数据源；空库返回空列表。
+         */
+        get: operations["list_namespaces_knowledge_namespaces_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/knowledge/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Knowledge Overview
+         * @description 知识库总览(I1):语料统计 + 每篇文档元数据,一次请求覆盖教师端。
+         *
+         *     - 无 catalog 装配(部署问题):503 knowledge_unavailable(与检索
+         *       端点同一稳定错误码);
+         *     - 空库(从未入库):stats 全 0、documents 空列表,不报错(与
+         *       「空库检索返回空」语义一致);
+         *     - 只读聚合,不触发 embedding 模型加载(数据全部来自词法库)。
+         */
+        get: operations["knowledge_overview_knowledge_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -241,6 +380,52 @@ export interface paths {
          *       细节(与 api/feedback 的存储异常处理同构)。
          */
         post: operations["search_knowledge_knowledge_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/learning/diagnosis/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Diagnosis Summary
+         * @description 返回学情诊断摘要（默认当前用户；student_id 供教师视角查询）。
+         *
+         *     边界与降级见模块 docstring：v1 的 student_id 查询是演示环境可信
+         *     声明（无鉴权），生产需待认证落地；store 缺失或空数据返回空报告。
+         */
+        get: operations["diagnosis_summary_learning_diagnosis_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/learning/insights/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Learning Insights
+         * @description 返回学情洞察摘要（错题归因/正确率趋势/路径存档回显）。
+         *
+         *     降级红线与诊断端点一致：store 缺失或空数据返回空报告 200。
+         *     数据窗口有界（趋势近 30 日、路径近 20 条，见 core/learning/store.py）。
+         */
+        get: operations["learning_insights_learning_insights_summary_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -335,6 +520,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sessions/{session_id}/process": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Session Process
+         * @description 返回 checkpoint 中可回放的思考、工具与协作过程快照。
+         */
+        get: operations["get_session_process_sessions__session_id__process_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/tool-approval": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Pending Tool Approval
+         * @description Return the exact validated invocation currently awaiting consent.
+         */
+        get: operations["get_pending_tool_approval_sessions__session_id__tool_approval_get"];
+        put?: never;
+        /**
+         * Decide Tool Approval
+         * @description Confirm or reject one exact invocation, then finish the graph turn.
+         */
+        post: operations["decide_tool_approval_sessions__session_id__tool_approval_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/tool-approval/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stream Tool Approval
+         * @description Resume one exact tool gate and stream terminal/model output as SSE.
+         */
+        post: operations["stream_tool_approval_sessions__session_id__tool_approval_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sessions/{session_id}/workspace-roots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Workspace Root
+         * @description Authorize one additional directory for this session's file tools.
+         */
+        post: operations["add_workspace_root_sessions__session_id__workspace_roots_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/stats/overview": {
         parameters: {
             query?: never;
@@ -355,10 +624,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/directories": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Workspace Directories
+         * @description Browse immediate directories without exposing files or file contents.
+         */
+        get: operations["list_workspace_directories_workspaces_directories_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate Workspace
+         * @description Resolve a typed path before the user creates or updates a session.
+         */
+        post: operations["validate_workspace_workspaces_validate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AddWorkspaceRootRequest
+         * @description One user-authorized additional workspace directory.
+         */
+        AddWorkspaceRootRequest: {
+            /** Path */
+            path: string;
+        };
         /**
          * AgentRole
          * @description Public collaborative-agent roles.
@@ -370,7 +687,7 @@ export interface components {
          * @description Stable HTTP API errors not emitted by a graph run.
          * @enum {string}
          */
-        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
+        ApiErrorCode: "invalid_request" | "internal_error" | "handoff_not_pending" | "tool_approval_not_pending" | "session_already_exists" | "session_busy" | "session_not_found" | "knowledge_unavailable";
         /**
          * Attachment
          * @description 聊天消息附件引用(D7-T1 契约扩展预留)。
@@ -396,6 +713,12 @@ export interface components {
         Body_upload_document_knowledge_documents_post: {
             /** File */
             file: string;
+            /**
+             * Knowledge Namespace
+             * @description 目标知识空间；public 为保留的公共库空间
+             * @default public
+             */
+            knowledge_namespace?: string;
         };
         /** Body_upload_file_files_post */
         Body_upload_file_files_post: {
@@ -427,9 +750,13 @@ export interface components {
             /** Events */
             events?: components["schemas"]["RunEvent"][];
             /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
+            /** @default null */
             message?: components["schemas"]["Message"] | null;
             /** @default null */
             pending_handoff?: components["schemas"]["PendingHandoff"] | null;
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
             /**
              * References
              * @default null
@@ -437,6 +764,11 @@ export interface components {
             references?: components["schemas"]["Citation"][] | null;
             /** @default null */
             run_error?: components["schemas"]["RunError"] | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Session Id */
             session_id: string;
             /** @default null */
@@ -446,6 +778,66 @@ export interface components {
              * @default null
              */
             task_results?: components["schemas"]["TaskResult"][] | null;
+            /** @default null */
+            workflow?: components["schemas"]["WorkflowProgress"] | null;
+        };
+        /**
+         * ChunkDetailResponse
+         * @description 单个分块原文(I2 查看原文):内容 + 配套引用凭证。
+         *
+         *     content 上限 8KB(后端截断,防撑爆响应,见 api/knowledge.py 的
+         *     CHUNK_CONTENT_MAX_LENGTH);citation 与检索命中的 Citation 同构
+         *     (document_id / source / page / chunk_id),可直接用于「查看原文」
+         *     跳转与引用展示。
+         */
+        ChunkDetailResponse: {
+            citation: components["schemas"]["Citation"];
+            /** Content */
+            content: string;
+        };
+        /**
+         * ChunkListEntry
+         * @description 分块列表条目(I2 浏览):不带全文,只带定位信息与摘要。
+         *
+         *     summary 由 chunk 内容截断生成(与检索命中同口径,上限
+         *     SUMMARY_MAX_LENGTH);完整原文经 GET /knowledge/chunks/{chunk_id}
+         *     单独获取——列表页先看摘要,点开再看全文。
+         */
+        ChunkListEntry: {
+            /** Chunk Id */
+            chunk_id: string;
+            /**
+             * End
+             * @default 0
+             */
+            end?: number;
+            /**
+             * Page
+             * @default null
+             */
+            page?: number | null;
+            /**
+             * Start
+             * @default 0
+             */
+            start?: number;
+            /** Summary */
+            summary: string;
+        };
+        /**
+         * ChunkListResponse
+         * @description 某文档的分块分页列表(I2 浏览)。
+         *
+         *     total 是该文档全部分块数(不分页),供前端算分页;items 为当前
+         *     页条目(按 start, chunk_id 排序,见 index.py chunks_of_document)。
+         */
+        ChunkListResponse: {
+            /** Document Id */
+            document_id: string;
+            /** Items */
+            items: components["schemas"]["ChunkListEntry"][];
+            /** Total */
+            total: number;
         };
         /**
          * Citation
@@ -470,17 +862,90 @@ export interface components {
          */
         CreateSessionRequest: {
             /**
+             * Knowledge Namespace
+             * @default null
+             */
+            knowledge_namespace?: string | null;
+            /**
              * Session Id
              * @default null
              */
             session_id?: string | null;
+            /**
+             * Workspace Root
+             * @default null
+             */
+            workspace_root?: string | null;
+        };
+        /**
+         * DailyAccuracyPoint
+         * @description 学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。
+         *
+         *     加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见
+         *     core/learning/store.py insights），确定性聚合、可复现。
+         */
+        DailyAccuracyPoint: {
+            /** Accuracy */
+            accuracy: number;
+            /** Attempts */
+            attempts: number;
+            /** Date */
+            date: string;
+        };
+        /**
+         * DiagnosisKnowledgePoint
+         * @description 学情诊断：一个知识点的作答聚合（六大功能 P3-15）。
+         */
+        DiagnosisKnowledgePoint: {
+            /** Accuracy */
+            accuracy: number;
+            /** Attempts */
+            attempts: number;
+            /** Correct */
+            correct: number;
+            /** Knowledge Point */
+            knowledge_point: string;
+            /**
+             * Last At
+             * @default null
+             */
+            last_at?: string | null;
+        };
+        /**
+         * DiagnosisSummary
+         * @description 学情诊断摘要（六大功能 P3-15）。
+         *
+         *     数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =
+         *     attempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM
+         *     叙述只出现在对话内诊断报告，不在本契约里。
+         */
+        DiagnosisSummary: {
+            /** Knowledge Points */
+            knowledge_points?: components["schemas"]["DiagnosisKnowledgePoint"][];
+            /**
+             * Total Attempts
+             * @default 0
+             */
+            total_attempts?: number;
+            /**
+             * Uncategorized Attempts
+             * @default 0
+             */
+            uncategorized_attempts?: number;
+            /**
+             * User Id
+             * @default null
+             */
+            user_id?: string | null;
+            /** Weak Points */
+            weak_points?: string[];
         };
         /**
          * ErrorCode
          * @description Stable API error codes aligned with the current Core classification.
          * @enum {string}
          */
-        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "agent_output_invalid";
+        ErrorCode: "tool_unknown" | "tool_unauthorized" | "tool_invalid_arguments" | "tool_execution_failed" | "tool_timeout" | "tool_no_progress" | "tool_budget_exceeded" | "tool_approval_rejected" | "tool_approval_queue_limit" | "model_call_failed" | "react_iteration_limit" | "graph_handoff_limit" | "graph_switch_limit" | "graph_invalid_target" | "graph_aggregation_invalid" | "workflow_budget_exceeded" | "agent_output_invalid";
         /**
          * ErrorDetail
          * @description A sanitized stable API error.
@@ -561,6 +1026,54 @@ export interface components {
             /** Url */
             url: string;
         };
+        /**
+         * GradingItemDto
+         * @description 一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。
+         */
+        GradingItemDto: {
+            /**
+             * Error Tag
+             * @default null
+             */
+            error_tag?: string | null;
+            /**
+             * Feedback
+             * @default
+             */
+            feedback?: string;
+            /**
+             * Knowledge Point
+             * @default null
+             */
+            knowledge_point?: string | null;
+            /** Max Score */
+            max_score: number;
+            /** Question Id */
+            question_id: string;
+            /** Score */
+            score: number;
+        };
+        /**
+         * GradingResultDto
+         * @description 一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。
+         *
+         *     total_score / max_total_score 由核心侧确定性汇总（不信任模型自报），
+         *     语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，
+         *     教师复核」（LLM 主观题评分的既有产品口径）。
+         */
+        GradingResultDto: {
+            /** Items */
+            items: components["schemas"]["GradingItemDto"][];
+            /** Max Total Score */
+            max_total_score: number;
+            /**
+             * Overall Comment
+             * @default
+             */
+            overall_comment?: string;
+            /** Total Score */
+            total_score: number;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -607,11 +1120,84 @@ export interface components {
             task_content: string;
         };
         /**
+         * KnowledgeBaseStatsDto
+         * @description 知识库语料统计(I1):教师端总览卡数据源。
+         *
+         *     total_pages 可空(纯 txt 语料无页概念时为 None);frontmatter_chunks
+         *     单独给出供教师了解噪音占比(检索侧默认排除,见 service.py 的
+         *     suppress_frontmatter)。
+         */
+        KnowledgeBaseStatsDto: {
+            /**
+             * Frontmatter Chunks
+             * @default 0
+             */
+            frontmatter_chunks?: number;
+            /** Total Chunks */
+            total_chunks: number;
+            /** Total Documents */
+            total_documents: number;
+            /**
+             * Total Pages
+             * @default null
+             */
+            total_pages?: number | null;
+        };
+        /**
+         * KnowledgeDocumentInfoDto
+         * @description 文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。
+         *
+         *     title / subjects / difficulty / ingested_at 可空:脚本入库的教材
+         *     由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
+         *     时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+         *     namespace 显式化（P1-5）。
+         */
+        KnowledgeDocumentInfoDto: {
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /**
+             * Difficulty
+             * @default null
+             */
+            difficulty?: string | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * Ingested At
+             * @default null
+             */
+            ingested_at?: string | null;
+            /**
+             * Namespace
+             * @default public
+             */
+            namespace?: string;
+            /**
+             * Page Count
+             * @default null
+             */
+            page_count?: number | null;
+            /** Source */
+            source: string;
+            /** Subjects */
+            subjects?: string[];
+            /**
+             * Title
+             * @default null
+             */
+            title?: string | null;
+        };
+        /**
          * KnowledgeDocumentListEntry
          * @description 知识库文档列表条目(只读元数据,不含内容)。
          *
          *     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
          *     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
+         *     namespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，
+         *     公共库为 "public"。
          */
         KnowledgeDocumentListEntry: {
             /**
@@ -621,6 +1207,11 @@ export interface components {
             chunk_count?: number | null;
             /** Document Id */
             document_id: string;
+            /**
+             * Namespace
+             * @default public
+             */
+            namespace?: string;
             /**
              * Page Count
              * @default null
@@ -636,6 +1227,27 @@ export interface components {
         KnowledgeDocumentListResponse: {
             /** Documents */
             documents: components["schemas"]["KnowledgeDocumentListEntry"][];
+        };
+        /**
+         * KnowledgeDocumentTreeResponse
+         * @description 文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。
+         *
+         *     - kind="tree"：chapters 有效（教材类有标题行结构）；
+         *     - kind="flat"：flat_pages 有效（无结构文档按页平铺；空列表 =
+         *       文档不存在或无内容）。
+         */
+        KnowledgeDocumentTreeResponse: {
+            /** Chapters */
+            chapters?: components["schemas"]["KnowledgeTreeChapterDto"][];
+            /** Document Id */
+            document_id: string;
+            /** Flat Pages */
+            flat_pages?: number[];
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "tree" | "flat";
         };
         /**
          * KnowledgeDocumentUploadResponse
@@ -654,8 +1266,25 @@ export interface components {
              * @default null
              */
             page_count?: number | null;
+            /**
+             * Replaced
+             * @default false
+             */
+            replaced?: boolean;
             /** Source */
             source: string;
+        };
+        /**
+         * KnowledgeOverviewResponse
+         * @description 知识库总览:统计 + 每篇文档元数据(I1,一次请求覆盖教师端)。
+         *
+         *     documents 与 stats 同源(同一词法库聚合);阈值/重排器等检索
+         *     配置装配状态预留字段(I3/I10,本期不填)。
+         */
+        KnowledgeOverviewResponse: {
+            /** Documents */
+            documents: components["schemas"]["KnowledgeDocumentInfoDto"][];
+            stats: components["schemas"]["KnowledgeBaseStatsDto"];
         };
         /**
          * KnowledgeSearchRequest
@@ -684,6 +1313,62 @@ export interface components {
             hits: components["schemas"]["SearchHitDto"][];
         };
         /**
+         * KnowledgeTreeChapterDto
+         * @description 知识树章节点（S5-C2）：含章直属 chunk 与小节列表。
+         */
+        KnowledgeTreeChapterDto: {
+            /** Chapter */
+            chapter: string;
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /** Sections */
+            sections?: components["schemas"]["KnowledgeTreeSectionDto"][];
+        };
+        /**
+         * KnowledgeTreeSectionDto
+         * @description 知识树小节节点（S5-C2）。
+         */
+        KnowledgeTreeSectionDto: {
+            /**
+             * Chunk Count
+             * @default 0
+             */
+            chunk_count?: number;
+            /** Section */
+            section: string;
+            /** Tags */
+            tags?: string[];
+        };
+        /**
+         * LearningInsights
+         * @description 学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。
+         *
+         *     与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），
+         *     本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；
+         *     数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、
+         *     路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。
+         */
+        LearningInsights: {
+            /** Daily Accuracy */
+            daily_accuracy?: components["schemas"]["DailyAccuracyPoint"][];
+            /** Error Tag Counts */
+            error_tag_counts?: {
+                [key: string]: number;
+            };
+            /** Recent Path Plans */
+            recent_path_plans?: components["schemas"]["PathPlanRecordDto"][];
+            /**
+             * Total Wrong
+             * @default 0
+             */
+            total_wrong?: number;
+            /** User Id */
+            user_id?: string | null;
+        };
+        /**
          * Message
          * @description A safe user or assistant message.
          */
@@ -702,6 +1387,8 @@ export interface components {
              * @default null
              */
             created_at?: string | null;
+            /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
             role: components["schemas"]["MessageRole"];
         };
         /**
@@ -710,6 +1397,34 @@ export interface components {
          * @enum {string}
          */
         MessageRole: "user" | "assistant";
+        /**
+         * NamespaceListResponse
+         * @description 知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。
+         */
+        NamespaceListResponse: {
+            /** Namespaces */
+            namespaces?: components["schemas"]["NamespaceUsageDto"][];
+        };
+        /**
+         * NamespaceUsageDto
+         * @description 一个知识空间的聚合信息（S5-C1 决策 6，只读）。
+         */
+        NamespaceUsageDto: {
+            /** Document Count */
+            document_count: number;
+            /** Namespace */
+            namespace: string;
+        };
+        /**
+         * PathPlanRecordDto
+         * @description 学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。
+         */
+        PathPlanRecordDto: {
+            /** Created At */
+            created_at?: string | null;
+            /** Knowledge Point */
+            knowledge_point?: string | null;
+        };
         /**
          * PendingHandoff
          * @description A handoff paused for a future confirmation or rejection.
@@ -730,6 +1445,22 @@ export interface components {
             session_id: string;
         };
         /**
+         * PendingToolApproval
+         * @description A tool invocation paused at a resumable graph gate.
+         */
+        PendingToolApproval: {
+            /** Interrupt Id */
+            interrupt_id: string;
+            request: components["schemas"]["ToolApprovalRequest"];
+        };
+        /** PendingToolApprovalResponse */
+        PendingToolApprovalResponse: {
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
+            /** Session Id */
+            session_id: string;
+        };
+        /**
          * RunError
          * @description A stable, sanitized error response for a completed run.
          */
@@ -743,11 +1474,16 @@ export interface components {
         };
         /**
          * RunEvent
-         * @description A safe incremental event emitted during one run.
+         * @description A replayable process event emitted during one run.
          */
         RunEvent: {
             /** @default null */
             agent?: components["schemas"]["AgentRole"] | null;
+            /**
+             * Content
+             * @default null
+             */
+            content?: string | null;
             /**
              * Degraded
              * @default null
@@ -762,10 +1498,45 @@ export interface components {
             error_code?: components["schemas"]["ErrorCode"] | null;
             event_type: components["schemas"]["StreamEventType"];
             /**
+             * Input Summary
+             * @default null
+             */
+            input_summary?: string | null;
+            /**
+             * Is Delta
+             * @default null
+             */
+            is_delta?: boolean | null;
+            /**
+             * Message Id
+             * @default null
+             */
+            message_id?: string | null;
+            /**
+             * Output Stream
+             * @default null
+             */
+            output_stream?: ("stdout" | "stderr") | null;
+            /**
+             * Output Summary
+             * @default null
+             */
+            output_summary?: string | null;
+            /**
+             * Parent Tool Call Id
+             * @default null
+             */
+            parent_tool_call_id?: string | null;
+            /**
              * Plan Step Sequence
              * @default null
              */
             plan_step_sequence?: number | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Sequence */
             sequence: number;
             /**
@@ -778,6 +1549,11 @@ export interface components {
              * @default null
              */
             success?: boolean | null;
+            /**
+             * Tool Call Id
+             * @default null
+             */
+            tool_call_id?: string | null;
             /**
              * Tool Name
              * @default null
@@ -800,6 +1576,8 @@ export interface components {
          * @description A session visible to its owner.
          */
         Session: {
+            /** Additional Workspace Roots */
+            additional_workspace_roots?: string[];
             /** Archived */
             archived: boolean;
             /**
@@ -807,10 +1585,55 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /**
+             * Knowledge Namespace
+             * @default null
+             */
+            knowledge_namespace?: string | null;
             /** Session Id */
             session_id: string;
+            /**
+             * Title
+             * @default null
+             */
+            title?: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
             /** User Id */
             user_id: string | null;
+            /** @default read_only */
+            workspace_access?: components["schemas"]["WorkspaceAccess"];
+            /** Workspace Root */
+            workspace_root: string;
+        };
+        /**
+         * SessionProcess
+         * @description 刷新或切回会话时用于重放协作过程的权威快照。
+         */
+        SessionProcess: {
+            /** @default null */
+            current_agent?: components["schemas"]["AgentRole"] | null;
+            /** Events */
+            events?: components["schemas"]["RunEvent"][];
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
+            /** @default null */
+            task_plan?: components["schemas"]["TaskPlan"] | null;
+            /**
+             * Task Results
+             * @default null
+             */
+            task_results?: components["schemas"]["TaskResult"][] | null;
+            /** @default null */
+            workflow?: components["schemas"]["WorkflowProgress"] | null;
         };
         /**
          * StatsOverview
@@ -839,12 +1662,8 @@ export interface components {
          * StreamEvent
          * @description SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
          *
-         *     事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
-         *     的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
-         *     - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
-         *       成功与否、耗时等摘要,绝不含工具参数与结果正文;
-         *     - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
-         *       模型中间输出;
+         *     - tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;
+         *     - thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;
          *     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
          *       ChatResponse.message.content 同源)。
          *     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
@@ -877,12 +1696,51 @@ export interface components {
             error_code?: components["schemas"]["ErrorCode"] | components["schemas"]["ApiErrorCode"] | null;
             event_type: components["schemas"]["StreamEventType"];
             /** @default null */
+            grading?: components["schemas"]["GradingResultDto"] | null;
+            /**
+             * Input Summary
+             * @default null
+             */
+            input_summary?: string | null;
+            /**
+             * Is Delta
+             * @default null
+             */
+            is_delta?: boolean | null;
+            /** @default null */
             message?: components["schemas"]["Message"] | null;
+            /**
+             * Message Id
+             * @default null
+             */
+            message_id?: string | null;
+            /**
+             * Output Stream
+             * @default null
+             */
+            output_stream?: ("stdout" | "stderr") | null;
+            /**
+             * Output Summary
+             * @default null
+             */
+            output_summary?: string | null;
+            /**
+             * Parent Tool Call Id
+             * @default null
+             */
+            parent_tool_call_id?: string | null;
+            /** @default null */
+            pending_tool_approval?: components["schemas"]["PendingToolApproval"] | null;
             /**
              * Plan Step Sequence
              * @default null
              */
             plan_step_sequence?: number | null;
+            /**
+             * Run Id
+             * @default null
+             */
+            run_id?: string | null;
             /** Sequence */
             sequence: number;
             /** Session Id */
@@ -893,6 +1751,11 @@ export interface components {
              */
             success?: boolean | null;
             /**
+             * Tool Call Id
+             * @default null
+             */
+            tool_call_id?: string | null;
+            /**
              * Tool Name
              * @default null
              */
@@ -900,10 +1763,10 @@ export interface components {
         };
         /**
          * StreamEventType
-         * @description Public event protocol reserved for future streaming support.
+         * @description Public SSE protocol for token deltas and safe execution events.
          * @enum {string}
          */
-        StreamEventType: "thinking" | "tool_call" | "tool_result" | "message_end" | "agent_switch" | "error" | "done";
+        StreamEventType: "thinking" | "reasoning" | "tool_call" | "tool_result" | "tool_output" | "approval_required" | "message_delta" | "message_end" | "agent_switch" | "error" | "done";
         /**
          * TaskPlan
          * @description A task plan reserved for future chat responses.
@@ -950,6 +1813,32 @@ export interface components {
             success: boolean;
             target_agent: components["schemas"]["WorkerAgentRole"];
         };
+        /**
+         * ToolApprovalDecisionAction
+         * @enum {string}
+         */
+        ToolApprovalDecisionAction: "confirm" | "reject";
+        /** ToolApprovalDecisionRequest */
+        ToolApprovalDecisionRequest: {
+            action: components["schemas"]["ToolApprovalDecisionAction"];
+            /** Interrupt Id */
+            interrupt_id: string;
+        };
+        /**
+         * ToolApprovalRequest
+         * @description The exact validated invocation shown to the user before execution.
+         */
+        ToolApprovalRequest: {
+            agent_role: components["schemas"]["AgentRole"];
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Tool Call Id */
+            tool_call_id: string;
+            /** Tool Name */
+            tool_name: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -969,6 +1858,94 @@ export interface components {
          * @enum {string}
          */
         WorkerAgentRole: "teaching_assistant" | "learning_assistant" | "evaluator";
+        /**
+         * WorkflowProgress
+         * @description Workflow run progress exposed to chat/process consumers.
+         *
+         *     与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与
+         *     budget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一
+         *     不泄露路径原则）；artifacts 保持相对路径。
+         */
+        WorkflowProgress: {
+            /** Artifacts */
+            artifacts?: string[];
+            /** Current Step Index */
+            current_step_index: number;
+            /** @default null */
+            error_code?: components["schemas"]["ErrorCode"] | null;
+            status: components["schemas"]["WorkflowStatus"];
+            /** Steps */
+            steps: components["schemas"]["WorkflowStep"][];
+            /** Workflow Id */
+            workflow_id: string;
+        };
+        /**
+         * WorkflowStatus
+         * @description Public workflow run status values (lesson-workflow-design §七).
+         * @enum {string}
+         */
+        WorkflowStatus: "running" | "paused_approval" | "completed" | "failed" | "cancelled";
+        /**
+         * WorkflowStep
+         * @description One workflow step's persisted progress entry.
+         */
+        WorkflowStep: {
+            /** Attempts */
+            attempts: number;
+            status: components["schemas"]["WorkflowStepStatus"];
+            /** Step Id */
+            step_id: string;
+            /**
+             * Summary
+             * @default null
+             */
+            summary?: string | null;
+            worker_role: components["schemas"]["WorkerAgentRole"];
+        };
+        /**
+         * WorkflowStepStatus
+         * @description Public workflow step status values.
+         * @enum {string}
+         */
+        WorkflowStepStatus: "pending" | "running" | "completed" | "failed" | "skipped";
+        /**
+         * WorkspaceAccess
+         * @description Access level granted to Agent filesystem tools for a session.
+         * @enum {string}
+         */
+        WorkspaceAccess: "read_only";
+        /**
+         * WorkspaceDirectory
+         * @description One directory entry in the server-side workspace picker.
+         */
+        WorkspaceDirectory: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+        };
+        /**
+         * WorkspaceDirectoryListing
+         * @description Directory picker state rooted in the server filesystem.
+         */
+        WorkspaceDirectoryListing: {
+            /** Directories */
+            directories?: components["schemas"]["WorkspaceDirectory"][];
+            /** Parent */
+            parent?: string | null;
+            /** Path */
+            path: string;
+        };
+        /**
+         * WorkspacePath
+         * @description A canonical existing directory accepted by the server policy.
+         */
+        WorkspacePath: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -1229,9 +2206,61 @@ export interface operations {
             };
         };
     };
-    list_documents_knowledge_documents_get: {
+    get_chunk_knowledge_chunks__chunk_id__get: {
         parameters: {
             query?: never;
+            header?: never;
+            path: {
+                chunk_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChunkDetailResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_documents_knowledge_documents_get: {
+        parameters: {
+            query?: {
+                /** @description 按知识空间过滤 */
+                namespace?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1374,6 +2403,201 @@ export interface operations {
             };
         };
     };
+    list_document_chunks_knowledge_documents__document_id__chunks_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChunkListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_document_tree_knowledge_documents__document_id__tree_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeDocumentTreeResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_namespaces_knowledge_namespaces_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceListResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    knowledge_overview_knowledge_overview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KnowledgeOverviewResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     search_knowledge_knowledge_search_post: {
         parameters: {
             query?: never;
@@ -1421,6 +2645,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    diagnosis_summary_learning_diagnosis_summary_get: {
+        parameters: {
+            query?: {
+                student_id?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnosisSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    learning_insights_learning_insights_summary_get: {
+        parameters: {
+            query?: {
+                student_id?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearningInsights"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -1728,6 +3018,273 @@ export interface operations {
             };
         };
     };
+    get_session_process_sessions__session_id__process_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionProcess"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_pending_tool_approval_sessions__session_id__tool_approval_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingToolApprovalResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    decide_tool_approval_sessions__session_id__tool_approval_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToolApprovalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    stream_tool_approval_sessions__session_id__tool_approval_stream_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToolApprovalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    add_workspace_root_sessions__session_id__workspace_roots_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddWorkspaceRootRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Session"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     stats_overview_stats_overview_get: {
         parameters: {
             query?: never;
@@ -1768,6 +3325,92 @@ export interface operations {
             };
             /** @description Internal Server Error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_workspace_directories_workspaces_directories_get: {
+        parameters: {
+            query?: {
+                path?: string | null;
+            };
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDirectoryListing"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    validate_workspace_workspaces_validate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-user-id"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddWorkspaceRootRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspacePath"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

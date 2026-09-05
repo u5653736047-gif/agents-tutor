@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from core.sessions import SessionRecord, SessionStore
+from core.sessions import SessionRecord, SessionStore, derive_session_title
 
 
 def test_session_store_creates_and_lists_immutable_records(tmp_path: Path) -> None:
@@ -17,13 +17,145 @@ def test_session_store_creates_and_lists_immutable_records(tmp_path: Path) -> No
         first = store.create_session("session-1", user_id="user-1")
         second = store.create_session("session-2", user_id="user-1")
 
-        assert store.list_sessions(user_id="user-1") == [first, second]
+        assert store.list_sessions(user_id="user-1") == [second, first]
 
     assert first.session_id == "session-1"
     assert first.user_id == "user-1"
+    assert first.updated_at == first.created_at
     assert first.archived is False
     with pytest.raises(FrozenInstanceError):
         first.archived = True  # type: ignore[misc]
+
+
+def test_session_store_persists_an_independent_workspace_per_session(
+    tmp_path: Path,
+) -> None:
+    first_workspace = tmp_path / "project-a"
+    second_workspace = tmp_path / "project-b"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    database_path = tmp_path / "sessions.sqlite"
+
+    with SessionStore(database_path, default_workspace_root=first_workspace) as store:
+        first = store.create_session("first", user_id="user-1")
+        second = store.create_session(
+            "second",
+            user_id="user-1",
+            workspace_root=second_workspace,
+        )
+
+    assert first.workspace_root == str(first_workspace.resolve())
+    assert second.workspace_root == str(second_workspace.resolve())
+    assert first.additional_workspace_roots == ()
+
+    with SessionStore(database_path, default_workspace_root=first_workspace) as reopened:
+        records = {record.session_id: record for record in reopened.list_sessions("user-1")}
+
+    assert records["first"].workspace_root == str(first_workspace.resolve())
+    assert records["second"].workspace_root == str(second_workspace.resolve())
+
+
+def test_session_store_adds_and_deduplicates_authorized_workspace_roots(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    database_path = tmp_path / "sessions.sqlite"
+
+    with SessionStore(database_path, default_workspace_root=primary) as store:
+        store.create_session("session-1", user_id="user-1")
+        updated = store.add_workspace_root("session-1", shared, user_id="user-1")
+        duplicate = store.add_workspace_root("session-1", shared, user_id="user-1")
+
+    assert updated is not None
+    assert duplicate is not None
+    assert updated.additional_workspace_roots == (str(shared.resolve()),)
+    assert duplicate.additional_workspace_roots == (str(shared.resolve()),)
+
+    with SessionStore(database_path, default_workspace_root=primary) as reopened:
+        persisted = reopened.get_session("session-1", user_id="user-1")
+
+    assert persisted is not None
+    assert persisted.additional_workspace_roots == (str(shared.resolve()),)
+
+
+def test_session_store_enforces_configured_workspace_allowlist(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    nested = allowed / "course"
+    outside = tmp_path / "outside"
+    nested.mkdir(parents=True)
+    outside.mkdir()
+
+    with SessionStore(
+        tmp_path / "sessions.sqlite",
+        default_workspace_root=allowed,
+        allowed_workspace_roots=[allowed],
+    ) as store:
+        accepted = store.create_session(
+            "accepted",
+            user_id="user-1",
+            workspace_root=nested,
+        )
+        with pytest.raises(ValueError, match="not allowed"):
+            store.create_session(
+                "rejected",
+                user_id="user-1",
+                workspace_root=outside,
+            )
+
+    assert accepted.workspace_root == str(nested.resolve())
+
+
+def test_session_store_lists_workspace_directories_without_escaping_policy(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    alpha = allowed / "alpha"
+    beta = allowed / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir()
+    (allowed / "file.txt").write_text("not a directory", encoding="utf-8")
+
+    with SessionStore(
+        tmp_path / "sessions.sqlite",
+        default_workspace_root=allowed,
+        allowed_workspace_roots=[allowed],
+    ) as store:
+        listing = store.list_workspace_directories()
+        nested_listing = store.list_workspace_directories(alpha)
+
+    assert listing == {
+        "path": str(allowed.resolve()),
+        "parent": None,
+        "directories": [
+            {"name": "alpha", "path": str(alpha.resolve())},
+            {"name": "beta", "path": str(beta.resolve())},
+        ],
+    }
+    assert nested_listing["parent"] == str(allowed.resolve())
+
+
+def test_session_store_orders_by_recent_activity_and_can_touch_a_session(
+    tmp_path: Path,
+) -> None:
+    with SessionStore(tmp_path / "sessions.sqlite") as store:
+        first = store.create_session("first", user_id="user-1")
+        store.create_session("second", user_id="user-1")
+
+        assert [record.session_id for record in store.list_sessions(user_id="user-1")] == [
+            "second",
+            "first",
+        ]
+
+        touch_session = getattr(store, "touch_session", None)
+        assert callable(touch_session)
+        assert touch_session("first", user_id="user-1") is True
+
+        records = store.list_sessions(user_id="user-1")
+        assert [record.session_id for record in records] == ["first", "second"]
+        assert records[0].updated_at > first.updated_at
 
 
 def test_session_store_archives_without_deleting_metadata(tmp_path: Path) -> None:
@@ -38,8 +170,8 @@ def test_session_store_archives_without_deleting_metadata(tmp_path: Path) -> Non
 
         all_sessions = store.list_sessions(user_id="user-1", include_archived=True)
 
-    assert [record.session_id for record in all_sessions] == ["active", "archived"]
-    assert [record.archived for record in all_sessions] == [False, True]
+    assert [record.session_id for record in all_sessions] == ["archived", "active"]
+    assert [record.archived for record in all_sessions] == [True, False]
 
 
 @pytest.mark.parametrize("session_id", ["", "   "])
@@ -77,7 +209,8 @@ def test_session_store_supports_one_instance_across_threads(tmp_path: Path) -> N
 
         assert store.list_sessions(user_id="user-1") == sorted(
             records,
-            key=lambda record: (record.created_at, record.session_id),
+            key=lambda record: (record.updated_at, record.created_at, record.session_id),
+            reverse=True,
         )
 
 
@@ -120,8 +253,10 @@ def test_session_store_isolates_users_and_persists_after_reopen(tmp_path: Path) 
                 session_id=first_user.session_id,
                 user_id=first_user.user_id,
                 created_at=first_user.created_at,
-                archived=True,
-            )
+                    updated_at=first_user.updated_at,
+                    archived=True,
+                    workspace_root=first_user.workspace_root,
+                )
         ]
         assert reopened.list_sessions(user_id="user-2") == [second_user]
 
@@ -166,3 +301,83 @@ def test_archive_failure_rolls_back_and_releases_the_write_lock(tmp_path: Path) 
         with sqlite3.connect(database_path, timeout=0) as independent:
             independent.execute("BEGIN IMMEDIATE")
             independent.rollback()
+
+
+def test_derive_session_title_normalizes_whitespace_and_truncates() -> None:
+    # 换行/缩进等连续空白压缩为单个空格(侧栏单行展示)
+    assert derive_session_title("  什么是\n  注意力机制?  ") == "什么是 注意力机制?"
+    # 短标题原样返回
+    assert derive_session_title("你好") == "你好"
+    # 超长按 30 字截断并加省略号
+    assert derive_session_title("字" * 40) == "字" * 30 + "…"
+    # 全空白返回 None(防御;ChatRequest 已拒绝空白消息)
+    assert derive_session_title("  \n\t ") is None
+
+
+def test_session_store_sets_title_once_and_persists(tmp_path: Path) -> None:
+    database_path = tmp_path / "sessions.sqlite"
+    with SessionStore(database_path) as store:
+        store.create_session("session-1", user_id="user-1")
+
+        assert store.set_title_if_absent("session-1", "首条消息标题", user_id="user-1") is True
+        # 只写一次:后续写入返回 False,标题保持首次值
+        assert store.set_title_if_absent("session-1", "后续消息", user_id="user-1") is False
+        # 不存在的会话静默 0 行(与归档同款语义)
+        assert store.set_title_if_absent("missing", "标题", user_id="user-1") is False
+
+    with SessionStore(database_path) as reopened:
+        assert [record.title for record in reopened.list_sessions(user_id="user-1")] == [
+            "首条消息标题"
+        ]
+
+
+@pytest.mark.parametrize("title", ["", "   "])
+def test_session_store_rejects_blank_titles(tmp_path: Path, title: str) -> None:
+    with (
+        SessionStore(tmp_path / "sessions.sqlite") as store,
+        pytest.raises(ValueError, match="title"),
+    ):
+        store.create_session("session-1", user_id="user-1")
+        store.set_title_if_absent("session-1", title, user_id="user-1")
+
+
+def test_session_store_migrates_legacy_database_without_title_column(tmp_path: Path) -> None:
+    database_path = tmp_path / "sessions.sqlite"
+    # 模拟 title 列加入前的旧库:老表结构 + 一行存量会话
+    with sqlite3.connect(database_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE sessions (
+                user_key TEXT NOT NULL,
+                user_id TEXT,
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_key, session_id)
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO sessions (user_key, user_id, session_id, created_at, archived)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            ("value:6:user-1", "user-1", "legacy-session", "2026-01-01T00:00:00+00:00"),
+        )
+
+    with SessionStore(database_path) as store:
+        # 迁移后:老行可读,title 为 None(前端回退显示 session_id)
+        records = store.list_sessions(user_id="user-1")
+        assert [record.session_id for record in records] == ["legacy-session"]
+        assert [record.title for record in records] == [None]
+        assert records[0].updated_at == records[0].created_at
+        # 迁移后的库可正常补标题
+        assert (
+            store.set_title_if_absent("legacy-session", "旧会话标题", user_id="user-1") is True
+        )
+
+    # 重开幂等:迁移不重复执行,已写标题保留
+    with SessionStore(database_path) as reopened:
+        assert [record.title for record in reopened.list_sessions(user_id="user-1")] == [
+            "旧会话标题"
+        ]

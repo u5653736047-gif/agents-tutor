@@ -30,7 +30,9 @@ def test_contract_models_represent_a_minimal_chat_response() -> None:
         session_id="session-1",
         user_id=None,
         created_at=datetime(2026, 8, 3, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 3, tzinfo=UTC),
         archived=False,
+        workspace_root="D:\\Projects\\course",
     )
     message = Message(
         role=MessageRole.ASSISTANT,
@@ -122,8 +124,12 @@ def test_chat_response_keeps_future_fields_optional() -> None:
 def test_stream_event_values_match_the_public_protocol() -> None:
     assert {event.value for event in StreamEventType} == {
         "thinking",
+        "reasoning",
         "tool_call",
         "tool_result",
+        "tool_output",
+        "approval_required",
+        "message_delta",
         "message_end",
         "agent_switch",
         "error",

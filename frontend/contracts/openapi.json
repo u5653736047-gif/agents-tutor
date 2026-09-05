@@ -1,6 +1,22 @@
 {
   "components": {
     "schemas": {
+      "AddWorkspaceRootRequest": {
+        "additionalProperties": false,
+        "description": "One user-authorized additional workspace directory.",
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "AddWorkspaceRootRequest",
+        "type": "object"
+      },
       "AgentRole": {
         "description": "Public collaborative-agent roles.",
         "enum": [
@@ -18,6 +34,7 @@
           "invalid_request",
           "internal_error",
           "handoff_not_pending",
+          "tool_approval_not_pending",
           "session_already_exists",
           "session_busy",
           "session_not_found",
@@ -74,6 +91,12 @@
             "contentMediaType": "application/octet-stream",
             "title": "File",
             "type": "string"
+          },
+          "knowledge_namespace": {
+            "default": "public",
+            "description": "目标知识空间；public 为保留的公共库空间",
+            "title": "Knowledge Namespace",
+            "type": "string"
           }
         },
         "required": [
@@ -106,6 +129,7 @@
                 "items": {
                   "$ref": "#/components/schemas/Attachment"
                 },
+                "maxItems": 10,
                 "type": "array"
               },
               {
@@ -155,6 +179,17 @@
             "title": "Events",
             "type": "array"
           },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "message": {
             "anyOf": [
               {
@@ -170,6 +205,17 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/PendingHandoff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
               },
               {
                 "type": "null"
@@ -203,6 +249,18 @@
             ],
             "default": null
           },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
+          },
           "session_id": {
             "title": "Session Id",
             "type": "string"
@@ -232,12 +290,112 @@
             ],
             "default": null,
             "title": "Task Results"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
           "session_id"
         ],
         "title": "ChatResponse",
+        "type": "object"
+      },
+      "ChunkDetailResponse": {
+        "additionalProperties": false,
+        "description": "单个分块原文(I2 查看原文):内容 + 配套引用凭证。\n\ncontent 上限 8KB(后端截断,防撑爆响应,见 api/knowledge.py 的\nCHUNK_CONTENT_MAX_LENGTH);citation 与检索命中的 Citation 同构\n(document_id / source / page / chunk_id),可直接用于「查看原文」\n跳转与引用展示。",
+        "properties": {
+          "citation": {
+            "$ref": "#/components/schemas/Citation"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "citation"
+        ],
+        "title": "ChunkDetailResponse",
+        "type": "object"
+      },
+      "ChunkListEntry": {
+        "additionalProperties": false,
+        "description": "分块列表条目(I2 浏览):不带全文,只带定位信息与摘要。\n\nsummary 由 chunk 内容截断生成(与检索命中同口径,上限\nSUMMARY_MAX_LENGTH);完整原文经 GET /knowledge/chunks/{chunk_id}\n单独获取——列表页先看摘要,点开再看全文。",
+        "properties": {
+          "chunk_id": {
+            "title": "Chunk Id",
+            "type": "string"
+          },
+          "end": {
+            "default": 0,
+            "title": "End",
+            "type": "integer"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page"
+          },
+          "start": {
+            "default": 0,
+            "title": "Start",
+            "type": "integer"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk_id",
+          "summary"
+        ],
+        "title": "ChunkListEntry",
+        "type": "object"
+      },
+      "ChunkListResponse": {
+        "additionalProperties": false,
+        "description": "某文档的分块分页列表(I2 浏览)。\n\ntotal 是该文档全部分块数(不分页),供前端算分页;items 为当前\n页条目(按 start, chunk_id 排序,见 index.py chunks_of_document)。",
+        "properties": {
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ChunkListEntry"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "document_id",
+          "total",
+          "items"
+        ],
+        "title": "ChunkListResponse",
         "type": "object"
       },
       "Citation": {
@@ -282,6 +440,18 @@
         "additionalProperties": false,
         "description": "Optional client-selected ID for a new session.",
         "properties": {
+          "knowledge_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Namespace"
+          },
           "session_id": {
             "anyOf": [
               {
@@ -293,9 +463,142 @@
             ],
             "default": null,
             "title": "Session Id"
+          },
+          "workspace_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Root"
           }
         },
         "title": "CreateSessionRequest",
+        "type": "object"
+      },
+      "DailyAccuracyPoint": {
+        "additionalProperties": false,
+        "description": "学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。\n\n加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见\ncore/learning/store.py insights），确定性聚合、可复现。",
+        "properties": {
+          "accuracy": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Accuracy",
+            "type": "number"
+          },
+          "attempts": {
+            "minimum": 1.0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "date": {
+            "minLength": 1,
+            "title": "Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date",
+          "attempts",
+          "accuracy"
+        ],
+        "title": "DailyAccuracyPoint",
+        "type": "object"
+      },
+      "DiagnosisKnowledgePoint": {
+        "additionalProperties": false,
+        "description": "学情诊断：一个知识点的作答聚合（六大功能 P3-15）。",
+        "properties": {
+          "accuracy": {
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Accuracy",
+            "type": "number"
+          },
+          "attempts": {
+            "minimum": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "correct": {
+            "minimum": 0,
+            "title": "Correct",
+            "type": "integer"
+          },
+          "knowledge_point": {
+            "title": "Knowledge Point",
+            "type": "string"
+          },
+          "last_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Last At"
+          }
+        },
+        "required": [
+          "knowledge_point",
+          "attempts",
+          "correct",
+          "accuracy"
+        ],
+        "title": "DiagnosisKnowledgePoint",
+        "type": "object"
+      },
+      "DiagnosisSummary": {
+        "additionalProperties": false,
+        "description": "学情诊断摘要（六大功能 P3-15）。\n\n数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =\nattempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM\n叙述只出现在对话内诊断报告，不在本契约里。",
+        "properties": {
+          "knowledge_points": {
+            "items": {
+              "$ref": "#/components/schemas/DiagnosisKnowledgePoint"
+            },
+            "title": "Knowledge Points",
+            "type": "array"
+          },
+          "total_attempts": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Total Attempts",
+            "type": "integer"
+          },
+          "uncategorized_attempts": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Uncategorized Attempts",
+            "type": "integer"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Id"
+          },
+          "weak_points": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Weak Points",
+            "type": "array"
+          }
+        },
+        "title": "DiagnosisSummary",
         "type": "object"
       },
       "ErrorCode": {
@@ -306,12 +609,17 @@
           "tool_invalid_arguments",
           "tool_execution_failed",
           "tool_timeout",
+          "tool_no_progress",
+          "tool_budget_exceeded",
+          "tool_approval_rejected",
+          "tool_approval_queue_limit",
           "model_call_failed",
           "react_iteration_limit",
           "graph_handoff_limit",
           "graph_switch_limit",
           "graph_invalid_target",
           "graph_aggregation_invalid",
+          "workflow_budget_exceeded",
           "agent_output_invalid"
         ],
         "title": "ErrorCode",
@@ -473,6 +781,98 @@
         "title": "FileUploadResponse",
         "type": "object"
       },
+      "GradingItemDto": {
+        "additionalProperties": false,
+        "description": "一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。",
+        "properties": {
+          "error_tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Tag"
+          },
+          "feedback": {
+            "default": "",
+            "title": "Feedback",
+            "type": "string"
+          },
+          "knowledge_point": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Point"
+          },
+          "max_score": {
+            "exclusiveMinimum": 0,
+            "title": "Max Score",
+            "type": "number"
+          },
+          "question_id": {
+            "title": "Question Id",
+            "type": "string"
+          },
+          "score": {
+            "minimum": 0,
+            "title": "Score",
+            "type": "number"
+          }
+        },
+        "required": [
+          "question_id",
+          "score",
+          "max_score"
+        ],
+        "title": "GradingItemDto",
+        "type": "object"
+      },
+      "GradingResultDto": {
+        "additionalProperties": false,
+        "description": "一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。\n\ntotal_score / max_total_score 由核心侧确定性汇总（不信任模型自报），\n语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，\n教师复核」（LLM 主观题评分的既有产品口径）。",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GradingItemDto"
+            },
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "max_total_score": {
+            "exclusiveMinimum": 0,
+            "title": "Max Total Score",
+            "type": "number"
+          },
+          "overall_comment": {
+            "default": "",
+            "title": "Overall Comment",
+            "type": "string"
+          },
+          "total_score": {
+            "minimum": 0,
+            "title": "Total Score",
+            "type": "number"
+          }
+        },
+        "required": [
+          "items",
+          "total_score",
+          "max_total_score"
+        ],
+        "title": "GradingResultDto",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -573,9 +973,131 @@
         "title": "HandoffRequest",
         "type": "object"
       },
+      "KnowledgeBaseStatsDto": {
+        "additionalProperties": false,
+        "description": "知识库语料统计(I1):教师端总览卡数据源。\n\ntotal_pages 可空(纯 txt 语料无页概念时为 None);frontmatter_chunks\n单独给出供教师了解噪音占比(检索侧默认排除,见 service.py 的\nsuppress_frontmatter)。",
+        "properties": {
+          "frontmatter_chunks": {
+            "default": 0,
+            "title": "Frontmatter Chunks",
+            "type": "integer"
+          },
+          "total_chunks": {
+            "title": "Total Chunks",
+            "type": "integer"
+          },
+          "total_documents": {
+            "title": "Total Documents",
+            "type": "integer"
+          },
+          "total_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Total Pages"
+          }
+        },
+        "required": [
+          "total_documents",
+          "total_chunks"
+        ],
+        "title": "KnowledgeBaseStatsDto",
+        "type": "object"
+      },
+      "KnowledgeDocumentInfoDto": {
+        "additionalProperties": false,
+        "description": "文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。\n\ntitle / subjects / difficulty / ingested_at 可空:脚本入库的教材\n由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks\n时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。\nnamespace 显式化（P1-5）。",
+        "properties": {
+          "chunk_count": {
+            "default": 0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "difficulty": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Difficulty"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "ingested_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingested At"
+          },
+          "namespace": {
+            "default": "public",
+            "title": "Namespace",
+            "type": "string"
+          },
+          "page_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Count"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "subjects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Subjects",
+            "type": "array"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          }
+        },
+        "required": [
+          "document_id",
+          "source"
+        ],
+        "title": "KnowledgeDocumentInfoDto",
+        "type": "object"
+      },
       "KnowledgeDocumentListEntry": {
         "additionalProperties": false,
-        "description": "知识库文档列表条目(只读元数据,不含内容)。\n\npage_count / chunk_count 可空:txt 无页概念、core 未来接入清单\n能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。",
+        "description": "知识库文档列表条目(只读元数据,不含内容)。\n\npage_count / chunk_count 可空:txt 无页概念、core 未来接入清单\n能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。\nnamespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，\n公共库为 \"public\"。",
         "properties": {
           "chunk_count": {
             "anyOf": [
@@ -591,6 +1113,11 @@
           },
           "document_id": {
             "title": "Document Id",
+            "type": "string"
+          },
+          "namespace": {
+            "default": "public",
+            "title": "Namespace",
             "type": "string"
           },
           "page_count": {
@@ -635,6 +1162,44 @@
         "title": "KnowledgeDocumentListResponse",
         "type": "object"
       },
+      "KnowledgeDocumentTreeResponse": {
+        "additionalProperties": false,
+        "description": "文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。\n\n- kind=\"tree\"：chapters 有效（教材类有标题行结构）；\n- kind=\"flat\"：flat_pages 有效（无结构文档按页平铺；空列表 =\n  文档不存在或无内容）。",
+        "properties": {
+          "chapters": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeTreeChapterDto"
+            },
+            "title": "Chapters",
+            "type": "array"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "flat_pages": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Flat Pages",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "tree",
+              "flat"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "document_id"
+        ],
+        "title": "KnowledgeDocumentTreeResponse",
+        "type": "object"
+      },
       "KnowledgeDocumentUploadResponse": {
         "additionalProperties": false,
         "description": "上传解析结果:文档已入库(幂等替换)后的元数据回执。",
@@ -667,6 +1232,11 @@
             "default": null,
             "title": "Page Count"
           },
+          "replaced": {
+            "default": false,
+            "title": "Replaced",
+            "type": "boolean"
+          },
           "source": {
             "title": "Source",
             "type": "string"
@@ -677,6 +1247,28 @@
           "source"
         ],
         "title": "KnowledgeDocumentUploadResponse",
+        "type": "object"
+      },
+      "KnowledgeOverviewResponse": {
+        "additionalProperties": false,
+        "description": "知识库总览:统计 + 每篇文档元数据(I1,一次请求覆盖教师端)。\n\ndocuments 与 stats 同源(同一词法库聚合);阈值/重排器等检索\n配置装配状态预留字段(I3/I10,本期不填)。",
+        "properties": {
+          "documents": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeDocumentInfoDto"
+            },
+            "title": "Documents",
+            "type": "array"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/KnowledgeBaseStatsDto"
+          }
+        },
+        "required": [
+          "stats",
+          "documents"
+        ],
+        "title": "KnowledgeOverviewResponse",
         "type": "object"
       },
       "KnowledgeSearchRequest": {
@@ -719,6 +1311,106 @@
           "hits"
         ],
         "title": "KnowledgeSearchResponse",
+        "type": "object"
+      },
+      "KnowledgeTreeChapterDto": {
+        "additionalProperties": false,
+        "description": "知识树章节点（S5-C2）：含章直属 chunk 与小节列表。",
+        "properties": {
+          "chapter": {
+            "title": "Chapter",
+            "type": "string"
+          },
+          "chunk_count": {
+            "default": 0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeTreeSectionDto"
+            },
+            "title": "Sections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chapter"
+        ],
+        "title": "KnowledgeTreeChapterDto",
+        "type": "object"
+      },
+      "KnowledgeTreeSectionDto": {
+        "additionalProperties": false,
+        "description": "知识树小节节点（S5-C2）。",
+        "properties": {
+          "chunk_count": {
+            "default": 0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          }
+        },
+        "required": [
+          "section"
+        ],
+        "title": "KnowledgeTreeSectionDto",
+        "type": "object"
+      },
+      "LearningInsights": {
+        "additionalProperties": false,
+        "description": "学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。\n\n与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），\n本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；\n数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、\n路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。",
+        "properties": {
+          "daily_accuracy": {
+            "items": {
+              "$ref": "#/components/schemas/DailyAccuracyPoint"
+            },
+            "title": "Daily Accuracy",
+            "type": "array"
+          },
+          "error_tag_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Error Tag Counts",
+            "type": "object"
+          },
+          "recent_path_plans": {
+            "items": {
+              "$ref": "#/components/schemas/PathPlanRecordDto"
+            },
+            "title": "Recent Path Plans",
+            "type": "array"
+          },
+          "total_wrong": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Wrong",
+            "type": "integer"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "title": "LearningInsights",
         "type": "object"
       },
       "Message": {
@@ -768,6 +1460,17 @@
             "default": null,
             "title": "Created At"
           },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "role": {
             "$ref": "#/components/schemas/MessageRole"
           }
@@ -787,6 +1490,71 @@
         ],
         "title": "MessageRole",
         "type": "string"
+      },
+      "NamespaceListResponse": {
+        "additionalProperties": false,
+        "description": "知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。",
+        "properties": {
+          "namespaces": {
+            "items": {
+              "$ref": "#/components/schemas/NamespaceUsageDto"
+            },
+            "title": "Namespaces",
+            "type": "array"
+          }
+        },
+        "title": "NamespaceListResponse",
+        "type": "object"
+      },
+      "NamespaceUsageDto": {
+        "additionalProperties": false,
+        "description": "一个知识空间的聚合信息（S5-C1 决策 6，只读）。",
+        "properties": {
+          "document_count": {
+            "title": "Document Count",
+            "type": "integer"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "document_count"
+        ],
+        "title": "NamespaceUsageDto",
+        "type": "object"
+      },
+      "PathPlanRecordDto": {
+        "additionalProperties": false,
+        "description": "学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "knowledge_point": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge Point"
+          }
+        },
+        "title": "PathPlanRecordDto",
+        "type": "object"
       },
       "PendingHandoff": {
         "additionalProperties": false,
@@ -833,6 +1601,50 @@
         "title": "PendingHandoffResponse",
         "type": "object"
       },
+      "PendingToolApproval": {
+        "additionalProperties": false,
+        "description": "A tool invocation paused at a resumable graph gate.",
+        "properties": {
+          "interrupt_id": {
+            "title": "Interrupt Id",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ToolApprovalRequest"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "request"
+        ],
+        "title": "PendingToolApproval",
+        "type": "object"
+      },
+      "PendingToolApprovalResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "PendingToolApprovalResponse",
+        "type": "object"
+      },
       "RunError": {
         "additionalProperties": false,
         "description": "A stable, sanitized error response for a completed run.",
@@ -873,7 +1685,7 @@
       },
       "RunEvent": {
         "additionalProperties": false,
-        "description": "A safe incremental event emitted during one run.",
+        "description": "A replayable process event emitted during one run.",
         "properties": {
           "agent": {
             "anyOf": [
@@ -885,6 +1697,18 @@
               }
             ],
             "default": null
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content"
           },
           "degraded": {
             "anyOf": [
@@ -925,6 +1749,82 @@
           "event_type": {
             "$ref": "#/components/schemas/StreamEventType"
           },
+          "input_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Summary"
+          },
+          "is_delta": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Delta"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message Id"
+          },
+          "output_stream": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Stream"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Summary"
+          },
+          "parent_tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Tool Call Id"
+          },
           "plan_step_sequence": {
             "anyOf": [
               {
@@ -937,6 +1837,18 @@
             ],
             "default": null,
             "title": "Plan Step Sequence"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "sequence": {
             "minimum": 0,
@@ -966,6 +1878,18 @@
             ],
             "default": null,
             "title": "Success"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Call Id"
           },
           "tool_name": {
             "anyOf": [
@@ -1015,6 +1939,13 @@
         "additionalProperties": false,
         "description": "A session visible to its owner.",
         "properties": {
+          "additional_workspace_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Additional Workspace Roots",
+            "type": "array"
+          },
           "archived": {
             "title": "Archived",
             "type": "boolean"
@@ -1024,8 +1955,37 @@
             "title": "Created At",
             "type": "string"
           },
+          "knowledge_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Knowledge Namespace"
+          },
           "session_id": {
             "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
             "type": "string"
           },
           "user_id": {
@@ -1038,15 +1998,111 @@
               }
             ],
             "title": "User Id"
+          },
+          "workspace_access": {
+            "$ref": "#/components/schemas/WorkspaceAccess",
+            "default": "read_only"
+          },
+          "workspace_root": {
+            "title": "Workspace Root",
+            "type": "string"
           }
         },
         "required": [
           "session_id",
           "user_id",
           "created_at",
-          "archived"
+          "updated_at",
+          "archived",
+          "workspace_root"
         ],
         "title": "Session",
+        "type": "object"
+      },
+      "SessionProcess": {
+        "additionalProperties": false,
+        "description": "刷新或切回会话时用于重放协作过程的权威快照。",
+        "properties": {
+          "current_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
+          },
+          "task_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskPlan"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "task_results": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TaskResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Results"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "SessionProcess",
         "type": "object"
       },
       "StatsOverview": {
@@ -1091,7 +2147,7 @@
       },
       "StreamEvent": {
         "additionalProperties": false,
-        "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」\n的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):\n- tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、\n  成功与否、耗时等摘要,绝不含工具参数与结果正文;\n- thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造\n  模型中间输出;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
+        "description": "SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。\n\n- tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;\n- thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;\n- message_end 事件的 content 是最终消息全文(与 POST /chat 的\n  ChatResponse.message.content 同源)。\nerror_code 复用 RunError 的联合类型:流式 error 事件需要携带\nApiErrorCode(SESSION_BUSY / INTERNAL_ERROR),仅 ErrorCode 装不下。",
         "properties": {
           "agent": {
             "anyOf": [
@@ -1173,10 +2229,108 @@
           "event_type": {
             "$ref": "#/components/schemas/StreamEventType"
           },
+          "grading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GradingResultDto"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "input_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Summary"
+          },
+          "is_delta": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Delta"
+          },
           "message": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Message"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message Id"
+          },
+          "output_stream": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Stream"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Summary"
+          },
+          "parent_tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Tool Call Id"
+          },
+          "pending_tool_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingToolApproval"
               },
               {
                 "type": "null"
@@ -1196,6 +2350,18 @@
             ],
             "default": null,
             "title": "Plan Step Sequence"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Run Id"
           },
           "sequence": {
             "minimum": 0,
@@ -1217,6 +2383,18 @@
             ],
             "default": null,
             "title": "Success"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Call Id"
           },
           "tool_name": {
             "anyOf": [
@@ -1240,11 +2418,15 @@
         "type": "object"
       },
       "StreamEventType": {
-        "description": "Public event protocol reserved for future streaming support.",
+        "description": "Public SSE protocol for token deltas and safe execution events.",
         "enum": [
           "thinking",
+          "reasoning",
           "tool_call",
           "tool_result",
+          "tool_output",
+          "approval_required",
+          "message_delta",
           "message_end",
           "agent_switch",
           "error",
@@ -1366,6 +2548,63 @@
         "title": "TaskResult",
         "type": "object"
       },
+      "ToolApprovalDecisionAction": {
+        "enum": [
+          "confirm",
+          "reject"
+        ],
+        "title": "ToolApprovalDecisionAction",
+        "type": "string"
+      },
+      "ToolApprovalDecisionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ToolApprovalDecisionAction"
+          },
+          "interrupt_id": {
+            "minLength": 1,
+            "title": "Interrupt Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "interrupt_id",
+          "action"
+        ],
+        "title": "ToolApprovalDecisionRequest",
+        "type": "object"
+      },
+      "ToolApprovalRequest": {
+        "additionalProperties": false,
+        "description": "The exact validated invocation shown to the user before execution.",
+        "properties": {
+          "agent_role": {
+            "$ref": "#/components/schemas/AgentRole"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_call_id",
+          "tool_name",
+          "agent_role",
+          "arguments"
+        ],
+        "title": "ToolApprovalRequest",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -1415,6 +2654,204 @@
         ],
         "title": "WorkerAgentRole",
         "type": "string"
+      },
+      "WorkflowProgress": {
+        "additionalProperties": false,
+        "description": "Workflow run progress exposed to chat/process consumers.\n\n与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与\nbudget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一\n不泄露路径原则）；artifacts 保持相对路径。",
+        "properties": {
+          "artifacts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "current_step_index": {
+            "minimum": 0,
+            "title": "Current Step Index",
+            "type": "integer"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "minItems": 1,
+            "title": "Steps",
+            "type": "array"
+          },
+          "workflow_id": {
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id",
+          "status",
+          "steps",
+          "current_step_index"
+        ],
+        "title": "WorkflowProgress",
+        "type": "object"
+      },
+      "WorkflowStatus": {
+        "description": "Public workflow run status values (lesson-workflow-design §七).",
+        "enum": [
+          "running",
+          "paused_approval",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "title": "WorkflowStatus",
+        "type": "string"
+      },
+      "WorkflowStep": {
+        "additionalProperties": false,
+        "description": "One workflow step's persisted progress entry.",
+        "properties": {
+          "attempts": {
+            "minimum": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStepStatus"
+          },
+          "step_id": {
+            "title": "Step Id",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Summary"
+          },
+          "worker_role": {
+            "$ref": "#/components/schemas/WorkerAgentRole"
+          }
+        },
+        "required": [
+          "step_id",
+          "worker_role",
+          "status",
+          "attempts"
+        ],
+        "title": "WorkflowStep",
+        "type": "object"
+      },
+      "WorkflowStepStatus": {
+        "description": "Public workflow step status values.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "skipped"
+        ],
+        "title": "WorkflowStepStatus",
+        "type": "string"
+      },
+      "WorkspaceAccess": {
+        "description": "Access level granted to Agent filesystem tools for a session.",
+        "enum": [
+          "read_only"
+        ],
+        "title": "WorkspaceAccess",
+        "type": "string"
+      },
+      "WorkspaceDirectory": {
+        "additionalProperties": false,
+        "description": "One directory entry in the server-side workspace picker.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "path"
+        ],
+        "title": "WorkspaceDirectory",
+        "type": "object"
+      },
+      "WorkspaceDirectoryListing": {
+        "additionalProperties": false,
+        "description": "Directory picker state rooted in the server filesystem.",
+        "properties": {
+          "directories": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceDirectory"
+            },
+            "title": "Directories",
+            "type": "array"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "WorkspaceDirectoryListing",
+        "type": "object"
+      },
+      "WorkspacePath": {
+        "additionalProperties": false,
+        "description": "A canonical existing directory accepted by the server policy.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "name"
+        ],
+        "title": "WorkspacePath",
+        "type": "object"
       }
     }
   },
@@ -1496,7 +2933,7 @@
     },
     "/chat/stream": {
       "post": {
-        "description": "SSE 事件级流式聊天(非 token 级,core 同步 ReAct)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence;若 checkpoint 中最近一轮已结束且存在更新的运行事件,服务端\n回放剩余事件 + done 收尾,不启动新 run(消息补发);默认 0 表示发新\n消息,启动新 run。",
+        "description": "SSE 原生流式聊天(token + 安全运行事件)。\n\n会话忙时与 POST /chat 行为一致:立即返回普通 JSON(session_busy),\n不是 SSE 流;正常时返回 text/event-stream,事件按 sequence 增量推送。\n\nfrom_sequence(D1-T3 断线重连):客户端断线重连时传上次收到的最新\nsequence；若 checkpoint 中最近一轮已结束,服务端回放剩余事件并补发\n权威 message_end + done；若仍是中间态则要求客户端继续等待，绝不\n重跑。默认 0 表示发新消息并启动新 run。",
         "operationId": "chat_stream_chat_stream_post",
         "parameters": [
           {
@@ -1792,7 +3229,7 @@
     },
     "/healthz": {
       "get": {
-        "description": "存活探针；lifespan 装配后附带检索模式诊断（H-T1）。\n\n- lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持\n  {\"status\": \"ok\"} 现状，不破坏既有探针语义与测试；\n- lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /\n  vector_dimension），运维据此判断语义检索是否在线。诊断只含\n  这三个字段，绝不含任何文件路径。",
+        "description": "存活探针；lifespan 装配后附带检索与 OCR 诊断（H-T1 / P0-6）。\n\n- lifespan 未跑（如单测直接 create_app()）或诊断未就绪：保持\n  {\"status\": \"ok\"} 现状，不破坏既有探针语义与测试；\n- lifespan 跑过：附加 retrieval 字段（mode / embedding_provider /\n  vector_dimension）与 ocr 字段（enabled，P0-6：图片附件识别\n  能力是否在线），运维据此判断可选能力状态。诊断只含状态字段，\n  绝不含任何文件路径。",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {
@@ -1811,10 +3248,93 @@
         "summary": "Healthz"
       }
     },
+    "/knowledge/chunks/{chunk_id}": {
+      "get": {
+        "description": "按 chunk_id 取回分块原文(I2 查看原文)。\n\n- 未命中(不存在 / 空白 / 超长 chunk_id):404 chunk_not_found——\n  chunk_id 是引用凭证,引用指向不存在的分块属「资源不存在」,\n  与检索「空结果不报错」语义刻意不同(检索是查询,这里是定位);\n- content 上限 CHUNK_CONTENT_MAX_LENGTH 截断(防撑爆响应体);\n- 只暴露 chunk 文本 + 逻辑引用,不暴露文件路径(models 层\n  _validate_logical_source 保证)。",
+        "operationId": "get_chunk_knowledge_chunks__chunk_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chunk_id",
+            "required": true,
+            "schema": {
+              "title": "Chunk Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChunkDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Get Chunk",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
     "/knowledge/documents": {
       "get": {
-        "description": "列出通过 API 上传的文档元数据。\n\ncore 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /\ndelete_document / search),因此 API 层维护进程内注册表\n(_document_registry):只登记经 POST /knowledge/documents 上传的\n文档——由 ingest_books 等脚本直接写入索引的文档不在列表内\n(core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随\napp 生命周期,测试各 app 实例隔离)。",
+        "description": "列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。\n\nI1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库\n的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API\n可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表\n(app.state.knowledge_documents)只作为「未落库条目」的防御性兜底\n合并(理论上不触发,保留以兼容极端时序)。",
         "operationId": "list_documents_knowledge_documents_get",
+        "parameters": [
+          {
+            "description": "按知识空间过滤",
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "按知识空间过滤",
+              "title": "Namespace"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -1925,7 +3445,7 @@
     },
     "/knowledge/documents/{document_id}": {
       "delete": {
-        "description": "删除文档(幂等:文档不存在也返回 204,不报 404)。\n\ncore 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),\n且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法\n区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——\n重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加\n404 区分。注册表同步移除该条目。",
+        "description": "删除文档(幂等:文档不存在也返回 204,不报 404)。\n\ncore 的 KnowledgeService.delete_document 是幂等删除(不存在不抛错),\n且 API 层没有文档存在性查询能力(原因见 list_documents 注释),无法\n区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——\n重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加\n404 区分。注册表同步移除该条目。\nP1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留\n（删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再\n误判为已入库）。",
         "operationId": "delete_document_knowledge_documents__document_id__delete",
         "parameters": [
           {
@@ -1974,6 +3494,259 @@
           }
         },
         "summary": "Delete Document",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/documents/{document_id}/chunks": {
+      "get": {
+        "description": "列出某文档的分块(I2 浏览):分页,只带定位信息与摘要。\n\n- offset 从 0 起、limit 默认 20;limit 由 FastAPI Query 参数拦截\n  越界(offset>=0、1<=limit<=CHUNK_LIST_PAGE_SIZE_MAX,422),不\n  依赖 core 校验;\n- chunks_of_document 按 (start, chunk_id) 排序(与 ingest 顺序一致),\n  分页截取稳定;\n- 条目只带摘要(SUMMARY_MAX_LENGTH 截断),完整原文经\n  GET /knowledge/chunks/{chunk_id} 获取——列表页先看摘要、点开\n  再看全文;\n- 文档不存在:空 items(分页在空集合上就是空),不报 404——与\n  删除端点「不存在幂等」同一哲学(见 delete_document 注释);\n- 用服务层的 chunk 能力做「索引未实现 chunk 的兜底」:若索引\n  未实现 chunk(getter 缺失),列表仍可用 chunks_of_document 逻辑?\n  ——不:本端点直接依赖 chunks_of_document(索引实现本身),与\n  chunk 单条端点无关。分页在 Python 侧完成(全部取出后切片),\n  数据量(单文档最多数千 chunk)可接受。",
+        "operationId": "list_document_chunks_knowledge_documents__document_id__chunks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChunkListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "List Document Chunks",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/documents/{document_id}/tree": {
+      "get": {
+        "description": "返回单篇文档的章→节结构树（S5-C2，只读）。\n\n- 教材类文档：kind=\"tree\"，chapters 含每章/节 chunk 计数与标签汇总；\n- 无结构文档（如无标题 API 上传件）：kind=\"flat\"，flat_pages 按页\n  升序；文档不存在时 flat_pages 为空列表（前端渲染「无内容」占位）；\n- catalog 未装配时同样降级为空 flat 形态，不报错。",
+        "operationId": "get_document_tree_knowledge_documents__document_id__tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeDocumentTreeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Get Document Tree",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/namespaces": {
+      "get": {
+        "description": "列出全部知识空间及各空间文档数（S5-C1 决策 6）。\n\n会话创建对话框与上传表单的空间选择器数据源；空库返回空列表。",
+        "operationId": "list_namespaces_knowledge_namespaces_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespaceListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "List Namespaces",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/knowledge/overview": {
+      "get": {
+        "description": "知识库总览(I1):语料统计 + 每篇文档元数据,一次请求覆盖教师端。\n\n- 无 catalog 装配(部署问题):503 knowledge_unavailable(与检索\n  端点同一稳定错误码);\n- 空库(从未入库):stats 全 0、documents 空列表,不报错(与\n  「空库检索返回空」语义一致);\n- 只读聚合,不触发 embedding 模型加载(数据全部来自词法库)。",
+        "operationId": "knowledge_overview_knowledge_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgeOverviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Knowledge Overview",
         "tags": [
           "knowledge"
         ]
@@ -2038,6 +3811,140 @@
         "summary": "Search Knowledge",
         "tags": [
           "knowledge"
+        ]
+      }
+    },
+    "/learning/diagnosis/summary": {
+      "get": {
+        "description": "返回学情诊断摘要（默认当前用户；student_id 供教师视角查询）。\n\n边界与降级见模块 docstring：v1 的 student_id 查询是演示环境可信\n声明（无鉴权），生产需待认证落地；store 缺失或空数据返回空报告。",
+        "operationId": "diagnosis_summary_learning_diagnosis_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "student_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Student Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosisSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Diagnosis Summary",
+        "tags": [
+          "learning"
+        ]
+      }
+    },
+    "/learning/insights/summary": {
+      "get": {
+        "description": "返回学情洞察摘要（错题归因/正确率趋势/路径存档回显）。\n\n降级红线与诊断端点一致：store 缺失或空数据返回空报告 200。\n数据窗口有界（趋势近 30 日、路径近 20 条，见 core/learning/store.py）。",
+        "operationId": "learning_insights_learning_insights_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "student_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Student Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearningInsights"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Learning Insights",
+        "tags": [
+          "learning"
         ]
       }
     },
@@ -2528,6 +4435,427 @@
         ]
       }
     },
+    "/sessions/{session_id}/process": {
+      "get": {
+        "description": "返回 checkpoint 中可回放的思考、工具与协作过程快照。",
+        "operationId": "get_session_process_sessions__session_id__process_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionProcess"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Get Session Process",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/tool-approval": {
+      "get": {
+        "description": "Return the exact validated invocation currently awaiting consent.",
+        "operationId": "get_pending_tool_approval_sessions__session_id__tool_approval_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingToolApprovalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Get Pending Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      },
+      "post": {
+        "description": "Confirm or reject one exact invocation, then finish the graph turn.",
+        "operationId": "decide_tool_approval_sessions__session_id__tool_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolApprovalDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Decide Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      }
+    },
+    "/sessions/{session_id}/tool-approval/stream": {
+      "post": {
+        "description": "Resume one exact tool gate and stream terminal/model output as SSE.",
+        "operationId": "stream_tool_approval_sessions__session_id__tool_approval_stream_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolApprovalDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Stream Tool Approval",
+        "tags": [
+          "tool-approvals"
+        ]
+      }
+    },
+    "/sessions/{session_id}/workspace-roots": {
+      "post": {
+        "description": "Authorize one additional directory for this session's file tools.",
+        "operationId": "add_workspace_root_sessions__session_id__workspace_roots_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddWorkspaceRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Add Workspace Root",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/stats/overview": {
       "get": {
         "description": "返回当前用户的学习进度基础统计(只读聚合)。",
@@ -2595,6 +4923,153 @@
         "summary": "Stats Overview",
         "tags": [
           "stats"
+        ]
+      }
+    },
+    "/workspaces/directories": {
+      "get": {
+        "description": "Browse immediate directories without exposing files or file contents.",
+        "operationId": "list_workspace_directories_workspaces_directories_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDirectoryListing"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "List Workspace Directories",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    },
+    "/workspaces/validate": {
+      "post": {
+        "description": "Resolve a typed path before the user creates or updates a session.",
+        "operationId": "validate_workspace_workspaces_validate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddWorkspaceRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspacePath"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "Validate Workspace",
+        "tags": [
+          "workspaces"
         ]
       }
     }

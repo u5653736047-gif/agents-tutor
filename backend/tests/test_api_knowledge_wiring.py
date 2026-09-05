@@ -25,10 +25,13 @@ from pytest import MonkeyPatch
 
 import api.app as api_app
 from api.app import create_app, create_knowledge_search_stack
+from core.knowledge.catalog import SqliteKnowledgeCatalog
 from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
-from core.knowledge.models import KnowledgeChunk
+from core.knowledge.llm_rewriter import LLMQueryRewriter
+from core.knowledge.models import KnowledgeChunk, SearchHit
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
+from core.models import DeepSeekSettings
 from core.state import AgentRole
 
 _ALGEBRA_CHUNK = KnowledgeChunk(
@@ -56,6 +59,7 @@ def _make_lexical_db(path: Path) -> None:
     """构造带两个分块的词法库（与 ingest 产物同构：SqliteKnowledgeIndex）。"""
     index = SqliteKnowledgeIndex(path)
     index.upsert(_CHUNKS)
+    index.mark_document_complete("algebra", chunk_count=1, page_count=1)
     index.close()
 
 
@@ -232,13 +236,17 @@ def test_lifespan_wires_search_knowledge_tool_and_permissions(
             assert graph.registry.is_authorized(
                 "search_knowledge", AgentRole.TEACHING_ASSISTANT
             )
-            # 最小权限：协调者与评价者不授（supervisor 是调度者、
-            # evaluator 基于历史工具观察结果评价，无需自己检索）。
+            # 六大功能 P2-11：evaluator 授权（有意逆转既定默认）——
+            # 批改场景 loop 中无其他 Agent 产出检索证据，评分依据必须
+            # 自己检索对齐（客观题佐证 + 主观题评分标准，理由见 app.py
+            # 模块底部注释更新）。
+            assert graph.registry.is_authorized(
+                "search_knowledge", AgentRole.EVALUATOR
+            )
+            # 最小权限：协调者不授（supervisor 是调度者，不直接产出
+            # 知识内容）。
             assert not graph.registry.is_authorized(
                 "search_knowledge", AgentRole.SUPERVISOR
-            )
-            assert not graph.registry.is_authorized(
-                "search_knowledge", AgentRole.EVALUATOR
             )
 
     asyncio.run(verify_runtime())
@@ -377,6 +385,10 @@ def test_healthz_reports_hybrid_mode(
             "mode": "hybrid",
             "embedding_provider": "HashEmbeddingProvider",
             "vector_dimension": 256,
+            # S5 诊断扩展字段：conftest 默认关闭改写/重排（测试不碰
+            # 真实模型与网络），如实报告 False。
+            "rewrite_enabled": False,
+            "reranker_enabled": False,
         }
 
     asyncio.run(verify_runtime())
@@ -400,6 +412,8 @@ def test_healthz_reports_lexical_only_when_vector_missing(
             "mode": "lexical_only",
             "embedding_provider": None,
             "vector_dimension": None,
+            "rewrite_enabled": False,
+            "reranker_enabled": False,
         }
 
     asyncio.run(verify_runtime())
@@ -425,6 +439,298 @@ def test_healthz_reports_lexical_only_on_dimension_mismatch(
             "mode": "lexical_only",
             "embedding_provider": None,
             "vector_dimension": None,
+            "rewrite_enabled": False,
+            "reranker_enabled": False,
+        }
+
+    asyncio.run(verify_runtime())
+
+
+# ── I1 知识库 catalog 装配 ─────────────────────────────────────────
+
+
+def test_lifespan_mounts_knowledge_catalog_and_exposes_documents(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """lifespan 装配 catalog 挂 app.state；/knowledge/overview 与
+    /knowledge/documents 经 catalog 返回脚本入库文档（不再只有注册表）。
+
+    与既有 lifespan 测试同一自包含模式：词法库指向 tmp（含
+    ingest_marks 标记）、向量库缺失自动降级、hash embedding 零依赖。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            catalog = getattr(app.state, "knowledge_catalog", None)
+            assert isinstance(catalog, SqliteKnowledgeCatalog)
+            # overview：catalog 聚合的统计与清单。
+            overview = await _get(app, "/knowledge/overview")
+            assert overview.status_code == 200
+            body = overview.json()
+            assert body["stats"]["total_documents"] == 2
+            assert body["stats"]["total_chunks"] == 2
+            docs = {doc["document_id"]: doc for doc in body["documents"]}
+            assert set(docs) == {"algebra", "ml"}
+            assert docs["algebra"]["ingested_at"] is not None
+            # 文档清单：脚本入库文档对 API 可见（I1 核心验收）。
+            listing = await _get(app, "/knowledge/documents")
+            assert listing.status_code == 200
+            assert {
+                doc["document_id"] for doc in listing.json()["documents"]
+            } == {"algebra", "ml"}
+
+    asyncio.run(verify_runtime())
+
+    # lifespan 退出后清空引用（与 service 同一清理语义）。
+    assert getattr(app.state, "knowledge_catalog", None) is None
+
+
+# ── 审查 S5：/healthz 的 ocr 诊断字段（P0-6）────────────────────
+
+
+def test_healthz_reports_ocr_disabled_when_mode_off(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """API_OCR_MODE=off → /healthz 的 ocr.enabled 如实报告 false。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_OCR_MODE", "off")
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+            assert response.status_code == 200
+            assert response.json()["ocr"] == {"enabled": False}
+
+    asyncio.run(verify_runtime())
+
+
+def test_healthz_reports_ocr_state_when_auto(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """auto 模式下诊断如实报告：依赖缺失→false、已装 extra→true。
+
+    断言值与 create_ocr_provider("auto") 的探测结果同源——两种路径
+    都是「诊断如实」，不依赖本地是否装了 rapidocr。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_OCR_MODE", "auto")
+    app = create_app()
+
+    from core.ocr import create_ocr_provider
+
+    expected_enabled = create_ocr_provider("auto") is not None
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+            assert response.status_code == 200
+            assert response.json()["ocr"] == {"enabled": expected_enabled}
+
+    asyncio.run(verify_runtime())
+
+
+# ── S5 RAG 增强装配（LLM 改写器 / Cross-Encoder 重排器）────────────
+
+
+class _FixedVariantRewriter:
+    """改写器替身：无论输入什么都返回固定变体（锁定「变体参与检索」）。"""
+
+    def __init__(self, variants: list[str]) -> None:
+        self._variants = variants
+        self.calls: list[str] = []
+
+    def rewrite(self, query: str) -> list[str]:
+        self.calls.append(query)
+        return self._variants
+
+
+class _ReverseReranker:
+    """重排器替身：把候选整体倒序（证明重排生效的最小确定性逻辑）。"""
+
+    def __init__(self, model_name: str = "") -> None:
+        self.model_name = model_name
+        self.calls = 0
+
+    def rerank(self, query: str, hits: list[SearchHit], top_k: int) -> list[SearchHit]:
+        self.calls += 1
+        return list(reversed(hits))
+
+
+def test_stack_wires_query_rewriter_into_search(tmp_path: Path) -> None:
+    """改写器经 stack 进入 service：变体决定检索走向。
+
+    原查询「一元二次方程」以高分命中 algebra chunk（ml chunk 仅因
+    共有单字「一」以 1 分低分尾随）；替身改写器把检索换成变体
+    「支持向量机」→ 结果只剩 ml chunk，证明改写器真实参与检索链路
+    （而非仅记录在诊断字段）。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+
+    plain = create_knowledge_search_stack(
+        knowledge_db, tmp_path / "missing-vector.db", embedding="hash"
+    )
+    rewriter = _FixedVariantRewriter(["支持向量机"])
+    enhanced = create_knowledge_search_stack(
+        knowledge_db,
+        tmp_path / "missing-vector.db",
+        embedding="hash",
+        query_rewriter=rewriter,
+    )
+
+    plain_result = plain.tool.invoke({"query": "一元二次方程", "top_k": 5})
+    enhanced_result = enhanced.tool.invoke({"query": "一元二次方程", "top_k": 5})
+
+    # 原查询：algebra 高分首位（ml 因共有单字「一」以低分进榜）。
+    assert plain_result["hits"][0]["content"] == _ALGEBRA_CHUNK.content
+    # 变体检索：只剩 ml chunk（变体「支持向量机」与 algebra 无交集）。
+    assert [hit["content"] for hit in enhanced_result["hits"]] == [_ML_CHUNK.content]
+    assert rewriter.calls == ["一元二次方程"]
+    assert enhanced.rewrite_enabled is True
+    assert enhanced.reranker_enabled is False
+    plain.close()
+    enhanced.close()
+
+
+def test_stack_wires_reranker_into_search(tmp_path: Path) -> None:
+    """重排器经 stack 进入 service：最终顺序由重排决定（倒序替身）。
+
+    词法初检按分数降序排为 [algebra, ml]；倒序重排后为 [ml, algebra]。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+
+    plain = create_knowledge_search_stack(
+        knowledge_db, tmp_path / "missing-vector.db", embedding="hash"
+    )
+    enhanced = create_knowledge_search_stack(
+        knowledge_db,
+        tmp_path / "missing-vector.db",
+        embedding="hash",
+        reranker=_ReverseReranker(),
+    )
+
+    query = "一元二次方程 支持向量机"  # 两个 chunk 都命中
+    plain_result = plain.tool.invoke({"query": query, "top_k": 5})
+    enhanced_result = enhanced.tool.invoke({"query": query, "top_k": 5})
+
+    assert [hit["content"] for hit in plain_result["hits"]] == [
+        _ALGEBRA_CHUNK.content,
+        _ML_CHUNK.content,
+    ]
+    assert [hit["content"] for hit in enhanced_result["hits"]] == [
+        _ML_CHUNK.content,
+        _ALGEBRA_CHUNK.content,
+    ]
+    assert enhanced.rewrite_enabled is False
+    assert enhanced.reranker_enabled is True
+    plain.close()
+    enhanced.close()
+
+
+def test_stack_without_enhancements_reports_flags_disabled(tmp_path: Path) -> None:
+    """零回归：不注入增强组件时诊断 flags 均为 False（默认路径）。"""
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+
+    stack = create_knowledge_search_stack(
+        knowledge_db, tmp_path / "missing-vector.db", embedding="hash"
+    )
+
+    assert stack.rewrite_enabled is False
+    assert stack.reranker_enabled is False
+    stack.close()
+
+
+def test_create_query_rewriter_mode_branches() -> None:
+    """改写器装配：off → None；非法值 → ValueError（配置错误暴露）。"""
+    settings = DeepSeekSettings(
+        model="test-model", base_url="https://api.example.test", api_key="sk-real"
+    )
+
+    assert api_app._create_query_rewriter("off", settings) is None
+    with pytest.raises(ValueError, match="API_KNOWLEDGE_REWRITE"):
+        api_app._create_query_rewriter("bogus", settings)
+
+
+def test_create_query_rewriter_auto_skips_without_api_key() -> None:
+    """auto + 未配置真实 key（not-configured 默认值）→ None（不白调模型）。"""
+    settings = DeepSeekSettings(
+        model="test-model",
+        base_url="https://api.example.test",
+        api_key=api_app.DEFAULT_API_KEY,
+    )
+
+    assert api_app._create_query_rewriter("auto", settings) is None
+
+
+def test_create_query_rewriter_auto_builds_lightweight_model() -> None:
+    """auto + 已配置 key → 装配改写器，底层模型用收紧的轻量参数。"""
+    settings = DeepSeekSettings(
+        model="test-model", base_url="https://api.example.test", api_key="sk-real"
+    )
+
+    rewriter = api_app._create_query_rewriter("auto", settings)
+
+    assert isinstance(rewriter, LLMQueryRewriter)
+
+
+def test_create_reranker_mode_branches(monkeypatch: MonkeyPatch) -> None:
+    """重排器装配：off → None；非法值 → ValueError；构造失败降级 None。"""
+    assert api_app._create_reranker("off", "any-model") is None
+    with pytest.raises(ValueError, match="API_KNOWLEDGE_RERANK"):
+        api_app._create_reranker("bogus", "any-model")
+
+    class _UnavailableReranker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("fastembed 未安装")
+
+    monkeypatch.setattr(api_app, "FastEmbedReranker", _UnavailableReranker)
+    assert api_app._create_reranker("auto", "any-model") is None
+
+    monkeypatch.setattr(api_app, "FastEmbedReranker", _ReverseReranker)
+    built = api_app._create_reranker("auto", "fake-model")
+    assert isinstance(built, _ReverseReranker)
+    assert built.model_name == "fake-model"  # env 指定的模型名透传
+
+
+def test_lifespan_reports_rag_enhancement_flags_when_enabled(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """lifespan 启用增强后，/healthz 如实报告 rewrite/reranker 已启用。
+
+    conftest 默认把两个开关置 off（测试不碰真实模型）；本测试显式
+    覆盖为 auto 并用替身替换 FastEmbedReranker（零下载），验证
+    「auto + 已配置 key + fastembed 可用」的完整启用链路。
+    """
+    knowledge_db = tmp_path / "knowledge.db"
+    _make_lexical_db(knowledge_db)
+    _lifespan_env(monkeypatch, tmp_path, knowledge_db, tmp_path / "missing-vector.db")
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    monkeypatch.setenv("API_KNOWLEDGE_REWRITE", "auto")
+    monkeypatch.setenv("API_KNOWLEDGE_RERANK", "auto")
+    monkeypatch.setattr(api_app, "FastEmbedReranker", _ReverseReranker)
+    app = create_app()
+
+    async def verify_runtime() -> None:
+        async with app.router.lifespan_context(app):
+            response = await _get(app, "/healthz")
+        assert response.status_code == 200
+        assert response.json()["retrieval"] == {
+            "mode": "lexical_only",
+            "embedding_provider": None,
+            "vector_dimension": None,
+            "rewrite_enabled": True,
+            "reranker_enabled": True,
         }
 
     asyncio.run(verify_runtime())

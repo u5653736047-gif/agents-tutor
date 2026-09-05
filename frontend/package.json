@@ -14,6 +14,7 @@
     "test:scaffold": "node --test tests/scaffold.test.mjs"
   },
   "devDependencies": {
+    "@next/bundle-analyzer": "^16.3.0",
     "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/katex": "^0.16.8",
@@ -22,6 +23,7 @@
     "@types/react-dom": "^19.2.4",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.2.12",
+    "jsdom": "^29.1.1",
     "openapi-typescript": "7.13.0",
     "postcss": "^8.5.25",
     "tailwindcss": "^4.3.3",
@@ -30,12 +32,15 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "@assistant-ui/react": "^0.15.14",
     "@tanstack/react-virtual": "^3.14.9",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "dompurify": "^3.4.14",
     "highlight.js": "^11.11.1",
     "katex": "^0.16.47",
     "lucide-react": "^1.28.0",
+    "mammoth": "^1.12.1",
     "next": "^16.2.12",
     "next-themes": "^0.4.6",
     "react": "^19.2.8",
@@ -46,6 +51,7 @@
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
     "tailwind-merge": "^3.6.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zustand": "^5.0.14"
   }
 }

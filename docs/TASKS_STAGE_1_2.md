@@ -4,8 +4,10 @@
 > 范围：`docs/TASK_BREAKDOWN_v2.md` 中的「阶段一：智能体框架搭建」与「阶段二：核心智能体与知识库」
 > 目标：收口 M1（框架就绪），达成 M2（知识闭环：基于教材回答 AI 学科问题并标注来源）
 
-本文档是执行层清单，面向负责开发的 agent 使用。总清单（`TASK_BREAKDOWN_v2.md`）
-仍然是唯一的范围与进度权威来源；本文档只把它前两个阶段拆解为可独立验收的原子任务。
+> ⚠️ 已冻结片段 2026-08-26 — Sprint5 见 docs/SIX_FEATURES_COMPETITION_MAPPING.md；S1-4 历史保留
+> ~~本文档是执行层清单，面向负责开发的 agent 使用。总清单（`TASK_BREAKDOWN_v2.md`）仍然是唯一的范围与进度权威来源；本文档只把它前两个阶段拆解为可独立验收的原子任务。~~
+
+本文档是执行层清单，面向负责开发的 agent 使用。~~总清单（`TASK_BREAKDOWN_v2.md`）仍然是唯一的范围与进度权威来源~~ → 范围权威见 `docs/SIX_FEATURES_COMPETITION_MAPPING.md` + `docs/TASKS_M3_CLOSE.md`；本文档只把前两个阶段（Sprint0-4）拆解为可独立验收的原子任务，Sprint5 已被 SIX_FEATURES/officecli-integration-plan/EMBEDDING_SELECTION 5.2 替代（S1-4 历史保留）。
 
 ---
 

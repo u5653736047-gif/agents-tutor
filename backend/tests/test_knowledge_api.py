@@ -566,6 +566,8 @@ def test_openapi_exposes_document_upload_contracts() -> None:
         "source",
         "page_count",
         "chunk_count",
+        # S5-C3 上传语义补齐：同名文件替换标志。
+        "replaced",
     }
     list_schema = schemas["KnowledgeDocumentListResponse"]
     assert list_schema["properties"]["documents"]["type"] == "array"
@@ -575,3 +577,378 @@ def test_openapi_exposes_document_upload_contracts() -> None:
     paths = openapi["paths"]
     assert set(paths["/knowledge/documents"]) == {"post", "get"}
     assert "delete" in paths["/knowledge/documents/{document_id}"]
+
+
+# ── S5-C3 上传语义补齐：replaced 标志 + 完成标记 ───────────────────
+
+
+def test_upload_same_file_twice_reports_replaced_and_writes_mark(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """同名文件上传两次：第二次 replaced=true；完成标记使 catalog 有入库时间。"""
+    from core.knowledge.catalog import SqliteKnowledgeCatalog
+
+    monkeypatch.setenv("DEEPSEEK_MODEL", "test-model")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
+    monkeypatch.setenv("API_SESSION_STORE_PATH", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("API_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite3"))
+    knowledge_db = tmp_path / "knowledge.db"
+    monkeypatch.setenv("API_KNOWLEDGE_DB_PATH", str(knowledge_db))
+    monkeypatch.setenv("API_VECTOR_DB_PATH", str(tmp_path / "missing-vector.db"))
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+    content = "一元二次方程求根公式与判别式说明。"
+
+    async def scenario() -> tuple[Response, Response]:
+        async with app.router.lifespan_context(app):
+            first = await _upload(app, "guide.txt", content.encode("utf-8"))
+            second = await _upload(app, "guide.txt", content.encode("utf-8"))
+            return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["replaced"] is False
+    assert second.json()["replaced"] is True
+
+    catalog = SqliteKnowledgeCatalog(knowledge_db)
+    try:
+        # C1 修复后 catalog 按 document_id 分组：public 上传为裸 stem。
+        docs = {d.document_id: d for d in catalog.list_documents()}
+        info = docs.get("guide")
+        assert info is not None
+        assert info.ingested_at is not None
+    finally:
+        catalog.close()
+
+
+def test_upload_first_time_reports_replaced_false(tmp_path: Path) -> None:
+    """首次上传 replaced=false（无注册表/catalog 前身时的新建语义）。"""
+    app = _app_with_service(_make_service())
+    response = asyncio.run(_upload(app, "notes.txt", "全新笔记内容".encode()))
+
+    assert response.status_code == 201
+    assert response.json()["replaced"] is False
+
+
+# ── S5-C1 知识空间：命名空间上传/聚合/scope 贯通 ────────────────────
+
+
+def test_upload_with_namespace_prefixes_id_and_namespaces_aggregate(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """非 public 空间上传 → document_id 带前缀；同名重传 replaced=true；
+    /knowledge/namespaces 聚合 public 与 course-a 各 1 篇。"""
+
+    monkeypatch.setenv("DEEPSEEK_MODEL", "test-model")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
+    monkeypatch.setenv("API_SESSION_STORE_PATH", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("API_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite3"))
+    knowledge_db = tmp_path / "knowledge.db"
+    monkeypatch.setenv("API_KNOWLEDGE_DB_PATH", str(knowledge_db))
+    monkeypatch.setenv("API_VECTOR_DB_PATH", str(tmp_path / "missing-vector.db"))
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+    app = create_app()
+    content = "一元二次方程求根公式与判别式说明。"
+
+    async def scenario() -> tuple[Response, Response, Response, Response]:
+        async with app.router.lifespan_context(app):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                public_doc = await client.post(
+                    "/knowledge/documents",
+                    files={"file": ("pub.txt", content.encode("utf-8"), "text/plain")},
+                )
+                first = await client.post(
+                    "/knowledge/documents",
+                    files={
+                        "file": ("guide.txt", content.encode("utf-8"), "text/plain")
+                    },
+                    data={"knowledge_namespace": "course-a"},
+                )
+                second = await client.post(
+                    "/knowledge/documents",
+                    files={
+                        "file": ("guide.txt", content.encode("utf-8"), "text/plain")
+                    },
+                    data={"knowledge_namespace": "course-a"},
+                )
+                namespaces = await client.get("/knowledge/namespaces")
+                return public_doc, first, second, namespaces
+
+    public_doc, first, second, namespaces = asyncio.run(scenario())
+
+    assert public_doc.status_code == 201
+    # 默认归入 public：裸 ID（决策 7——public 空间不加前缀）。
+    assert public_doc.json()["document_id"] == "pub"
+    # 非 public 空间 → document_id 前缀化，同名重传 replaced=true。
+    assert first.status_code == 201
+    assert first.json()["document_id"] == "course-a:guide"
+    assert second.status_code == 201
+    assert second.json()["replaced"] is True
+    # 空间聚合：public 与 course-a 各 1 篇（course-a 同名替换后仍 1）。
+    aggregated = {
+        item["namespace"]: item["document_count"]
+        for item in namespaces.json()["namespaces"]
+    }
+    assert aggregated["public"] == 1
+    assert aggregated["course-a"] == 1
+
+
+def test_upload_rejects_invalid_knowledge_namespace_format() -> None:
+    """空间标识校验对齐 manifest 的 source 规则（连字符边界）。
+
+    - "course-" 尾连字符 / "a--b" 连续连字符 → 422；
+    - "course-a" 合法形态照常通过。
+    """
+    app = create_app()
+    content = "正文内容。"
+
+    async def scenario() -> list[Response]:
+        async with app.router.lifespan_context(app):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                responses = []
+                for bad in ("course-", "a--b"):
+                    responses.append(
+                        await client.post(
+                            "/knowledge/documents",
+                            files={
+                                "file": (
+                                    f"{bad}.txt",
+                                    content.encode("utf-8"),
+                                    "text/plain",
+                                )
+                            },
+                            data={"knowledge_namespace": bad},
+                        )
+                    )
+                ok = await client.post(
+                    "/knowledge/documents",
+                    files={
+                        "file": ("guide.txt", content.encode("utf-8"), "text/plain")
+                    },
+                    data={"knowledge_namespace": "course-a"},
+                )
+                return [*responses, ok]
+
+    responses = asyncio.run(scenario())
+
+    for response in responses[:2]:
+        assert response.status_code == 422
+        assert response.json()["detail"]["error_code"] == "invalid_request"
+    hyphen_ok = responses[2]
+    assert hyphen_ok.status_code == 201
+    assert hyphen_ok.json()["document_id"] == "course-a:guide"
+
+
+def test_namespaces_endpoint_empty_catalog_returns_empty_list(tmp_path: Path) -> None:
+    """空库（catalog 无表）→ 空列表而非报错（与「空库检索返回空」一致）。"""
+    from core.knowledge.catalog import SqliteKnowledgeCatalog
+
+    app = create_app()
+    catalog = SqliteKnowledgeCatalog(tmp_path / "empty-knowledge.db")
+    app.state.knowledge_catalog = catalog
+    try:
+        response = asyncio.run(_get_namespaces(app))
+    finally:
+        catalog.close()
+
+    assert response.status_code == 200
+    assert response.json() == {"namespaces": []}
+
+
+async def _get_namespaces_async(app: FastAPI) -> Response:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.get("/knowledge/namespaces")
+
+
+def _get_namespaces(app: FastAPI) -> Response:
+    return asyncio.run(_get_namespaces_async(app))
+
+
+# ── S5-C1 决策 4：scope 贯通（knowledge_scope → service.namespace）──
+
+
+class _NamespaceSpyService:
+    """记录 search 收到的 namespace 参数并返回空结果（工具走 search 路）。"""
+
+    def __init__(self) -> None:
+        self.namespaces: list[str | None] = []
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: dict[str, str] | None = None,
+        namespace: str | None = None,
+    ) -> list[SearchHit]:
+        self.namespaces.append(namespace)
+        return []
+
+
+def test_search_knowledge_threads_public_namespace_from_scope() -> None:
+    """未绑定会话（上游解析为 "public"）→ 工具把 "public" 透传给 service。"""
+    from core.knowledge.tools import create_search_knowledge_tool, knowledge_scope
+
+    spy = _NamespaceSpyService()
+    tool = create_search_knowledge_tool(spy)  # type: ignore[arg-type]
+    token = knowledge_scope.set("public")
+    try:
+        tool.invoke({"query": "任何内容"})
+    finally:
+        knowledge_scope.reset(token)
+
+    assert spy.namespaces == ["public"]
+
+
+def test_search_knowledge_threads_bound_namespace_from_scope() -> None:
+    """绑定 course-a 的会话 → 工具把 "course-a" 透传给 service。"""
+    from core.knowledge.tools import create_search_knowledge_tool, knowledge_scope
+
+    spy = _NamespaceSpyService()
+    tool = create_search_knowledge_tool(spy)  # type: ignore[arg-type]
+    token = knowledge_scope.set("course-a")
+    try:
+        tool.invoke({"query": "任何内容"})
+    finally:
+        knowledge_scope.reset(token)
+
+    assert spy.namespaces == ["course-a"]
+
+
+def test_search_knowledge_defaults_unbound_scope_to_public() -> None:
+    """S5-C1 决策 4（兜底不变式）：scope 未注入（None = 未绑定）时工具
+    兜底传 "public"——任何图入口漏传 extra 都不会退化成跨空间无过滤
+    检索（评审修复：该保证原依赖 chat.py 入口映射，现下沉到工具层）。"""
+    from core.knowledge.tools import create_search_knowledge_tool
+
+    spy = _NamespaceSpyService()
+    tool = create_search_knowledge_tool(spy)  # type: ignore[arg-type]
+    # 不设置 knowledge_scope（ContextVar 默认 None = 未绑定）。
+    tool.invoke({"query": "任何内容"})
+
+    assert spy.namespaces == ["public"]
+
+
+# ── S5-C1/C2：命名空间上传、空间聚合与树端点（含冒号 ID 编码往返）──────
+
+
+def _env_for_knowledge(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_MODEL", "test-model")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
+    monkeypatch.setenv("API_SESSION_STORE_PATH", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("API_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite3"))
+    monkeypatch.setenv("API_KNOWLEDGE_DB_PATH", str(tmp_path / "knowledge.db"))
+    monkeypatch.setenv("API_VECTOR_DB_PATH", str(tmp_path / "missing-vector.db"))
+    monkeypatch.setenv("API_KNOWLEDGE_EMBEDDING", "hash")
+
+
+async def _upload_namespaced(
+    app: FastAPI, filename: str, content: bytes, namespace: str
+) -> Response:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.post(
+            "/knowledge/documents",
+            files={"file": (filename, content, "application/octet-stream")},
+            data={"knowledge_namespace": namespace},
+        )
+
+
+def test_upload_to_namespace_prefixes_id_and_aggregates(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """非 public 空间上传 → document_id 带前缀；同名重传 replaced=true；
+    /knowledge/namespaces 聚合 public 与 course-a 各 1 篇。"""
+    _env_for_knowledge(tmp_path, monkeypatch)
+    app = create_app()
+    content = "一元二次方程求根公式与判别式说明。"
+
+    async def scenario() -> list[Response]:
+        async with app.router.lifespan_context(app):
+            responses = []
+            # public 空间一篇 + course-a 空间两篇（第二篇验证前缀替换语义）。
+            responses.append(await _upload(app, "guide.txt", content.encode("utf-8")))
+            responses.append(
+                await _upload_namespaced(app, "guide.txt", content.encode("utf-8"), "course-a")
+            )
+            responses.append(
+                await _upload_namespaced(app, "guide.txt", content.encode("utf-8"), "course-a")
+            )
+            responses.append(await _get_documents(app))
+            namespaces = await (
+                ASGITransport(app=app) and _get_namespaces(app)
+            )
+            responses.append(namespaces)
+            return responses
+
+    first_public, first_ns, second_ns, listing, namespaces = asyncio.run(scenario())
+
+    assert first_public.json()["replaced"] is False
+    assert first_ns.json()["document_id"] == "course-a:guide"
+    assert second_ns.json()["document_id"] == "course-a:guide"
+    assert second_ns.json()["replaced"] is True
+
+    docs = {d["document_id"]: d for d in listing.json()["documents"]}
+    # public 裸 stem、非 public 带前缀——两种形态并存且互不合并。
+    assert "guide" in docs
+    assert "course-a:guide" in docs
+
+    usage = {item["namespace"]: item["document_count"] for item in namespaces.json()["namespaces"]}
+    assert usage == {"public": 1, "course-a": 1}
+
+
+async def _get_namespaces(app: FastAPI) -> Response:
+    from httpx import ASGITransport as _T
+    from httpx import AsyncClient as _AC
+
+    async with _AC(transport=_T(app=app), base_url="http://testserver") as client:
+        return await client.get("/knowledge/namespaces")
+
+
+def test_tree_endpoint_flat_and_colon_id_round_trip(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """树端点两态：上传 txt（无标题结构）→ flat；冒号 ID 经 URL 编码往返。"""
+    from urllib.parse import quote
+
+    _env_for_knowledge(tmp_path, monkeypatch)
+    app = create_app()
+    content = "一元二次方程求根公式与判别式说明。"
+
+    async def scenario() -> tuple[Response, Response]:
+        async with app.router.lifespan_context(app):
+            await _upload_namespaced(app, "guide.txt", content.encode("utf-8"), "course-a")
+            encoded = quote("course-a:guide", safe="")
+            tree = await _get_tree(app, encoded)
+            missing = await _get_tree(app, quote("course-a:missing", safe=""))
+            return tree, missing
+
+    tree, missing = asyncio.run(scenario())
+
+    assert tree.status_code == 200
+    body = tree.json()
+    assert body["kind"] == "flat"
+    assert body["document_id"] == "course-a:guide"
+    # txt 上传无页概念 → flat_pages 为空列表（前端渲染「无内容」占位）。
+    assert body["flat_pages"] == []
+
+    assert missing.status_code == 200
+    assert missing.json()["kind"] == "flat"
+    assert missing.json()["flat_pages"] == []
+
+
+async def _get_tree(app: FastAPI, encoded_document_id: str) -> Response:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.get(f"/knowledge/documents/{encoded_document_id}/tree")

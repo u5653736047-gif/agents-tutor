@@ -50,9 +50,97 @@ test("the API client preserves an optional generated session ID", async () => {
     },
   });
 
-  await client.createSession({ session_id: "session/1" });
+  await client.createSession({
+    session_id: "session/1",
+    workspace_root: "D:\\Projects\\course",
+  });
 
-  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), { session_id: "session/1" });
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    session_id: "session/1",
+    workspace_root: "D:\\Projects\\course",
+  });
+});
+
+test("the API client validates, browses, and adds workspace directories", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null; method: string; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({
+        body: init?.body ? String(init.body) : null,
+        method: init?.method ?? "GET",
+        url: String(input),
+      });
+      if (String(input).includes("/directories")) {
+        return Response.json({
+          directories: [],
+          parent: "D:\\Projects",
+          path: "D:\\Projects\\course",
+        });
+      }
+      if (String(input).includes("/validate")) {
+        return Response.json({ name: "course", path: "D:\\Projects\\course" });
+      }
+      return Response.json({
+        additional_workspace_roots: ["D:\\Shared"],
+        archived: false,
+        created_at: "2026-08-03T00:00:00Z",
+        session_id: "session/1",
+        updated_at: "2026-08-03T00:00:00Z",
+        user_id: "demo-user",
+        workspace_access: "read_only",
+        workspace_root: "D:\\Projects\\course",
+      });
+    },
+  });
+
+  await client.validateWorkspace("D:\\Projects\\course");
+  await client.listWorkspaceDirectories("D:\\Projects\\course");
+  await client.addWorkspaceRoot("session/1", "D:\\Shared");
+
+  assert.equal(requests[0]?.url, "https://api.example/workspaces/validate");
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
+    path: "D:\\Projects\\course",
+  });
+  assert.equal(
+    requests[1]?.url,
+    "https://api.example/workspaces/directories?path=D%3A%5CProjects%5Ccourse",
+  );
+  assert.equal(requests[2]?.url, "https://api.example/sessions/session%2F1/workspace-roots");
+  assert.deepEqual(JSON.parse(requests[2]?.body ?? "{}"), { path: "D:\\Shared" });
+});
+
+test("the API client loads a replayable session process snapshot", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: string[] = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input) => {
+      requests.push(String(input));
+      return Response.json({
+        current_agent: "learning_assistant",
+        events: [
+          {
+            agent: "learning_assistant",
+            content: "先检索再解释",
+            event_type: "reasoning",
+            message_id: "assistant-step-1",
+            sequence: 2,
+            session_id: "session/1",
+          },
+        ],
+        task_plan: null,
+        task_results: null,
+      });
+    },
+  });
+
+  const process = await client.getSessionProcess("session/1");
+
+  assert.equal(requests[0], "https://api.example/sessions/session%2F1/process");
+  assert.equal(process.events[0]?.event_type, "reasoning");
+  assert.equal(process.current_agent, "learning_assistant");
 });
 
 test("the API client exposes non-success responses as one error shape", async () => {
@@ -120,6 +208,36 @@ test("the handoff client only serializes supported decision fields", async () =>
   assert.deepEqual(JSON.parse(requests[0]?.body ?? "{}"), {
     action: "confirm",
     interrupt_id: "interrupt-1",
+  });
+});
+
+test("the tool approval client keeps the exact interrupt and encoded session path", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ body: string | null; method?: string; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({
+        body: init?.body == null ? null : String(init.body),
+        method: init?.method,
+        url: String(input),
+      });
+      return Response.json({ events: [], session_id: "session/1" });
+    },
+  });
+
+  await client.decideToolApproval("session/1", {
+    action: "reject",
+    interrupt_id: "interrupt-shell-1",
+  });
+
+  assert.deepEqual(requests[0], {
+    body: JSON.stringify({
+      action: "reject",
+      interrupt_id: "interrupt-shell-1",
+    }),
+    method: "POST",
+    url: "https://api.example/sessions/session%2F1/tool-approval",
   });
 });
 
@@ -411,6 +529,70 @@ test("getStatsOverview GETs /stats/overview with the user header and passes the 
     teaching_assistant: 1,
   });
   assert.equal(overview.last_activity_at, "2026-08-03T10:00:00+00:00");
+});
+
+// 赛前可视化增强:学情诊断与洞察客户端 —————————————————————————
+test("getDiagnosisSummary GETs /learning/diagnosis/summary with the user header", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        knowledge_points: [
+          {
+            accuracy: 0.333,
+            attempts: 3,
+            correct: 1,
+            knowledge_point: "梯度下降",
+            last_at: "2026-08-30T08:00:00+00:00",
+          },
+        ],
+        total_attempts: 5,
+        uncategorized_attempts: 0,
+        user_id: "demo-user",
+        weak_points: ["梯度下降"],
+      });
+    },
+  });
+
+  const summary = await client.getDiagnosisSummary();
+
+  assert.equal(requests[0]?.url, "https://api.example/learning/diagnosis/summary");
+  assert.equal(requests[0]?.init?.method, undefined);
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.equal(summary.total_attempts, 5);
+  assert.deepEqual(summary.weak_points, ["梯度下降"]);
+});
+
+test("getLearningInsights GETs /learning/insights/summary and passes the contract through", async () => {
+  const { createApiClient } = await loadApiClient();
+  const requests: Array<{ init: RequestInit | undefined; url: string }> = [];
+  const client = createApiClient({
+    baseUrl: "https://api.example",
+    fetchImpl: async (input, init) => {
+      requests.push({ init, url: String(input) });
+      return Response.json({
+        daily_accuracy: [{ accuracy: 0.75, attempts: 4, date: "2026-08-30" }],
+        error_tag_counts: { "概念不清": 2, "计算失误": 1 },
+        recent_path_plans: [
+          { created_at: "2026-08-30T09:00:00+00:00", knowledge_point: "链式法则" },
+        ],
+        total_wrong: 3,
+        user_id: "demo-user",
+      });
+    },
+  });
+
+  const insights = await client.getLearningInsights();
+
+  assert.equal(requests[0]?.url, "https://api.example/learning/insights/summary");
+  assert.equal(new Headers(requests[0]?.init?.headers).get("X-User-Id"), "demo-user");
+  assert.equal(insights.total_wrong, 3);
+  assert.deepEqual(insights.error_tag_counts, { "概念不清": 2, "计算失误": 1 });
+  assert.equal(insights.daily_accuracy[0]?.accuracy, 0.75);
+  assert.equal(insights.recent_path_plans[0]?.knowledge_point, "链式法则");
 });
 
 test("getStatsOverview normalizes stats errors like other endpoints", async () => {

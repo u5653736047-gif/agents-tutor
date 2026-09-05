@@ -85,6 +85,26 @@ class BlockingChatGraph(ChatGraph):
         return super().run(user_input, session_id, user_id)
 
 
+class WorkspaceAwareChatGraph(ChatGraph):
+    """Capture the workspace capability forwarded by the HTTP session layer."""
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        super().__init__(state)
+        self.workspace_calls: list[tuple[str | None, tuple[str, ...]]] = []
+
+    def run(
+        self,
+        user_input: str,
+        session_id: str,
+        user_id: str | None = None,
+        *,
+        workspace_root: str | None = None,
+        additional_workspace_roots: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        self.workspace_calls.append((workspace_root, tuple(additional_workspace_roots)))
+        return super().run(user_input, session_id, user_id)
+
+
 def _chat_app(tmp_path: Path, graph: ChatGraph) -> tuple[FastAPI, SessionStore]:
     app = create_app()
     store = SessionStore(tmp_path / "sessions.sqlite3")
@@ -156,9 +176,45 @@ def test_chat_creates_missing_session_runs_in_worker_and_returns_event_delta(tmp
         "agent": "evaluator",
         "created_at": None,
         "attachments": None,
+        # P2-12:无批改元数据时显式为 null（契约新增可选字段）
+        "grading": None,
     }
     assert response.json()["current_agent"] == "evaluator"
     assert [session.session_id for session in sessions] == ["session-1"]
+
+
+def test_chat_runs_with_the_workspace_authorized_for_its_session(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    graph = WorkspaceAwareChatGraph(
+        {
+            "messages": [HumanMessage(content="分析"), AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    store.create_session(
+        "session-1",
+        user_id="user-1",
+        workspace_root=primary,
+    )
+    store.add_workspace_root("session-1", shared, user_id="user-1")
+    try:
+        response = asyncio.run(
+            _post_chat(app, {"session_id": "session-1", "message": "分析"})
+        )
+    finally:
+        store.close()
+
+    assert response.status_code == 200
+    assert graph.workspace_calls == [
+        (str(primary.resolve()), (str(shared.resolve()),))
+    ]
 
 
 def test_chat_returns_run_errors_as_a_successful_contract_response(tmp_path: Path) -> None:
@@ -758,3 +814,42 @@ def test_chat_response_task_plan_degrades_to_none_on_wrong_types(tmp_path: Path)
     assert response.status_code == 200
     assert response.json()["task_plan"] is None
     assert response.json()["task_results"] is None
+
+
+def test_chat_titles_session_from_first_message_only(tmp_path: Path) -> None:
+    """UX-20260808#1:首条用户消息提炼为会话标题,且只写一次。
+
+    侧栏列表不再只显示 session_id:标题 = 消息压缩空白后截断;
+    同会话后续消息不得覆盖首个标题(set_title_if_absent)。
+    """
+    graph = ChatGraph(
+        {
+            "messages": [AIMessage(content="完成")],
+            "events": [],
+            "current_agent": "supervisor",
+            "run_error": None,
+            "pending_handoff": None,
+        }
+    )
+    app, store = _chat_app(tmp_path, graph)
+    try:
+        first = asyncio.run(
+            _post_chat(
+                app,
+                {"session_id": "session-1", "message": "  什么是\n  注意力机制?  "},
+            )
+        )
+        first_activity = store.list_sessions(user_id="user-1")[0].updated_at
+        second = asyncio.run(
+            _post_chat(app, {"session_id": "session-1", "message": "后续消息不改标题"})
+        )
+        records = store.list_sessions(user_id="user-1")
+    finally:
+        store.close()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert [record.title for record in records] == ["什么是 注意力机制?"]
+    # F3：两次时间戳可能落在同一微秒（时钟精度限制），> 会间歇性失败，
+    # 用 >= 表达「后续消息确实触碰了 updated_at」这一真实语义。
+    assert records[0].updated_at >= first_activity

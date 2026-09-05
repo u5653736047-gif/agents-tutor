@@ -1,6 +1,6 @@
 "use client";
 
-import { create } from "zustand";
+import { create, type StoreApi } from "zustand";
 
 import {
   ApiClientError,
@@ -12,7 +12,9 @@ import {
   type HandoffDecision,
   type Message,
   type PendingHandoffResponse,
+  type PendingToolApprovalResponse,
   type Session,
+  type ToolApprovalDecision,
 } from "../lib/api-client";
 import type { components } from "../contracts/api.generated";
 
@@ -20,10 +22,17 @@ type ChatStoreClient = Pick<
   ApiClient,
   "archiveSession" | "createSession" | "getSessionMessages" | "listSessions" | "sendChat"
 > & {
+  // 正式客户端会从 checkpoint 恢复过程；可选以兼容只关注消息的测试替身。
+  getSessionProcess?: ApiClient["getSessionProcess"];
+  // 正式客户端可为当前会话追加只读授权目录；可选以兼容旧测试替身。
+  addWorkspaceRoot?: ApiClient["addWorkspaceRoot"];
   // D2-T3:审批接口——可选:既有测试注入的 stub 未实现,正式 apiClient
   // 一定实现;decideHandoff action 在未注入时直接跳过(与 streamChat 同模式)
   decideHandoff?: ApiClient["decideHandoff"];
   getPendingHandoff?: ApiClient["getPendingHandoff"];
+  decideToolApproval?: ApiClient["decideToolApproval"];
+  getPendingToolApproval?: ApiClient["getPendingToolApproval"];
+  streamToolApproval?: ApiClient["streamToolApproval"];
   // 可选:既有测试注入的 stub 未实现流式通道,正式 apiClient 一定实现
   streamChat?: ApiClient["streamChat"];
   // D1-T3:断线重连通道(指数退避重试 + fromSequence 续传)。store 优先
@@ -38,6 +47,9 @@ type ChatStoreClient = Pick<
 // NonNullable:响应字段可选(含 undefined),store 语义统一为 null
 // (所有写入点都用 ?? null 归一化)——否则组件 props 会收到 undefined。
 type PendingHandoff = NonNullable<PendingHandoffResponse["pending_handoff"]>;
+type PendingToolApproval = NonNullable<
+  PendingToolApprovalResponse["pending_tool_approval"]
+>;
 type RunError = ChatResponse["run_error"];
 type RunEvent = components["schemas"]["RunEvent"];
 type StreamEvent = components["schemas"]["StreamEvent"];
@@ -54,19 +66,28 @@ type TaskResult = components["schemas"]["TaskResult"];
 // D3-T4:回答引用(ChatResponse.references)——与既有字段同一取型方式,
 // 直接取生成契约,保持单一数据源
 type Citation = components["schemas"]["Citation"];
+// P2-12:本轮批改结论(ChatResponse.grading / StreamEvent.grading)——
+// 与 references 同一取型与归一化口径;历史轮次的批改经消息级
+// Message.grading 元数据恢复(刷新/切会话不丢,pi 审查 🟡4)。
+type GradingResult = NonNullable<components["schemas"]["GradingResultDto"]>;
 
 // D1-T3:流式通道重试上限(重试次数,不含首次尝试),传给
-// streamChatWithRetry 的 maxRetries;耗尽后降级到同步通道。
+// streamChatWithRetry 的 maxRetries;耗尽后向用户报告连接错误，绝不
+// 自动改走同步通道重发同一条消息。
 const _STREAM_RETRY_LIMIT = 3;
 
 export type ChatStore = {
+  addWorkspaceRoot(path: string): Promise<Session | null>;
   archiveSession(sessionId: string): Promise<void>;
   // D4-T3:停止生成——abort 当前流式请求(仅对流式通道生效,同步
   // 通道无取消能力);无活跃流时为 no-op。
   cancelStreaming(): void;
   clearConversationState(): void;
   clearRequestError(): void;
-  createSession(): Promise<Session | null>;
+  createSession(
+    workspaceRoot?: string,
+    knowledgeNamespace?: string,
+  ): Promise<Session | null>;
   currentAgent: AgentRole | null;
   currentSessionId: string | null;
   // D2-T3:审批决策——决定(确认/拒绝/修改)与状态字段
@@ -75,9 +96,14 @@ export type ChatStore = {
     action: "confirm" | "reject" | "modify",
     modifications?: HandoffModifications,
   ): Promise<void>;
+  decideToolApproval(action: "confirm" | "reject"): Promise<void>;
   degradedNotice: string | null;
   events: (RunEvent | StreamEvent)[];
+  // P2-12:本轮批改结论(null = 非批改轮,与后端「无批改不携带」契约
+  // 一致;GradingCard 组件零渲染降级)
+  grading: GradingResult | null;
   isDecidingHandoff: boolean;
+  isDecidingToolApproval: boolean;
   isLoadingMessages: boolean;
   isLoadingSessions: boolean;
   isSending: boolean;
@@ -86,10 +112,14 @@ export type ChatStore = {
   loadCurrentSessionMessages(): Promise<void>;
   messages: Message[];
   pendingHandoff: PendingHandoff | null;
+  pendingToolApproval: PendingToolApproval | null;
   // D3-T4:本轮回答的引用列表(null = 无引用,与后端「无引用不携带」
   // 契约一致;组件层零渲染降级)
   references: Citation[] | null;
-  refreshSessions(): Promise<void>;
+  // UX-20260808#1:quiet=true 时后台静默换新(不切换 isLoadingSessions、
+  // 不闪骨架)——用于消息完成后补拉标题等「列表已在展示」的场景;
+  // 缺省 false 维持挂载/重试/归档切换时的骨架加载态。
+  refreshSessions(options?: { quiet?: boolean }): Promise<void>;
   requestError: ApiClientError | null;
   retryLastMessage(): Promise<void>;
   runError: RunError | null;
@@ -120,12 +150,16 @@ function emptyConversationState() {
     degradedNotice: null as string | null,
     events: [] as (RunEvent | StreamEvent)[],
     isDecidingHandoff: false,
+    isDecidingToolApproval: false,
     isLoadingMessages: false,
     isSending: false,
     isStreaming: false,
     lastSentMessage: null,
     messages: [] as Message[],
     pendingHandoff: null,
+    pendingToolApproval: null,
+    // P2-12:批改结论与引用同一轮次语义(对应最后一轮回答,不残留)
+    grading: null,
     // D3-T4:引用随轮次清空(引用对应最后一轮回答,切会话/新建会话不残留)
     references: null,
     runError: null,
@@ -156,6 +190,9 @@ function applyChatResponse(
     currentAgent: response.current_agent ?? null,
     events: [...(response.events ?? [])],
     pendingHandoff: response.pending_handoff ?? null,
+    pendingToolApproval: response.pending_tool_approval ?? null,
+    // P2-12:批改结论同一归一化口径(缺失 → null,组件零渲染)
+    grading: response.grading ?? null,
     // D3-T4:响应缺失(undefined/null)统一归一为 null,store 语义与
     // 其它可选字段一致,组件层收到 null 时零渲染
     references: response.references ?? null,
@@ -163,6 +200,152 @@ function applyChatResponse(
     taskPlan: response.task_plan ?? null,
     taskResults: response.task_results ?? null,
   };
+}
+
+type ChatStoreSet = StoreApi<ChatStore>["setState"];
+type ChatStoreGet = StoreApi<ChatStore>["getState"];
+type StreamDispatchContext = { activeSupervisorMessageId: string | null };
+
+function dispatchStreamEvent(
+  set: ChatStoreSet,
+  get: ChatStoreGet,
+  sessionId: string,
+  event: StreamEvent,
+  context: StreamDispatchContext,
+) {
+  if (get().currentSessionId !== sessionId) {
+    return;
+  }
+  switch (event.event_type) {
+    case "thinking":
+      set((state) => ({
+        events: [...state.events, event],
+        streamingAgent: event.agent ?? null,
+      }));
+      break;
+    case "reasoning": {
+      const messageId =
+        event.message_id ?? `${event.agent ?? "agent"}-reasoning-${event.sequence}`;
+      const delta = event.content ?? "";
+      set((state) => {
+        const existingIndex = state.events.findIndex(
+          (item) =>
+            item.event_type === "reasoning" &&
+            "message_id" in item &&
+            item.message_id === messageId,
+        );
+        if (existingIndex < 0) {
+          return {
+            events: [...state.events, { ...event, message_id: messageId }],
+            streamingAgent: event.agent ?? null,
+          };
+        }
+        const events = [...state.events];
+        const existing = events[existingIndex];
+        const previousContent =
+          existing && "content" in existing ? (existing.content ?? "") : "";
+        events[existingIndex] = {
+          ...event,
+          content: event.is_delta === false ? delta : `${previousContent}${delta}`,
+          message_id: messageId,
+          sequence: existing?.sequence ?? event.sequence,
+        };
+        return { events, streamingAgent: event.agent ?? null };
+      });
+      break;
+    }
+    case "tool_call":
+    case "tool_result":
+    case "tool_output":
+      set((state) => ({ events: [...state.events, event] }));
+      break;
+    case "approval_required":
+      set({
+        pendingToolApproval: event.pending_tool_approval ?? null,
+        streamingAgent: event.agent ?? null,
+      });
+      break;
+    case "message_delta": {
+      const delta = event.content ?? "";
+      if (event.agent === "supervisor") {
+        const messageId = event.message_id ?? "supervisor";
+        const continuesCurrent = context.activeSupervisorMessageId === messageId;
+        context.activeSupervisorMessageId = messageId;
+        set((state) => ({
+          streamingAgent: "supervisor",
+          streamingMessage: {
+            agent: "supervisor",
+            content: `${continuesCurrent ? (state.streamingMessage?.content ?? "") : ""}${delta}`,
+            created_at: undefined,
+            role: "assistant",
+          },
+        }));
+        break;
+      }
+
+      set((state) => {
+        const messageId =
+          event.message_id ?? `${event.agent ?? "agent"}-${event.sequence}`;
+        const existingIndex = state.events.findIndex(
+          (item) =>
+            item.event_type === "message_delta" &&
+            "message_id" in item &&
+            item.message_id === messageId,
+        );
+        if (existingIndex < 0) {
+          return {
+            events: [...state.events, event],
+            streamingAgent: event.agent ?? null,
+          };
+        }
+        const events = [...state.events];
+        const existing = events[existingIndex];
+        const previousContent =
+          existing && "content" in existing ? (existing.content ?? "") : "";
+        events[existingIndex] = {
+          ...event,
+          content: `${previousContent}${delta}`,
+          message_id: messageId,
+        };
+        return { events, streamingAgent: event.agent ?? null };
+      });
+      break;
+    }
+    case "agent_switch":
+      set((state) => ({
+        currentAgent: event.agent ?? null,
+        events: [...state.events, event],
+        streamingAgent: event.agent ?? null,
+      }));
+      break;
+    case "message_end": {
+      const streamed: Message = event.message ?? {
+        agent: event.agent ?? undefined,
+        content: event.content ?? "",
+        created_at: undefined,
+        role: "assistant",
+      };
+      set({
+        streamingAgent: event.agent ?? null,
+        streamingMessage: streamed,
+        references: event.citations ?? null,
+        // P2-12:流式 message_end 载荷携带本轮批改结论(与 citations 同位)
+        grading: event.grading ?? null,
+      });
+      break;
+    }
+    case "error":
+      set({
+        runError: {
+          agent: event.agent ?? undefined,
+          error_code: event.error_code ?? "internal_error",
+          message: "The request could not be completed.",
+        },
+      });
+      break;
+    case "done":
+      break;
+  }
 }
 
 export function createChatStore(client: ChatStoreClient = apiClient) {
@@ -185,6 +368,25 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     requestError: null,
     sessions: [],
     showArchived: false,
+    addWorkspaceRoot: async (path) => {
+      const sessionId = get().currentSessionId;
+      if (!sessionId || !client.addWorkspaceRoot) {
+        return null;
+      }
+      set({ requestError: null });
+      try {
+        const session = await client.addWorkspaceRoot(sessionId, path);
+        set((state) => ({
+          sessions: state.sessions.map((item) =>
+            item.session_id === session.session_id ? session : item,
+          ),
+        }));
+        return session;
+      } catch (error) {
+        set({ requestError: asApiClientError(error) });
+        return null;
+      }
+    },
     archiveSession: async (sessionId) => {
       // D4-T3 review 修正:切会话时 abort 活跃流——旧流继续在后台
       // 跑完浪费算力,且「切走再切回」时旧流剩余事件会重新通过会话
@@ -218,12 +420,19 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
     cancelStreaming: () => {
       activeStreamController?.abort();
     },
-    createSession: async () => {
+    createSession: async (workspaceRoot, knowledgeNamespace) => {
       // D4-T3 review 修正:新建会话同样中止旧流(见 archiveSession 注释)。
       activeStreamController?.abort();
       set({ requestError: null });
       try {
-        const session = await client.createSession();
+        const session = await client.createSession({
+          ...(workspaceRoot !== undefined
+            ? { workspace_root: workspaceRoot }
+            : {}),
+          ...(knowledgeNamespace !== undefined
+            ? { knowledge_namespace: knowledgeNamespace }
+            : {}),
+        });
         set((state) => ({
           ...emptyConversationState(),
           currentSessionId: session.session_id,
@@ -247,9 +456,27 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       set({ isLoadingMessages: true, requestError: null });
       try {
-        const messages = await client.getSessionMessages(sessionId);
+        const processSnapshot = client.getSessionProcess
+          ? client.getSessionProcess(sessionId).catch(() => null)
+          : Promise.resolve(null);
+        const [messages, process] = await Promise.all([
+          client.getSessionMessages(sessionId),
+          processSnapshot,
+        ]);
         if (get().currentSessionId === sessionId) {
-          set({ isLoadingMessages: false, messages });
+          set({
+            isLoadingMessages: false,
+            messages,
+            ...(process
+              ? {
+                  currentAgent: process.current_agent ?? null,
+                  events: [...(process.events ?? [])],
+                  pendingToolApproval: process.pending_tool_approval ?? null,
+                  taskPlan: process.task_plan ?? null,
+                  taskResults: process.task_results ?? null,
+                }
+              : {}),
+          });
         }
       } catch (error) {
         if (get().currentSessionId === sessionId) {
@@ -257,7 +484,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       }
     },
-    refreshSessions: async () => {
+    refreshSessions: async (options) => {
       // D4-T5 review 修正:桌面静态侧栏与移动抽屉是两个组件实例,
       // 打开抽屉会再次触发挂载拉取——进行中去重,避免重复请求
       // (数据幂等,仅去网络开销;并发失败时下一次调用仍可重试,
@@ -266,14 +493,20 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         return;
       }
       sessionsRefreshInFlight = true;
-      set({ isLoadingSessions: true, requestError: null });
+      // UX-20260808#1:quiet 模式不动 isLoadingSessions 与 requestError
+      // ——列表原地换新不闪骨架;后台补拉失败静默(标题下次刷新再补),
+      // 绝不覆盖历史拉取等主流程刚写入的错误。
+      const quiet = options?.quiet ?? false;
+      set(quiet ? {} : { isLoadingSessions: true, requestError: null });
       try {
         // D4-T7:按当前归档视图拉取——showArchived=true 时带上
         // include_archived=true,归档会话可见(api-client 已支持该参数)。
         const sessions = await client.listSessions(get().showArchived);
-        set({ isLoadingSessions: false, sessions });
+        set(quiet ? { sessions } : { isLoadingSessions: false, sessions });
       } catch (error) {
-        set({ isLoadingSessions: false, requestError: asApiClientError(error) });
+        if (!quiet) {
+          set({ isLoadingSessions: false, requestError: asApiClientError(error) });
+        }
       } finally {
         sessionsRefreshInFlight = false;
       }
@@ -386,12 +619,121 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         }
       }
     },
+    decideToolApproval: async (action: "confirm" | "reject") => {
+      const sessionId = get().currentSessionId;
+      const pending = get().pendingToolApproval;
+      const streamDecision = client.streamToolApproval;
+      const syncDecision = client.decideToolApproval;
+      if (
+        !sessionId ||
+        !pending ||
+        (!streamDecision && !syncDecision) ||
+        get().isDecidingToolApproval
+      ) {
+        return;
+      }
+
+      const decision: ToolApprovalDecision = {
+        action,
+        interrupt_id: pending.interrupt_id,
+      };
+      const dispatchContext: StreamDispatchContext = {
+        activeSupervisorMessageId: null,
+      };
+      set({
+        isDecidingToolApproval: true,
+        isStreaming: true,
+        requestError: null,
+        runError: null,
+        streamingAgent: pending.request.agent_role,
+        streamingMessage: null,
+      });
+
+      try {
+        if (streamDecision) {
+          await streamDecision({
+            decision,
+            onEvent: (event) =>
+              dispatchStreamEvent(
+                set,
+                get,
+                sessionId,
+                event,
+                dispatchContext,
+              ),
+            sessionId,
+          });
+        } else if (syncDecision) {
+          const response = await syncDecision(sessionId, decision);
+          if (get().currentSessionId === sessionId) {
+            set((state) => ({
+              ...applyChatResponse(state, response),
+              events: [...state.events, ...(response.events ?? [])],
+            }));
+          }
+        }
+
+        if (get().currentSessionId === sessionId) {
+          set((state) => ({
+            isDecidingToolApproval: false,
+            isStreaming: false,
+            messages: state.streamingMessage
+              ? [...state.messages, state.streamingMessage]
+              : state.messages,
+            pendingToolApproval:
+              state.pendingToolApproval?.interrupt_id === pending.interrupt_id
+                ? null
+                : state.pendingToolApproval,
+            streamingAgent: null,
+            streamingMessage: null,
+          }));
+          await get().loadCurrentSessionMessages();
+        }
+      } catch (error) {
+        if (get().currentSessionId === sessionId) {
+          const apiError = asApiClientError(error);
+          if (apiError.code === "tool_approval_not_pending") {
+            set({
+              isDecidingToolApproval: false,
+              isStreaming: false,
+              pendingToolApproval: null,
+            });
+            const refreshPending = client.getPendingToolApproval;
+            if (refreshPending) {
+              try {
+                const fresh = await refreshPending(sessionId);
+                if (get().currentSessionId === sessionId) {
+                  set({
+                    pendingToolApproval: fresh.pending_tool_approval ?? null,
+                  });
+                }
+              } catch {
+                // A stale approval stays cleared when the refresh also fails.
+              }
+            }
+          } else {
+            set({
+              isDecidingToolApproval: false,
+              isStreaming: false,
+              requestError: apiError,
+            });
+          }
+        }
+      } finally {
+        if (get().currentSessionId === sessionId) {
+          set({ isDecidingToolApproval: false, isStreaming: false });
+        }
+      }
+    },
     sendMessage: async (message, attachments) => {
       const sessionId = get().currentSessionId;
       if (!sessionId) {
         set({
           requestError: new ApiClientError("请先选择会话。", { code: null, status: null }),
         });
+        return;
+      }
+      if (get().pendingToolApproval) {
         return;
       }
 
@@ -436,6 +778,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             messages,
           }));
         }
+        // UX-20260808#1:消息落库后后端已按首条消息补标题——静默刷新
+        // 会话列表(quiet 不闪骨架),侧栏尽快以标题替换 session_id。
+        void get().refreshSessions({ quiet: true });
       } catch (error) {
         if (get().currentSessionId === sessionId) {
           // D4-T2:失败回滚——只移除本次追加的乐观消息。按对象引用
@@ -505,10 +850,20 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         });
         return;
       }
+      if (get().pendingToolApproval) {
+        return;
+      }
+
+      // 同一 store 同时只允许一个发送动作。UI 禁用需要一次 React
+      // 重渲染才生效，双击/连续 Enter 仍可能在同一事件循环内进入两次；
+      // 这里用同步状态做最终闸门，避免启动两个后端 run。
+      if (get().isStreaming || get().isSending) {
+        return;
+      }
 
       // D7-T2:附件消息——stream-client 已扩展 attachments 透传(与同步
-      // 通道同契约),正常走流式主通道获得流式体验;重试耗尽降级到同步
-      // sendMessage 时同样携带附件(见降级分支)。
+      // 通道同契约),正常走流式主通道获得流式体验。网络状态不确定时
+      // 也不自动重发，避免同一条附件消息触发两个后端 run。
 
       // D1-T3:优先走带断线重连的通道(指数退避 + fromSequence 续传);
       // 未注入重试通道的旧 stub 退回底层 streamChat(D1-T1 行为不变)。
@@ -534,7 +889,8 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       // UX-20260807#1:乐观回显——与 sendMessage 同构,流式请求发起前
       // 先把用户消息追加进 messages(输入框立即清空后用户能看到自己
-      // 说了什么)。run 结束/失败/降级后权威历史整体替换 messages,
+      // 说了什么)。run 正常结束后权威历史整体替换 messages；连接失败
+      // 时保留乐观消息与已经收到的部分结果，
       // 乐观消息自然被覆盖,无需去重。
       const optimistic: Message = {
         agent: null,
@@ -545,6 +901,7 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
 
       set((state) => ({
         isStreaming: true,
+        degradedNotice: null,
         requestError: null,
         runError: null,
         streamingAgent: null,
@@ -557,56 +914,11 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
         messages: [...state.messages, optimistic],
       }));
 
-      // 事件分发与 sendMessage 的 response.events 同一列表(会话守卫一致)
-      const dispatch = (event: StreamEvent) => {
-        // 旧会话的流事件不回写新会话状态(与 sendMessage 的会话守卫一致)
-        if (get().currentSessionId !== sessionId) {
-          return;
-        }
-        switch (event.event_type) {
-          case "thinking":
-            // thinking 的 content 只是占位文本,不进消息体,仅更新当前 agent
-            set({ streamingAgent: event.agent ?? null });
-            break;
-          case "tool_call":
-          case "tool_result":
-            // 摘要事件追加进 events(与 sendMessage 的 response.events 同一列表)
-            set((state) => ({ events: [...state.events, event] }));
-            break;
-          case "agent_switch":
-            // D2-T2:流式路径没有 ChatResponse,用最后一条 agent_switch
-            // 的目标 Agent 作为当前活跃 Agent(与面板内的兜底逻辑一致)。
-            set({ currentAgent: event.agent ?? null, streamingAgent: event.agent ?? null });
-            break;
-          case "message_end": {
-            const streamed: Message = event.message ?? {
-              agent: event.agent ?? undefined,
-              content: event.content ?? "",
-              created_at: undefined,
-              role: "assistant",
-            };
-            set({
-              streamingMessage: streamed,
-              // D3-T5:流式主通道的引用由 message_end 事件携带(与
-              // POST /chat 的 references 同源);未携带时为 null。
-              references: event.citations ?? null,
-            });
-            break;
-          }
-          case "error":
-            set({
-              runError: {
-                agent: event.agent ?? undefined,
-                error_code: event.error_code ?? "internal_error",
-                message: "The request could not be completed.",
-              },
-            });
-            break;
-          case "done":
-            // done 无需处理,await 返回后统一收尾
-            break;
-        }
+      const dispatchContext: StreamDispatchContext = {
+        activeSupervisorMessageId: null,
       };
+      const dispatch = (event: StreamEvent) =>
+        dispatchStreamEvent(set, get, sessionId, event, dispatchContext);
 
       try {
         if (retryStream) {
@@ -650,6 +962,9 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
             set({ requestError: asApiClientError(historyError) });
           }
         }
+        // UX-20260808#1:与 sendMessage 同步路径一致——消息落库后静默
+        // 刷新会话列表,让后端补写的标题尽快替换侧栏的 session_id。
+        void get().refreshSessions({ quiet: true });
       } catch (error) {
         // 此处只处理流式通道(streamChatWithRetry / streamChat)抛出的错误。
         // D4-T3 review 修正:用户点击「停止生成」(abort)恰逢后端错误
@@ -664,51 +979,15 @@ export function createChatStore(client: ChatStoreClient = apiClient) {
           return;
         }
         if (get().currentSessionId === sessionId) {
-          // UX-20260807#1:失败回滚——按对象引用移除本次追加的乐观消息
-          // (复用 sendMessage 的按引用查找模式)。降级分支随后走
-          // sendMessage,其内部会重新追加新的乐观消息,不会重复。
-          set((state) => {
-            const messages = [...state.messages];
-            let index = -1;
-            for (let i = messages.length - 1; i >= 0; i -= 1) {
-              if (messages[i] === optimistic) {
-                index = i;
-                break;
-              }
-            }
-            if (index !== -1) {
-              messages.splice(index, 1);
-            }
-            return { messages };
+          // 流式请求是否已经送达服务端在断线后不可判定，因此绝不能
+          // 自动切换 POST /chat 重发同一消息。保留乐观用户消息与已收到
+          // 的部分回答，让用户看得见发生了什么；仅标记连接失败。
+          set({
+            degradedNotice: null,
+            isStreaming: false,
+            requestError: asApiClientError(error),
+            streamingAgent: null,
           });
-          if (retryStream) {
-            // D1-T3 降级:重试通道耗尽(重试 + 续传均失败)后走同步通道
-            // 保证消息一致。sendMessage 内部「POST + 拉全量」以历史为
-            // 权威,流式残留先并入消息列表再拉全量,不闪失。
-            set({ isStreaming: false, requestError: asApiClientError(error) });
-            set({
-              degradedNotice: "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
-            });
-            const streamed = get().streamingMessage;
-            if (streamed) {
-              set((state) => ({
-                messages: [...state.messages, streamed],
-                streamingMessage: null,
-              }));
-            }
-            try {
-              // D7-T2:降级重发同样携带附件引用(与首次发送一致;当前
-              // 附件消息不会进入本分支——流式分流在上游,此处防御性
-              // 透传,待流式附件支持后自然衔接)。
-              await get().sendMessage(message, attachments);
-            } catch {
-              // sendMessage 内部已处理错误(requestError / 会话守卫),无需再处理
-            }
-          } else {
-            // 旧通道失败:保留已流式收到的内容(streamingMessage 不清空),
-            // 仅标记失败(D1-T1 行为)
-            set({ isStreaming: false, requestError: asApiClientError(error) });
-          }
         }
       } finally {
         // D4-T3:清理 controller 引用(按引用比对,只清自己的;流结束后

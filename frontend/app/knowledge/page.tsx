@@ -25,7 +25,10 @@ import Link from "next/link";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 import { Button } from "@/components/ui/button";
+import { DocumentTreeView, type TreeResponse } from "@/components/document-tree-view";
+import { NamespaceSelector } from "@/components/namespace-selector";
 import { Skeleton } from "@/components/ui/skeleton";
+import type { components } from "@/contracts/api.generated";
 import {
   ApiClientError,
   apiClient,
@@ -69,6 +72,11 @@ export default function KnowledgePage() {
   );
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // S5-C2：文档结构树缓存（首次展开时拉取）+ 当前展开的文档 id。
+  const [trees, setTrees] = useState<Record<string, TreeResponse>>({});
+  const [expandedDocId, setExpandedDocId] = useState<string | null>(null);
+  // S5-C1：上传目标空间（默认 public，选择器含「＋ 新建空间」入口）。
+  const [uploadNamespace, setUploadNamespace] = useState("public");
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -111,6 +119,48 @@ export default function KnowledgePage() {
     }
   }, []);
 
+  // S5-C2:按需拉取文档结构树——首次展开时请求,结果缓存进 trees。
+  const loadTree = useCallback(
+    async (documentId: string) => {
+      try {
+        const tree = await apiClient.getDocumentTree(documentId);
+        setTrees((prev) => ({ ...prev, [documentId]: tree }));
+      } catch {
+        setTrees((prev) => ({
+          ...prev,
+          [documentId]: {
+            kind: "flat",
+            document_id: documentId,
+            flat_pages: [],
+          },
+        }));
+      }
+    },
+    [],
+  );
+
+  // P1-5：按显式 namespace 字段分组（不再对 document_id 前缀反推）。
+  const groupedDocuments = (() => {
+    const groups = new Map<string, KnowledgeDocumentEntry[]>();
+    for (const doc of documents) {
+      // 后端显式返回 namespace，缺省兼容旧契约回退为 public
+      const ns = (doc as { namespace?: string }).namespace ?? "public";
+      const bucket = groups.get(ns) ?? [];
+      bucket.push(doc);
+      groups.set(ns, bucket);
+    }
+    // public 恒排首位,其余按空间名稳定排序。
+    return [...groups.entries()].sort(([a], [b]) => {
+      if (a === "public") {
+        return -1;
+      }
+      if (b === "public") {
+        return 1;
+      }
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  })();
+
   // 挂载拉取:采用 React 官方数据拉取模式——effect 内局部 async 函数,
   // setState 在 await 之后的异步回调里执行(规则只拦 effect 同步体内
   // 的 setState),ignore 标志防止卸载后 setState。
@@ -150,7 +200,11 @@ export default function KnowledgePage() {
     setUploadError(null);
     setUploadResult(null);
     try {
-      const uploaded = await apiClient.uploadDocument(selectedFile);
+      const uploaded = await apiClient.uploadDocument(
+        selectedFile,
+        undefined,
+        uploadNamespace,
+      );
       setUploadResult(uploaded);
       setSelectedFile(null);
       // 上传成功(后端幂等替换)后刷新列表,新文档立即可见
@@ -218,6 +272,13 @@ export default function KnowledgePage() {
 
         {/* 上传区:accept 仅作前端提示,大小/类型仍由服务端校验(422 兜底) */}
         <div className="mt-4" data-slot="upload-area">
+          <div className="mb-3 max-w-xs" data-slot="upload-namespace">
+            <p className="mb-1 text-caption font-medium text-foreground">目标知识空间</p>
+            <NamespaceSelector
+              onChange={setUploadNamespace}
+              value={uploadNamespace}
+            />
+          </div>
           <div className="flex flex-wrap items-center gap-3">
             <input
               aria-label="选择要上传的知识文档"
@@ -300,33 +361,78 @@ export default function KnowledgePage() {
               暂无上传文档
             </p>
           ) : (
-            <ul className="mt-3 space-y-2">
-              {documents.map((doc) => (
-                <li
-                  className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2"
-                  data-slot="document-item"
-                  key={doc.document_id}
+            groupedDocuments.map(([namespace, docs]) => (
+              <section data-slot="namespace-group" key={namespace}>
+                <h4
+                  className="mt-4 flex items-center gap-2 text-caption font-medium text-muted-foreground"
+                  data-slot="namespace-group-title"
                 >
-                  <div className="min-w-0">
-                    <p className="truncate text-body text-foreground">{doc.source}</p>
-                    <p className="text-caption text-muted-foreground">
-                      文档 {doc.document_id} · 页数 {doc.page_count ?? "—"} · 分块{" "}
-                      {doc.chunk_count ?? "—"}
-                    </p>
-                  </div>
-                  <Button
-                    data-slot="document-delete"
-                    disabled={deletingId === doc.document_id}
-                    onClick={() => void handleDelete(doc.document_id)}
-                    size="sm"
-                    type="button"
-                    variant="outline"
-                  >
-                    {deletingId === doc.document_id ? "删除中…" : "删除"}
-                  </Button>
-                </li>
-              ))}
-            </ul>
+                  <span className="rounded bg-muted px-1.5 py-0.5">{namespace}</span>
+                  <span>{docs.length} 篇</span>
+                </h4>
+                <ul className="mt-2 space-y-2">
+                  {docs.map((doc) => {
+                    const expanded = expandedDocId === doc.document_id;
+                    const tree = trees[doc.document_id];
+                    return (
+                      <li
+                        className="rounded-md border border-border px-3 py-2"
+                        data-slot="document-item"
+                        key={doc.document_id}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-body text-foreground">{doc.source}</p>
+                            <p className="text-caption text-muted-foreground">
+                              文档 {doc.document_id} · 页数 {doc.page_count ?? "—"} · 分块{" "}
+                              {doc.chunk_count ?? "—"}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 gap-2">
+                            <Button
+                              data-slot="document-tree-toggle"
+                              onClick={() => {
+                                if (expanded) {
+                                  setExpandedDocId(null);
+                                  return;
+                                }
+                                setExpandedDocId(doc.document_id);
+                                if (trees[doc.document_id] === undefined) {
+                                  void loadTree(doc.document_id);
+                                }
+                              }}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {expanded ? "收起结构" : "展开结构"}
+                            </Button>
+                            <Button
+                              data-slot="document-delete"
+                              disabled={deletingId === doc.document_id}
+                              onClick={() => void handleDelete(doc.document_id)}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {deletingId === doc.document_id ? "删除中…" : "删除"}
+                            </Button>
+                          </div>
+                        </div>
+                        {expanded && tree !== undefined ? (
+                          <div className="mt-2" data-slot="document-tree-panel">
+                            <DocumentTreeView tree={tree} />
+                          </div>
+                        ) : null}
+                        {expanded && tree === undefined ? (
+                          <p className="mt-2 text-caption text-muted-foreground">结构加载中…</p>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ))
           )}
         </div>
       </section>

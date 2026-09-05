@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
@@ -11,12 +12,32 @@ from .policy import RetrievalPolicy
 from .retrieval import QueryRefiner
 from .service import KnowledgeService
 
+# S5-C1 决策 4：会话绑定的知识空间（模型不可见不可控——工具参数面不
+# 暴露空间，防跨空间伪造检索）。由 graph_builder._wrap 按 learning_scope
+# 先例从 AgentState.extra["knowledge_namespace"] 注入；None = 未绑定，
+# 工具层兜底为 "public"（单路 public 过滤——见 search_knowledge 内注释；
+# chat.py 入口的 `or "public"` 与此互为冗余防御）。
+knowledge_scope: ContextVar[str | None] = ContextVar(
+    "knowledge_scope",
+    default=None,
+)
+
 
 class _SearchKnowledgeInput(BaseModel):
-    """Validate tool inputs before execution so errors are classified correctly."""
+    """Validate tool inputs before execution so errors are classified correctly.
+
+    source / difficulty（六大功能计划 P0-3）：可选的检索过滤参数——
+    source 限定逻辑来源（某本书/某类文档，如课程标准），difficulty
+    限定难度标签；两者组装为 metadata_filter 后**两个检索分支
+    （普通与 adaptive）同步透传**（pi 审查 🔴2：adaptive 分支不透传
+    会让生产模式的难度/课标过滤静默失效）。默认 None 时不携带
+    对应键，行为与扩展前逐项一致（零回归）。
+    """
 
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=10)
+    source: str | None = Field(default=None, max_length=200)
+    difficulty: str | None = Field(default=None, max_length=50)
 
     @field_validator("query")
     @classmethod
@@ -24,6 +45,33 @@ class _SearchKnowledgeInput(BaseModel):
         if not value.strip():
             raise ValueError("query must not be empty")
         return value
+
+    @field_validator("source", "difficulty")
+    @classmethod
+    def normalize_blank_filter(cls, value: str | None) -> str | None:
+        # 空白字符串归一为 None：「传了空值」与「没传」语义一致，
+        # 避免把空字符串当过滤值注入索引层产生零命中误会。
+        if value is None or not value.strip():
+            return None
+        return value.strip()
+
+
+def _metadata_filter_from_input(
+    source: str | None, difficulty: str | None
+) -> dict[str, str] | None:
+    """把工具的可选过滤参数组装为 service 层的 metadata_filter。
+
+    无过滤参数时返回 None（与原路径完全一致，service 层
+    _apply_suppression 会自行附加默认的 frontmatter 抑制）；有任一
+    参数时返回「键→值」字典（多键 AND 语义，见 service.search
+    的过滤语义注释）。
+    """
+    filters: dict[str, str] = {}
+    if source is not None:
+        filters["source"] = source
+    if difficulty is not None:
+        filters["difficulty"] = difficulty
+    return filters or None
 
 
 # ── S4-T3 阈值未达标提示（Observation 可见文本）──
@@ -79,13 +127,29 @@ def create_search_knowledge_tool(
     )
 
     @tool("search_knowledge", args_schema=_SearchKnowledgeInput)
-    def search_knowledge(query: str, top_k: int = 5) -> dict[str, Any]:
-        """检索可引用的知识片段。"""
+    def search_knowledge(
+        query: str,
+        top_k: int = 5,
+        source: str | None = None,
+        difficulty: str | None = None,
+    ) -> dict[str, Any]:
+        """检索可引用的知识片段；可用 source/difficulty 限定来源与难度。"""
+        # P0-3（pi 审查 🔴2）：过滤参数组装后在两个分支同步透传——
+        # service 层会在其上叠加默认 frontmatter 抑制（_apply_suppression）。
+        metadata_filter = _metadata_filter_from_input(source, difficulty)
+        # S5-C1 决策 4：空间由 scope 注入而非模型参数（模型不可见不可控）。
+        # 未绑定（scope 为 None）在此兜底为 "public"——「未绑定 = 单路
+        # public 过滤」的不变式在工具层成立，任何图入口漏传 extra 都不会
+        # 退化成跨空间无过滤检索；service 层的 namespace=None 保持
+        # 「不过滤」语义仅供非工具调用方（管理面/既有测试）使用。
+        namespace = knowledge_scope.get() or "public"
         if not adaptive_enabled:
             # 未启用自适应：原路径原样保留（零回归，见上方注释）——
             # 输出不含 metadata 键，旧消费者（引用收集、评价证据、
             # 事件转换）全部无感。
-            hits = service.search(query, top_k)
+            hits = service.search(
+                query, top_k, metadata_filter=metadata_filter, namespace=namespace
+            )
             if not hits:
                 return {
                     "found": False,
@@ -109,9 +173,11 @@ def create_search_knowledge_tool(
         result = service.adaptive_search(
             query,
             top_k,
+            metadata_filter=metadata_filter,
             policy=policy,
             relevance_threshold=relevance_threshold,
             refiner=refiner,
+            namespace=namespace,
         )
         meta = result.metadata
         # metadata 字段语义（面向初学者）：

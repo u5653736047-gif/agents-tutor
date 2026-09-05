@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Annotated, Any, cast
@@ -11,6 +12,8 @@ from fastapi import APIRouter, Depends, Request, status
 from langchain_core.messages import AIMessage, BaseMessage
 from starlette.concurrency import run_in_threadpool
 
+from api.attachments import compose_message_with_attachments
+from api.files import attachments_for_generated_files
 from api.schemas import (
     AgentRole,
     ApiErrorCode,
@@ -18,10 +21,13 @@ from api.schemas import (
     ChatResponse,
     Citation,
     ErrorResponse,
+    GradingItemDto,
+    GradingResultDto,
     HandoffRequest,
     Message,
     MessageRole,
     PendingHandoff,
+    PendingToolApproval,
     RunError,
     RunEvent,
     StreamEventType,
@@ -29,7 +35,12 @@ from api.schemas import (
     TaskPlanStatus,
     TaskPlanStep,
     TaskResult,
+    ToolApprovalRequest,
     WorkerAgentRole,
+    WorkflowProgress,
+    WorkflowStatus,
+    WorkflowStep,
+    WorkflowStepStatus,
 )
 from api.schemas import (
     ErrorCode as ApiRunErrorCode,
@@ -39,10 +50,14 @@ from core.events import EventType
 from core.events import RunError as CoreRunError
 from core.events import RunEvent as CoreRunEvent
 from core.graph_builder import CollaborativeAgentGraph
-from core.sessions import SessionStore
+from core.sessions import SessionRecord, SessionStore, derive_session_title
 from core.state import AgentState, PendingHandoffApproval
+from core.state import GradingResult as CoreGradingResult
+from core.state import PendingToolApproval as CorePendingToolApproval
 from core.state import TaskPlan as CoreTaskPlan
 from core.state import TaskStepResult as CoreTaskStepResult
+from core.state import WorkflowState as CoreWorkflowState
+from core.state import message_grading as core_message_grading
 from core.state import message_references as core_message_references
 
 router = APIRouter(tags=["chat"])
@@ -52,8 +67,10 @@ CHAT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 EVENT_TYPE_MAP = {
     EventType.AGENT_STARTED: StreamEventType.THINKING,
+    EventType.AGENT_REASONING: StreamEventType.REASONING,
     EventType.TOOL_STARTED: StreamEventType.TOOL_CALL,
     EventType.TOOL_COMPLETED: StreamEventType.TOOL_RESULT,
+    EventType.TOOL_OUTPUT: StreamEventType.TOOL_OUTPUT,
     EventType.AGENT_COMPLETED: StreamEventType.MESSAGE_END,
     EventType.AGENT_SWITCHED: StreamEventType.AGENT_SWITCH,
     EventType.RUN_FAILED: StreamEventType.ERROR,
@@ -150,6 +167,39 @@ def _public_task_results(results: object) -> list[TaskResult] | None:
     return public or None
 
 
+def _public_workflow(workflow: object) -> WorkflowProgress | None:
+    """core WorkflowState → 公开契约 WorkflowProgress（类型不符 → None）。
+
+    投影边界（lesson-workflow-design §七）：不携带 artifact_root 绝对
+    路径与 budget_used 内部计数，artifacts 保持注册时登记的相对路径；
+    其余字段与 core 同名同义、按值转换枚举（core StrEnum 与 api Enum
+    值一致，与 _public_task_plan 同一策略，不做字段级降级）。
+    """
+    if not isinstance(workflow, CoreWorkflowState):
+        return None
+    return WorkflowProgress(
+        workflow_id=workflow.workflow_id,
+        status=WorkflowStatus(workflow.status.value),
+        steps=[
+            WorkflowStep(
+                step_id=step.step_id,
+                worker_role=WorkerAgentRole(step.worker_role.value),
+                status=WorkflowStepStatus(step.status.value),
+                attempts=step.attempts,
+                summary=step.summary,
+            )
+            for step in workflow.steps
+        ],
+        current_step_index=workflow.current_step_index,
+        artifacts=list(workflow.artifacts),
+        error_code=(
+            ApiRunErrorCode(workflow.error_code.value)
+            if workflow.error_code is not None
+            else None
+        ),
+    )
+
+
 def _safe_created_at(message: BaseMessage) -> datetime | None:
     created_at = getattr(message, "created_at", None)
     return created_at if isinstance(created_at, datetime) else None
@@ -169,7 +219,9 @@ def _is_answer_message(message: BaseMessage) -> bool:
 
 
 def _final_assistant_message(
-    state: AgentState, previous_message_count: int
+    state: AgentState,
+    previous_message_count: int,
+    user_id: str | None = None,
 ) -> Message | None:
     agent = _public_agent(state.get("current_agent"))
     messages = state.get("messages", [])
@@ -188,6 +240,10 @@ def _final_assistant_message(
             content=content,
             agent=agent,
             created_at=_safe_created_at(message),
+            # T5-3：officecli_edit 生成的文件注册为可下载附件（无则 None）。
+            attachments=attachments_for_generated_files(user_id, message),
+            # P2-12：该消息若挂着批改元数据则随消息透出（无则 None）。
+            grading=_message_grading_dto(message),
         )
     return None
 
@@ -251,6 +307,38 @@ def _response_references(
     return None
 
 
+def _public_grading(grading: object) -> GradingResultDto | None:
+    """core GradingResult → 公开契约 GradingResultDto（字段逐项映射）。
+
+    与 _public_task_plan 同一哲学：整体类型不符 → None（宽容读取，
+    checkpoint 反序列化后的脏 dict 不击穿响应）；core 模型 extra=
+    "forbid" + 校验保证实例字段必然合法，故不做字段级降级。
+    """
+    if not isinstance(grading, CoreGradingResult):
+        return None
+    return GradingResultDto(
+        items=[
+            GradingItemDto(
+                question_id=item.question_id,
+                score=item.score,
+                max_score=item.max_score,
+                feedback=item.feedback,
+                knowledge_point=item.knowledge_point,
+                error_tag=item.error_tag,
+            )
+            for item in grading.items
+        ],
+        overall_comment=grading.overall_comment,
+        total_score=grading.total_score,
+        max_total_score=grading.max_total_score,
+    )
+
+
+def _message_grading_dto(message: BaseMessage) -> GradingResultDto | None:
+    """消息元数据里的批改结论 → 契约 DTO（历史回放用，pi 审查 🟡4）。"""
+    return _public_grading(core_message_grading(message))
+
+
 def _previous_sequence(state: AgentState | None) -> int:
     if state is None:
         return -1
@@ -279,8 +367,17 @@ def _public_event(event: CoreRunEvent) -> RunEvent | None:
         event_type=event_type,
         sequence=event.sequence,
         session_id=event.session_id,
+        run_id=event.run_id,
         agent=_public_agent(event.agent),
         tool_name=event.tool_name,
+        tool_call_id=event.tool_call_id,
+        parent_tool_call_id=event.parent_tool_call_id,
+        input_summary=event.input_summary,
+        output_summary=event.output_summary,
+        content=event.content,
+        output_stream=event.output_stream,
+        message_id=event.message_id,
+        is_delta=(False if event.event_type is EventType.AGENT_REASONING else None),
         success=event.success,
         duration_ms=event.duration_ms,
         error_code=error_code,
@@ -338,11 +435,119 @@ def _ensure_session(session_store: SessionStore, session_id: str, user_id: str |
             raise
 
 
+def _ensure_session_with_title(
+    session_store: SessionStore,
+    session_id: str,
+    user_id: str | None,
+    message: str,
+    touch_activity: bool = True,
+) -> SessionRecord:
+    """Ensure the session exists, then title it from its first user message.
+
+    侧栏列表不再只显示 session_id:标题取首条用户消息的压缩截断,
+    且只写一次(set_title_if_absent)——后续消息/断线重连回放不会
+    覆盖;存量老会话在下次发消息时按同规则补标题。
+    """
+    _ensure_session(session_store, session_id, user_id)
+    title = derive_session_title(message)
+    if title is not None:
+        session_store.set_title_if_absent(session_id, title, user_id=user_id)
+    if touch_activity:
+        session_store.touch_session(session_id, user_id=user_id)
+    record = session_store.get_session(session_id, user_id=user_id)
+    if record is None:
+        raise RuntimeError("session disappeared after creation")
+    return record
+
+
+def _workspace_call_kwargs(
+    method: object,
+    session: SessionRecord,
+) -> dict[str, Any]:
+    """Pass workspace capability only to graph implementations that support it.
+
+    返回 dict[str, Any] 而非 dict[str, object]：调用方以 ** 解包传给
+    run/stream（参数类型为 str | None / Sequence[str]），object 值与
+    这些形参不兼容会被 mypy 拒绝；Any 是「动态透传」的正确口径
+    （值在运行时由本函数按参数名精选，类型安全由 SessionRecord 保证）。
+    """
+    if not callable(method):
+        return {}
+    parameters = inspect.signature(method).parameters
+    kwargs: dict[str, Any] = {}
+    if "workspace_root" in parameters:
+        kwargs["workspace_root"] = session.workspace_root
+    if "additional_workspace_roots" in parameters:
+        kwargs["additional_workspace_roots"] = session.additional_workspace_roots
+    # S5-C1 决策 2：会话绑定的知识空间经图入口写入 extra（未绑定 =
+    # "public"，单路 public 过滤检索）。按方法签名门控传递：测试替身
+    # 的 run/stream 未声明该参数时不传（零回归）。
+    # P1-2 显性化兜底：空串/空白与 None 同归 public，避免 `or` 的隐式
+    # 真值语义掩盖空串边界；与 tools.py `knowledge_scope.get() or "public"`
+    # 互为冗余防御但此处显式分支更可审计。
+    if "knowledge_namespace" in parameters:
+        raw_ns = session.knowledge_namespace
+        if isinstance(raw_ns, str):
+            stripped = raw_ns.strip()
+            kwargs["knowledge_namespace"] = stripped if stripped else "public"
+        else:
+            kwargs["knowledge_namespace"] = raw_ns if raw_ns else "public"
+    return kwargs
+
+
+def _run_graph_turn(
+    graph: CollaborativeAgentGraph,
+    message: str,
+    session_id: str,
+    user_id: str | None,
+    session: SessionRecord,
+) -> AgentState:
+    return graph.run(
+        message,
+        session_id,
+        user_id,
+        **_workspace_call_kwargs(graph.run, session),
+    )
+
+
+def _public_pending_tool_approval(
+    pending: object,
+) -> PendingToolApproval | None:
+    if not isinstance(pending, CorePendingToolApproval):
+        return None
+    return PendingToolApproval(
+        interrupt_id=pending.interrupt_id,
+        request=ToolApprovalRequest(
+            tool_call_id=pending.request.tool_call_id,
+            tool_name=pending.request.tool_name,
+            agent_role=AgentRole(pending.request.agent_role.value),
+            arguments=pending.request.arguments,
+        ),
+    )
+
+
 async def pending_handoff_for_session(
     graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
 ) -> PendingHandoff | None:
-    pending = await run_in_threadpool(graph.get_pending_handoff, session_id, user_id)
+    pending_method = getattr(graph, "get_pending_handoff", None)
+    if not callable(pending_method):
+        return None
+    pending = await run_in_threadpool(pending_method, session_id, user_id)
     return _public_pending_handoff(pending)
+
+
+async def pending_tool_approval_for_session(
+    graph: CollaborativeAgentGraph, session_id: str, user_id: str | None
+) -> PendingToolApproval | None:
+    pending_method = getattr(graph, "get_pending_tool_approval", None)
+    if not callable(pending_method):
+        return None
+    pending = await run_in_threadpool(
+        pending_method,
+        session_id,
+        user_id,
+    )
+    return _public_pending_tool_approval(pending)
 
 
 def session_busy_response(session_id: str, message: str) -> ChatResponse:
@@ -366,13 +571,23 @@ async def chat_response_for_state(
     previous_count = _previous_message_count(previous_state)
     return ChatResponse(
         session_id=session_id,
-        message=_final_assistant_message(state, previous_count),
+        run_id=state.get("run_id"),
+        message=_final_assistant_message(state, previous_count, user_id),
         references=_response_references(state, previous_count),
+        # P2-12：本轮批改结论（grading 通道每轮重置；历史轮经消息
+        # 元数据恢复，见 Message.grading）。
+        grading=_public_grading(state.get("grading")),
         task_plan=_public_task_plan(state.get("task_plan")),
         task_results=_public_task_results(state.get("task_results")),
+        workflow=_public_workflow(state.get("workflow")),
         events=_public_events(state.get("events", []), _previous_sequence(previous_state)),
         run_error=_public_run_error(state.get("run_error")),
         pending_handoff=await pending_handoff_for_session(graph, session_id, user_id),
+        pending_tool_approval=await pending_tool_approval_for_session(
+            graph,
+            session_id,
+            user_id,
+        ),
         current_agent=_public_agent(state.get("current_agent")),
     )
 
@@ -394,20 +609,54 @@ async def chat(
         )
 
     async with active_session_lock:
-        await run_in_threadpool(_ensure_session, session_store, payload.session_id, user_id)
+        session = await run_in_threadpool(
+            _ensure_session_with_title,
+            session_store,
+            payload.session_id,
+            user_id,
+            payload.message,
+        )
+        # P2-7：消费 attachments 契约字段（此前路由忽略）——附件提取
+        # 文本拼入本轮用户消息；无附件时与原消息逐字节一致（零回归）。
+        # 会话标题仍用原消息（简洁），附件材料只进模型上下文。
+        # 提取含磁盘 IO / PDF 全页解析 / OCR CPU 推理，必须走线程池
+        # （审查 C1：同步执行会阻塞事件循环，殃及全部并发请求），
+        # 与下方 _ensure_session_with_title / get_state 同一模式。
+        message_text = await run_in_threadpool(
+            compose_message_with_attachments,
+            payload.message,
+            payload.attachments,
+            user_id,
+            getattr(request.app.state, "ocr_provider", None),
+            getattr(request.app.state, "vision_provider", None),
+        )
         previous_state = await run_in_threadpool(
             graph.get_state, payload.session_id, user_id
         )
         try:
             state = await run_in_threadpool(
-                graph.run, payload.message, payload.session_id, user_id
+                _run_graph_turn,
+                graph,
+                message_text,
+                payload.session_id,
+                user_id,
+                session,
             )
         except RuntimeError as error:
             pending_handoff = await pending_handoff_for_session(
                 graph, payload.session_id, user_id
             )
-            if pending_handoff is not None or str(error).startswith(
-                PENDING_RESUME_ERROR_PREFIX
+            pending_tool_approval = await pending_tool_approval_for_session(
+                graph,
+                payload.session_id,
+                user_id,
+            )
+            if (
+                pending_handoff is not None
+                or pending_tool_approval is not None
+                or str(error).startswith(
+                    PENDING_RESUME_ERROR_PREFIX
+                )
             ):
                 return ChatResponse(
                     session_id=payload.session_id,
@@ -416,6 +665,7 @@ async def chat(
                         message="The session is waiting for a pending operation.",
                     ),
                     pending_handoff=pending_handoff,
+                    pending_tool_approval=pending_tool_approval,
                 )
             return ChatResponse(
                 session_id=payload.session_id,

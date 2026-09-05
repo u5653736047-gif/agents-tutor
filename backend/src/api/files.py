@@ -23,21 +23,25 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from langchain_core.messages import BaseMessage
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import FileResponse
 
 from api.schemas import (
     ApiErrorCode,
+    Attachment,
     ErrorDetail,
     ErrorResponse,
     FileUploadResponse,
 )
 from api.sessions import current_user_id
+from core.state import GeneratedFile, message_generated_files
 
 router = APIRouter(prefix="/files", tags=["files"])
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -62,6 +66,11 @@ _UPLOAD_CONTENT_TYPES: dict[str, str] = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".txt": "text/plain",
+    # T5-3：officecli 生成文件的下载类型（上传白名单仍不收这些扩展名——
+    # ALLOWED_UPLOAD_EXTENSIONS 在上传入口先行拦截，本表只影响下载响应）。
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 # 目录名 / URL 路径段的安全字符集:上传消毒与下载校验共用同一口径。
 _UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -105,6 +114,18 @@ def _is_safe_segment(value: str) -> bool:
     {root}/{user_key}/.. 解析到上一级目录,绕过用户隔离与根目录边界。
     """
     return value not in (".", "..") and _SAFE_SEGMENT_RE.fullmatch(value) is not None
+
+
+# T5-3：生成文件下载回执的确定性 file_id 命名空间。file_id 由
+# 「user_key + 授权路径 + 写入时刻 size/mtime_ns」派生——同一文件多轮
+# 修改各是各的回执（版本化）；重复 serve（实时响应与历史刷新）命中同一
+# ID，已落盘的拷贝不重复复制（幂等）。
+_GENERATED_FILE_ID_MATERIAL = "agents-tutor-generated-file"
+# 单条消息最多挂出的生成文件附件数（防异常清单撑爆响应）。
+_MAX_GENERATED_ATTACHMENTS = 4
+# 生成文件只允许这三类 Office 扩展名（与 core 侧 OFFICE_EXTENSIONS 同源
+# 口径；防御一层，防止脏元数据把任意后缀的文件引入下载目录）。
+_GENERATED_FILE_SUFFIXES = frozenset({".docx", ".xlsx", ".pptx"})
 
 
 def _uploads_root() -> Path:
@@ -249,3 +270,69 @@ async def get_uploaded_file(
             ApiErrorCode.INTERNAL_ERROR,
             "The request could not be completed.",
         )
+
+
+def attachments_for_generated_files(
+    user_id: str | None,
+    message: BaseMessage,
+) -> list[Attachment] | None:
+    """把 core 消息元数据中的生成文件清单注册为受控下载附件（T5-3）。
+
+    - 读取端宽容：无 generated_files 元数据 → None（与「无附件就不携带」
+      的契约一致，前端零渲染）；逐项注册失败（文件已被移走/占用等）跳过，
+      不让单个坏项击穿整条消息的映射；
+    - 注册是把工作区文件复制进上传目录（用户隔离不变，下载复用现有
+      GET /files/{file_id} 通道），复制在首次 serve 时惰性发生——实时
+      响应与历史刷新共用本函数，幂等。
+    """
+    entries = message_generated_files(message)
+    if not entries:
+        return None
+    user_key = _sanitize_user_key(user_id)
+    attachments: list[Attachment] = []
+    for entry in entries[:_MAX_GENERATED_ATTACHMENTS]:
+        attachment = _register_generated_file(user_key, entry)
+        if attachment is not None:
+            attachments.append(attachment)
+    return attachments or None
+
+
+def _register_generated_file(user_key: str, entry: GeneratedFile) -> Attachment | None:
+    """把单个生成文件复制进用户上传目录并返回附件回执；失败返回 None。
+
+    - file_id 确定性派生（版本化：同一文件多轮修改各是各的回执）；
+    - 只接受三类 Office 扩展名（防御脏元数据把任意文件引入下载目录）；
+    - 复制经临时文件 + os.replace 原子落盘，并发重复注册不会得到半个文件。
+    """
+    suffix = Path(entry.name).suffix.lower()
+    if suffix not in _GENERATED_FILE_SUFFIXES:
+        return None
+    source = Path(entry.path)
+    try:
+        if not source.is_file():
+            return None
+    except OSError:
+        return None
+    file_id = (
+        uuid5(
+            NAMESPACE_URL,
+            f"{_GENERATED_FILE_ID_MATERIAL}:{user_key}:{entry.path}:"
+            f"{entry.size}:{entry.mtime_ns}",
+        ).hex
+        + suffix
+    )
+    target = _uploads_root() / user_key / file_id
+    if not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+            shutil.copy2(source, staging)
+            os.replace(staging, target)
+        except OSError:
+            return None
+    return Attachment(
+        file_id=file_id,
+        name=entry.name,
+        content_type=_UPLOAD_CONTENT_TYPES[suffix],
+        size=entry.size,
+    )

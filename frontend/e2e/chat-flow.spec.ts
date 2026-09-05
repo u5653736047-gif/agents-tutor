@@ -27,7 +27,6 @@ import {
   installMocks,
   mockAnswerFor,
   mockSession,
-  type MockPendingHandoff,
 } from "./mocks";
 
 // 默认 mock 模式安装;@real 用例(REAL_E2E=1)不装 mock,走真实后端
@@ -37,6 +36,18 @@ test.beforeEach(async ({ page }) => {
   }
 });
 
+// 现行 UI 的建会话链路:侧栏「新建会话」→ 工作空间对话框填路径提交
+// (validateWorkspace 由 mocks.ts 伪造)→ createSession。两个老用例写于
+// 对话框引入之前,此处补齐同步(测试破坏点强制同步规范)。
+async function createSessionViaDialog(page: import("@playwright/test").Page) {
+  await page.getByRole("button", { name: "新建会话" }).click();
+  const dialog = page.locator('[data-slot="workspace-dialog"]');
+  await expect(dialog).toBeVisible();
+  await page.getByLabel("工作空间绝对路径").fill("D:\\CODE\\Agents");
+  await dialog.getByRole("button", { name: "使用此文件夹" }).click();
+  await expect(dialog).toHaveCount(0);
+}
+
 test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染", async ({ page }) => {
   const question = "E2E 什么是注意力机制?";
   const answer = mockAnswerFor(question);
@@ -45,8 +56,8 @@ test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染
   // 空态:侧栏无会话
   await expect(page.getByText("暂无会话")).toBeVisible();
 
-  // 新建会话(侧栏按钮,aria-label="新建会话")
-  await page.getByRole("button", { name: "新建会话" }).click();
+  // 新建会话(侧栏按钮 → 工作空间对话框)
+  await createSessionViaDialog(page);
   const input = page.getByLabel("输入消息");
   await expect(input).toBeVisible();
 
@@ -63,6 +74,24 @@ test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染
   await expect(page.locator('[data-slot="streaming-message"]')).toBeVisible({
     timeout: 10_000,
   });
+  // 当前轮的思考摘要、工具调用与子代理轨迹必须在回答旁实时可见。
+  const processPanel = page.locator('[data-slot="collaboration-panel"]');
+  await expect(processPanel).toBeVisible();
+  await expect(processPanel).toContainText("执行过程");
+  await expect(processPanel).toContainText("检索课程知识库");
+  const reasoningBlock = processPanel.locator('[data-slot="reasoning-block"]');
+  await expect(reasoningBlock).toBeVisible();
+  await reasoningBlock.locator("summary").click();
+  await expect(reasoningBlock).toContainText("先识别问题目标");
+  const toolRows = processPanel.locator('[data-slot="tool-row"]');
+  await toolRows.first().click();
+  await expect(processPanel.locator('[data-slot="tool-details"]').first()).toContainText(
+    question,
+  );
+  await toolRows.last().click();
+  await expect(processPanel.locator('[data-slot="tool-details"]').last()).toContainText(
+    '"hits":2',
+  );
 
   // message_end 后完整回答渲染(气泡并入消息列表,权威历史覆盖)
   await expect(page.locator('[data-message-role="assistant"]').last()).toContainText(
@@ -73,44 +102,37 @@ test("创建会话并提问:流式气泡出现,message_end 后完整回答渲染
   await expect(page.locator('[data-message-role="user"]')).toContainText(question);
 });
 
-test("审批卡片出现并确认后消失(同步降级路径)", async ({ page }) => {
-  // 契约事实:StreamEvent 无 pending_handoff 字段,chat-store 流式
-  // dispatch 不消费它——审批卡片数据只能来自同步 ChatResponse
-  // (applyChatResponse)。因此本用例让流式通道恒 500,触发
-  // streamChatWithRetry 重试耗尽后的同步降级(sendMessage),
-  // 由 mock 的 POST /chat 响应携带 pending_handoff 呈现审批卡片:
-  // 这是不改生产代码前提下唯一能驱动卡片出现的真实 UI 路径,
-  // 也顺带覆盖 D1-T3 降级链路。
-  const pendingHandoff: MockPendingHandoff = {
-    interrupt_id: "mock-interrupt-1",
-    request: {
-      plan_step_sequence: 1,
-      target_agent: "teaching_assistant",
-      task_content: "E2E 审批任务:讲解反向传播",
-    },
-  };
-  await installMocks(page, { failStreaming: true, pendingHandoff });
+test("流式重试耗尽后不通过同步接口重复执行任务", async ({ page }) => {
+  await installMocks(page, { failStreaming: true });
+  let syncChatRequests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/chat") {
+      syncChatRequests += 1;
+    }
+  });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "新建会话" }).click();
+  await createSessionViaDialog(page);
   const input = page.getByLabel("输入消息");
   await expect(input).toBeVisible();
-  await input.fill("请帮我规划一条学习路径");
+  await input.fill("这条任务只能执行一次");
   await input.press("Enter");
 
-  // 3 次流式重试退避(1s+2s+4s)后降级同步 → 卡片出现(放宽超时)
-  const handoffCard = page.locator('[data-slot="handoff-card"]');
-  await expect(handoffCard).toBeVisible({ timeout: 25_000 });
-  await expect(handoffCard).toContainText("等待审批");
-  await expect(handoffCard).toContainText("E2E 审批任务:讲解反向传播");
-
-  // 点「确认」→ POST /sessions/{id}/handoff → 卡片消失
-  await page.locator('[data-slot="handoff-confirm"]').click();
-  await expect(handoffCard).toHaveCount(0, { timeout: 10_000 });
+  // 初次 + 3 次流式重试约 7s；耗尽后显示服务错误并保留用户消息，
+  // 绝不能自动 POST /chat 原样重发。mock 返回结构化 internal_error，
+  // 因此错误由侧栏统一呈现，而不是网络错误专用块。
+  await expect(page.locator('[data-slot="sidebar-request-error"]')).toBeVisible({
+    timeout: 20_000,
+  });
+  await expect(page.locator('[data-message-role="user"]')).toContainText(
+    "这条任务只能执行一次",
+  );
+  expect(syncChatRequests).toBe(0);
 });
 
-test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
+test("切换并刷新后历史回溯:消息与协作过程仍可渲染", async ({ page }) => {
   const session = mockSession("mock-session-history");
+  const otherSession = mockSession("mock-session-other");
   const messages = [
     {
       role: "user" as const,
@@ -124,14 +146,45 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
       created_at: "2026-01-01T10:00:01.000Z",
     },
   ];
+  const processEvents = [
+    {
+      event_type: "reasoning",
+      sequence: 1,
+      session_id: session.session_id,
+      agent: "supervisor",
+      content: "先检查梯度经过每一层时的连乘效应。",
+      is_delta: false,
+      message_id: "history-reasoning-1",
+    },
+    {
+      event_type: "tool_call",
+      sequence: 2,
+      session_id: session.session_id,
+      agent: "supervisor",
+      tool_name: "search_knowledge",
+      tool_call_id: "history-tool-1",
+      input_summary: '{"query":"梯度消失"}',
+    },
+    {
+      event_type: "tool_result",
+      sequence: 3,
+      session_id: session.session_id,
+      agent: "supervisor",
+      tool_name: "search_knowledge",
+      tool_call_id: "history-tool-1",
+      output_summary: '{"hits":2}',
+      success: true,
+    },
+  ];
   await installMocks(page, {
-    seedSessions: [session],
+    seedSessions: [session, otherSession],
     seedMessages: { [session.session_id]: messages },
+    seedProcess: { [session.session_id]: processEvents },
   });
 
   await page.goto("/");
   // 会话出现在侧栏,点选后历史消息渲染
-  const sessionButton = page.getByRole("button", { name: session.session_id });
+  const sessionButton = page.getByTitle(session.session_id);
   await expect(sessionButton).toBeVisible();
   await sessionButton.click();
   await expect(page.locator('[data-message-role="user"]')).toContainText(
@@ -140,12 +193,24 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
   await expect(page.locator('[data-message-role="assistant"]')).toContainText(
     "历史回答:梯度消失",
   );
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+  await expect(page.locator('[data-slot="tool-details"]').first()).toContainText(
+    "梯度消失",
+  );
 
-  // 刷新页面(内存状态清空)→ 重新从 mock 列表拉取 → 再点会话 → 消息仍在
+  // 切到另一会话再切回，必须从后端快照恢复协作过程。
+  await page.getByTitle(otherSession.session_id).click();
+  await expect(page.locator('[data-slot="reasoning-block"]')).toHaveCount(0);
+  await page.getByTitle(session.session_id).click();
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+
+  // 刷新页面(内存状态清空)→ 重新从 mock 拉取 → 消息与协作过程仍在。
   await page.reload();
-  const sessionButtonAfterReload = page.getByRole("button", {
-    name: session.session_id,
-  });
+  const sessionButtonAfterReload = page.getByTitle(session.session_id);
   await expect(sessionButtonAfterReload).toBeVisible();
   await sessionButtonAfterReload.click();
   await expect(page.locator('[data-message-role="user"]')).toContainText(
@@ -153,6 +218,12 @@ test("刷新后历史回溯:历史消息仍可渲染", async ({ page }) => {
   );
   await expect(page.locator('[data-message-role="assistant"]')).toContainText(
     "历史回答:梯度消失",
+  );
+  await expect(page.locator('[data-slot="reasoning-block"]')).toContainText(
+    "先检查梯度经过每一层",
+  );
+  await expect(page.locator('[data-slot="tool-details"]').last()).toContainText(
+    '"hits":2',
   );
 });
 
@@ -162,17 +233,17 @@ test("归档会话:从默认列表消失,归档视图可见", async ({ page }) =
   await installMocks(page, { seedSessions: [s1, s2] });
 
   await page.goto("/");
-  await expect(page.getByRole("button", { name: s1.session_id })).toBeVisible();
-  await expect(page.getByRole("button", { name: s2.session_id })).toBeVisible();
+  await expect(page.getByTitle(s1.session_id)).toBeVisible();
+  await expect(page.getByTitle(s2.session_id)).toBeVisible();
 
   // 归档 s1(归档按钮 aria-label="归档会话 <id>")
   await page.getByRole("button", { name: `归档会话 ${s1.session_id}` }).click();
-  await expect(page.getByRole("button", { name: s1.session_id })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: s2.session_id })).toBeVisible();
+  await expect(page.getByTitle(s1.session_id)).toHaveCount(0);
+  await expect(page.getByTitle(s2.session_id)).toBeVisible();
 
   // 归档视图:切换后 mock 列表(include_archived=true)带回归档会话
   await page.locator('[data-slot="archive-toggle"]').click();
-  await expect(page.getByRole("button", { name: s1.session_id })).toBeVisible();
+  await expect(page.getByTitle(s1.session_id)).toBeVisible();
 });
 
 // ── 真实 DeepSeek 冒烟(默认跳过,主线程手动执行) ─────────────────
@@ -186,15 +257,29 @@ test.describe("真实 DeepSeek 冒烟(手动)", () => {
   );
 
   test("@real 真实提问冒烟", async ({ page }) => {
+    test.setTimeout(150_000);
     await page.goto("/");
     await page.getByRole("button", { name: "新建会话" }).click();
     const input = page.getByLabel("输入消息");
     await expect(input).toBeVisible();
     await input.fill("用一句话介绍反向传播");
+    const processRefreshed = page.waitForResponse(
+      (response) =>
+        response.request().method() === "GET" &&
+        /\/sessions\/[^/]+\/process$/.test(new URL(response.url()).pathname),
+      { timeout: 120_000 },
+    );
     await input.press("Enter");
+    // 运行事件应先让执行过程面板出现，证明真实后端而非仅 mock 能把
+    // 思考摘要、工具/子代理生命周期推到页面。
+    await expect(page.locator('[data-slot="collaboration-panel"]')).toBeVisible({
+      timeout: 30_000,
+    });
     // 真实模型回答耗时不定,放宽超时;助手回答出现即冒烟通过
     await expect(
       page.locator('[data-message-role="assistant"]').last(),
     ).toBeVisible({ timeout: 120_000 });
+    expect((await processRefreshed).status()).toBe(200);
+    await expect(page.locator('[data-slot="sidebar-request-error"]')).toHaveCount(0);
   });
 });

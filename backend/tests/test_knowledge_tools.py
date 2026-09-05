@@ -13,7 +13,7 @@ from core.events import ErrorCode
 from core.graph_builder import CollaborativeAgentGraph
 from core.knowledge.index import InMemoryKnowledgeIndex
 from core.knowledge.loaders import load_text
-from core.knowledge.models import KnowledgeDocument
+from core.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from core.knowledge.service import KnowledgeService
 from core.knowledge.tools import create_search_knowledge_tool
 from core.state import AgentRole
@@ -175,3 +175,69 @@ def test_graph_allows_workers_but_rejects_supervisor_search() -> None:
         AgentRole.SUPERVISOR,
     )
     assert execution.result.error_code is ErrorCode.TOOL_UNAUTHORIZED
+
+
+# ── P0-3 检索过滤参数（六大功能计划；pi 审查 🔴2：过滤必须在
+# 两个检索分支同步透传，adaptive 路径组合用例见
+# test_search_knowledge_adaptive.py）───────────────────────
+
+
+def _chunk_with_metadata(
+    chunk_id: str, content: str, *, difficulty: str
+) -> KnowledgeChunk:
+    return KnowledgeChunk(
+        chunk_id=chunk_id,
+        document_id="doc-ml",
+        content=content,
+        source="ml.txt",
+        page=None,
+        start=0,
+        end=len(content),
+        metadata={"difficulty": difficulty},
+    )
+
+
+def _service_with_difficulty_metadata() -> KnowledgeService:
+    index = InMemoryKnowledgeIndex()
+    index.upsert(
+        [
+            _chunk_with_metadata(
+                "c-basic", "支持向量机的基础概念与直观解释", difficulty="basic"
+            ),
+            _chunk_with_metadata(
+                "c-adv", "支持向量机的核方法与对偶问题推导", difficulty="advanced"
+            ),
+        ]
+    )
+    return KnowledgeService(index)
+
+
+def test_search_tool_difficulty_filter_restricts_hits() -> None:
+    search_tool = create_search_knowledge_tool(_service_with_difficulty_metadata())
+
+    result = search_tool.invoke({"query": "支持向量机", "difficulty": "basic"})
+
+    assert result["found"] is True
+    assert [hit["citation"]["chunk_id"] for hit in result["hits"]] == ["c-basic"]
+
+
+def test_search_tool_without_filters_returns_all_hits() -> None:
+    search_tool = create_search_knowledge_tool(_service_with_difficulty_metadata())
+
+    result = search_tool.invoke({"query": "支持向量机", "top_k": 10})
+
+    assert {hit["citation"]["chunk_id"] for hit in result["hits"]} == {
+        "c-basic",
+        "c-adv",
+    }
+
+
+def test_search_tool_blank_filter_treated_as_absent() -> None:
+    search_tool = create_search_knowledge_tool(_service_with_difficulty_metadata())
+
+    # 空白过滤值归一为 None（schema 归一化），不产生零命中误会
+    result = search_tool.invoke(
+        {"query": "支持向量机", "top_k": 10, "difficulty": "   "}
+    )
+
+    assert len(result["hits"]) == 2

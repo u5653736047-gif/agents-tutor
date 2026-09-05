@@ -1,7 +1,10 @@
 # 挑战杯项目任务分解清单
+
+> ⚠️ 已冻结 2026-08-26 — 本文件为历史范围归档，不再勾选。范围权威已迁移至 docs/SIX_FEATURES_COMPETITION_MAPPING.md（功能/赛题口径）+ docs/TASKS_M3_CLOSE.md（D1-D7执行出口）；阶段三细节以 docs/TASKS_STAGE_3_DETAILS.md 为准。后续会话禁止据此判断"47任务仅3完成/阶段四未开始"。本文档冻结于 2026-08-02，M3 后未同步；完成度请看 SIX_FEATURES 而非本文件 3/47 统计。
+
 ## 多智能体助教助学系统
 
-> 更新时间：2026-08-02
+> 更新时间：2026-08-02（已冻结，不再更新）
 > 技术栈：Python (LangGraph) + TypeScript (Next.js)
 
 ---
@@ -48,13 +51,13 @@
 - 只统计 `1.1.1`、`2.3.2` 这类三级编号任务；更细子项用于解释完成边界，
   不重复计入总数。
 
-| 状态 | 数量 |
-|------|-----:|
-| 已完成 | 3 |
-| 部分完成 | 14 |
-| 尚未开始 | 30 |
-| **未完整完成（部分完成 + 尚未开始）** | **44** |
-| **三级编号任务总数** | **47** |
+| 状态 | 数量 | 备注 |
+|------|-----:|------|
+| ~~已完成~~ | ~~3~~ | [已冻结，实盘见 M3_CLOSE 出口检查 2026-08-26] |
+| ~~部分完成~~ | ~~14~~ | [已冻结，实盘见 M3_CLOSE 出口检查 2026-08-26] |
+| ~~尚未开始~~ | ~~30~~ | [已冻结，实盘见 M3_CLOSE 出口检查 2026-08-26] |
+| ~~**未完整完成（部分完成 + 尚未开始）**~~ | ~~**44**~~ | [已冻结，实盘见 M3_CLOSE 出口检查 2026-08-26] |
+| ~~**三级编号任务总数**~~ | ~~**47**~~ | [已冻结，实盘见 M3_CLOSE 出口检查 2026-08-26] |
 
 ### 当前冲刺：推送前安全加固与关键注释
 
@@ -121,7 +124,7 @@
   - [x] 工具异常会转换为结构化错误和 ReAct Observation。
   - [x] 工具结果、耗时和安全事件可供评价 Agent 审计。
   - [x] 工具执行支持全局默认与按工具覆盖，超时结果可安全审计（S1-T1）。
-- [ ] **（部分完成）** 1.2.3 领域专用工具
+- [ ] **（部分完成）** 1.2.3 领域专用工具 → `backend/src/core/knowledge/service.py:1` / `backend/src/core/knowledge/hybrid.py:75` / `backend/src/core/knowledge/retrieval.py:adaptive_search`（代码锚点，范围已冻结见 SIX_FEATURES）
   - [x] 已封装 `search_knowledge` 知识检索工具。
   - [ ] Python 代码执行沙箱尚未实现。
   - [ ] LaTeX 公式渲染工具尚未实现。
@@ -185,7 +188,7 @@
   - [x] 已实现确定性重叠字符分块及来源、页码、自定义 metadata 保留。
   - [ ] 按章节、段落、公式和代码块进行语义分块尚未实现。
   - [ ] 难度级别、关联概念等领域元数据尚未定义。
-- [ ] **（部分完成）** 2.2.3 向量化与索引
+- [ ] **（部分完成）** 2.2.3 向量化与索引 → `backend/src/core/knowledge/hybrid.py:75` / `backend/src/core/knowledge/service.py:1`（代码锚点，范围已冻结见 SIX_FEATURES + EMBEDDING_SELECTION 5.2）
   - [x] 已定义可替换的 `KnowledgeIndex` 协议和纯内存中英文词法索引。
   - [ ] Embedding 模型尚未选型和接入。
   - [ ] Chroma / Milvus / pgvector 尚未接入。
@@ -199,7 +202,7 @@
   - [x] 已实现文档写入、整文档替换、删除、Top-K 词法检索和 Agent 工具封装。
   - [x] 零命中返回明确空结果，不生成虚假 Citation。
   - [ ] Query 改写、多路联合检索和 Cross-Encoder 重排序尚未实现。
-- [ ] 2.3.2 自适应 RAG 策略
+- [ ] 2.3.2 自适应 RAG 策略 → `backend/src/core/knowledge/retrieval.py:adaptive_search` / `backend/src/core/knowledge/policy.py`（代码锚点，范围已冻结见 SIX_FEATURES）
   - 判断是否需要检索（简单问题直接回答）
   - 检索结果质量评估（相关性打分，低于阈值则不注入）
   - 多轮检索：首次检索不足时自动 refine query

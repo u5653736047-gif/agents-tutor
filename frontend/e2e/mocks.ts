@@ -12,6 +12,7 @@
 //   GET  /sessions[?include_archived] → Session[](listSessions)
 //   GET  /sessions/{id}/messages      → Message[] 数组(直接返回数组,
 //                                       没有外层对象——以 api-client 为准)
+//   GET  /sessions/{id}/process       → SessionProcess(checkpoint 回放快照)
 //   POST /chat                        → ChatResponse(sendChat)
 //   POST /chat/stream?from_sequence=N → SSE 帧序列(stream-client 逐行解析)
 //   POST /sessions/{id}/handoff       → ChatResponse(decideHandoff)
@@ -47,6 +48,8 @@ export type MockSession = {
   archived: boolean;
   created_at: string;
   session_id: string;
+  title?: string | null;
+  updated_at: string;
   user_id: string | null;
 };
 
@@ -71,26 +74,45 @@ export type MockPendingHandoff = {
 // 重置,配合 playwright.config 的 fullyParallel: false 保证用例隔离。
 let mockSessions: MockSession[] = [];
 const mockMessagesBySession = new Map<string, MockMessage[]>();
+const mockProcessBySession = new Map<string, Record<string, unknown>[]>();
 let mockPendingHandoff: MockPendingHandoff | null = null;
+// assistant-ui 接入(T16):工具审批门控(approval_required 事件流用例)
+let mockPendingToolApproval: Record<string, unknown> | null = null;
+// 门控挂起时暂存最终答案:审批恢复流据此补发 message_end,历史不重复追加
+const mockGatedAnswers = new Map<string, { answer: string; assistantAt: string }>();
+// T16:message_end 携带引用(引用/反馈用例)
+let mockStreamCitations: Record<string, unknown>[] | null = null;
+// T16:悬挂流(停止生成用例)——响应永不交付,请求挂起直到调用方 abort
+let hangStreaming = false;
 let failStreaming = false;
 let sessionCounter = 0;
 
 export type InstallMocksOptions = {
-  // 用例 2:流式通道恒 500 → streamChatWithRetry 重试耗尽 → store 降级
-  // 同步 /chat,再由同步响应携带 pending_handoff 呈现审批卡片
+  // 流式通道恒 500，用于验证重试耗尽后不会自动同步重发。
   failStreaming?: boolean;
-  // 同步 /chat 与 GET /handoff 返回的待审批(用例 2 使用)
+  // 同步 /chat 与 GET /handoff 返回的待审批(独立接口用例使用)
   pendingHandoff?: MockPendingHandoff | null;
+  // 流式通道在 tool_call 后发 approval_required 并挂起(工具审批用例);
+  // 决策经 /sessions/{id}/tool-approval/stream 恢复(见下方路由)
+  pendingToolApproval?: Record<string, unknown> | null;
+  // message_end 携带的引用列表(引用/反馈用例,契约 Citation 形状)
+  streamCitations?: Record<string, unknown>[] | null;
+  // 悬挂流:响应永不交付(停止生成用例——isStreaming 持续为真直到 abort)
+  hangStreaming?: boolean;
   // 预置会话与消息(用例 3 历史回溯 / 用例 4 归档)
   seedSessions?: MockSession[];
   seedMessages?: Record<string, MockMessage[]>;
+  seedProcess?: Record<string, Record<string, unknown>[]>;
 };
 
-export function mockSession(sessionId: string): MockSession {
+export function mockSession(sessionId: string, title: string | null = null): MockSession {
+  const now = new Date().toISOString();
   return {
     archived: false,
-    created_at: new Date().toISOString(),
+    created_at: now,
     session_id: sessionId,
+    title,
+    updated_at: now,
     user_id: "demo-user",
   };
 }
@@ -122,6 +144,10 @@ function appendHistory(
     created_at: assistantAt,
   });
   mockMessagesBySession.set(sessionId, history);
+  const session = mockSessions.find((item) => item.session_id === sessionId);
+  if (session) {
+    session.updated_at = assistantAt;
+  }
   return assistantAt;
 }
 
@@ -153,7 +179,15 @@ export async function installMocks(
   for (const [sessionId, messages] of Object.entries(options.seedMessages ?? {})) {
     mockMessagesBySession.set(sessionId, [...messages]);
   }
+  mockProcessBySession.clear();
+  for (const [sessionId, events] of Object.entries(options.seedProcess ?? {})) {
+    mockProcessBySession.set(sessionId, [...events]);
+  }
   mockPendingHandoff = options.pendingHandoff ?? null;
+  mockPendingToolApproval = options.pendingToolApproval ?? null;
+  mockGatedAnswers.clear();
+  mockStreamCitations = options.streamCitations ?? null;
+  hangStreaming = options.hangStreaming ?? false;
   failStreaming = options.failStreaming ?? false;
   // review nit:会话计数一并重置,避免跨用例 id 递增(不影响正确性,
   // 仅让「mock-session-1」在用例间稳定可预期)。
@@ -186,8 +220,32 @@ export async function installMocks(
     }),
   );
 
+  // ── 工作空间(T16 补登记):POST /workspaces/validate 与
+  //    GET /workspaces/directories——新建会话必经工作空间对话框
+  //    (D4-Tx 引入,早于本套件),按 WorkspacePath/DirectoryListing 契约伪造
+  await page.route("**/workspaces/validate", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      path?: string;
+    };
+    const requested = body.path ?? "D:\\CODE\\Agents";
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ name: "Agents", path: requested }),
+    });
+  });
+  await page.route("**/workspaces/directories", async (route) => {
+    const url = new URL(route.request().url());
+    const current = url.searchParams.get("path") ?? "D:\\CODE\\Agents";
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ directories: [], parent: null, path: current }),
+    });
+  });
+
   // ── POST /chat/stream?from_sequence=N(SSE) ──
-  await page.route("**/chat/stream", async (route) => {
+  await page.route(/\/chat\/stream(?:\?.*)?$/, async (route) => {
     const fromSequence =
       new URL(route.request().url()).searchParams.get("from_sequence") ?? "0";
     const body = JSON.parse(route.request().postData() ?? "{}") as {
@@ -197,9 +255,15 @@ export async function installMocks(
     const sessionId = body.session_id ?? "mock-session";
     const question = body.message ?? "";
 
+    // T16:悬挂流——永不 fulfill,请求挂起(store 的 isStreaming 持续为真,
+    // 直到调用方 abort;stream-client 的 abort 静默返回语义覆盖收尾)
+    if (hangStreaming) {
+      return;
+    }
+
     if (failStreaming) {
       // 用例 2:恒 500(ErrorResponse 形状,stream-client readErrorDetail
-      // 按 detail.error_code / detail.message 解析)→ 重试耗尽 → 降级同步
+      // 按 detail.error_code / detail.message 解析)→ 重试耗尽 → 显示错误
       await route.fulfill({
         status: 500,
         headers: jsonHeaders(),
@@ -215,7 +279,7 @@ export async function installMocks(
       await route.fulfill({
         status: 200,
         headers: { "content-type": "text/event-stream" },
-        body: sseFrame({ event_type: "done", sequence: 5, session_id: sessionId }),
+        body: sseFrame({ event_type: "done", sequence: 6, session_id: sessionId }),
       });
       return;
     }
@@ -227,39 +291,76 @@ export async function installMocks(
     // 出现」,同时顺带覆盖 D1-T3 断线重连续传路径。
     const answer = mockAnswerFor(question);
     const assistantAt = appendHistory(sessionId, question, answer);
-    const frames = [
-      // thinking:content 只放占位文本(Agent 名),与契约安全红线一致
-      sseFrame({
+    const processEvents = [
+      {
         event_type: "thinking",
         sequence: 1,
         session_id: sessionId,
         agent: "supervisor",
-        content: "supervisor",
-      }),
-      // tool_call:摘要事件,不含工具参数
-      sseFrame({
-        event_type: "tool_call",
+        content: "正在分析问题并规划协作",
+      },
+      {
+        event_type: "reasoning",
         sequence: 2,
         session_id: sessionId,
         agent: "supervisor",
-        tool_name: "search_knowledge",
-        success: null,
-      }),
-      // tool_result:摘要事件 + 耗时
-      sseFrame({
-        event_type: "tool_result",
+        content: "先识别问题目标，再选择合适的知识检索路径。",
+        is_delta: false,
+        message_id: "mock-reasoning-1",
+      },
+      {
+        event_type: "tool_call",
         sequence: 3,
         session_id: sessionId,
         agent: "supervisor",
         tool_name: "search_knowledge",
+        tool_call_id: "mock-tool-1",
+        input_summary: JSON.stringify({ query: question }),
+        success: null,
+      },
+      {
+        event_type: "tool_result",
+        sequence: 4,
+        session_id: sessionId,
+        agent: "supervisor",
+        tool_name: "search_knowledge",
+        tool_call_id: "mock-tool-1",
+        output_summary: JSON.stringify({ found: true, hits: 2 }),
         success: true,
         duration_ms: 12,
-      }),
+      },
+    ];
+    mockProcessBySession.set(sessionId, processEvents);
+    // T16:工具审批用例——tool_call 之后发 approval_required 即收尾
+    // (不发 message_end/done,模拟门控挂起;恢复走 tool-approval/stream)。
+    // 历史已在上方 appendHistory 写入最终问答;这里暂存答案供恢复流
+    // 补发 message_end(与历史同一条,不重复追加)。
+    if (mockPendingToolApproval) {
+      mockGatedAnswers.set(sessionId, { answer, assistantAt });
+      const frames = [
+        ...processEvents.map((event) => sseFrame(event)),
+        sseFrame({
+          event_type: "approval_required",
+          sequence: 5,
+          session_id: sessionId,
+          agent: "supervisor",
+          pending_tool_approval: mockPendingToolApproval,
+        }),
+      ];
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        body: frames.join(""),
+      });
+      return;
+    }
+    const frames = [
+      ...processEvents.map((event) => sseFrame(event)),
       // message_end:content 为最终消息全文,message 与 getSessionMessages
       // 返回的历史消息同构(chat-store 优先取 event.message)
       sseFrame({
         event_type: "message_end",
-        sequence: 4,
+        sequence: 5,
         session_id: sessionId,
         agent: "supervisor",
         content: answer,
@@ -269,7 +370,7 @@ export async function installMocks(
           agent: "supervisor",
           created_at: assistantAt,
         },
-        citations: null,
+        citations: mockStreamCitations,
       }),
     ];
     await route.fulfill({
@@ -279,7 +380,62 @@ export async function installMocks(
     });
   });
 
-  // ── POST /chat(同步,降级路径与 API 直测使用) ──
+  // ── POST /feedback(T16 引用/反馈用例)——契约 FeedbackResponse ──
+  await page.route("**/feedback", async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({ received: true }),
+    });
+  });
+
+  // ── POST /sessions/{id}/tool-approval/stream(T16 工具审批恢复通道) ──
+  // 决策(confirm/reject)后后端恢复执行:补发门控时暂存的最终答案
+  // message_end + done 收尾(不重复执行整轮,与 D1-T3 回放语义一致)
+  await page.route("**/sessions/*/tool-approval/stream", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    const gated = mockGatedAnswers.get(sessionId) ?? {
+      answer: mockAnswerFor("审批后恢复"),
+      assistantAt: iso(),
+    };
+    mockPendingToolApproval = null;
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        sseFrame({
+          event_type: "message_end",
+          sequence: 6,
+          session_id: sessionId,
+          agent: "supervisor",
+          content: gated.answer,
+          message: {
+            role: "assistant",
+            content: gated.answer,
+            agent: "supervisor",
+            created_at: gated.assistantAt,
+          },
+          citations: null,
+        }),
+        sseFrame({ event_type: "done", sequence: 7, session_id: sessionId }),
+      ].join(""),
+    });
+  });
+
+  // ── GET /sessions/{id}/tool-approval(决策后兜底刷新) ──
+  await page.route("**/sessions/*/tool-approval", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        session_id: sessionId,
+        pending_tool_approval: mockPendingToolApproval,
+      }),
+    });
+  });
+
+  // ── POST /chat(同步 API 的独立直测使用) ──
   await page.route("**/chat", async (route) => {
     const body = JSON.parse(route.request().postData() ?? "{}") as {
       message?: string;
@@ -327,6 +483,21 @@ export async function installMocks(
       status: 200,
       headers: jsonHeaders(),
       body: JSON.stringify(mockMessagesBySession.get(sessionId) ?? []),
+    });
+  });
+
+  // ── GET /sessions/{id}/process → SessionProcess(checkpoint 快照) ──
+  await page.route("**/sessions/*/process", async (route) => {
+    const sessionId = sessionIdFromPath(route);
+    await route.fulfill({
+      status: 200,
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        current_agent: "supervisor",
+        events: mockProcessBySession.get(sessionId) ?? [],
+        task_plan: null,
+        task_results: null,
+      }),
     });
   });
 
@@ -382,6 +553,8 @@ export async function installMocks(
           archived: true,
           created_at: new Date().toISOString(),
           session_id: sessionId,
+          title: null,
+          updated_at: new Date().toISOString(),
           user_id: "demo-user",
         },
       ),
@@ -389,7 +562,7 @@ export async function installMocks(
   });
 
   // ── /sessions(GET 列表 + POST 创建) ──
-  await page.route("**/sessions", async (route) => {
+  await page.route(/\/sessions(?:\?.*)?$/, async (route) => {
     if (route.request().method() === "POST") {
       sessionCounter += 1;
       const session = mockSession(`mock-session-${sessionCounter}`);

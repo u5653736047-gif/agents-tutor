@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -15,10 +17,13 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
+import core.nodes.react_agent as react_agent_module
 from core.events import ErrorCode, EventType, RunError, RunEvent
+from core.filesystem import WorkspaceFileSystem
 from core.nodes.react_agent import ReActAgentNode
 from core.state import AgentRole, create_initial_state
 from core.tools.executor import ToolExecutor
+from core.tools.file_tools import create_read_only_file_tools
 
 MODEL_ERROR_SECRET = "secret=/srv/private/model-token"
 UNKNOWN_TOOL_NAME = "unknown_tool"
@@ -47,6 +52,12 @@ class FailingModel:
 def double(value: int) -> int:
     """返回输入数字的两倍。"""
     return value * 2
+
+
+@tool
+def echo_with_secret(query: str, api_key: str) -> dict[str, str]:
+    """返回查询与凭据，用来验证事件展示层会脱敏。"""
+    return {"query": query, "api_key": api_key, "status": "ok"}
 
 
 def tool_call(name: str, call_id: str = "call-1") -> dict[str, object]:
@@ -210,6 +221,71 @@ def test_react_agent_returns_direct_answer_without_tool() -> None:
     ]
     assert {event.session_id for event in result.updates["events"]} == {None}
     assert result.updates["events"][-1].success is True
+
+
+def test_react_agent_publishes_events_while_the_iteration_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent/工具事件走 live writer，不等节点结束才批量可见。"""
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        react_agent_module,
+        "get_stream_writer",
+        lambda: published.append,
+        raising=False,
+    )
+
+    @tool
+    def observed_tool() -> str:
+        """检查工具真正执行前，tool_started 已经发布。"""
+        event_types = [item["event"]["event_type"] for item in published]  # type: ignore[index]
+        assert event_types == ["agent_started", "tool_started"]
+        return "observation"
+
+    class InspectingModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+            self.calls += 1
+            event_types = [item["event"]["event_type"] for item in published]  # type: ignore[index]
+            if self.calls == 1:
+                assert event_types == ["agent_started"]
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "observed_tool",
+                            "args": {},
+                            "id": "observed-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            assert event_types == [
+                "agent_started",
+                "tool_started",
+                "tool_completed",
+            ]
+            return AIMessage(content="done")
+
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=InspectingModel(),
+        tool_executor=ToolExecutor([observed_tool]),
+    )
+
+    result = agent.run(create_initial_state(session_id="live-events"))
+
+    assert result.error is None
+    assert [item["kind"] for item in published] == ["run_event"] * 4
+    assert [item["event"]["event_type"] for item in published] == [  # type: ignore[index]
+        "agent_started",
+        "tool_started",
+        "tool_completed",
+        "agent_completed",
+    ]
     assert result.updates["events"][-1].duration_ms is not None
 
 
@@ -424,8 +500,16 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "event_type",
         "sequence",
         "session_id",
+        "run_id",
         "agent",
         "tool_name",
+        "tool_call_id",
+        "parent_tool_call_id",
+        "input_summary",
+        "output_summary",
+            "content",
+            "output_stream",
+            "message_id",
         "success",
         "duration_ms",
         "error_code",
@@ -436,6 +520,11 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论摘要，
         # 默认 None 向后兼容（旧事件与未评价轮次不携带）
         "evaluation_verdict",
+        # 六大功能 P2-8：GRADING_COMPLETED 事件的数字摘要（脱敏），
+        # 默认 None 向后兼容（旧事件与非批改轮次不携带）
+        "grading_item_count",
+        "grading_total_score",
+        "grading_max_total_score",
         # S4-T3：RETRIEVAL_DECISION 事件携带的检索决策摘要字段，
         # 默认 None 向后兼容（旧事件与未启用自适应检索的轮次不携带）
         "retrieval_rounds",
@@ -445,8 +534,88 @@ def test_react_agent_emits_safe_ordered_events_after_history() -> None:
         "retrieval_top_score",
         "retrieval_needed",
         "retrieval_need_reason",
+        # 固定工作流事件族字段（WORKFLOW_* 事件携带）与产物区自动授权
+        # 标记（TOOL_COMPLETED 附属），默认 None 向后兼容
+        "workflow_id",
+        "workflow_step_id",
+        "workflow_step_index",
+        "auto_approved",
     }
     assert all(set(event.model_dump()) == safe_fields for event in events)
+
+
+def test_react_agent_persists_reasoning_and_redacted_tool_details() -> None:
+    secret = "sk-never-show-this"
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                additional_kwargs={"reasoning_content": "先检索概念，再整理解释"},
+                id="assistant-step-1",
+                tool_calls=[
+                    {
+                        "name": "echo_with_secret",
+                        "args": {"query": "反向传播", "api_key": secret},
+                        "id": "call-secret-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="最终解释",
+                additional_kwargs={"reasoning_content": "结合工具结果形成答案"},
+                id="assistant-step-2",
+            ),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.LEARNING_ASSISTANT,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([echo_with_secret]),
+    )
+
+    result = agent.run(create_initial_state(session_id="session-1"))
+    events = result.updates["events"]
+
+    assert [event.event_type for event in events] == [
+        EventType.AGENT_STARTED,
+        EventType.AGENT_REASONING,
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.AGENT_REASONING,
+        EventType.AGENT_COMPLETED,
+    ]
+    reasoning_events = [
+        event for event in events if event.event_type is EventType.AGENT_REASONING
+    ]
+    assert [event.content for event in reasoning_events] == [
+        "先检索概念，再整理解释",
+        "结合工具结果形成答案",
+    ]
+    assert [event.message_id for event in reasoning_events] == [
+        "assistant-step-1",
+        "assistant-step-2",
+    ]
+
+    tool_started = next(
+        event for event in events if event.event_type is EventType.TOOL_STARTED
+    )
+    tool_completed = next(
+        event for event in events if event.event_type is EventType.TOOL_COMPLETED
+    )
+    assert tool_started.tool_call_id == "call-secret-1"
+    assert tool_completed.tool_call_id == "call-secret-1"
+    assert json.loads(tool_started.input_summary or "{}") == {
+        "api_key": "[REDACTED]",
+        "query": "反向传播",
+    }
+    assert json.loads(tool_completed.output_summary or "{}") == {
+        "api_key": "[REDACTED]",
+        "query": "反向传播",
+        "status": "ok",
+    }
+    assert secret not in "".join(event.model_dump_json() for event in events)
 
 
 def test_react_agent_replaces_unknown_tool_name_in_public_updates() -> None:
@@ -585,6 +754,97 @@ def test_react_agent_stops_at_iteration_limit() -> None:
         result.updates["events"][-1].error_code
         is ErrorCode.REACT_ITERATION_LIMIT
     )
+
+
+def test_react_agent_blocks_an_identical_tool_call_after_no_progress() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call("double", "call-1")]),
+            AIMessage(content="", tool_calls=[tool_call("double", "call-2")]),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+    )
+
+    result = agent.run(create_initial_state())
+
+    assert [item.success for item in result.updates["tool_results"]] == [True, False]
+    assert result.updates["tool_results"][1].error_code is ErrorCode.TOOL_NO_PROGRESS
+
+
+def test_react_agent_enforces_a_separate_tool_call_budget() -> None:
+    calls = [
+        {
+            "name": "double",
+            "args": {"value": value},
+            "id": f"call-{value}",
+            "type": "tool_call",
+        }
+        for value in (1, 2, 3)
+    ]
+    model = ScriptedModel(
+        [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor([double]),
+        max_tool_calls=2,
+    )
+
+    result = agent.run(create_initial_state())
+
+    assert [item.success for item in result.updates["tool_results"]] == [
+        True,
+        True,
+        False,
+    ]
+    assert result.updates["tool_results"][2].error_code is ErrorCode.TOOL_BUDGET_EXCEEDED
+
+
+def test_react_agent_uses_the_workspace_bound_to_its_state(tmp_path: Path) -> None:
+    default = tmp_path / "default"
+    selected = tmp_path / "selected"
+    default.mkdir()
+    selected.mkdir()
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_info",
+                        "args": {},
+                        "id": "workspace-info-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = ReActAgentNode(
+        role=AgentRole.SUPERVISOR,
+        system_prompt="system",
+        model=model,
+        tool_executor=ToolExecutor(
+            create_read_only_file_tools(WorkspaceFileSystem(default))
+        ),
+    )
+    state = create_initial_state(session_id="session-1")
+    state["workspace_root"] = str(selected.resolve())
+    state["additional_workspace_roots"] = []
+
+    result = agent.run(state)
+
+    workspace_result = json.loads(result.updates["tool_results"][0].output)
+    assert workspace_result["root"] == str(selected.resolve())
 
 
 def test_react_agent_returns_model_error() -> None:

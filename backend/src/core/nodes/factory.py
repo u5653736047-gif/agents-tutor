@@ -20,11 +20,13 @@ def create_agent_nodes(
     tools: Sequence[BaseTool] = (),
     registry: ToolRegistry | None = None,
     max_iterations: int = 5,
+    max_tool_calls: int = 20,
     max_context_messages: int | None = None,
     max_context_tokens: int | None = None,
     context_token_counter: MessageTokenCounter | None = None,
     tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     tool_timeouts: Mapping[str, float] | None = None,
+    prompt_overrides: Mapping[AgentRole, str] | None = None,
 ) -> dict[AgentRole, ReActAgentNode]:
     """共享模型、工具和循环配置，仅为每个角色替换 Prompt。"""
     # 所有角色共享同一个工具执行器：同一份工具注册表与超时配置。
@@ -36,27 +38,35 @@ def create_agent_nodes(
     )
     # 工具只绑定一次，四个 Agent 复用同一模型实例（省内存、行为一致）。
     prepared_model = _bind_tools(model, tool_executor.registry.list_tools())
+    prompts = {**ROLE_PROMPTS, **dict(prompt_overrides or {})}
     # 按角色批量创建 4 个 Agent：共享模型/工具/循环配置，仅 Prompt（与可选的动态提示词）不同。
     return {
         role: ReActAgentNode(
             role=role,
             system_prompt=prompt,
-            model=prepared_model,
+            model=_with_agent_metadata(prepared_model, role),
             tool_executor=tool_executor,
             max_iterations=max_iterations,
+            max_tool_calls=max_tool_calls,
             max_context_messages=max_context_messages,
             max_context_tokens=max_context_tokens,
             context_token_counter=context_token_counter,
             # S2-T2 分层讲解：只有助学 Agent 需要按状态动态调整提示词
             # （按 state["level"] 学生水平分层，见 prompts.py）；其余角色
             # 传 None，沿用静态 system_prompt，行为与改动前完全一致。
+            # 六大功能 P5-18：钩子同时传 intent——learning_path /
+            # study_coaching 意图追加对应的动态约定段（prompts.py）。
             prompt_builder=(
-                (lambda state: learning_assistant_system_prompt(state.get("level")))
+                (
+                    lambda state: learning_assistant_system_prompt(
+                        state.get("level"), state.get("intent")
+                    )
+                )
                 if role is AgentRole.LEARNING_ASSISTANT
                 else None
             ),
         )
-        for role, prompt in ROLE_PROMPTS.items()
+        for role, prompt in prompts.items()
     }
 
 
@@ -66,6 +76,22 @@ def _bind_tools(model: ChatModel, tools: Sequence[BaseTool]) -> ChatModel:
     if not tools or not callable(bind_tools):
         return model
     return cast(ChatModel, bind_tools(tools))
+
+
+def _with_agent_metadata(model: ChatModel, role: AgentRole) -> ChatModel:
+    """给真实 Runnable 模型附加角色元数据，供 token 流准确标注来源。"""
+    with_config = getattr(model, "with_config", None)
+    if not callable(with_config):
+        return model
+    return cast(
+        ChatModel,
+        with_config(
+            {
+                "metadata": {"agent_role": role.value},
+                "tags": [f"agent:{role.value}"],
+            }
+        ),
+    )
 
 
 __all__ = ["create_agent_nodes"]

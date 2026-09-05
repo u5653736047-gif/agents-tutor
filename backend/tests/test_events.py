@@ -17,7 +17,19 @@ def test_run_event_allows_session_id_none() -> None:
     assert event.session_id is None
 
 
-def test_run_event_serializes_only_safe_fields() -> None:
+def test_run_event_carries_a_stable_run_id_for_turn_grouping() -> None:
+    event = RunEvent(
+        event_type=EventType.AGENT_STARTED,
+        sequence=1,
+        session_id="session-1",
+        run_id="run-1",
+        agent="supervisor",
+    )
+
+    assert event.run_id == "run-1"
+
+
+def test_run_event_serializes_replayable_process_fields() -> None:
     event = RunEvent(
         event_type=EventType.TOOL_COMPLETED,
         sequence=3,
@@ -33,8 +45,16 @@ def test_run_event_serializes_only_safe_fields() -> None:
         "event_type",
         "sequence",
         "session_id",
+        "run_id",
         "agent",
         "tool_name",
+        "tool_call_id",
+        "parent_tool_call_id",
+        "input_summary",
+        "output_summary",
+        "content",
+        "output_stream",
+        "message_id",
         "success",
         "duration_ms",
         "error_code",
@@ -45,6 +65,11 @@ def test_run_event_serializes_only_safe_fields() -> None:
         # S2-T3：EVALUATION_COMPLETED 事件携带的评价总结论摘要，
         # 默认 None 向后兼容（旧事件与未评价轮次不携带）
         "evaluation_verdict",
+        # 六大功能 P2-8：GRADING_COMPLETED 事件携带的数字摘要（脱敏：
+        # 只记题数/总分），默认 None 向后兼容（旧事件与非批改轮次不携带）
+        "grading_item_count",
+        "grading_total_score",
+        "grading_max_total_score",
         # S4-T3：RETRIEVAL_DECISION 事件携带的检索决策摘要字段，
         # 默认 None 向后兼容（旧事件与未启用自适应检索的轮次不携带）
         "retrieval_rounds",
@@ -54,16 +79,22 @@ def test_run_event_serializes_only_safe_fields() -> None:
         "retrieval_top_score",
         "retrieval_needed",
         "retrieval_need_reason",
+        # 固定工作流事件族字段（WORKFLOW_* 事件携带）与产物区自动授权
+        # 标记（TOOL_COMPLETED 附属），默认 None 向后兼容
+        "workflow_id",
+        "workflow_step_id",
+        "workflow_step_index",
+        "auto_approved",
     }
 
 
-def test_run_event_rejects_content_and_argument_payloads() -> None:
+def test_run_event_allows_bounded_content_but_rejects_raw_argument_payloads() -> None:
     with pytest.raises(ValidationError):
         RunEvent(
             event_type=EventType.TOOL_STARTED,
             sequence=1,
             session_id="session-1",
-            content="secret",
+            content="可回放思考",
             arguments={"api_key": "secret"},
         )
 

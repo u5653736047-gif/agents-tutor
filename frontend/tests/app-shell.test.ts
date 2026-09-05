@@ -26,6 +26,26 @@ test("the application shell renders a desktop session sidebar and empty conversa
   assert.match(markup, /后端已连接/);
 });
 
+test("the desktop sidebar can be resized and collapsed without detaching the conversation", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /data-slot="sidebar-resizer"/);
+  assert.match(markup, /role="separator"/);
+  assert.match(markup, /aria-label="调整会话侧栏宽度"/);
+  assert.match(markup, /data-slot="sidebar-collapse"/);
+  assert.match(markup, /--sidebar-width/);
+  assert.match(markup, /data-slot="conversation-area"/);
+});
+
+test("the workspace header uses product language instead of development phase labels", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /多智能体学习空间/);
+  assert.doesNotMatch(markup, /阶段三/);
+});
+
 test("selecting a session asks the store to load its history", () => {
   const sidebarPath = new URL("../components/session-sidebar.tsx", import.meta.url);
 
@@ -53,9 +73,12 @@ test("the mobile layout shows only the toggle and no drawer on initial render", 
 test("the app shell closes the mobile drawer on overlay, Escape, and session selection", () => {
   const source = readFileSync(appShellPath, "utf8");
 
-  // 断点语义:移动端单栏 + md 起桌面两栏
+  // 断点语义:移动端单栏 + md 起由 CSS 变量控制的桌面两栏
   // 断点类可能被中间类(bg-background 等)隔开,用 [\s\S]*? 放宽
-  assert.match(source, /grid-cols-1[\s\S]*?md:grid-cols-\[18rem_minmax\(0,1fr\)\]/);
+  assert.match(
+    source,
+    /grid-cols-1[\s\S]*?md:grid-cols-\[var\(--sidebar-width\)_minmax\(0,1fr\)\]/,
+  );
   // 汉堡按钮打开抽屉
   assert.match(source, /data-slot="sidebar-toggle"/);
   assert.match(source, /setSidebarOpen\(true\)/);
@@ -155,9 +178,17 @@ test("the empty state renders example questions and first-use onboarding", async
   // 首次使用引导 + 跳过按钮
   assert.match(markup, /data-slot="onboarding"/);
   assert.match(markup, /data-slot="onboarding-skip"/);
-  assert.match(markup, /跳过引导/);
-  // 既有空态标题保留(零回归)
-  assert.match(markup, /请选择或新建会话/);
+  assert.match(markup, /知道了/);
+  assert.match(markup, /今天想学点什么/);
+});
+
+test("the empty workspace leads with a focused learning prompt grid", async () => {
+  const { AppShell } = await loadAppShell();
+  const markup = renderToStaticMarkup(createElement(AppShell, { apiConnected: true }));
+
+  assert.match(markup, /今天想学点什么/);
+  assert.match(markup, /sm:grid-cols-2/);
+  assert.match(markup, /max-w-2xl/);
 });
 
 // D5-T4:示例问题点击时序的源码正则守卫——建会话成功后流式发送问题,

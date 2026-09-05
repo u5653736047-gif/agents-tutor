@@ -32,6 +32,7 @@ from ingest_books import (
 
 from core.knowledge.embedding import HashEmbeddingProvider
 from core.knowledge.index import SqliteKnowledgeIndex
+from core.knowledge.loaders import iter_pdf_pages
 from core.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from core.knowledge.service import KnowledgeService
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
@@ -188,6 +189,24 @@ def test_load_manifest_rejects_missing_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="文件不存在"):
         load_manifest(manifest_path, books_dir=books_dir)
+
+
+def test_load_manifest_accepts_blocked_entry_with_missing_file(tmp_path: Path) -> None:
+    """blocked 条目语义是「数据源不可用」：文件缺失是常态，可加载；
+    入库与验证均按 blocked 跳过（如课标 PDF 尚未提供的场景）。
+    占位条目作者未知（空列表）同样不阻止清单加载。"""
+    entries = [
+        _book_entry("cs-x", file_name="not-provided.pdf", blocked="pdf-not-provided")
+    ]
+    entries[0]["authors"] = []
+    manifest_path, books_dir = _write_manifest(
+        tmp_path, entries, create_files=False
+    )
+
+    manifest = load_manifest(manifest_path, books_dir=books_dir)
+
+    assert manifest.books[0].blocked == "pdf-not-provided"
+    assert manifest.books[0].authors == []
 
 
 def test_load_manifest_rejects_unknown_difficulty(tmp_path: Path) -> None:
@@ -1203,3 +1222,223 @@ def test_main_relabel_frontmatter_flag(tmp_path: Path) -> None:
     # 入库后运行：已入库 chunk 被重标注（CLI 分支不解析 PDF），同样正常退出。
     assert main(common) == 0
     assert main([*common, "--relabel-frontmatter"]) == 0
+
+
+# ── S5-C3：ingest_marks 版本管理 ──────────────────────────────────
+
+
+def test_ingest_marks_migration_adds_version_columns(tmp_path: Path) -> None:
+    """旧形态表（无 content_hash/chunking 列）打开后自动补列并可写入。"""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db)
+    # 手工构造升级前的旧形态：chunks + 无新列的 ingest_marks。
+    raw.execute(
+        "CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, document_id TEXT, "
+        "content TEXT, source TEXT, page INTEGER, start INTEGER, end INTEGER, "
+        "metadata_json TEXT NOT NULL)"
+    )
+    raw.execute(
+        "CREATE TABLE ingest_marks (document_id TEXT PRIMARY KEY, "
+        "chunk_count INTEGER NOT NULL, page_count INTEGER NOT NULL, "
+        "completed_at TEXT NOT NULL)"
+    )
+    raw.commit()
+    raw.close()
+
+    index = SqliteKnowledgeIndex(db)
+    try:
+        index.mark_document_complete(
+            "legacy-book",
+            chunk_count=3,
+            page_count=2,
+            content_hash="abc123",
+            chunking="semantic",
+        )
+        mark = index.document_mark("legacy-book")
+        assert mark is not None
+        assert mark.content_hash == "abc123"
+        assert mark.chunking == "semantic"
+    finally:
+        index.close()
+
+
+def test_document_mark_returns_none_for_unknown_book(tmp_path: Path) -> None:
+    index = SqliteKnowledgeIndex(tmp_path / "marks.db")
+    try:
+        assert index.document_mark("never-ingested") is None
+    finally:
+        index.close()
+
+
+def test_check_updates_reports_content_and_strategy_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--check-updates 只读检测：内容变更与策略漂移都被报告且不写库。"""
+    entries = [_book_entry("book-a", file_name="a.pdf")]
+    manifest_path, books_dir = _write_manifest(tmp_path, entries)
+
+    db = tmp_path / "knowledge.db"
+    index = SqliteKnowledgeIndex(db)
+    try:
+        # 伪造一个「内容已变更 + 策略漂移」的标记。
+        index.mark_document_complete(
+            "book-a",
+            chunk_count=2,
+            page_count=2,
+            content_hash="stale-hash",
+            chunking="semantic",
+        )
+    finally:
+        index.close()
+
+    exit_code = main(
+        [
+            "--check-updates",
+            "--manifest",
+            str(manifest_path),
+            "--books-dir",
+            str(books_dir),
+            "--db",
+            str(db),
+            "--chunking",
+            "character",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "[变更]" in captured.out
+    assert "源文件内容已变更" in captured.out
+    assert "分块策略不一致（标记 semantic ≠ 当前 character）" in captured.out
+
+
+def test_check_updates_consistent_book_reports_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """哈希与策略一致的书籍报告 [一致]，不产生变更告警。"""
+    entries = [_book_entry("book-a", file_name="a.pdf")]
+    manifest_path, books_dir = _write_manifest(tmp_path, entries)
+    pdf_path = books_dir / "a.pdf"
+    import hashlib
+
+    digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+
+    db = tmp_path / "knowledge.db"
+    index = SqliteKnowledgeIndex(db)
+    try:
+        index.mark_document_complete(
+            "book-a",
+            chunk_count=2,
+            page_count=2,
+            content_hash=digest,
+            chunking="character",
+        )
+    finally:
+        index.close()
+
+    exit_code = main(
+        [
+            "--check-updates",
+            "--manifest",
+            str(manifest_path),
+            "--books-dir",
+            str(books_dir),
+            "--db",
+            str(db),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "[一致]" in captured.out
+    assert "[变更]" not in captured.out
+
+
+# ── S5-C3 分段入库：--page-range ─────────────────────────────────
+
+
+def test_iter_pdf_pages_page_range_filters_pages(tmp_path: Path) -> None:
+    """page_range 闭区间过滤：只产出范围内页面；非法区间尽早 ValueError。"""
+    pdf = tmp_path / "multi.pdf"
+    _write_tiny_pdf(pdf, ["alpha one", "beta two", "gamma three"])
+
+    def yielded(range_arg: tuple[int, int] | None) -> list[int | None]:
+        return [
+            doc.page for doc in iter_pdf_pages(pdf, page_range=range_arg)
+        ]
+
+    assert yielded((1, 2)) == [1, 2]
+    assert yielded((2, 3)) == [2, 3]
+    assert yielded(None) == [1, 2, 3]
+    with pytest.raises(ValueError, match="page_range"):
+        list(iter_pdf_pages(pdf, page_range=(3, 1)))
+
+
+def test_parse_page_range_variants() -> None:
+    from ingest_books import _parse_page_range
+
+    assert _parse_page_range("1-120") == (1, 120)
+    assert _parse_page_range(" 5-5 ") == (5, 5)
+    for bad in ("abc", "1_120", "0-10", "10-5", "1-"):
+        with pytest.raises(ValueError):
+            _parse_page_range(bad)
+
+
+def test_ingest_book_segment_mode_preserves_other_segments_and_skips_mark(
+    index: SqliteKnowledgeIndex,
+) -> None:
+    """分段模式：其他分段的 chunk 不被整文档替换破坏，且不写整本完成标记。"""
+    book = _manifest_book("ml-a")
+    # 预置「另一分段」（页 4-5 已入库，代表先前的分段成果）。
+    previous_segment = [
+        KnowledgeDocument(
+            document_id="ml-a",
+            content="第四章 决策树 内容",
+            source="ml-a",
+            page=4,
+        ),
+        KnowledgeDocument(
+            document_id="ml-a",
+            content="第五章 集成学习 内容",
+            source="ml-a",
+            page=5,
+        ),
+    ]
+    KnowledgeService(index).add_documents(previous_segment)
+
+    result = ingest_book(
+        index,
+        book,
+        Path("book.pdf"),
+        page_loader=_fake_pages,  # 页 1-2
+        page_range=(1, 2),
+    )
+
+    assert result.status == "ingested"
+    # 安全侧语义：分段永不写整本完成标记（避免剩余页被误判已入库）。
+    assert index.document_mark("ml-a") is None
+    # 非破坏性调和：先前分段保留 + 新分段写入。
+    pages = sorted(
+        chunk.page for chunk in index.chunks_of_document("ml-a")
+    )
+    assert pages == [1, 2, 4, 5]
+
+
+def test_main_rejects_invalid_page_range(tmp_path: Path) -> None:
+    """"--page-range 格式非法 → CLI 报错退出码 2（配置错误要暴露）。"""
+    manifest_path, books_dir, db_path, _ = _cli_manifest(tmp_path)
+    exit_code = main(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--books-dir",
+            str(books_dir),
+            "--db",
+            str(db_path),
+            "--page-range",
+            "abc",
+        ]
+    )
+    assert exit_code == 2

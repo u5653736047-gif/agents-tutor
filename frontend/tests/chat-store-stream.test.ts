@@ -115,10 +115,10 @@ test("streaming lifecycle merges the final message and tracks the active agent",
   assert.equal(state.streamingAgent, null);
   assert.equal(state.streamingMessage, null);
   assert.deepEqual(state.messages, [assistantMessage]);
-  // 摘要事件(tool_call)追加进 events 列表
+  // 安全思考摘要、工具调用与 Agent 切换都进入协作时间线。
   assert.deepEqual(
     state.events.map((event) => event.event_type),
-    ["tool_call"],
+    ["thinking", "tool_call", "agent_switch"],
   );
   // 生命周期:流式期间 isStreaming 一直为 true
   assert.ok(observations.every((item) => item.isStreaming === true));
@@ -137,6 +137,213 @@ test("streaming lifecycle merges the final message and tracks the active agent",
   assert.deepEqual(
     (messagesAtHistoryFetch as Array<{ content: string }>).map((item) => item.content),
     ["请解释流式概念", "流式回答"],
+  );
+});
+
+test("message deltas grow the supervisor bubble and coalesce subagent output", async () => {
+  const supervisorSnapshots: string[] = [];
+  const store = await createStreamStore({
+    getSessionMessages: async () => [assistantMessage],
+    streamChat: async ({ onEvent }) => {
+      onEvent({
+        agent: "supervisor",
+        content: "流",
+        event_type: "message_delta",
+        message_id: "supervisor-answer",
+        sequence: 1,
+        session_id: "session-1",
+      });
+      supervisorSnapshots.push(store.getState().streamingMessage?.content ?? "");
+      onEvent({
+        agent: "supervisor",
+        content: "式",
+        event_type: "message_delta",
+        message_id: "supervisor-answer",
+        sequence: 2,
+        session_id: "session-1",
+      });
+      supervisorSnapshots.push(store.getState().streamingMessage?.content ?? "");
+      onEvent({
+        agent: "learning_assistant",
+        content: "子",
+        event_type: "message_delta",
+        message_id: "worker-answer",
+        sequence: 3,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "任务",
+        event_type: "message_delta",
+        message_id: "worker-answer",
+        sequence: 4,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "流式完成",
+        event_type: "message_end",
+        sequence: 5,
+        session_id: "session-1",
+      });
+      onEvent({ event_type: "done", sequence: 6, session_id: "session-1" });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("解释流式");
+
+  assert.deepEqual(supervisorSnapshots, ["流", "流式"]);
+  const workerMessages = store
+    .getState()
+    .events.filter((event) => event.event_type === "message_delta");
+  assert.equal(workerMessages.length, 1);
+  assert.equal("content" in workerMessages[0]! ? workerMessages[0].content : null, "子任务");
+});
+
+test("tool approval streams terminal output and continues the same turn", async () => {
+  const { createChatStore } = await loadChatStore();
+  let receivedDecision: unknown = null;
+  const store = createChatStore({
+    archiveSession: async () => session as never,
+    createSession: async () => session as never,
+    getSessionMessages: async () => [
+      {
+        agent: "supervisor",
+        content: "检查完成",
+        role: "assistant",
+      },
+    ],
+    listSessions: async () => [session as never],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+    streamToolApproval: async ({ decision, onEvent }) => {
+      receivedDecision = decision;
+      onEvent({
+        agent: "supervisor",
+        content: "first\n",
+        event_type: "tool_output",
+        output_stream: "stdout",
+        sequence: 2,
+        session_id: session.session_id,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      });
+      onEvent({
+        agent: "supervisor",
+        event_type: "tool_result",
+        output_summary: '{"exit_code":0,"ok":true}',
+        sequence: 3,
+        session_id: session.session_id,
+        success: true,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "检查完成",
+        event_type: "message_end",
+        sequence: 4,
+        session_id: session.session_id,
+      });
+      onEvent({
+        event_type: "done",
+        sequence: 5,
+        session_id: session.session_id,
+      });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  store.setState({
+    events: [
+      {
+        agent: "supervisor",
+        event_type: "tool_call",
+        input_summary: '{"command":"echo first"}',
+        sequence: 1,
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      },
+    ],
+    pendingToolApproval: {
+      interrupt_id: "interrupt-shell-1",
+      request: {
+        agent_role: "supervisor",
+        arguments: { command: "echo first", cwd: "." },
+        tool_call_id: "shell-1",
+        tool_name: "shell",
+      },
+    },
+  });
+
+  await store.getState().decideToolApproval("confirm");
+
+  assert.deepEqual(receivedDecision, {
+    action: "confirm",
+    interrupt_id: "interrupt-shell-1",
+  });
+  assert.deepEqual(
+    store.getState().events.map((item) => item.event_type),
+    ["tool_call", "tool_output", "tool_result"],
+  );
+  assert.equal(store.getState().pendingToolApproval, null);
+  assert.equal(store.getState().isDecidingToolApproval, false);
+  assert.equal(store.getState().isStreaming, false);
+  assert.equal(store.getState().messages[0]?.content, "检查完成");
+});
+
+test("reasoning deltas coalesce and a persisted full event replaces the partial trace", async () => {
+  const store = await createStreamStore({
+    getSessionMessages: async () => [assistantMessage],
+    streamChat: async ({ onEvent }) => {
+      onEvent({
+        agent: "learning_assistant",
+        content: "先识别",
+        event_type: "reasoning",
+        is_delta: true,
+        message_id: "reasoning-step-1",
+        sequence: 1,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "链式法则",
+        event_type: "reasoning",
+        is_delta: true,
+        message_id: "reasoning-step-1",
+        sequence: 2,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "learning_assistant",
+        content: "先识别链式法则，再组织讲解",
+        event_type: "reasoning",
+        is_delta: false,
+        message_id: "reasoning-step-1",
+        sequence: 3,
+        session_id: "session-1",
+      });
+      onEvent({
+        agent: "supervisor",
+        content: "完成",
+        event_type: "message_end",
+        sequence: 4,
+        session_id: "session-1",
+      });
+      onEvent({ event_type: "done", sequence: 5, session_id: "session-1" });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().streamSendMessage("解释链式法则");
+
+  const reasoningEvents = store
+    .getState()
+    .events.filter((event) => event.event_type === "reasoning");
+  assert.equal(reasoningEvents.length, 1);
+  assert.equal(
+    "content" in reasoningEvents[0]! ? reasoningEvents[0].content : null,
+    "先识别链式法则，再组织讲解",
   );
 });
 
@@ -294,7 +501,7 @@ async function createRetryStreamStore(overrides: {
   });
 }
 
-test("streamSendMessage falls back to the sync channel after retries are exhausted", async () => {
+test("streamSendMessage never resends through the sync channel after retries are exhausted", async () => {
   const { ApiClientError } = await loadApiClient();
   const failure = new ApiClientError("流式通道重试耗尽。", { code: null, status: null });
   let sendChatCalls = 0;
@@ -310,17 +517,40 @@ test("streamSendMessage falls back to the sync channel after retries are exhaust
   });
 
   store.getState().selectSession(session.session_id);
-  await store.getState().streamSendMessage("会降级的请求");
+  await store.getState().streamSendMessage("不能自动重发的请求");
 
   const state = store.getState();
   assert.equal(state.isStreaming, false);
-  // 降级提示被设置,且同步通道确实被调用(sendMessage 拉全量后消息一致)。
-  assert.equal(
-    state.degradedNotice,
-    "网络不稳定,已切换到同步通道,消息可能缺少过程事件。",
+  assert.equal(sendChatCalls, 0, "a failed stream must not execute the same task again");
+  assert.equal(state.degradedNotice, null);
+  assert.equal(state.requestError, failure);
+  assert.deepEqual(
+    state.messages.map((message) => message.content),
+    ["不能自动重发的请求"],
   );
-  assert.equal(sendChatCalls, 1);
-  assert.deepEqual(state.messages, [assistantMessage]);
+});
+
+test("concurrent stream submissions start only one run", async () => {
+  let calls = 0;
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const store = await createRetryStreamStore({
+    streamChatWithRetry: async ({ onEvent }) => {
+      calls += 1;
+      await pending;
+      onEvent({ event_type: "done", sequence: 1, session_id: session.session_id });
+    },
+  });
+
+  store.getState().selectSession(session.session_id);
+  const first = store.getState().streamSendMessage("只执行一次");
+  const second = store.getState().streamSendMessage("只执行一次");
+
+  assert.equal(calls, 1);
+  release?.();
+  await Promise.all([first, second]);
 });
 
 test("streamSendMessage finishes normally via the retry channel after internal recovery", async () => {

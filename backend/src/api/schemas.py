@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import models_json_schema
@@ -41,11 +42,15 @@ class MessageRole(str, Enum):
 
 
 class StreamEventType(str, Enum):
-    """Public event protocol reserved for future streaming support."""
+    """Public SSE protocol for token deltas and safe execution events."""
 
     THINKING = "thinking"
+    REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    TOOL_OUTPUT = "tool_output"
+    APPROVAL_REQUIRED = "approval_required"
+    MESSAGE_DELTA = "message_delta"
     MESSAGE_END = "message_end"
     AGENT_SWITCH = "agent_switch"
     ERROR = "error"
@@ -60,12 +65,17 @@ class ErrorCode(str, Enum):
     TOOL_INVALID_ARGUMENTS = "tool_invalid_arguments"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     TOOL_TIMEOUT = "tool_timeout"
+    TOOL_NO_PROGRESS = "tool_no_progress"
+    TOOL_BUDGET_EXCEEDED = "tool_budget_exceeded"
+    TOOL_APPROVAL_REJECTED = "tool_approval_rejected"
+    TOOL_APPROVAL_QUEUE_LIMIT = "tool_approval_queue_limit"
     MODEL_CALL_FAILED = "model_call_failed"
     REACT_ITERATION_LIMIT = "react_iteration_limit"
     GRAPH_HANDOFF_LIMIT = "graph_handoff_limit"
     GRAPH_SWITCH_LIMIT = "graph_switch_limit"
     GRAPH_INVALID_TARGET = "graph_invalid_target"
     GRAPH_AGGREGATION_INVALID = "graph_aggregation_invalid"
+    WORKFLOW_BUDGET_EXCEEDED = "workflow_budget_exceeded"
     AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
 
@@ -75,6 +85,7 @@ class ApiErrorCode(str, Enum):
     INVALID_REQUEST = "invalid_request"
     INTERNAL_ERROR = "internal_error"
     HANDOFF_NOT_PENDING = "handoff_not_pending"
+    TOOL_APPROVAL_NOT_PENDING = "tool_approval_not_pending"
     SESSION_ALREADY_EXISTS = "session_already_exists"
     SESSION_BUSY = "session_busy"
     SESSION_NOT_FOUND = "session_not_found"
@@ -90,19 +101,144 @@ class TaskPlanStatus(str, Enum):
     FAILED = "failed"
 
 
+class WorkflowStatus(str, Enum):
+    """Public workflow run status values (lesson-workflow-design §七)."""
+
+    RUNNING = "running"
+    PAUSED_APPROVAL = "paused_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowStepStatus(str, Enum):
+    """Public workflow step status values."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class WorkflowStep(ContractModel):
+    """One workflow step's persisted progress entry."""
+
+    step_id: str
+    worker_role: WorkerAgentRole
+    status: WorkflowStepStatus
+    attempts: int = Field(ge=0)
+    summary: str | None = None
+
+
+class WorkflowProgress(ContractModel):
+    """Workflow run progress exposed to chat/process consumers.
+
+    与 core WorkflowState 的投影边界：不暴露 artifact_root 绝对路径与
+    budget_used 内部计数（契约不含机器布局，与 healthz 诊断字段同一
+    不泄露路径原则）；artifacts 保持相对路径。
+    """
+
+    workflow_id: str
+    status: WorkflowStatus
+    steps: list[WorkflowStep] = Field(min_length=1)
+    current_step_index: int = Field(ge=0)
+    artifacts: list[str] = Field(default_factory=list)
+    error_code: ErrorCode | None = None
+
+
+class WorkspaceAccess(str, Enum):
+    """Access level granted to Agent filesystem tools for a session."""
+
+    READ_ONLY = "read_only"
+
+
 class Session(ContractModel):
     """A session visible to its owner."""
 
     session_id: str
     user_id: str | None
     created_at: datetime
+    updated_at: datetime
     archived: bool
+    # 侧栏标题：首条用户消息提炼（只写一次）；存量老会话为 None，
+    # 前端按 session_id 回退展示。
+    title: str | None = None
+    workspace_root: str
+    additional_workspace_roots: list[str] = Field(default_factory=list)
+    workspace_access: WorkspaceAccess = WorkspaceAccess.READ_ONLY
+    # S5-C1 决策 2：会话绑定的知识空间；None = 未绑定（检索按单路
+    # public 过滤处理）。
+    knowledge_namespace: str | None = None
 
 
 class CreateSessionRequest(ContractModel):
     """Optional client-selected ID for a new session."""
 
     session_id: str | None = None
+    workspace_root: str | None = None
+    # S5-C1 决策 1/2：会话绑定的知识空间（可选；小写标识规则同 manifest
+    # 的 source 标识——小写字母开头，只含小写字母/数字/连字符）。None =
+    # 未绑定（检索按单路 public 过滤处理）。
+    knowledge_namespace: str | None = None
+
+    @field_validator("workspace_root")
+    @classmethod
+    def reject_blank_workspace_root(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("workspace_root must not be blank")
+        return value
+
+    @field_validator("knowledge_namespace")
+    @classmethod
+    def validate_knowledge_namespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", stripped):
+            raise ValueError(
+                "knowledge_namespace must start with a lowercase letter and "
+                "contain only lowercase letters or digits, with single inner "
+                "hyphens (no leading/trailing or consecutive hyphens)"
+            )
+        return stripped
+
+
+class AddWorkspaceRootRequest(ContractModel):
+    """One user-authorized additional workspace directory."""
+
+    path: str = Field(min_length=1)
+
+    @field_validator("path")
+    @classmethod
+    def reject_blank_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path must not be blank")
+        return value
+
+
+class WorkspacePath(ContractModel):
+    """A canonical existing directory accepted by the server policy."""
+
+    path: str
+    name: str
+
+
+class WorkspaceDirectory(ContractModel):
+    """One directory entry in the server-side workspace picker."""
+
+    name: str
+    path: str
+
+
+class WorkspaceDirectoryListing(ContractModel):
+    """Directory picker state rooted in the server filesystem."""
+
+    path: str
+    parent: str | None = None
+    directories: list[WorkspaceDirectory] = Field(default_factory=list)
 
 
 class ErrorDetail(ContractModel):
@@ -126,7 +262,9 @@ class ChatRequest(ContractModel):
     # D7-T1:附件引用(契约扩展预留)——chat 路由当前忽略该字段(缺失
     # 或携带均不影响现有行为),由 D7-T3 或后续 core 能力决定如何进入
     # 模型上下文;留空列表与 None 等价。
-    attachments: list[Attachment] | None = None
+    # max_length=10（审查 W2）：服务端自保上限——附件提取含磁盘 IO，
+    # 与单附件 30K/合计 100K 字符护栏同为「防单轮注入失控」的双层防线。
+    attachments: list[Attachment] | None = Field(default=None, max_length=10)
 
     @field_validator("session_id", "message")
     @classmethod
@@ -135,6 +273,91 @@ class ChatRequest(ContractModel):
         if not value.strip():
             raise ValueError("must not be blank")
         return value
+
+
+class DiagnosisKnowledgePoint(ContractModel):
+    """学情诊断：一个知识点的作答聚合（六大功能 P3-15）。"""
+
+    knowledge_point: str
+    attempts: int = Field(ge=0)
+    correct: int = Field(ge=0)
+    accuracy: float = Field(ge=0, le=1)
+    last_at: str | None = None
+
+
+class DiagnosisSummary(ContractModel):
+    """学情诊断摘要（六大功能 P3-15）。
+
+    数据源是 learning_records 的 SQL 聚合（确定性规则：预警 =
+    attempts≥2 且加权正确率<0.6，见 core/learning/store.py），LLM
+    叙述只出现在对话内诊断报告，不在本契约里。
+    """
+
+    user_id: str | None = None
+    total_attempts: int = Field(default=0, ge=0)
+    knowledge_points: list[DiagnosisKnowledgePoint] = Field(default_factory=list)
+    uncategorized_attempts: int = Field(default=0, ge=0)
+    weak_points: list[str] = Field(default_factory=list)
+
+
+class DailyAccuracyPoint(ContractModel):
+    """学情洞察：一个 UTC 日的作答量与加权正确率（赛前可视化增强）。
+
+    加权口径与 DiagnosisSummary 同源（correct×1 + partial×0.5，见
+    core/learning/store.py insights），确定性聚合、可复现。
+    """
+
+    date: str = Field(min_length=1)
+    attempts: int = Field(ge=1)
+    accuracy: float = Field(ge=0, le=1)
+
+
+class PathPlanRecordDto(ContractModel):
+    """学习路径存档回显项（只有知识点与时间，无路径正文——脱敏口径）。"""
+
+    knowledge_point: str | None = None
+    created_at: str | None = None
+
+
+class LearningInsights(ContractModel):
+    """学情洞察摘要（学习进度页错题/趋势/路径卡的数据源）。
+
+    与 DiagnosisSummary 的分工：后者面向「知识点掌握与预警」（诊断），
+    本契约面向「错题归因分布 / 正确率趋势 / 路径存档回显」（展示）；
+    数据源同为 learning_records 的确定性 SQL 聚合（有界窗口：趋势近 30 日、
+    路径近 20 条）。store 未注入/无记录时返回空报告 200（降级红线同诊断端点）。
+    """
+
+    user_id: str | None = None
+    total_wrong: int = Field(default=0, ge=0)
+    error_tag_counts: dict[str, int] = Field(default_factory=dict)
+    daily_accuracy: list[DailyAccuracyPoint] = Field(default_factory=list)
+    recent_path_plans: list[PathPlanRecordDto] = Field(default_factory=list)
+
+
+class GradingItemDto(ContractModel):
+    """一道题的批改结论（六大功能 P2-12；与 core GradingItem 同构）。"""
+
+    question_id: str
+    score: float = Field(ge=0)
+    max_score: float = Field(gt=0)
+    feedback: str = ""
+    knowledge_point: str | None = None
+    error_tag: str | None = None
+
+
+class GradingResultDto(ContractModel):
+    """一次批改的结构化结论（六大功能 P2-12；与 core GradingResult 同构）。
+
+    total_score / max_total_score 由核心侧确定性汇总（不信任模型自报），
+    语义见 core.state.GradingResult 注释。前端渲染时须标注「建议评分，
+    教师复核」（LLM 主观题评分的既有产品口径）。
+    """
+
+    items: list[GradingItemDto] = Field(min_length=1)
+    overall_comment: str = ""
+    total_score: float = Field(ge=0)
+    max_total_score: float = Field(gt=0)
 
 
 class Message(ContractModel):
@@ -147,16 +370,67 @@ class Message(ContractModel):
     # D7-T3:附件引用(可选;历史消息/非附件消息为 None)。core 消息当前
     # 无附件元数据,映射侧保持 None——契约预留,前端按字段渲染。
     attachments: list[Attachment] | None = None
+    # 六大功能 P2-12（pi 审查 🟡4）：消息级批改元数据——挂在产出
+    # 批改的作答消息上，任意历史轮的批改卡刷新/切会话后经 history
+    # 端点恢复（grading 通道每轮重置，不靠它跨轮保留）。
+    grading: GradingResultDto | None = None
+
+
+class ToolApprovalRequest(ContractModel):
+    """The exact validated invocation shown to the user before execution."""
+
+    tool_call_id: str
+    tool_name: str
+    agent_role: AgentRole
+    arguments: dict[str, Any]
+
+
+class PendingToolApproval(ContractModel):
+    """A tool invocation paused at a resumable graph gate."""
+
+    interrupt_id: str
+    request: ToolApprovalRequest
+
+
+class PendingToolApprovalResponse(ContractModel):
+    session_id: str
+    pending_tool_approval: PendingToolApproval | None = None
+
+
+class ToolApprovalDecisionAction(str, Enum):
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+class ToolApprovalDecisionRequest(ContractModel):
+    interrupt_id: str = Field(min_length=1)
+    action: ToolApprovalDecisionAction
+
+    @field_validator("interrupt_id")
+    @classmethod
+    def reject_blank_interrupt_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
 
 class RunEvent(ContractModel):
-    """A safe incremental event emitted during one run."""
+    """A replayable process event emitted during one run."""
 
     event_type: StreamEventType
     sequence: int = Field(ge=0)
     session_id: str | None = None
+    run_id: str | None = None
     agent: AgentRole | None = None
     tool_name: str | None = None
+    tool_call_id: str | None = None
+    parent_tool_call_id: str | None = None
+    input_summary: str | None = None
+    output_summary: str | None = None
+    content: str | None = None
+    output_stream: Literal["stdout", "stderr"] | None = None
+    message_id: str | None = None
+    is_delta: bool | None = None
     success: bool | None = None
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | None = None
@@ -167,12 +441,8 @@ class RunEvent(ContractModel):
 class StreamEvent(ContractModel):
     """SSE 流式事件(D1-T1):基于 RunEvent 扩展内容字段。
 
-    事件安全红线(与 core/events.RunEvent「不携带内容、参数或密钥」
-    的注释、api/chat.py 的 EVENT_TYPE_MAP 白名单同口径):
-    - tool_call / tool_result 事件由 _public_event 映射而来,只含工具名、
-      成功与否、耗时等摘要,绝不含工具参数与结果正文;
-    - thinking 事件的 content 只放固定占位文本(如 Agent 名),绝不伪造
-      模型中间输出;
+    - tool_call / tool_result 仅携带 core 已有界、脱敏的输入/输出摘要;
+    - thinking 是固定阶段文案，reasoning 才是 provider 显式返回的字段;
     - message_end 事件的 content 是最终消息全文(与 POST /chat 的
       ChatResponse.message.content 同源)。
     error_code 复用 RunError 的联合类型:流式 error 事件需要携带
@@ -182,16 +452,28 @@ class StreamEvent(ContractModel):
     event_type: StreamEventType
     sequence: int = Field(ge=0)
     session_id: str
+    run_id: str | None = None
     agent: AgentRole | None = None
     tool_name: str | None = None
+    tool_call_id: str | None = None
+    parent_tool_call_id: str | None = None
+    input_summary: str | None = None
+    output_summary: str | None = None
     success: bool | None = None
     duration_ms: float | None = Field(default=None, ge=0)
     error_code: ErrorCode | ApiErrorCode | None = None
     plan_step_sequence: int | None = Field(default=None, ge=1)
-    content: str | None = None  # thinking 占位 / message_end 全文
+    content: str | None = None  # thinking 摘要 / message_delta 增量 / message_end 全文
+    output_stream: Literal["stdout", "stderr"] | None = None
+    message_id: str | None = None  # 同一模型消息的增量关联键
+    is_delta: bool | None = None  # reasoning/message 的增量与完整快照标记
     message: Message | None = None  # message_end 的完整消息(可选)
     citations: list[Citation] | None = None
+    # 六大功能 P2-12：message_end 载荷携带本轮批改结论（与 citations
+    # 同位；非批改轮为 None）。
+    grading: GradingResultDto | None = None
     current_agent: AgentRole | None = None
+    pending_tool_approval: PendingToolApproval | None = None
 
 
 class RunError(ContractModel):
@@ -318,12 +600,15 @@ class KnowledgeDocumentListEntry(ContractModel):
 
     page_count / chunk_count 可空:txt 无页概念、core 未来接入清单
     能力前由 API 层留空(见 api/knowledge.py 的 list_documents 注释)。
-    """
+    namespace 显式化（P1-5）：前端不再对 document_id 的 `:` 前缀反推，
+    公共库为 "public"。"""
 
     document_id: str
     source: str
     page_count: int | None = None
     chunk_count: int | None = None
+    # P1-5：显式空间字段，替代前端前缀反推
+    namespace: str = "public"
 
 
 class KnowledgeDocumentUploadResponse(ContractModel):
@@ -333,12 +618,143 @@ class KnowledgeDocumentUploadResponse(ContractModel):
     source: str
     page_count: int | None = None
     chunk_count: int | None = None
+    # S5-C3 上传语义补齐:true=本次上传替换了同名旧文档(false=首次新建)。
+    replaced: bool = False
 
 
 class KnowledgeDocumentListResponse(ContractModel):
     """文档清单响应(当前恒为空列表,原因见 list_documents 路由注释)。"""
 
     documents: list[KnowledgeDocumentListEntry]
+
+
+class KnowledgeDocumentInfoDto(ContractModel):
+    """文档元数据(I1 清单能力):与 core catalog 的 KnowledgeDocumentInfo 同构。
+
+    title / subjects / difficulty / ingested_at 可空:脚本入库的教材
+    由 manifest 注入元数据(title/subjects/difficulty)与 ingest_marks
+    时间;API 上传文档无这些字段时为 None。chunk_count 恒为整数。
+    namespace 显式化（P1-5）。
+    """
+
+    document_id: str
+    source: str
+    title: str | None = None
+    page_count: int | None = None
+    chunk_count: int = 0
+    subjects: list[str] = Field(default_factory=list)
+    difficulty: str | None = None
+    ingested_at: str | None = None
+    # P1-5：显式空间字段
+    namespace: str = "public"
+
+
+class NamespaceUsageDto(ContractModel):
+    """一个知识空间的聚合信息（S5-C1 决策 6，只读）。"""
+
+    namespace: str
+    document_count: int
+
+
+class KnowledgeTreeSectionDto(ContractModel):
+    """知识树小节节点（S5-C2）。"""
+
+    section: str
+    chunk_count: int = 0
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeTreeChapterDto(ContractModel):
+    """知识树章节点（S5-C2）：含章直属 chunk 与小节列表。"""
+
+    chapter: str
+    chunk_count: int = 0
+    sections: list[KnowledgeTreeSectionDto] = Field(default_factory=list)
+
+
+class KnowledgeDocumentTreeResponse(ContractModel):
+    """文档结构树响应（S5-C2）：kind 判别 tree/flat 两形态。
+
+    - kind="tree"：chapters 有效（教材类有标题行结构）；
+    - kind="flat"：flat_pages 有效（无结构文档按页平铺；空列表 =
+      文档不存在或无内容）。
+    """
+
+    kind: Literal["tree", "flat"]
+    document_id: str
+    chapters: list[KnowledgeTreeChapterDto] = Field(default_factory=list)
+    flat_pages: list[int] = Field(default_factory=list)
+
+
+class NamespaceListResponse(ContractModel):
+    """知识空间清单（S5-C1 决策 6）：会话创建/上传选择器的数据源。"""
+
+    namespaces: list[NamespaceUsageDto] = Field(default_factory=list)
+
+
+class KnowledgeBaseStatsDto(ContractModel):
+    """知识库语料统计(I1):教师端总览卡数据源。
+
+    total_pages 可空(纯 txt 语料无页概念时为 None);frontmatter_chunks
+    单独给出供教师了解噪音占比(检索侧默认排除,见 service.py 的
+    suppress_frontmatter)。
+    """
+
+    total_documents: int
+    total_chunks: int
+    total_pages: int | None = None
+    frontmatter_chunks: int = 0
+
+
+class KnowledgeOverviewResponse(ContractModel):
+    """知识库总览:统计 + 每篇文档元数据(I1,一次请求覆盖教师端)。
+
+    documents 与 stats 同源(同一词法库聚合);阈值/重排器等检索
+    配置装配状态预留字段(I3/I10,本期不填)。
+    """
+
+    stats: KnowledgeBaseStatsDto
+    documents: list[KnowledgeDocumentInfoDto]
+
+
+class ChunkDetailResponse(ContractModel):
+    """单个分块原文(I2 查看原文):内容 + 配套引用凭证。
+
+    content 上限 8KB(后端截断,防撑爆响应,见 api/knowledge.py 的
+    CHUNK_CONTENT_MAX_LENGTH);citation 与检索命中的 Citation 同构
+    (document_id / source / page / chunk_id),可直接用于「查看原文」
+    跳转与引用展示。
+    """
+
+    content: str
+    citation: Citation
+
+
+class ChunkListEntry(ContractModel):
+    """分块列表条目(I2 浏览):不带全文,只带定位信息与摘要。
+
+    summary 由 chunk 内容截断生成(与检索命中同口径,上限
+    SUMMARY_MAX_LENGTH);完整原文经 GET /knowledge/chunks/{chunk_id}
+    单独获取——列表页先看摘要,点开再看全文。
+    """
+
+    chunk_id: str
+    page: int | None = None
+    start: int = 0
+    end: int = 0
+    summary: str
+
+
+class ChunkListResponse(ContractModel):
+    """某文档的分块分页列表(I2 浏览)。
+
+    total 是该文档全部分块数(不分页),供前端算分页;items 为当前
+    页条目(按 start, chunk_id 排序,见 index.py chunks_of_document)。
+    """
+
+    document_id: str
+    total: int
+    items: list[ChunkListEntry]
 
 
 class Attachment(ContractModel):
@@ -403,14 +819,32 @@ class ChatResponse(ContractModel):
     """The synchronous response contract shared by chat and approval routes."""
 
     session_id: str
+    run_id: str | None = None
     message: Message | None = None
     events: list[RunEvent] = Field(default_factory=list)
     run_error: RunError | None = None
     pending_handoff: PendingHandoff | None = None
+    pending_tool_approval: PendingToolApproval | None = None
     references: list[Citation] | None = None
+    # 六大功能 P2-12：本轮批改结论（可选；非批改轮为 None）。历史
+    # 轮次的批改经 Message.grading 消息元数据恢复（pi 审查 🟡4）。
+    grading: GradingResultDto | None = None
     task_plan: TaskPlan | None = None
     task_results: list[TaskResult] | None = None
+    workflow: WorkflowProgress | None = None
     current_agent: AgentRole | None = None
+
+
+class SessionProcess(ContractModel):
+    """刷新或切回会话时用于重放协作过程的权威快照。"""
+
+    run_id: str | None = None
+    events: list[RunEvent] = Field(default_factory=list)
+    task_plan: TaskPlan | None = None
+    task_results: list[TaskResult] | None = None
+    workflow: WorkflowProgress | None = None
+    current_agent: AgentRole | None = None
+    pending_tool_approval: PendingToolApproval | None = None
 
 
 class FeedbackRating(str, Enum):
@@ -460,6 +894,10 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     ErrorResponse,
     ChatRequest,
     Message,
+    ToolApprovalRequest,
+    PendingToolApproval,
+    PendingToolApprovalResponse,
+    ToolApprovalDecisionRequest,
     RunEvent,
     StreamEvent,
     RunError,
@@ -468,10 +906,17 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     PendingHandoffResponse,
     HandoffDecisionRequest,
     Citation,
+    DiagnosisKnowledgePoint,
+    DiagnosisSummary,
+    GradingItemDto,
+    GradingResultDto,
     TaskPlanStep,
     TaskPlan,
     TaskResult,
+    WorkflowStep,
+    WorkflowProgress,
     ChatResponse,
+    SessionProcess,
     FeedbackRequest,
     FeedbackResponse,
     StatsOverview,
@@ -481,6 +926,15 @@ CONTRACT_MODELS: tuple[type[ContractModel], ...] = (
     KnowledgeDocumentListEntry,
     KnowledgeDocumentUploadResponse,
     KnowledgeDocumentListResponse,
+    KnowledgeDocumentInfoDto,
+    KnowledgeBaseStatsDto,
+    KnowledgeTreeChapterDto,
+    KnowledgeTreeSectionDto,
+    KnowledgeDocumentTreeResponse,
+    KnowledgeOverviewResponse,
+    ChunkDetailResponse,
+    ChunkListEntry,
+    ChunkListResponse,
     FileUploadResponse,
     Attachment,
 )

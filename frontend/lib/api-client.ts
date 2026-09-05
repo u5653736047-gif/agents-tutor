@@ -2,20 +2,30 @@ import type { components, paths } from "@/contracts/api.generated";
 import {
   streamChat as streamChatImpl,
   streamChatWithRetry as streamChatWithRetryImpl,
+  streamToolApproval as streamToolApprovalImpl,
   type StreamChatOptions,
   type StreamRetryOptions,
+  type StreamToolApprovalOptions,
 } from "./stream-client";
 
 export type ApiErrorCode = components["schemas"]["ApiErrorCode"];
 export type ChatRequest = components["schemas"]["ChatRequest"];
 export type ChatResponse = paths["/chat"]["post"]["responses"][200]["content"]["application/json"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
+export type WorkspaceDirectoryListing =
+  components["schemas"]["WorkspaceDirectoryListing"];
+export type WorkspacePath = components["schemas"]["WorkspacePath"];
 // D2-T4:审批决策放开为全字段契约(action/interrupt_id + modify 的
 // target_agent/task_content),由 store 按 action 构造合法组合。
 export type HandoffDecision = components["schemas"]["HandoffDecisionRequest"];
 export type Message = components["schemas"]["Message"];
 export type PendingHandoffResponse = components["schemas"]["PendingHandoffResponse"];
+export type PendingToolApprovalResponse =
+  components["schemas"]["PendingToolApprovalResponse"];
+export type ToolApprovalDecision =
+  components["schemas"]["ToolApprovalDecisionRequest"];
 export type Session = components["schemas"]["Session"];
+export type SessionProcess = components["schemas"]["SessionProcess"];
 // D6-T2:反馈评分方向与受理响应,直接取生成契约(单一数据源)
 export type FeedbackRating = components["schemas"]["FeedbackRating"];
 export type FeedbackResponse = components["schemas"]["FeedbackResponse"];
@@ -55,6 +65,10 @@ export type AttachmentInput = components["schemas"]["Attachment"];
 // last_activity_at(ISO 时间戳或 null,无活动为 null)。响应字段是
 // 契约 snake_case,request() 不做转换,页面按 snake_case 直接读取。
 export type StatsOverview = components["schemas"]["StatsOverview"];
+// 赛前可视化增强：学情诊断摘要与洞察摘要（学习进度页薄弱点/
+// 错题归因/正确率趋势/路径回显卡的数据源），同样直接透传契约。
+export type DiagnosisSummary = components["schemas"]["DiagnosisSummary"];
+export type LearningInsights = components["schemas"]["LearningInsights"];
 
 const defaultApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -82,13 +96,22 @@ export class ApiClientError extends Error {
 }
 
 export type ApiClient = {
+  addWorkspaceRoot(sessionId: string, path: string): Promise<Session>;
   archiveSession(sessionId: string): Promise<Session>;
   createSession(payload?: CreateSessionRequest): Promise<Session>;
   decideHandoff(sessionId: string, decision: HandoffDecision): Promise<ChatResponse>;
+  decideToolApproval(
+    sessionId: string,
+    decision: ToolApprovalDecision,
+  ): Promise<ChatResponse>;
   getPendingHandoff(sessionId: string): Promise<PendingHandoffResponse>;
+  getPendingToolApproval(sessionId: string): Promise<PendingToolApprovalResponse>;
   getSessionMessages(sessionId: string): Promise<Message[]>;
+  getSessionProcess(sessionId: string): Promise<SessionProcess>;
   listSessions(includeArchived?: boolean): Promise<Session[]>;
+  listWorkspaceDirectories(path?: string): Promise<WorkspaceDirectoryListing>;
   sendChat(payload: ChatRequest): Promise<ChatResponse>;
+  validateWorkspace(path: string): Promise<WorkspacePath>;
   // D6-T2:提交用户反馈(点赞/点踩+纠错)。与主对话接口解耦:错误与
   // 其它接口一样归一为 ApiClientError,由调用方(FeedbackButtons)
   // 决定呈现方式,不进入主流程错误状态。
@@ -106,11 +129,23 @@ export type ApiClient = {
   uploadDocument(
     file: File,
     onProgress?: (fraction: number) => void,
+    knowledgeNamespace?: string,
   ): Promise<KnowledgeDocumentUploadResponse>;
   // D6-T7:学习进度基础统计(只读聚合)——独立接口,不进入主会话 store
   // (与 searchKnowledge 同一隔离哲学)。GET /stats/overview,响应
   // 直接透传契约 StatsOverview;错误归一为 ApiClientError。
+  getDocumentTree(
+    documentId: string,
+  ): Promise<components["schemas"]["KnowledgeDocumentTreeResponse"]>;
+  listNamespaces(): Promise<
+    components["schemas"]["NamespaceUsageDto"][]
+  >;
   getStatsOverview(): Promise<StatsOverview>;
+  // 赛前可视化增强：学情诊断与洞察只读聚合——与 getStatsOverview 同一
+  // 隔离哲学（不进入主会话 store）；错误归一为 ApiClientError，调用方
+  // 决定降级呈现（学习进度页：洞察拉取失败不击穿基础统计卡）。
+  getDiagnosisSummary(): Promise<DiagnosisSummary>;
+  getLearningInsights(): Promise<LearningInsights>;
   // D7-T2:聊天附件——uploadFile 走 multipart/form-data(field 名
   // "file",与 uploadDocument 同一 FormData 通道,错误归一为
   // ApiClientError);getFileUrl 纯字符串拼接(不 fetch),供
@@ -127,6 +162,12 @@ export type ApiClient = {
   streamChatWithRetry(
     options: Omit<
       StreamChatOptions & StreamRetryOptions,
+      "baseUrl" | "fetchImpl" | "userId"
+    >,
+  ): Promise<void>;
+  streamToolApproval(
+    options: Omit<
+      StreamToolApprovalOptions,
       "baseUrl" | "fetchImpl" | "userId"
     >,
   ): Promise<void>;
@@ -245,6 +286,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   };
 
   return {
+    addWorkspaceRoot: (sessionId, path) =>
+      request<Session>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/workspace-roots`,
+        {
+          body: JSON.stringify({ path }),
+          method: "POST",
+        },
+      ),
     archiveSession: (sessionId) =>
       request<Session>(config, `/sessions/${encodeURIComponent(sessionId)}/archive`, {
         method: "POST",
@@ -259,21 +309,49 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         body: JSON.stringify(decision),
         method: "POST",
       }),
+    decideToolApproval: (sessionId, decision) =>
+      request<ChatResponse>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/tool-approval`,
+        {
+          body: JSON.stringify(decision),
+          method: "POST",
+        },
+      ),
     getPendingHandoff: (sessionId) =>
       request<PendingHandoffResponse>(
         config,
         `/sessions/${encodeURIComponent(sessionId)}/handoff`,
       ),
+    getPendingToolApproval: (sessionId) =>
+      request<PendingToolApprovalResponse>(
+        config,
+        `/sessions/${encodeURIComponent(sessionId)}/tool-approval`,
+      ),
     getSessionMessages: (sessionId) =>
       request<Message[]>(config, `/sessions/${encodeURIComponent(sessionId)}/messages`),
+    getSessionProcess: (sessionId) =>
+      request<SessionProcess>(config, `/sessions/${encodeURIComponent(sessionId)}/process`),
     listSessions: (includeArchived = false) =>
       request<Session[]>(
         config,
         includeArchived ? "/sessions?include_archived=true" : "/sessions",
       ),
+    listWorkspaceDirectories: (path) =>
+      request<WorkspaceDirectoryListing>(
+        config,
+        path === undefined
+          ? "/workspaces/directories"
+          : `/workspaces/directories?path=${encodeURIComponent(path)}`,
+      ),
     sendChat: (payload) =>
       request<ChatResponse>(config, "/chat", {
         body: JSON.stringify(payload),
+        method: "POST",
+      }),
+    validateWorkspace: (path) =>
+      request<WorkspacePath>(config, "/workspaces/validate", {
+        body: JSON.stringify({ path }),
         method: "POST",
       }),
     // D6-T2:反馈接口——只发契约 FeedbackRequest 的脱敏字段(不含消息
@@ -305,11 +383,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // FormData 不设 Content-Type(见 request 注释),由浏览器自动带
     // multipart boundary。onProgress 仅 0/1 里程碑(成功 1、失败回 0),
     // 页面以「上传中…」禁用态表达进度,不依赖进度回调。
-    uploadDocument: async (file, onProgress) => {
+    uploadDocument: async (file, onProgress, knowledgeNamespace) => {
       onProgress?.(0);
       try {
         const body = new FormData();
         body.append("file", file);
+        // S5-C1 决策 1：目标空间随表单上传（缺省 public，由后端校验）。
+        if (knowledgeNamespace !== undefined && knowledgeNamespace !== "public") {
+          body.append("knowledge_namespace", knowledgeNamespace);
+        }
         const response = await request<KnowledgeDocumentUploadResponse>(
           config,
           "/knowledge/documents",
@@ -323,8 +405,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       }
     },
     // D6-T6:文档清单——GET 直接透传契约响应(documents 数组)。
-    listDocuments: () =>
-      request<KnowledgeDocumentListResponse>(config, "/knowledge/documents"),
+    // P1-5：支持按 namespace 过滤（显式字段，不再前端反推前缀）。
+    listDocuments: (namespace?: string) =>
+      request<KnowledgeDocumentListResponse>(
+        config,
+        namespace
+          ? `/knowledge/documents?namespace=${encodeURIComponent(namespace)}`
+          : "/knowledge/documents",
+      ),
     // D6-T6:删除文档——204 空响应体由 request() 放行(见 request 注释)。
     deleteDocument: (documentId) =>
       request<void>(
@@ -334,7 +422,21 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       ),
     // D6-T7:学习进度——GET /stats/overview,响应直接透传契约字段
     // (snake_case 原样,与 listDocuments 等先例一致)。
+    getDocumentTree: (documentId) =>
+      request<components["schemas"]["KnowledgeDocumentTreeResponse"]>(
+        config,
+        `/knowledge/documents/${encodeURIComponent(documentId)}/tree`,
+      ),
+    listNamespaces: () =>
+      request<{ namespaces?: components["schemas"]["NamespaceUsageDto"][] }>(
+        config,
+        "/knowledge/namespaces",
+      ).then((res) => res.namespaces ?? []),
     getStatsOverview: () => request<StatsOverview>(config, "/stats/overview"),
+    getDiagnosisSummary: () =>
+      request<DiagnosisSummary>(config, "/learning/diagnosis/summary"),
+    getLearningInsights: () =>
+      request<LearningInsights>(config, "/learning/insights/summary"),
     // D7-T2:附件上传——与 uploadDocument 同一 FormData 模式(field 名
     // "file",request() 对 FormData 不设 Content-Type,浏览器自动带
     // multipart boundary)。无进度回调:上传中态由组件 pendingFiles
@@ -363,6 +465,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     // 断线重连(指数退避 + fromSequence 续传,实现见 stream-client)。
     streamChatWithRetry: (options) =>
       streamChatWithRetryImpl({
+        baseUrl: config.baseUrl,
+        fetchImpl: config.fetchImpl,
+        timeoutMs: config.timeoutMs,
+        userId: config.userId,
+        ...options,
+      }),
+    streamToolApproval: (options) =>
+      streamToolApprovalImpl({
         baseUrl: config.baseUrl,
         fetchImpl: config.fetchImpl,
         timeoutMs: config.timeoutMs,

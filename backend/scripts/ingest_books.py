@@ -88,13 +88,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
 import sys
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
 
 from core.knowledge.embedding import (
     EmbeddingProvider,
@@ -105,9 +106,10 @@ from core.knowledge.frontmatter import classify_frontmatter
 from core.knowledge.hybrid import HybridKnowledgeIndex, open_vector_index_if_available
 from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import iter_pdf_pages
-from core.knowledge.models import KnowledgeDocument
+from core.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from core.knowledge.service import KnowledgeService
 from core.knowledge.vector_index import SqliteVectorKnowledgeIndex
+from core.ocr import OcrProvider, create_ocr_provider
 
 # ── 路径与常量约定 ───────────────────────────────────────────────
 # 脚本位于 backend/scripts/，向上两级即仓库根；数据目录与数据库都放在
@@ -192,7 +194,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         raise ValueError(f"无法读取知识清单 {manifest_path}: {exc}") from exc
 
     if not isinstance(raw, dict) or not isinstance(raw.get("version"), int):
-        raise ValueError("知识清单缺少整数 version 字段")
+        raise TypeError("知识清单缺少整数 version 字段")
     raw_books = raw.get("books")
     if not isinstance(raw_books, list) or not raw_books:
         raise ValueError("知识清单的 books 必须是非空数组")
@@ -202,7 +204,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
     seen_sources: set[str] = set()
     for index, entry in enumerate(raw_books):
         if not isinstance(entry, dict):
-            raise ValueError(f"第 {index + 1} 本书的条目必须是对象")
+            raise TypeError(f"第 {index + 1} 本书的条目必须是对象")
         source = _validate_source_identifier(str(entry.get("source", "")))
         if source in seen_sources:
             raise ValueError(f"source 重复：{source!r}")
@@ -211,7 +213,15 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         file_name = str(entry.get("file", ""))
         if not file_name or "/" in file_name or "\\" in file_name:
             raise ValueError(f"{source}: file 必须是不含路径分隔符的文件名")
-        if not (books_dir_path / file_name).is_file():
+        # 文件存在性校验：blocked 条目的语义是「数据源不可用」（如课标
+        # PDF 尚未提供），此时文件缺失是常态而非配置错误——入库与验证均会
+        # 按 blocked 跳过，因此放宽为仅对未阻塞条目强校验；未阻塞条目缺文件
+        # 仍属配置错误，尽早失败。
+        raw_blocked_check = entry.get("blocked")
+        is_blocked_entry = isinstance(raw_blocked_check, str) and bool(
+            raw_blocked_check.strip()
+        )
+        if not is_blocked_entry and not (books_dir_path / file_name).is_file():
             raise ValueError(f"{source}: 文件不存在于 {books_dir_path}：{file_name}")
 
         title = str(entry.get("title", "")).strip()
@@ -220,7 +230,9 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         difficulty = str(entry.get("difficulty", ""))
         if not title:
             raise ValueError(f"{source}: title 不能为空")
-        if not authors:
+        # authors 必填仅对未阻塞条目强校验：blocked 占位条目（数据源未到位，
+        # 如课标）作者信息可能未知，不应阻止清单加载（与文件存在性放宽同一语义）。
+        if not is_blocked_entry and not authors:
             raise ValueError(f"{source}: authors 至少一个作者")
         if not subjects:
             raise ValueError(f"{source}: subjects 至少一个学科标签")
@@ -266,7 +278,7 @@ def load_manifest(path: str | Path, *, books_dir: str | Path) -> Manifest:
         verify: list[VerifyCase] = []
         for case_index, case in enumerate(raw_verify):
             if not isinstance(case, dict):
-                raise ValueError(f"{book.source}: 第 {case_index + 1} 个用例必须是对象")
+                raise TypeError(f"{book.source}: 第 {case_index + 1} 个用例必须是对象")
             query = str(case.get("query", "")).strip()
             expected = str(case.get("expected_source", ""))
             if not query:
@@ -324,6 +336,32 @@ class IngestResult:
 PageLoader = Callable[[Path, str, str], Iterator[KnowledgeDocument]]
 
 
+def _file_sha256(path: Path) -> str:
+    """源文件 sha256（S5-C3 版本管理：内容变更检测的比对基准）。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _parse_page_range(raw: str) -> tuple[int, int]:
+    """解析 --page-range 参数（格式 "A-B"，闭区间，1 起）。
+
+    非法格式 / 非正数 / start > end 都直接 ValueError（调用方转为
+    CLI 报错退出）——配置错误要暴露，不静默猜测。
+    """
+    match = re.fullmatch(r"(\d+)-(\d+)", raw.strip())
+    if match is None:
+        raise ValueError(
+            f"--page-range 格式非法：{raw!r}（应为 A-B，如 1-120；闭区间、1 起）"
+        )
+    start, end = int(match.group(1)), int(match.group(2))
+    if start < 1 or end < start:
+        raise ValueError(f"--page-range 非法：{raw!r}（需 1 <= A <= B）")
+    return start, end
+
+
 def ingest_book(
     index: SqliteKnowledgeIndex,
     book: ManifestBook,
@@ -334,6 +372,8 @@ def ingest_book(
     progress: Callable[[int, int], None] | None = None,
     chunking: str = "character",
     vector_index: SqliteVectorKnowledgeIndex | None = None,
+    ocr_provider: OcrProvider | None = None,
+    page_range: tuple[int, int] | None = None,
 ) -> IngestResult:
     """入库一本书，返回入库结果。
 
@@ -361,7 +401,17 @@ def ingest_book(
     if book.blocked:
         return IngestResult(book_source=book.source, status="blocked")
 
-    if not force and index.is_document_complete(book.source):
+    # S5-C3 分段模式（--page-range）：非破坏性调和 + 不写整本标记。
+    # 为什么不能直接走整文档替换：add_documents 是「先删该书全部旧
+    # chunk 再插新」——分段入库会把其他已入库分段的 chunk 一并删掉。
+    # 因此先快照范围外的旧 chunk，写入新分段后原样回插（chunk_id 相同，
+    # INSERT OR REPLACE 幂等）；完成标记永不写入——写标记会让剩余页被
+    # 误判为已入库而永远无法补齐（安全侧语义，见 --page-range help）。
+    segment_mode = page_range is not None
+    start_page = page_range[0] if page_range is not None else 0
+    end_page = page_range[1] if page_range is not None else 0
+
+    if not force and not segment_mode and index.is_document_complete(book.source):
         if vector_index is not None and not vector_index.has_document(book.source):
             # 增量补建向量（S3-T4）：词法库已入库但向量库缺失——例如
             # 先前入库未带 --vector。直接从词法库读出该书的全部 chunk
@@ -369,11 +419,13 @@ def ingest_book(
             vector_index.upsert(index.chunks_of_document(book.source))
         return IngestResult(book_source=book.source, status="skipped")
 
-    if force:
+    if force and not segment_mode:
         # 先清标记：若本次入库中途失败，保证下次默认运行不会误跳过。
+        # 分段模式不清标记：分段是对已有入库内容的范围性维护，不应
+        # 抹掉整本完成状态。
         index.clear_document_complete(book.source)
 
-    loader = page_loader or _default_page_loader(progress)
+    loader = page_loader or _default_page_loader(progress, ocr_provider, page_range)
     pages = list(loader(pdf_path, book.source, book.source))
     if not pages:
         raise ValueError(f"{book.source}: 解析结果为空，拒绝入库")
@@ -385,16 +437,48 @@ def ingest_book(
         page.metadata["difficulty"] = book.difficulty
         page.metadata["title"] = book.title
 
+    # 分段调和的快照必须在 add_documents 之前：后者是整文档替换
+    # （先删该书全部旧 chunk），删后快照拿到的只会是空列表。
+    retained: list[KnowledgeChunk] = []
+    if segment_mode:
+        retained = [
+            chunk
+            for chunk in index.chunks_of_document(book.source)
+            if chunk.page is None or not (start_page <= chunk.page <= end_page)
+        ]
+
     service = KnowledgeService(index, chunking=chunking)
     chunks = service.add_documents(pages)
+    if segment_mode and retained:
+        # 回插其他分段的 chunk（在 add_documents 的整文档删除之后）。
+        index.upsert(retained)
     if vector_index is not None:
         # 向量索引与词法索引是两份独立数据（不同数据库文件），整文档替换
         # 语义需要手动同步：先删该书旧向量，再写入新向量（与上方
         # add_documents 内部「先删后插」的顺序一致，中途失败不残留旧版）。
+        # 分段模式同样回插保留 chunk 的向量（重算 embedding，代价可接受）。
         vector_index.delete_document(book.source)
-        vector_index.upsert(chunks)
+        vector_index.upsert([*chunks, *retained] if segment_mode else chunks)
+    if segment_mode:
+        print(
+            f"    [分段模式] --page-range {start_page}-{end_page}：只入库该范围页面；"
+            "不写整本完成标记（全量重入时不要带该参数）",
+            file=sys.stderr,
+        )
+        return IngestResult(
+            book_source=book.source,
+            status="ingested",
+            pages=len(pages),
+            chunks=len(chunks),
+        )
+    # 源文件缺失（测试注入 page_loader 的场景）时无哈希可记，落 NULL。
+    content_hash = _file_sha256(pdf_path) if pdf_path.exists() else None
     index.mark_document_complete(
-        book.source, chunk_count=len(chunks), page_count=len(pages)
+        book.source,
+        chunk_count=len(chunks),
+        page_count=len(pages),
+        content_hash=content_hash,
+        chunking=chunking,
     )
     return IngestResult(
         book_source=book.source,
@@ -406,8 +490,14 @@ def ingest_book(
 
 def _default_page_loader(
     progress: Callable[[int, int], None] | None,
+    ocr_provider: OcrProvider | None = None,
+    page_range: tuple[int, int] | None = None,
 ) -> PageLoader:
-    """默认 loader：复用 core loaders.iter_pdf_pages（惰性逐页解析）。"""
+    """默认 loader：复用 core loaders.iter_pdf_pages（惰性逐页解析）。
+
+    ocr_provider（S5-C3）：非 None 时无文本层页经 OCR 兜底提取。
+    page_range（S5-C3）：非 None 时仅解析范围内页面（分段入库）。
+    """
 
     def load(path: Path, document_id: str, source_label: str) -> Iterator[KnowledgeDocument]:
         return iter_pdf_pages(
@@ -415,6 +505,8 @@ def _default_page_loader(
             document_id=document_id,
             source_label=source_label,
             progress=progress,
+            ocr_provider=ocr_provider,
+            page_range=page_range,
         )
 
     return load
@@ -651,6 +743,33 @@ def main(argv: list[str] | None = None) -> int:
         help="向量索引数据库路径（默认 data/vector_knowledge.db，随 data/ 不进 git）",
     )
     parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="S5-C3 扫描页 OCR 兜底：页面无文本层时渲染为图片经 RapidOCR "
+        "提取文本（需 uv sync --extra ocr）。默认关闭，评委/CI 零影响。"
+        "注意：OCR 每页秒级，数百页扫描书为数十分钟级任务",
+    )
+    parser.add_argument(
+        "--page-range",
+        default=None,
+        metavar="A-B",
+        help="S5-C3 分段入库：只解析并入库 A-B 页（闭区间，1 起，如 1-120）——"
+        "大扫描书可分多次入库。分段模式不写整本完成标记（避免剩余页被误判为"
+        "已入库而永远无法补齐），全量重入时不要带该参数；与 --force 组合时"
+        "也不清标记（分段是对已有内容的范围性维护）",
+    )
+    parser.add_argument(
+        "--rebuild-fts",
+        action="store_true",
+        help="重建词法库 FTS5 预筛表（独立维护动作，不执行入库；大库为秒级～十秒级操作）",
+    )
+    parser.add_argument(
+        "--check-updates",
+        action="store_true",
+        help="S5-C3 只读检测模式：比对源文件 sha256 与完成标记，报告内容"
+        "变更与分块策略漂移；不解析 PDF（首次打开旧库会幂等回填 namespace 字段，仅此一次写入）",
+    )
+    parser.add_argument(
         "--relabel-frontmatter",
         action="store_true",
         help="H-T2：只对已入库 chunk 重新执行前言/目录分类并更新两库 "
@@ -663,6 +782,15 @@ def main(argv: list[str] | None = None) -> int:
         print("错误: --top-k 必须在 1-10 之间", file=sys.stderr)
         return 2
 
+    # S5-C3：--page-range 解析与校验（非法格式直接报错退出，不静默猜测）。
+    page_range: tuple[int, int] | None = None
+    if args.page_range is not None:
+        try:
+            page_range = _parse_page_range(args.page_range)
+        except ValueError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 2
+
     try:
         manifest = load_manifest(args.manifest, books_dir=args.books_dir)
         books = select_books(manifest, args.books)
@@ -671,6 +799,57 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     index = SqliteKnowledgeIndex(args.db)
+
+    if args.rebuild_fts:
+        # S5-C4 显式管理动作：清空并从 chunks 全量重写 FTS 预筛表，
+        # 不执行入库流程。大库预期成本：秒级～十秒级线性操作。
+        # 复用上方已打开的 index 连接（评审修正：此前重复构造了第二个
+        # SqliteKnowledgeIndex 且第一个未关闭）。
+        rebuilt = index.rebuild_fts()
+        print(f"FTS5 预筛表已重建：{rebuilt} 行")
+        index.close()
+        return 0
+
+    if args.check_updates:
+        # S5-C3 只读检测模式：比对源文件 sha256 与完成标记，不解析 PDF。
+        # 首次打开旧库会幂等回填 namespace 字段（SqliteKnowledgeIndex
+        # 构造时的存量迁移），除此之外不写业务数据。
+        issues = 0
+        for book in books:
+            pdf_path = args.books_dir / book.file
+            label = f"{book.source}（《{book.title}》）"
+            if book.blocked:
+                print(f"[跳过] {label}：清单标记阻塞")
+                continue
+            if not pdf_path.exists():
+                print(f"[跳过] {label}：源文件不存在 {pdf_path}")
+                continue
+            digest = _file_sha256(pdf_path)
+            mark = index.document_mark(book.source)
+            problems: list[str] = []
+            if mark is None:
+                problems.append("无完成标记（未入库）")
+            else:
+                if mark.content_hash is None:
+                    problems.append("旧标记无 content_hash（升级前入库）")
+                elif mark.content_hash != digest:
+                    problems.append("源文件内容已变更")
+                if mark.chunking is not None and mark.chunking != args.chunking:
+                    problems.append(
+                        f"分块策略不一致（标记 {mark.chunking} ≠ 当前 {args.chunking}）"
+                    )
+            if problems:
+                issues += 1
+                print(f"[变更] {label}：{'；'.join(problems)}")
+            else:
+                print(f"[一致] {label}")
+        print(
+            f"检测完成：{issues}/{len(books)} 本书需要关注"
+            f"（--check-updates 不解析 PDF；除首次打开旧库的幂等回填外未写入业务数据）"
+        )
+        index.close()
+        return 0
+
     # S3-T4：向量库在「入库/补建」路径（--vector）显式打开；
     # --verify 分支用 open_vector_index_if_available「存在才打开」——
     # 文件不存在时返回 None（不会白白创建空库文件），检索自动降级
@@ -696,6 +875,18 @@ def main(argv: list[str] | None = None) -> int:
         # ——用户显式选了 fastembed，静默换 provider 会与库维度错位。
         print(f"错误: {exc}", file=sys.stderr)
         return 2
+    # S5-C3：--ocr 显式开启时构造 OCR provider；未装 ocr extra（构造
+    # 返回 None）→ 打印警告并以无 OCR 模式继续（不阻断入库）。
+    ocr_provider: OcrProvider | None = None
+    if args.ocr:
+        ocr_provider = create_ocr_provider("auto")
+        if ocr_provider is None:
+            print(
+                "警告: 未安装 ocr 可选依赖组（uv sync --extra ocr），"
+                "--ocr 不生效，无文本层页将按现状跳过",
+                file=sys.stderr,
+            )
+
     vector_index: SqliteVectorKnowledgeIndex | None = None
     try:
         if args.verify:
@@ -780,6 +971,19 @@ def main(argv: list[str] | None = None) -> int:
         for book_number, book in enumerate(books, start=1):
             pdf_path = args.books_dir / book.file
             print(f"[{book_number}/{total_books}] 《{book.title}》 ({book.source})")
+            if not args.force:
+                mark = index.document_mark(book.source)
+                if (
+                    mark is not None
+                    and mark.chunking is not None
+                    and mark.chunking != args.chunking
+                ):
+                    print(
+                        f"    [警告] 标记的分块策略为 {mark.chunking}，与当前 "
+                        f"--chunking {args.chunking} 不一致——本次运行将跳过该书；"
+                        "如需按新策略重建请加 --force",
+                        file=sys.stderr,
+                    )
             try:
                 result = ingest_book(
                     index,
@@ -789,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
                     progress=_print_progress,
                     chunking=args.chunking,
                     vector_index=vector_index,
+                    ocr_provider=ocr_provider,
+                    page_range=page_range,
                 )
             except ValueError as exc:
                 # 单本书失败只影响它自己：无完成标记，下次默认运行会自动重试；

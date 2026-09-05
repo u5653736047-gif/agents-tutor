@@ -9,22 +9,30 @@ export type StreamEvent = components["schemas"]["StreamEvent"];
 
 export type StreamEventCallback = (event: StreamEvent) => void;
 
-export interface StreamChatOptions {
+interface EventStreamOptions {
   baseUrl: string;
   userId: string;
+  onEvent: StreamEventCallback;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export interface StreamChatOptions extends EventStreamOptions {
   sessionId: string;
   message: string;
   // D7-T2:附件引用列表(契约 ChatRequest.attachments)——流式通道与同步
   // 通道同契约,有附件时一并提交;缺省 undefined 不落 body 字段。
   // 类型直接引用生成契约,store→stream 间字段零漂移(review nit)。
   attachments?: components["schemas"]["Attachment"][];
-  onEvent: StreamEventCallback;
-  signal?: AbortSignal;
-  fetchImpl?: typeof fetch;
-  timeoutMs?: number;
   // D1-T3:断线重连续传起点——上次成功收到的最新事件 sequence。
   // 服务端据此回放剩余事件 + done,不重复执行整轮;默认 0 表示新消息。
   fromSequence?: number;
+}
+
+export interface StreamToolApprovalOptions extends EventStreamOptions {
+  sessionId: string;
+  decision: components["schemas"]["ToolApprovalDecisionRequest"];
 }
 
 // D1-T3 重连参数:指数退避 + 重试上限。重试期间携带递增的
@@ -79,31 +87,36 @@ async function readErrorDetail(response: Response): Promise<{
   return { code: null, message: "请求失败，请稍后重试。" };
 }
 
-export async function streamChat(options: StreamChatOptions): Promise<void> {
+async function streamEvents(
+  options: EventStreamOptions,
+  path: string,
+  body: unknown,
+): Promise<void> {
   const {
-    attachments,
     baseUrl,
     fetchImpl = fetch,
-    fromSequence = 0,
-    message,
     onEvent,
-    sessionId,
     signal,
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     userId,
   } = options;
 
-  // 内部超时计时器与调用方 signal 合并:任一触发都中止 fetch 与读取循环
-  // (reader.read 在 signal abort 时拒绝)。超时按失败抛错;调用方主动取消
-  // (AbortController.abort)则静默返回——D1-T3 的重连依赖后者。
-  // 注意:计时器与监听必须覆盖「fetch + 读取」全程,不能在响应头返回后就
-  // 清理——否则后端挂起时前端无限挂起(review 修正)。
+  // timeoutMs 是「空闲看门狗」而不是整轮硬截止时间：多 Agent 一轮可能
+  // 合法运行数分钟，只要正文、过程事件或 keepalive 仍持续到达就不能
+  // 中止。每个网络 chunk 都会重新计时；真正连续静默 timeoutMs 才失败。
   const controller = new AbortController();
   let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const armInactivityTimeout = () => {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  };
+  armInactivityTimeout();
   const abortFromCaller = () => controller.abort();
   signal?.addEventListener("abort", abortFromCaller, { once: true });
 
@@ -112,16 +125,9 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     let response: Response;
     try {
       response = await fetchImpl(
-        `${baseUrl}/chat/stream?from_sequence=${fromSequence}`,
+        `${baseUrl}${path}`,
         {
-          body: JSON.stringify({
-            message,
-            session_id: sessionId,
-            // D7-T2:流式通道同契约透传附件(见 StreamChatOptions.attachments);
-            // 条件展开:缺省不落字段,与既有请求体逐字节一致(既有测试
-            // 零回归)。
-            ...(attachments && attachments.length > 0 ? { attachments } : {}),
-          }),
+          body: JSON.stringify(body),
           headers: {
             "Content-Type": "application/json",
             "X-User-Id": userId,
@@ -196,6 +202,9 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       if (done) {
         break;
       }
+      // 注释心跳也属于有效网络活动；在解析 data 帧之前就重置，避免
+      // 长工具/子代理阶段因没有正文 token 被误判超时。
+      armInactivityTimeout();
       // stream: true 让 TextDecoder 保留跨 chunk 的半截多字节字符
       buffer += decoder.decode(value, { stream: true });
       let newlineIndex = buffer.indexOf("\n");
@@ -231,10 +240,40 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       status: null,
     });
   } finally {
-    // 计时器与监听在此统一清理:覆盖 fetch + 读取全程(review 修正)。
-    clearTimeout(timeout);
+    // 计时器与监听在此统一清理:覆盖 fetch + 读取全程。
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
     signal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+export async function streamChat(options: StreamChatOptions): Promise<void> {
+  const {
+    attachments,
+    fromSequence = 0,
+    message,
+    sessionId,
+  } = options;
+  await streamEvents(
+    options,
+    `/chat/stream?from_sequence=${fromSequence}`,
+    {
+      message,
+      session_id: sessionId,
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    },
+  );
+}
+
+export async function streamToolApproval(
+  options: StreamToolApprovalOptions,
+): Promise<void> {
+  await streamEvents(
+    options,
+    `/sessions/${encodeURIComponent(options.sessionId)}/tool-approval/stream`,
+    options.decision,
+  );
 }
 
 // D1-T3:可中断的退避等待。signal abort 时立即返回(不抛错)——调用方
@@ -306,7 +345,7 @@ export async function streamChatWithRetry(
         return;
       }
       if (attempt >= options.maxRetries) {
-        throw error; // 重试耗尽:原样抛出,由调用方决定降级策略
+        throw error; // 重试耗尽:原样抛出,由调用方展示并提供显式恢复入口
       }
       options.onRetry?.(attempt + 1, error);
       await delay(

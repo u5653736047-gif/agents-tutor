@@ -1,15 +1,76 @@
 "use client";
 
-import { CircleCheck, CircleX, Menu, Moon, Sun } from "lucide-react";
+import {
+  ArrowUpRight,
+  BookOpen,
+  CircleCheck,
+  CircleX,
+  FolderPlus,
+  Menu,
+  Moon,
+  Sparkles,
+  Sun,
+} from "lucide-react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useTheme } from "next-themes";
-import { useCallback, useEffect, useRef, useSyncExternalStore, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useSyncExternalStore,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 import { ConversationPanel } from "@/components/conversation-panel";
 import { SessionSidebar } from "@/components/session-sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { WorkspaceDialog, type WorkspaceDialogMode } from "@/components/workspace-dialog";
+import {
+  ASSISTANT_UI_ENV_DEFAULT,
+  isAssistantUiEnabled,
+  subscribeAssistantUiFlag,
+} from "@/lib/feature-flags";
 import { apiBaseUrl } from "@/lib/api-base-url";
 import { isOnboardingSeen, markOnboardingSeen, subscribeOnboarding } from "@/lib/onboarding";
+import {
+  COLLAPSED_SIDEBAR_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  resizeSidebarWidth,
+  sidebarWidthForKey,
+} from "@/lib/sidebar-layout";
 import { useChatStore } from "@/stores/chat-store";
+
+// assistant-ui 接入(T4):新渲染路径按需加载——动态导入保证 assistant-ui
+// 代码进独立 async chunk,不增首屏体积(T1 预算门禁);灰度关闭时本分支
+// 完全不加载。loading 骨架与消息气泡结构对齐(徽章 + 两行文本占位)。
+const AssistantThread = dynamic(
+  () => import("@/components/assistant-ui/assistant-thread"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex min-h-0 flex-1 flex-col" data-slot="assistant-thread-loading">
+        <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-5 px-4 py-8 md:px-8">
+          <div className="max-w-[90%] rounded-2xl rounded-bl-md border border-border/70 bg-card/80 px-5 py-4 shadow-sm md:max-w-[85%]">
+            <div className="flex items-center gap-2">
+              <Skeleton className="size-5 rounded-full" />
+              <Skeleton className="h-4 w-16" />
+            </div>
+            <div className="mt-3 space-y-2">
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-4/5" />
+            </div>
+          </div>
+        </div>
+      </div>
+    ),
+  },
+);
 
 // D5-T4:空态示例问题——点击后按「建会话 → 流式提问」时序快速开始,
 // 不依赖引导标记,新老用户始终可见。
@@ -25,9 +86,84 @@ type AppShellProps = {
 };
 
 export function AppShell({ apiConnected }: AppShellProps) {
+  const addWorkspaceRoot = useChatStore((state) => state.addWorkspaceRoot);
   const currentSessionId = useChatStore((state) => state.currentSessionId);
   const createSession = useChatStore((state) => state.createSession);
+  const sessions = useChatStore((state) => state.sessions);
   const streamSendMessage = useChatStore((state) => state.streamSendMessage);
+  const [workspaceDialogMode, setWorkspaceDialogMode] =
+    useState<WorkspaceDialogMode | null>(null);
+
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const resizeStartRef = useRef<{
+    pointerId: number;
+    pointerX: number;
+    width: number;
+  } | null>(null);
+  const activeSidebarWidth = sidebarCollapsed
+    ? COLLAPSED_SIDEBAR_WIDTH
+    : sidebarWidth;
+  const shellStyle = {
+    "--sidebar-width": `${activeSidebarWidth}px`,
+  } as CSSProperties;
+  const currentSession = sessions.find(
+    (session) => session.session_id === currentSessionId,
+  );
+  const currentSessionTitle = currentSessionId
+    ? currentSession?.title?.trim() || "未命名会话"
+    : "开始新的学习";
+  const recentWorkspaceRoots = Array.from(
+    new Set(
+      sessions
+        .map((session) => session.workspace_root)
+        .filter((root): root is string => Boolean(root)),
+    ),
+  );
+
+  const confirmWorkspace = async (path: string) => {
+    if (workspaceDialogMode === "add") {
+      return (await addWorkspaceRoot(path)) !== null;
+    }
+    return (await createSession(path)) !== null;
+  };
+
+  const handleResizePointerDown = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+    resizeStartRef.current = {
+      pointerId: event.pointerId,
+      pointerX: event.clientX,
+      width: sidebarWidth,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleResizePointerMove = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    const start = resizeStartRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    setSidebarWidth(
+      resizeSidebarWidth(start.width, start.pointerX, event.clientX),
+    );
+  };
+
+  const finishResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (resizeStartRef.current?.pointerId !== event.pointerId) return;
+    resizeStartRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const handleResizeKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const nextWidth = sidebarWidthForKey(sidebarWidth, event.key);
+    if (nextWidth === sidebarWidth) return;
+    event.preventDefault();
+    setSidebarWidth(nextWidth);
+  };
 
   // D5-T4:首次引导「已看过」标记——useSyncExternalStore 读 localStorage 外部
   // 存储(react-hooks lint 拦截 effect 内 setState,mounted 模式不可用,先例
@@ -38,6 +174,15 @@ export function AppShell({ apiConnected }: AppShellProps) {
     subscribeOnboarding,
     isOnboardingSeen,
     () => false,
+  );
+
+  // assistant-ui 接入(T4):渲染路径开关——三快照模式复刻上方 onboarding
+  // 先例:服务端快照恒为 env 默认(SSR/客户端首帧一致,无 hydration
+  // mismatch);localStorage 覆盖在 hydration 后经订阅生效(灰度/回滚操作)。
+  const assistantUiEnabled = useSyncExternalStore(
+    subscribeAssistantUiFlag,
+    isAssistantUiEnabled,
+    () => ASSISTANT_UI_ENV_DEFAULT,
   );
 
   // D5-T4:示例问题点击时序——先 await createSession()(成功时 currentSessionId
@@ -153,16 +298,48 @@ export function AppShell({ apiConnected }: AppShellProps) {
 
   return (
     <main
-      // D4-T5:断点语义——移动端单栏(grid-cols-1,主区独占整行),
-      // md 起恢复桌面两栏(18rem 侧栏 + 自适应主区)。
-      className="grid min-h-screen grid-cols-1 bg-background md:grid-cols-[18rem_minmax(0,1fr)]"
+      // 移动端单栏；桌面列宽由 --sidebar-width 驱动，拖拽/收起时主区
+      // 使用同一个 Grid 自动联动，不需要手工计算内容宽度。
+      // UX-20260808#2:min-h-screen → h-dvh + overflow-hidden——「最小一屏」
+      // 会让整页随消息撑高、浏览器滚动 body(侧栏被一起顶走);固定视口
+      // 高度后,侧栏会话列表与消息区各自成为独立滚动容器(两者内部均有
+      // flex-1 overflow-y-auto,此前因祖先无高度上限从未生效)。dvh 兼容
+      // 移动端浏览器地址栏伸缩。
+      className="grid h-dvh grid-cols-1 overflow-hidden bg-background md:grid-cols-[var(--sidebar-width)_minmax(0,1fr)]"
       data-layout="desktop-two-column"
       data-slot="app-shell"
+      style={shellStyle}
     >
       {/* D4-T5:桌面分支——静态侧栏仅 md 及以上可见;移动端隐藏,
           改由下方抽屉承担。 */}
-      <div className="hidden md:block">
-        <SessionSidebar />
+      <div className="relative hidden min-w-0 md:block" data-slot="desktop-sidebar">
+        <SessionSidebar
+          collapsed={sidebarCollapsed}
+          onCreateSession={() => setWorkspaceDialogMode("create")}
+          onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
+        />
+        {!sidebarCollapsed ? (
+          <div
+            aria-label="调整会话侧栏宽度"
+            aria-orientation="vertical"
+            aria-valuemax={MAX_SIDEBAR_WIDTH}
+            aria-valuemin={MIN_SIDEBAR_WIDTH}
+            aria-valuenow={sidebarWidth}
+            className="group absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize touch-none outline-none"
+            data-slot="sidebar-resizer"
+            onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+            onKeyDown={handleResizeKeyDown}
+            onPointerCancel={finishResize}
+            onPointerDown={handleResizePointerDown}
+            onPointerMove={handleResizePointerMove}
+            onPointerUp={finishResize}
+            role="separator"
+            tabIndex={0}
+            title="拖拽调整宽度，双击恢复默认"
+          >
+            <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent transition-colors group-hover:bg-primary/50 group-focus-visible:bg-primary" />
+          </div>
+        ) : null}
       </div>
 
       {/* D4-T5:移动端分支——抽屉只在 sidebarOpen 时渲染(SSR 初始态
@@ -186,22 +363,32 @@ export function AppShell({ apiConnected }: AppShellProps) {
           {/* D5-T5:抽屉容器 tabIndex={-1} 使其可被程序化聚焦(focus()),
               打开时焦点移入(见上方 effect);ref 持有供聚焦。 */}
           <div
-            className="fixed inset-y-0 left-0 z-40 w-72 animate-in fade-in-0 slide-in-from-left-2 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
+            className="fixed inset-y-0 left-0 z-40 w-[min(20rem,calc(100vw-2rem))] animate-in fade-in-0 slide-in-from-left-2 duration-[var(--app-duration-normal)] ease-[var(--app-ease-out)]"
             data-slot="sidebar-drawer"
             ref={drawerRef}
             tabIndex={-1}
           >
             {/* D4-T5:选中会话后自动收起抽屉(方案 A:容器可选回调)。
                 D5-T5:走 closeDrawer,焦点归还汉堡按钮。 */}
-            <SessionSidebar onSessionSelected={closeDrawer} />
+            <SessionSidebar
+              onClose={closeDrawer}
+              onCreateSession={() => {
+                closeDrawer();
+                setWorkspaceDialogMode("create");
+              }}
+              onSessionSelected={closeDrawer}
+            />
           </div>
         </>
       ) : null}
 
-      <section className="flex min-w-0 flex-col" data-slot="conversation-area">
+      {/* UX-20260808#2:h-dvh 与主容器对齐——消息区(ConversationPanel 内
+          flex-1 overflow-y-auto)以本 section 为高度上限独立滚动;
+          min-w-0 保留(grid 子项横向防撑破)。 */}
+      <section className="flex h-dvh min-w-0 flex-col" data-slot="conversation-area">
         {/* D4-T5:汉堡按钮仅移动端可见(md:hidden),位于顶栏左侧;抽屉
             打开后遮罩(固定全屏)会盖住它,关闭走遮罩/Esc/选中会话。 */}
-        <header className="flex items-center justify-between border-b border-border px-4 py-4 md:px-8">
+        <header className="flex min-h-16 items-center justify-between border-b border-border/70 bg-card/50 px-4 py-3 backdrop-blur md:px-6">
           <div className="flex items-center gap-3">
             <button
               aria-label="打开会话侧栏"
@@ -214,32 +401,47 @@ export function AppShell({ apiConnected }: AppShellProps) {
               <Menu aria-hidden className="size-5" />
             </button>
             <div>
-              <p className="text-caption font-medium text-primary">阶段三 · 协作工作台</p>
-              <h2 className="text-title font-semibold text-foreground">对话区</h2>
+              <h2 className="max-w-[min(50vw,32rem)] truncate text-body font-semibold text-foreground">
+                {currentSessionTitle}
+              </h2>
+              <p className="text-caption text-muted-foreground">多智能体学习空间</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {currentSession?.workspace_root ? (
+              <button
+                aria-label="添加工作空间授权目录"
+                className="hidden max-w-64 items-center gap-2 rounded-lg border border-border/70 bg-background/60 px-3 py-1.5 text-caption text-muted-foreground transition-colors hover:border-primary/35 hover:text-foreground xl:flex"
+                onClick={() => setWorkspaceDialogMode("add")}
+                title={`${currentSession.workspace_root} · 添加授权目录`}
+                type="button"
+              >
+                <FolderPlus aria-hidden className="size-4 shrink-0 text-primary" />
+                <span className="truncate">{currentSession.workspace_root}</span>
+              </button>
+            ) : null}
             {/* D6-T4:知识库检索测试入口(教师端)——独立页面 /knowledge,
                 不经过主会话 store;小链接样式与顶栏辅助文案一致 */}
             <Link
               // UX-20260807#4:顶栏入口 hover 品牌化(交互热区变蓝)
-              className="text-caption text-muted-foreground hover:text-primary"
+              className="text-caption text-muted-foreground hover:text-primary inline-flex h-9 items-center gap-2 rounded-lg px-3 transition-colors hover:bg-muted"
               data-slot="knowledge-link"
               href="/knowledge"
             >
+              <BookOpen aria-hidden className="size-4" />
               知识库
             </Link>
             {/* D6-T7:学习进度入口——独立页面 /stats(基础统计版),与
                 知识库入口并列,同样不经过主会话 store */}
             <Link
               // UX-20260807#4:顶栏入口 hover 品牌化(交互热区变蓝)
-              className="text-caption text-muted-foreground hover:text-primary"
+              className="text-caption text-muted-foreground hover:text-primary inline-flex h-9 items-center rounded-lg px-3 transition-colors hover:bg-muted"
               data-slot="stats-link"
               href="/stats"
             >
               进度
             </Link>
-            <div className="flex items-center gap-2 text-caption text-muted-foreground">
+            <div className="hidden items-center gap-2 rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-caption text-muted-foreground lg:flex">
               {connected ? (
                 <CircleCheck aria-hidden className="size-4 text-success" />
               ) : (
@@ -268,67 +470,95 @@ export function AppShell({ apiConnected }: AppShellProps) {
           </div>
         </header>
 
+        {/* assistant-ui 接入(T4):渲染路径唯一切换点——开关开 =
+            AssistantThread(动态加载),关 = 旧 ConversationPanel(封存基线,
+            行为零变化)。除此条件表达式外本文件无任何 assistant-ui 耦合。 */}
         {currentSessionId ? (
-          <ConversationPanel />
+          assistantUiEnabled ? <AssistantThread /> : <ConversationPanel />
         ) : (
-          <div className="flex flex-1 flex-col items-center justify-center gap-8 overflow-y-auto p-8">
-            <div className="max-w-md text-center">
-              <p className="text-title font-semibold text-foreground">请选择或新建会话</p>
-              <p className="mt-3 text-body text-muted-foreground">
-                从左侧创建一个会话，或选择已有会话后开始对话。
-              </p>
-            </div>
-
-            {/* D5-T4:示例问题卡——始终展示(不依赖 seen),点击即建会话并提问 */}
-            <section
-              className="w-full max-w-md rounded-lg border border-border bg-card p-5"
-              data-slot="example-questions"
-            >
-              <p className="text-caption font-medium text-foreground">
-                选择一个示例问题快速开始，或手动创建会话
-              </p>
-              <div className="mt-4 grid gap-2">
-                {EXAMPLE_QUESTIONS.map((question) => (
-                  <button
-                    // UX-20260807#4:hover 品牌化——替换(非叠加)原灰底
-                    className="rounded-md border border-border px-4 py-2 text-left text-body text-foreground hover:border-primary/40 hover:bg-primary/5"
-                    data-slot="example-question"
-                    key={question}
-                    onClick={() => startExample(question)}
-                    type="button"
-                  >
-                    {question}
-                  </button>
-                ))}
-              </div>
-            </section>
-
-            {/* D5-T4:首次使用三步引导——仅「未看过」时展示;跳过即写入本地标记,
-                事件驱动 useSyncExternalStore 订阅者重渲染隐藏本卡 */}
-            {onboardingSeen ? null : (
-              <section
-                className="w-full max-w-md rounded-lg border border-border bg-card p-5"
-                data-slot="onboarding"
-              >
-                <p className="text-caption font-medium text-foreground">首次使用？三步开始</p>
-                <ol className="mt-3 list-decimal space-y-2 pl-5 text-body text-muted-foreground">
-                  <li>创建会话：点击左侧「新建会话」，或直接选一个示例问题</li>
-                  <li>提问：在输入框描述你的问题，等待多智能体协作回答</li>
-                  <li>查看审批与协作过程：审批卡片确认任务，协作面板看事件时间线</li>
-                </ol>
-                <button
-                  className="mt-4 rounded-md border border-border px-3 py-1.5 text-caption text-muted-foreground hover:bg-muted hover:text-foreground"
-                  data-slot="onboarding-skip"
-                  onClick={markOnboardingSeen}
-                  type="button"
+          <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-10 md:px-8">
+            <div className="w-full max-w-2xl">
+              <div className="text-center">
+                <div className="mx-auto flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/15">
+                  <Sparkles aria-hidden className="size-5" />
+                </div>
+                <h2 className="mt-5 text-display font-semibold tracking-tight text-foreground">
+                  今天想学点什么？
+                </h2>
+                <p className="mx-auto mt-3 max-w-lg text-body text-muted-foreground">
+                  提出问题后，主智能体会按需调用助教、助学与评价智能体，并整合成一份完整回答。
+                </p>
+                {/* 伦理合规:空态全局声明——系统回答均为 AI 生成内容 */}
+                <p
+                  className="mx-auto mt-2 max-w-lg text-caption text-muted-foreground/80"
+                  data-slot="ai-content-notice"
                 >
-                  跳过引导
-                </button>
+                  内容由 AI 生成，仅供参考，重要信息请人工复核。
+                </p>
+              </div>
+
+              {/* 示例问题始终展示，点击后创建会话并立即开始流式回答。 */}
+              <section className="mt-8" data-slot="example-questions">
+                <p className="text-caption font-medium text-muted-foreground">从一个示例开始</p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  {EXAMPLE_QUESTIONS.map((question) => (
+                    <button
+                      className="group flex min-h-16 items-center justify-between gap-3 rounded-xl border border-border/70 bg-card/70 px-4 py-3 text-left text-body text-foreground shadow-sm transition-[border-color,background-color,transform] hover:-translate-y-0.5 hover:border-primary/35 hover:bg-card"
+                      data-slot="example-question"
+                      key={question}
+                      onClick={() => startExample(question)}
+                      type="button"
+                    >
+                      <span>{question}</span>
+                      <ArrowUpRight
+                        aria-hidden
+                        className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-primary"
+                      />
+                    </button>
+                  ))}
+                </div>
               </section>
-            )}
+
+              {/* 首次使用说明降为轻量提示，不再与核心示例问题争夺视觉层级。 */}
+              {onboardingSeen ? null : (
+                <section
+                  className="mt-6 rounded-xl border border-dashed border-border bg-muted/30 p-4"
+                  data-slot="onboarding"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <p className="text-caption font-medium text-foreground">三步开始协作学习</p>
+                      <ol className="mt-2 grid gap-1 text-caption text-muted-foreground sm:grid-cols-3 sm:gap-4">
+                        <li>1. 选择示例或新建会话</li>
+                        <li>2. 描述你的学习问题</li>
+                        <li>3. 等待智能体整合答案</li>
+                      </ol>
+                    </div>
+                    <button
+                      className="shrink-0 rounded-lg px-2 py-1 text-caption text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                      data-slot="onboarding-skip"
+                      onClick={markOnboardingSeen}
+                      type="button"
+                    >
+                      知道了
+                    </button>
+                  </div>
+                </section>
+              )}
+            </div>
           </div>
         )}
       </section>
+      {workspaceDialogMode ? (
+        <WorkspaceDialog
+          key={workspaceDialogMode}
+          mode={workspaceDialogMode}
+          onClose={() => setWorkspaceDialogMode(null)}
+          onConfirm={confirmWorkspace}
+          open
+          recentRoots={recentWorkspaceRoots}
+        />
+      ) : null}
     </main>
   );
 }

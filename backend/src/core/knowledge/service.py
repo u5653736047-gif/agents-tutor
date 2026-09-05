@@ -13,6 +13,7 @@ from .retrieval import (
     QueryRefiner,
     QueryRewriter,
     Reranker,
+    RetrievalMetadata,
     adaptive_search,
     multi_query_search,
 )
@@ -151,6 +152,12 @@ class KnowledgeService:
                 raise ValueError("duplicate document page in one batch")
             coordinates.add(coordinate)
 
+        # S5-C1 决策 3（写时保证）：所有新入库 chunk 强制携带 namespace
+        # （缺省 public，已显式提供的不覆盖）——不再产生新的缺键数据；
+        # 存量缺键由回填迁移与读时归一两层兜底（见 index.py 决策 3 注释）。
+        for document in document_batch:
+            document.metadata.setdefault("namespace", "public")
+
         # 按构造时选定的分块策略分块：character 保持 S3-T1 行为不变；
         # semantic 按标题/段落边界切分（公式/代码保护、坐标语义见
         # chunking 模块注释）。两种策略产出的 chunk 坐标都可回溯原文，
@@ -180,12 +187,29 @@ class KnowledgeService:
         """Remove all chunks for a document."""
         self._index.delete_document(document_id)
 
+    def chunk(self, chunk_id: str) -> KnowledgeChunk | None:
+        """按 chunk_id 取回分块（I2：查看原文 / 引用回溯的读接口）。
+
+        与 search 同一输入校验哲学（面向初学者）：chunk_id 是引用
+        凭证（document_id:page:start:end 形态），空白 / 过长的
+        chunk_id 不可能是合法引用——返回 None（未命中），不向索引
+        发起无意义的查询。索引未实现 chunk（鸭子契约缺失时）同样
+        返回 None，与「读接口未命中」语义一致，不抛错。
+        """
+        if not chunk_id or not chunk_id.strip() or len(chunk_id) > 512:
+            return None
+        getter = getattr(self._index, "chunk", None)
+        if getter is None:
+            return None
+        return getter(chunk_id)  # type: ignore[no-any-return]
+
     def search(
         self,
         query: str,
         top_k: int = 5,
         *,
         metadata_filter: dict[str, str] | None = None,
+        namespace: str | None = None,
     ) -> list[SearchHit]:
         """Validate public search inputs, then delegate ranking to the index.
 
@@ -231,14 +255,70 @@ class KnowledgeService:
         # H-T2：入口校验后合并默认抑制——词法/向量/混合三路都经
         # service 收到同一份过滤条件，行为一致（见 _apply_suppression）。
         metadata_filter = self._apply_suppression(metadata_filter)
-        return multi_query_search(
-            self._index,
-            query,
-            top_k,
-            rewriter=self._rewriter,
-            reranker=self._reranker,
-            metadata_filter=metadata_filter,
+        # S5-C1 决策 4/5：namespace 三态语义——
+        # - None：不过滤（现状零回归，既有调用方/测试不受影响）；
+        # - "public"：单路 public 过滤检索（未绑定会话）；
+        # - 其他值：命名空间 ∪ 公共库两路合并（按 score 每 chunk_id 取
+        #   最大、chunk_id 升序平局、截断 top_k——与多变体 max 合并同
+        #   一哲学）。
+        # P1-1 性能契约：两路检索复用同一次 query embedding——向量索引
+        # 的 LRU 查询向量缓存（vector_index._QUERY_VECTOR_CACHE_SIZE=16）
+        # 使第二腿命中缓存零重复计算；Hybrid 的 lexical 路本就不走
+        # embedding，实测复用已由 cache 保证（见 test 向量缓存单测）。
+        if namespace is None or namespace == "public":
+            effective = (
+                self._with_namespace(metadata_filter, namespace)
+                if namespace is not None
+                else metadata_filter
+            )
+            return multi_query_search(
+                self._index,
+                query,
+                top_k,
+                rewriter=self._rewriter,
+                reranker=self._reranker,
+                metadata_filter=effective,
+            )
+        legs = [
+            multi_query_search(
+                self._index,
+                query,
+                top_k,
+                rewriter=self._rewriter,
+                reranker=self._reranker,
+                metadata_filter=self._with_namespace(metadata_filter, ns),
+            )
+            for ns in (namespace, "public")
+        ]
+        return self._merge_namespace_legs(legs, top_k)
+
+    @staticmethod
+    def _with_namespace(
+        metadata_filter: dict[str, str] | None, namespace: str
+    ) -> dict[str, str]:
+        """把空间过滤并入调用方条件（scope 赢：调用方不可伪造空间）。
+
+        与 _apply_suppression 尊重显式 chunk_class 不同，namespace 是
+        scope 注入的会话属性而非模型/调用方可表达意图——调用方即使
+        显式传入 namespace 键也会被解析值覆盖。
+        """
+        return {**(metadata_filter or {}), "namespace": namespace}
+
+    @staticmethod
+    def _merge_namespace_legs(
+        legs: list[list[SearchHit]], top_k: int
+    ) -> list[SearchHit]:
+        """命名空间两腿结果合并：每 chunk_id 取最大分、降序、截断 top_k。"""
+        merged: dict[str, SearchHit] = {}
+        for hits in legs:
+            for hit in hits:
+                existing = merged.get(hit.chunk.chunk_id)
+                if existing is None or hit.score > existing.score:
+                    merged[hit.chunk.chunk_id] = hit
+        ordered = sorted(
+            merged.values(), key=lambda hit: (-hit.score, hit.chunk.chunk_id)
         )
+        return ordered[:top_k]
 
     def adaptive_search(
         self,
@@ -249,6 +329,7 @@ class KnowledgeService:
         policy: RetrievalPolicy | None = None,
         relevance_threshold: float | None = None,
         refiner: QueryRefiner | None = None,
+        namespace: str | None = None,
     ) -> AdaptiveSearchResult:
         """自适应检索（S4-T3）：必要性判断 → 检索 → 阈值判定 → 多轮重检。
 
@@ -305,6 +386,100 @@ class KnowledgeService:
             raise ValueError("top_k must be between 1 and 10")
         # H-T2：与 search 同一套默认抑制（三路一致，见 _apply_suppression）。
         metadata_filter = self._apply_suppression(metadata_filter)
+        resolved_threshold = (
+            relevance_threshold
+            if relevance_threshold is not None
+            else self._relevance_threshold
+        )
+        active_refiner = refiner if refiner is not None else self._refiner
+        # S5-C1 决策 4/5：namespace 语义与 search 一致（None 不过滤 /
+        # public 单路 / 其他值两路合并）。非 public 时阈值判定在**合并
+        # 后的并集 top_score** 上执行——单调性论证：绑定空间后的候选集
+        # ⊇ 仅公共库候选集，故 threshold_met 只会由假变真、不会由真变
+        # 假（计划决策 5）。实现：两腿各自跑完整 adaptive 链路（含各自
+        # 的 refine 重检），合并 hits 后按并集 top_score 重算 threshold_met。
+        if namespace is not None and namespace != "public":
+            legs = [
+                adaptive_search(
+                    self._index,
+                    query,
+                    top_k,
+                    policy=policy if policy is not None else self._policy,
+                    rewriter=self._rewriter,
+                    reranker=self._reranker,
+                    refiner=active_refiner,
+                    relevance_threshold=resolved_threshold,
+                    max_refine_rounds=self._max_refine_rounds,
+                    metadata_filter=self._with_namespace(metadata_filter, ns),
+                )
+                for ns in (namespace, "public")
+            ]
+            merged_hits = self._merge_namespace_legs(
+                [result.hits for result in legs], top_k
+            )
+            merged_top = merged_hits[0].score if merged_hits else 0.0
+            merged_met = (
+                None if resolved_threshold is None else merged_top >= resolved_threshold
+            )
+            primary = legs[0].metadata
+            if not primary.needed:
+                # 与单路语义对齐（retrieval.py needed=False 分支）：policy
+                # 判定无需检索时不做阈值暗示——threshold_met=None、中性
+                # 「无需检索」reason。两腿 policy 与查询相同，判定必然一致，
+                # 取 primary 即可；hits 恒为空（无腿触发检索）。
+                return AdaptiveSearchResult(
+                    hits=[],
+                    metadata=RetrievalMetadata(
+                        needed=False,
+                        need_reason=primary.need_reason,
+                        threshold=resolved_threshold,
+                        threshold_met=None,
+                        rounds=tuple(
+                            round_item
+                            for result in legs
+                            for round_item in result.metadata.rounds
+                        ),
+                        refine_history=tuple(
+                            item
+                            for result in legs
+                            for item in result.metadata.refine_history
+                        ),
+                        stopped_reason=f"无需检索：{primary.need_reason}",
+                    ),
+                )
+            return AdaptiveSearchResult(
+                hits=merged_hits,
+                metadata=RetrievalMetadata(
+                    needed=primary.needed,
+                    need_reason=primary.need_reason,
+                    threshold=resolved_threshold,
+                    threshold_met=merged_met,
+                    rounds=tuple(
+                        round_item
+                        for result in legs
+                        for round_item in result.metadata.rounds
+                    ),
+                    refine_history=tuple(
+                        item
+                        for result in legs
+                        for item in result.metadata.refine_history
+                    ),
+                    stopped_reason=(
+                        "命名空间并集合并：达到相关性阈值"
+                        if merged_met
+                        else (
+                            "命名空间并集合并（未启用阈值判定）"
+                            if merged_met is None
+                            else "命名空间并集合并：未达到相关性阈值（各路独立重检后合并）"
+                        )
+                    ),
+                ),
+            )
+        effective = (
+            self._with_namespace(metadata_filter, namespace)
+            if namespace is not None
+            else metadata_filter
+        )
         return adaptive_search(
             self._index,
             query,
@@ -320,7 +495,7 @@ class KnowledgeService:
                 else self._relevance_threshold
             ),
             max_refine_rounds=self._max_refine_rounds,
-            metadata_filter=metadata_filter,
+            metadata_filter=effective,
         )
 
 

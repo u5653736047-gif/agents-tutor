@@ -16,10 +16,14 @@ async function loadApiClient() {
 }
 
 const session = {
+  additional_workspace_roots: [],
   archived: false,
   created_at: "2026-08-03T00:00:00Z",
   session_id: "session-1",
+  updated_at: "2026-08-03T00:00:00Z",
   user_id: "demo-user",
+  workspace_access: "read_only" as const,
+  workspace_root: "D:\\Projects\\course",
 };
 
 const assistantMessage = {
@@ -38,6 +42,26 @@ const event = {
   event_type: "message_end" as const,
   sequence: 1,
 };
+
+test("the chat store creates a session with the selected workspace", async () => {
+  const { createChatStore } = await loadChatStore();
+  let payload: { workspace_root?: string | null } | undefined;
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async (value) => {
+      payload = value;
+      return session;
+    },
+    getSessionMessages: async () => [],
+    listSessions: async () => [],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  const created = await store.getState().createSession("D:\\Projects\\course");
+
+  assert.equal(created?.workspace_root, "D:\\Projects\\course");
+  assert.deepEqual(payload, { workspace_root: "D:\\Projects\\course" });
+});
 
 test("the chat store keeps response messages and events in separate fields", async () => {
   const { createChatStore } = await loadChatStore();
@@ -118,6 +142,81 @@ test("switching sessions clears a pending send from the previous session", async
   await sending;
   assert.equal(store.getState().currentSessionId, "session-b");
   assert.equal(store.getState().isSending, false);
+  assert.equal(store.getState().requestError, null);
+});
+
+test("switching away and back restores the persisted collaboration process", async () => {
+  const { createChatStore } = await loadChatStore();
+  const replayedEvent = {
+    agent: "learning_assistant" as const,
+    content: "先识别链式法则，再说明梯度回传",
+    event_type: "reasoning" as const,
+    message_id: "assistant-step-1",
+    sequence: 2,
+    session_id: "session-1",
+  };
+  const toolEvent = {
+    agent: "learning_assistant" as const,
+    event_type: "tool_call" as const,
+    input_summary: '{"query":"反向传播"}',
+    sequence: 3,
+    session_id: "session-1",
+    tool_call_id: "call-search-1",
+    tool_name: "search_knowledge",
+  };
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async (sessionId) =>
+      sessionId === "session-1" ? [userMessage, assistantMessage] : [],
+    getSessionProcess: async (sessionId) => ({
+      current_agent: sessionId === "session-1" ? "learning_assistant" : null,
+      events: sessionId === "session-1" ? [replayedEvent, toolEvent] : [],
+      task_plan: null,
+      task_results: null,
+    }),
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  store.getState().selectSession("session-1");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, [replayedEvent, toolEvent]);
+
+  store.getState().selectSession("session-2");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, []);
+
+  store.getState().selectSession("session-1");
+  await store.getState().loadCurrentSessionMessages();
+  assert.deepEqual(store.getState().events, [replayedEvent, toolEvent]);
+  assert.equal(store.getState().currentAgent, "learning_assistant");
+});
+
+test("a process snapshot failure does not turn loaded messages into a request error", async () => {
+  const { ApiClientError } = await loadApiClient();
+  const { createChatStore } = await loadChatStore();
+  const processFailure = new ApiClientError("Not Found", {
+    code: null,
+    status: 404,
+  });
+  const store = createChatStore({
+    archiveSession: async () => session,
+    createSession: async () => session,
+    getSessionMessages: async () => [userMessage, assistantMessage],
+    getSessionProcess: async () => {
+      throw processFailure;
+    },
+    listSessions: async () => [session],
+    sendChat: async () => ({ events: [], session_id: session.session_id }),
+  });
+
+  store.getState().selectSession(session.session_id);
+  await store.getState().loadCurrentSessionMessages();
+
+  assert.deepEqual(store.getState().messages, [userMessage, assistantMessage]);
+  assert.deepEqual(store.getState().events, []);
+  assert.equal(store.getState().isLoadingMessages, false);
   assert.equal(store.getState().requestError, null);
 });
 

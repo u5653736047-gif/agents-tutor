@@ -35,10 +35,25 @@ test("the chat input renders a multiline form and disables controls while sendin
   assert.match(idleMarkup, /<form/);
   assert.match(idleMarkup, /data-slot="chat-input"/);
   assert.match(idleMarkup, /<textarea/);
-  assert.match(idleMarkup, /rows="3"/);
+  assert.match(idleMarkup, /rows="2"/);
   assert.doesNotMatch(idleMarkup, /<textarea[^>]* disabled=""/);
   assert.match(sendingMarkup, /<textarea[^>]* disabled=""/);
   assert.match(sendingMarkup, /<button[^>]* disabled=""/);
+});
+
+test("the composer uses one compact elevated surface instead of nested boxes", async () => {
+  const { ChatInputContent } = await loadChatInput();
+  const markup = renderToStaticMarkup(
+    createElement(ChatInputContent, {
+      isSending: false,
+      onChange: () => {},
+      onSubmit: () => {},
+      value: "",
+    }),
+  );
+
+  assert.match(markup, /<form class="[^"]*rounded-2xl[^"]*bg-card[^"]*shadow-sm/);
+  assert.match(markup, /<textarea[^>]*class="[^"]*border-0[^"]*bg-transparent/);
 });
 
 test("the chat input reserves plain Enter for send and leaves Shift+Enter as a newline", async () => {
@@ -58,9 +73,9 @@ test("clampTextareaHeight clamps the textarea height to the min baseline and max
   const { clampTextareaHeight } = await loadChatInput();
 
   assert.equal(typeof clampTextareaHeight, "function", "missing height clamp helper");
-  // 低于基线(空输入/短内容)夹到 96px 基线
-  assert.equal(clampTextareaHeight(60, 192), 96);
-  assert.equal(clampTextareaHeight(96, 192), 96);
+  // 低于基线(空输入/短内容)夹到 64px 基线
+  assert.equal(clampTextareaHeight(40, 192), 64);
+  assert.equal(clampTextareaHeight(64, 192), 64);
   // 中间值原样返回
   assert.equal(clampTextareaHeight(100, 192), 100);
   // 超过上限(8 行 × 24px = 192px)夹到 192px

@@ -38,12 +38,44 @@ test("groupSessions splits sessions into today, recent, and older", async () => 
   );
   assert.deepEqual(
     groups.recent.map((session) => session.id),
-    ["recent-5d", "recent-edge", "recent-2"],
+    ["recent-2", "recent-5d", "recent-edge"],
   );
   assert.deepEqual(
     groups.older.map((session) => session.id),
-    ["older-9d", "older-edge"],
+    ["older-edge", "older-9d"],
   );
+});
+
+test("groupSessions groups and sorts by the latest conversation activity", async () => {
+  const { groupSessions } = await loadSessionGroups();
+
+  const groups = groupSessions(
+    [
+      {
+        created_at: "2024-12-01T00:00:00Z",
+        updated_at: "2025-01-10T08:00:00Z",
+        id: "revived-today",
+      },
+      {
+        created_at: "2025-01-10T09:00:00Z",
+        updated_at: "2025-01-10T09:00:00Z",
+        id: "newest-today",
+      },
+      {
+        created_at: "2025-01-05T00:00:00Z",
+        updated_at: "2025-01-09T20:00:00Z",
+        id: "recent",
+      },
+    ],
+    now,
+  );
+
+  assert.deepEqual(
+    groups.today.map((session) => session.id),
+    ["newest-today", "revived-today"],
+  );
+  assert.deepEqual(groups.recent.map((session) => session.id), ["recent"]);
+  assert.deepEqual(groups.older, []);
 });
 
 test("groupSessions puts sessions without created_at into older", async () => {
@@ -63,7 +95,7 @@ test("groupSessions puts sessions without created_at into older", async () => {
   assert.deepEqual(groups.older.map((session) => session.id), ["no-date", "invalid-date"]);
 });
 
-test("groupSessions preserves the input order within each group", async () => {
+test("groupSessions orders each group by latest activity", async () => {
   const { groupSessions } = await loadSessionGroups();
 
   const sessions = [
@@ -72,9 +104,9 @@ test("groupSessions preserves the input order within each group", async () => {
     { created_at: "2025-01-08T00:00:00Z", id: "c" },
   ];
 
-  // 三笔都属「近 7 天」,组内顺序与输入顺序一致(不按时间重排)
+  // 三笔都属「近 7 天」,组内按最近活跃时间倒序。
   const groups = groupSessions(sessions, now);
-  assert.deepEqual(groups.recent.map((session) => session.id), ["a", "b", "c"]);
+  assert.deepEqual(groups.recent.map((session) => session.id), ["a", "c", "b"]);
   assert.deepEqual(groups.today, []);
   assert.deepEqual(groups.older, []);
 });

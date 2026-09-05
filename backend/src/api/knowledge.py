@@ -25,25 +25,55 @@ D6-T5 新增文档管理端点(错误码约定同上):
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, TypedDict, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from starlette.concurrency import run_in_threadpool
 
 from api.schemas import (
     ApiErrorCode,
+    ChunkDetailResponse,
+    ChunkListEntry,
+    ChunkListResponse,
     Citation,
     ErrorDetail,
     ErrorResponse,
+    KnowledgeBaseStatsDto,
+    KnowledgeDocumentInfoDto,
     KnowledgeDocumentListEntry,
     KnowledgeDocumentListResponse,
+    KnowledgeDocumentTreeResponse,
     KnowledgeDocumentUploadResponse,
+    KnowledgeOverviewResponse,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
+    KnowledgeTreeChapterDto,
+    KnowledgeTreeSectionDto,
+    NamespaceListResponse,
+    NamespaceUsageDto,
     SearchHitDto,
 )
+from core.knowledge.catalog import (
+    KnowledgeDocumentInfo,
+    SqliteKnowledgeCatalog,
+    merge_uploaded_catalog,
+)
+from core.knowledge.index import SqliteKnowledgeIndex
 from core.knowledge.loaders import load_pdf, load_text
 from core.knowledge.models import KnowledgeChunk, KnowledgeDocument, SearchHit
 from core.knowledge.service import KnowledgeService
@@ -56,8 +86,23 @@ class _DocumentEntry(TypedDict):
     source: str
     page_count: int | None
     chunk_count: int | None
+    namespace: str
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _knowledge_db_path() -> Path:
+    """词法库路径解析：与 app.py lifespan 同一 env 约定。
+
+    函数级导入 DEFAULT_KNOWLEDGE_DB_PATH 避免模块环（app → 本路由模块）；
+    上传完成标记需要独立的短生命周期索引连接（stack/catalog 都不暴露
+    路径），上传是低频操作，临时开闭连接可接受。
+    """
+    from api.app import DEFAULT_KNOWLEDGE_DB_PATH
+
+    return Path(os.getenv("API_KNOWLEDGE_DB_PATH", DEFAULT_KNOWLEDGE_DB_PATH))
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
@@ -66,6 +111,13 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 # SearchHitDto.summary 的截断上限(字符数):chunk 内容可能很长,对外
 # 只暴露摘要,防止单条命中撑爆响应体;超过上限截断并追加省略号。
 SUMMARY_MAX_LENGTH = 200
+# I2 chunk 原文端点:单条分块内容返回上限(字符数)。分块本身由 chunking
+# 限制(character 策略 ≤ chunk_size + overlap),这里防御性再截断一层,
+# 防止极端场景(超大单行 chunk)撑爆响应体。
+CHUNK_CONTENT_MAX_LENGTH = 8 * 1024
+# I2 分块浏览端点:单页分块条目上限(防御:分页参数由客户端指定,
+# 服务端设硬上限防止一次请求返回整本书的分块列表)。
+CHUNK_LIST_PAGE_SIZE_MAX = 200
 # D6-T5 上传限制:扩展名白名单是服务端校验(文件名小写后缀;浏览器/
 # 客户端可伪造 content-type,白名单以扩展名为准);大小上限在逐块读取
 # 时累计拦截,不能信 Content-Length(客户端可谎报),超限即 422。
@@ -135,6 +187,7 @@ def _store_uploaded_document(
     document_id: str,
     source_label: str,
     service: KnowledgeService,
+    knowledge_namespace: str = "public",
 ) -> tuple[list[KnowledgeDocument], list[KnowledgeChunk]]:
     """写临时文件 → core loader 解析 → service 幂等替换入库(同步,线程池内跑)。
 
@@ -163,8 +216,80 @@ def _store_uploaded_document(
             documents = load_text(
                 tmp_path, document_id=document_id, source_label=source_label
             )
+        # S5-C1 决策 1：上传文档显式写入空间（service.add_documents 的
+        # 写时保证只兑底缺省 public；非 public 必须显式携带）。
+        for document in documents:
+            document.metadata["namespace"] = knowledge_namespace
         chunks = service.add_documents(documents)
     return documents, chunks
+
+
+@router.get(
+    "/namespaces",
+    response_model=NamespaceListResponse,
+    responses=ERROR_RESPONSES,
+)
+async def list_namespaces(
+    request: Request,
+) -> NamespaceListResponse:
+    """列出全部知识空间及各空间文档数（S5-C1 决策 6）。
+
+    会话创建对话框与上传表单的空间选择器数据源；空库返回空列表。
+    """
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        return NamespaceListResponse()
+    namespaces = await run_in_threadpool(catalog.list_namespaces)
+    return NamespaceListResponse(
+        namespaces=[
+            NamespaceUsageDto(namespace=item.namespace, document_count=item.document_count)
+            for item in namespaces
+        ]
+    )
+
+
+@router.get(
+    "/documents/{document_id}/tree",
+    response_model=KnowledgeDocumentTreeResponse,
+    responses=ERROR_RESPONSES,
+)
+async def get_document_tree(
+    document_id: str,
+    request: Request,
+) -> KnowledgeDocumentTreeResponse:
+    """返回单篇文档的章→节结构树（S5-C2，只读）。
+
+    - 教材类文档：kind="tree"，chapters 含每章/节 chunk 计数与标签汇总；
+    - 无结构文档（如无标题 API 上传件）：kind="flat"，flat_pages 按页
+      升序；文档不存在时 flat_pages 为空列表（前端渲染「无内容」占位）；
+    - catalog 未装配时同样降级为空 flat 形态，不报错。
+    """
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        return KnowledgeDocumentTreeResponse(
+            kind="flat", document_id=document_id, flat_pages=[]
+        )
+    tree = await run_in_threadpool(catalog.document_tree, document_id)
+    return KnowledgeDocumentTreeResponse(
+        kind=tree.kind,
+        document_id=tree.document_id,
+        chapters=[
+            KnowledgeTreeChapterDto(
+                chapter=chapter.chapter,
+                chunk_count=chapter.chunk_count,
+                sections=[
+                    KnowledgeTreeSectionDto(
+                        section=section_.section,
+                        chunk_count=section_.chunk_count,
+                        tags=section_.tags,
+                    )
+                    for section_ in chapter.sections
+                ],
+            )
+            for chapter in tree.chapters
+        ],
+        flat_pages=list(tree.flat_pages),
+    )
 
 
 @router.post(
@@ -211,6 +336,9 @@ async def upload_document(
     file: UploadFile,
     request: Request,
     service: Annotated[KnowledgeService, Depends(get_knowledge_service)],
+    knowledge_namespace: Annotated[
+        str, Form(description="目标知识空间；public 为保留的公共库空间")
+    ] = "public",
 ) -> KnowledgeDocumentUploadResponse:
     """上传 txt/pdf 文档入库(幂等替换),返回文档元数据回执。
 
@@ -253,6 +381,34 @@ async def upload_document(
             ApiErrorCode.INVALID_REQUEST,
             "File is empty.",
         )
+    # S5-C1 决策 1/7：空间标识复用 manifest 的 source 标识规则（小写
+    # 字母开头，只含小写字母/数字/连字符）；public 为保留的公共库空间。
+    # 非 public 空间的 document_id 加空间前缀（{namespace}:{stem}），
+    # 使同名文件在不同空间互不覆盖；public 保持裸 stem（存量约定）。
+    namespace = (knowledge_namespace or "public").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", namespace):
+        _raise_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            ApiErrorCode.INVALID_REQUEST,
+            "knowledge_namespace must start with a lowercase letter and contain "
+            "only lowercase letters or digits, with single inner hyphens "
+            "(no leading/trailing or consecutive hyphens).",
+        )
+    final_document_id = (
+        Path(basename).stem
+        if namespace == "public"
+        else f"{namespace}:{Path(basename).stem}"
+    )
+    catalog = get_knowledge_catalog(request)
+    replaced = False
+    if catalog is not None:
+        # 文档键是 document_id（非 public 空间带前缀，见上）——同名文件
+        # 重传在同一空间内可见为替换语义。
+        replaced = any(
+            info.document_id == final_document_id for info in catalog.list_documents()
+        )
+    if not replaced:
+        replaced = final_document_id in _document_registry(request)
     try:
         # 同步核心调用(写临时文件 + loader 解析 + 入库)走 run_in_threadpool,
         # 与 search 端点的既有约定一致,避免阻塞事件循环。
@@ -260,9 +416,10 @@ async def upload_document(
             _store_uploaded_document,
             bytes(data),
             basename,
-            document_id=Path(basename).stem,
+            document_id=final_document_id,
             source_label=basename,
             service=service,
+            knowledge_namespace=namespace,
         )
     except ValueError:
         # loader 解析失败(空文件/无文本/损坏 PDF)属请求问题 → 422;
@@ -286,7 +443,26 @@ async def upload_document(
         source=documents[0].source,
         page_count=len(pages) if pages else None,
         chunk_count=len(chunks),
+        replaced=replaced,
     )
+    # S5-C3 上传语义补齐:写 ingest_marks 完成标记(与脚本入库同一通道),
+    # catalog 的 ingested_at 由此覆盖 API 上传文档。content_hash=上传字节
+    # sha256(即磁盘上同一字节序列);chunking 取 service 实际策略(私有
+    # 属性读取属过渡,后续可在 service 暴露公开访问器后替换)。
+    index = SqliteKnowledgeIndex(_knowledge_db_path())
+    try:
+        # 标记键 = document_id（非 public 空间带前缀）：catalog 按
+        # document_id 分组与 join（S5-C1 修复后口径），跨空间同名文件
+        # 不再互相覆盖完成标记。
+        index.mark_document_complete(
+            final_document_id,
+            chunk_count=len(chunks),
+            page_count=len(pages) if pages else 1,
+            content_hash=hashlib.sha256(bytes(data)).hexdigest(),
+            chunking=getattr(service, "_chunking", "character"),
+        )
+    finally:
+        index.close()
     # D6-T5 review 修正:core 无文档枚举能力,API 层注册表记录本次上传
     # (GET /knowledge/documents 由此返回;删除时同步移除)。
     _document_registry(request)[documents[0].document_id] = {
@@ -294,6 +470,7 @@ async def upload_document(
         "source": documents[0].source,
         "page_count": response.page_count,
         "chunk_count": response.chunk_count,
+        "namespace": namespace,
     }
     return response
 
@@ -305,28 +482,123 @@ async def upload_document(
 )
 async def list_documents(
     request: Request,
+    namespace: Annotated[str | None, Query(description="按知识空间过滤")] = None,
 ) -> KnowledgeDocumentListResponse:
-    """列出通过 API 上传的文档元数据。
+    """列出文档元数据:词法库聚合(脚本入库教材 + 已落库上传) + 注册表合并。
 
-    core 的 KnowledgeIndex 协议不提供文档枚举能力(仅 upsert /
-    delete_document / search),因此 API 层维护进程内注册表
-    (_document_registry):只登记经 POST /knowledge/documents 上传的
-    文档——由 ingest_books 等脚本直接写入索引的文档不在列表内
-    (core 扩展清单能力后可与注册表合并)。注册表挂 app.state(随
-    app 生命周期,测试各 app 实例隔离)。
+    I1 起 core 提供清单能力(SqliteKnowledgeCatalog):直接聚合词法库
+    的 chunks / ingest_marks / metadata,脚本入库的教材首次对 API
+    可见。API 上传文档成功入库后同样出现在聚合结果里,因此注册表
+    (app.state.knowledge_documents)只作为「未落库条目」的防御性兜底
+    合并(理论上不触发,保留以兼容极端时序)。
     """
-    registry = _document_registry(request)
-    return KnowledgeDocumentListResponse(
-        documents=[
-            KnowledgeDocumentListEntry(
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        # catalog 未装配(lifespan 未跑/已退出):退化为注册表视图,
+        # 与 I1 之前行为一致(不报错,见组件头注释)。
+        registry_docs = [
+            KnowledgeDocumentInfo(
                 document_id=entry["document_id"],
                 source=entry["source"],
                 page_count=entry["page_count"],
-                chunk_count=entry["chunk_count"],
+                chunk_count=entry["chunk_count"] or 0,
+                namespace=entry.get("namespace", "public"),
             )
-            for entry in registry.values()
+            for entry in _document_registry(request).values()
         ]
+        return KnowledgeDocumentListResponse(
+            documents=[
+                _to_document_dto(doc)
+                for doc in sorted(
+                    registry_docs, key=lambda doc: doc.document_id
+                )
+            ]
+        )
+    catalog_docs = await run_in_threadpool(catalog.list_documents)
+    registry_docs = [
+        KnowledgeDocumentInfo(
+            document_id=entry["document_id"],
+            source=entry["source"],
+            page_count=entry["page_count"],
+            chunk_count=entry["chunk_count"] or 0,
+            namespace=entry.get("namespace", "public"),
+        )
+        for entry in _document_registry(request).values()
+    ]
+    merged = merge_uploaded_catalog(catalog_docs, registry_docs)
+    if namespace is not None:
+        # P1-5：按显式 namespace 字段过滤，不再对 document_id 前缀反推
+        # （注册表兜底条目同样携带 namespace，见下；catalog 已显式聚合）。
+        merged = [doc for doc in merged if doc.namespace == namespace]
+    return KnowledgeDocumentListResponse(
+        documents=[_to_document_dto(doc) for doc in merged]
     )
+
+
+def _to_document_dto(doc: KnowledgeDocumentInfo) -> KnowledgeDocumentListEntry:
+    """core KnowledgeDocumentInfo → API 列表条目(与注册表回执同构)。"""
+    return KnowledgeDocumentListEntry(
+        document_id=doc.document_id,
+        source=doc.source,
+        page_count=doc.page_count,
+        chunk_count=doc.chunk_count,
+        namespace=doc.namespace,
+    )
+
+
+@router.get(
+    "/overview",
+    response_model=KnowledgeOverviewResponse,
+    responses=ERROR_RESPONSES,
+)
+async def knowledge_overview(
+    request: Request,
+) -> KnowledgeOverviewResponse:
+    """知识库总览(I1):语料统计 + 每篇文档元数据,一次请求覆盖教师端。
+
+    - 无 catalog 装配(部署问题):503 knowledge_unavailable(与检索
+      端点同一稳定错误码);
+    - 空库(从未入库):stats 全 0、documents 空列表,不报错(与
+      「空库检索返回空」语义一致);
+    - 只读聚合,不触发 embedding 模型加载(数据全部来自词法库)。
+    """
+    catalog = get_knowledge_catalog(request)
+    if catalog is None:
+        _raise_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            ApiErrorCode.KNOWLEDGE_UNAVAILABLE,
+            "Knowledge search is unavailable.",
+        )
+    stats, docs = await run_in_threadpool(_overview_snapshot, catalog)
+    return KnowledgeOverviewResponse(stats=stats, documents=docs)
+
+
+def _overview_snapshot(
+    catalog: SqliteKnowledgeCatalog,
+) -> tuple[KnowledgeBaseStatsDto, list[KnowledgeDocumentInfoDto]]:
+    """catalog 统计 + 清单 → API DTO(线程池内同步执行)。"""
+    core_stats = catalog.document_stats()
+    stats = KnowledgeBaseStatsDto(
+        total_documents=core_stats.total_documents,
+        total_chunks=core_stats.total_chunks,
+        total_pages=core_stats.total_pages,
+        frontmatter_chunks=core_stats.frontmatter_chunks,
+    )
+    documents = [
+        KnowledgeDocumentInfoDto(
+            document_id=doc.document_id,
+            source=doc.source,
+            title=doc.title,
+            page_count=doc.page_count,
+            chunk_count=doc.chunk_count,
+            subjects=doc.subjects,
+            difficulty=doc.difficulty,
+            ingested_at=doc.ingested_at,
+            namespace=doc.namespace,
+        )
+        for doc in catalog.list_documents()
+    ]
+    return stats, documents
 
 
 def _document_registry(request: Request) -> dict[str, _DocumentEntry]:
@@ -338,10 +610,23 @@ def _document_registry(request: Request) -> dict[str, _DocumentEntry]:
     return registry
 
 
+def get_knowledge_catalog(request: Request) -> SqliteKnowledgeCatalog | None:
+    """从 app.state 取知识库清单服务(lifespan 装配,见 app.py)。
+
+    与 get_knowledge_service 同一 getattr 兜底哲学:lifespan 未跑/已
+    退出时该属性不存在,返回 None(调用方据此 503 或降级)。
+    """
+    catalog = getattr(request.app.state, "knowledge_catalog", None)
+    if isinstance(catalog, SqliteKnowledgeCatalog):
+        return catalog
+    return None
+
+
 @router.delete(
     "/documents/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses=ERROR_RESPONSES,
+    response_model=None,
 )
 async def delete_document(
     document_id: str,
@@ -355,6 +640,164 @@ async def delete_document(
     区分「存在/不存在」。按 core 语义,删除不存在的文档同样返回 204——
     重复删除/清理任务幂等安全;待 core 提供清单/存在性能力后再增加
     404 区分。注册表同步移除该条目。
+    P1-3：同步清理 ingest_marks 完成标记，避免 catalog ingested_at 残留
+    （删除后清单不再显示该文档时间，‑‑relabel/‑‑check‑updates 亦不再
+    误判为已入库）。
     """
     await run_in_threadpool(service.delete_document, document_id)
     _document_registry(request).pop(document_id, None)
+    # P1-3：清理完成标记（幂等，文档不存在时 0 行受影响不报错）。
+    # 走独立短生命周期连接（与上传标记写入同一路径约定）；删除是
+    # 低频操作，临时开闭可接受，且不依赖 service 内部索引类型
+    # （Hybrid 场景下 service._index 可能是混合索引）。
+    # 删除已成功，标记清理为 best-effort：异常仅告警，不影响 204。
+    def _clear_mark() -> None:
+        # best-effort: 删除已成功，标记清理任何异常仅告警，不阻断 204
+        index = None
+        try:
+            index = SqliteKnowledgeIndex(_knowledge_db_path())
+            try:
+                index.clear_document_complete(document_id)
+            except Exception as exc:  # noqa: BLE001 - best-effort 清理不阻断已成功的删除
+                _LOGGER.warning(
+                    "清理文档完成标记失败 document_id=%s: %s",
+                    document_id,
+                    exc,
+                )
+        except Exception as exc:  # noqa: BLE001 - 建连/路径异常同样 best-effort
+            _LOGGER.warning(
+                "清理文档完成标记失败 document_id=%s: %s",
+                document_id,
+                exc,
+            )
+        finally:
+            if index is not None:
+                try:
+                    index.close()
+                except Exception as exc:  # noqa: BLE001 - close best-effort
+                    _LOGGER.warning(
+                        "清理文档完成标记失败 document_id=%s: %s",
+                        document_id,
+                        exc,
+                    )
+
+    try:
+        await run_in_threadpool(_clear_mark)
+    except Exception as exc:  # noqa: BLE001 - 防御性兜底，任何未捕获异常不影响已成功的删除
+        _LOGGER.warning(
+            "清理文档完成标记失败 document_id=%s: %s",
+            document_id,
+            exc,
+        )
+
+
+@router.get(
+    "/chunks/{chunk_id}",
+    response_model=ChunkDetailResponse,
+    responses=ERROR_RESPONSES,
+)
+async def get_chunk(
+    chunk_id: str,
+    service: Annotated[KnowledgeService, Depends(get_knowledge_service)],
+) -> ChunkDetailResponse:
+    """按 chunk_id 取回分块原文(I2 查看原文)。
+
+    - 未命中(不存在 / 空白 / 超长 chunk_id):404 chunk_not_found——
+      chunk_id 是引用凭证,引用指向不存在的分块属「资源不存在」,
+      与检索「空结果不报错」语义刻意不同(检索是查询,这里是定位);
+    - content 上限 CHUNK_CONTENT_MAX_LENGTH 截断(防撑爆响应体);
+    - 只暴露 chunk 文本 + 逻辑引用,不暴露文件路径(models 层
+      _validate_logical_source 保证)。
+    """
+    chunk = await run_in_threadpool(service.chunk, chunk_id)
+    if chunk is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ErrorDetail(
+                error_code=ApiErrorCode.INVALID_REQUEST,
+                message="Chunk not found.",
+            ).model_dump(mode="json"),
+        )
+    content = chunk.content
+    if len(content) > CHUNK_CONTENT_MAX_LENGTH:
+        content = content[:CHUNK_CONTENT_MAX_LENGTH]
+    return ChunkDetailResponse(
+        content=content,
+        citation=Citation(
+            document_id=chunk.document_id,
+            source=chunk.source,
+            page=chunk.page,
+            chunk_id=chunk.chunk_id,
+        ),
+    )
+
+
+@router.get(
+    "/documents/{document_id}/chunks",
+    response_model=ChunkListResponse,
+    responses=ERROR_RESPONSES,
+)
+async def list_document_chunks(
+    document_id: str,
+    request: Request,
+    service: Annotated[KnowledgeService, Depends(get_knowledge_service)],
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=CHUNK_LIST_PAGE_SIZE_MAX),
+) -> ChunkListResponse:
+    """列出某文档的分块(I2 浏览):分页,只带定位信息与摘要。
+
+    - offset 从 0 起、limit 默认 20;limit 由 FastAPI Query 参数拦截
+      越界(offset>=0、1<=limit<=CHUNK_LIST_PAGE_SIZE_MAX,422),不
+      依赖 core 校验;
+    - chunks_of_document 按 (start, chunk_id) 排序(与 ingest 顺序一致),
+      分页截取稳定;
+    - 条目只带摘要(SUMMARY_MAX_LENGTH 截断),完整原文经
+      GET /knowledge/chunks/{chunk_id} 获取——列表页先看摘要、点开
+      再看全文;
+    - 文档不存在:空 items(分页在空集合上就是空),不报 404——与
+      删除端点「不存在幂等」同一哲学(见 delete_document 注释);
+    - 用服务层的 chunk 能力做「索引未实现 chunk 的兜底」:若索引
+      未实现 chunk(getter 缺失),列表仍可用 chunks_of_document 逻辑?
+      ——不:本端点直接依赖 chunks_of_document(索引实现本身),与
+      chunk 单条端点无关。分页在 Python 侧完成(全部取出后切片),
+      数据量(单文档最多数千 chunk)可接受。
+    """
+    chunks = await run_in_threadpool(_chunks_of_document_safe, service, document_id)
+    page = chunks[offset : offset + limit]
+    return ChunkListResponse(
+        document_id=document_id,
+        total=len(chunks),
+        items=[
+            ChunkListEntry(
+                chunk_id=chunk.chunk_id,
+                page=chunk.page,
+                start=chunk.start,
+                end=chunk.end,
+                summary=_chunk_summary(chunk.content),
+            )
+            for chunk in page
+        ],
+    )
+
+
+def _chunks_of_document_safe(
+    service: KnowledgeService, document_id: str
+) -> list[KnowledgeChunk]:
+    """经服务层取某文档分块:索引未实现 chunk() 时退化为空(不报错)。
+
+    说明:本端点依赖索引的 chunks_of_document 能力(InMemory/Sqlite
+    均有),该能力不在 KnowledgeIndex 协议上(协议只有 upsert /
+    delete_document / search),因此走 getattr 兜底——测试替身索引
+    (只实现 search 的桩)调用本端点时返回空列表,不抛错。
+    """
+    getter = getattr(service._index, "chunks_of_document", None)
+    if getter is None:
+        return []
+    return list(getter(document_id))
+
+
+def _chunk_summary(content: str) -> str:
+    """与检索命中同口径的摘要截断(上限 SUMMARY_MAX_LENGTH + 省略号)。"""
+    if len(content) <= SUMMARY_MAX_LENGTH:
+        return content
+    return content[:SUMMARY_MAX_LENGTH] + "…"

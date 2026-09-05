@@ -1,6 +1,7 @@
 """安全、精简的运行事件模型。"""
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,10 +13,14 @@ class EventType(StrEnum):
     AGENT_STARTED = "agent_started"
     # Agent 节点正常结束（agent=角色名）
     AGENT_COMPLETED = "agent_completed"
+    # 模型显式返回的 reasoning/thinking 字段（不是 API 伪造的阶段文案）
+    AGENT_REASONING = "agent_reasoning"
     # 工具开始执行（tool_name=工具名）
     TOOL_STARTED = "tool_started"
     # 工具执行结束（tool_name=工具名，success 标记成败）
     TOOL_COMPLETED = "tool_completed"
+    # 审批后前台进程产生的增量输出；按 tool_call_id 归入同一终端卡片。
+    TOOL_OUTPUT = "tool_output"
     # 控制权从当前 Agent 切换到下一个
     AGENT_SWITCHED = "agent_switched"
     # S2-T1 意图识别：Supervisor 完成本轮意图分类后发出（agent=supervisor，
@@ -29,6 +34,12 @@ class EventType(StrEnum):
     # （随 checkpoint 持久化，供审计读取）——与「事件不记录敏感正文」的
     # 仓库惯例一致（RunEvent 无 content/arguments 字段，见该类注释）。
     EVALUATION_COMPLETED = "evaluation_completed"
+    # 六大功能 P2-8：evaluator 完成一次结构化批改后发出（agent=evaluator，
+    # 载体字段见 RunEvent 的 grading_* 注释）。与 EVALUATION_COMPLETED
+    # 同一脱敏原则：事件只记数字摘要（题数/总分），逐题反馈等正文存
+    # state["grading"] 与消息元数据（随 checkpoint 持久化供审计/回放）。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射本类型时安全跳过。
+    GRADING_COMPLETED = "grading_completed"
     # S4-T3 检索决策：search_knowledge 工具的检索元数据由 core 侧
     # （graph_builder._wrap）解析后发出（agent=调用检索工具的角色，
     # tool_name="search_knowledge"，字段见 RunEvent 的 retrieval_* 注释）。
@@ -38,10 +49,28 @@ class EventType(StrEnum):
     # 决策摘要供评价 Agent 与审计链路核对——「知识库未覆盖」这类结论
     # 不应只在工具输出里一闪而过，事件通道随 checkpoint 持久化。
     RETRIEVAL_DECISION = "retrieval_decision"
+    # S5-A1 tool 模式：Supervisor 成功创建任务计划后发出。脱敏原则与
+    # 既有事件一致：事件只记步骤数（content 字段，字符串数字），计划
+    # 正文（步骤描述/目标角色）在 state["task_plan"] 随 checkpoint 持久化。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射本类型时安全跳过。
+    TASK_PLAN_CREATED = "task_plan_created"
     # 计划步骤结果已归档（写入 task_results 通道）
     TASK_RESULT_ARCHIVED = "task_result_archived"
     # 任务计划结果聚合动作发生（成功或失败都会发出）
     TASK_RESULTS_AGGREGATED = "task_results_aggregated"
+    # ── 固定工作流事件族（lesson-workflow-design §七）──
+    # 与 TASK_* 家族的边界：TASK_* 只服务 tool 模式嵌套 ask 的计划门控
+    # 账本；WORKFLOW_* 服务图节点确定性调度路径。脱敏原则一致：事件只记
+    # 枚举/计数/step_id（workflow_id、workflow_step_index 专有字段），
+    # 步骤指令与产出正文在 messages、进度权威在 state["workflow"]。
+    # 消费方（api/chat.py EVENT_TYPE_MAP 白名单）未映射时安全跳过。
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_STEP_STARTED = "workflow_step_started"
+    WORKFLOW_STEP_COMPLETED = "workflow_step_completed"
+    WORKFLOW_STEP_RETRY = "workflow_step_retry"
+    WORKFLOW_COMPLETED = "workflow_completed"
+    WORKFLOW_FAILED = "workflow_failed"
+    WORKFLOW_INPUT_QUEUED = "workflow_input_queued"
     # 整个 run 正常结束
     RUN_COMPLETED = "run_completed"
     # 整个 run 以失败结束（配合 state["run_error"]）
@@ -57,6 +86,10 @@ class ErrorCode(StrEnum):
     TOOL_INVALID_ARGUMENTS = "tool_invalid_arguments"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     TOOL_TIMEOUT = "tool_timeout"
+    TOOL_NO_PROGRESS = "tool_no_progress"
+    TOOL_BUDGET_EXCEEDED = "tool_budget_exceeded"
+    TOOL_APPROVAL_REJECTED = "tool_approval_rejected"
+    TOOL_APPROVAL_QUEUE_LIMIT = "tool_approval_queue_limit"
     # 模型调用与 ReAct 循环错误
     MODEL_CALL_FAILED = "model_call_failed"
     REACT_ITERATION_LIMIT = "react_iteration_limit"
@@ -65,17 +98,20 @@ class ErrorCode(StrEnum):
     GRAPH_SWITCH_LIMIT = "graph_switch_limit"
     GRAPH_INVALID_TARGET = "graph_invalid_target"
     GRAPH_AGGREGATION_INVALID = "graph_aggregation_invalid"
+    # 固定工作流预算耗尽（lesson-workflow-design §八）：步骤数×重试或
+    # 工具调用预算用尽仍未完成，区别于单角色 ReAct 迭代上限。
+    WORKFLOW_BUDGET_EXCEEDED = "workflow_budget_exceeded"
     # 模型输出不符合 Agent 的 schema 校验
     AGENT_OUTPUT_INVALID = "agent_output_invalid"
 
 
 class RunEvent(BaseModel):
-    """不携带内容、参数或密钥的运行事件。
+    """可持久化、可回放的运行事件。
 
-    安全设计：事件只记录「发生了什么」的轻量事实——类型、角色、工具名、
-    耗时、错误码等结构化摘要；消息正文、工具调用参数与密钥都不进事件，
-    完整内容留在 state 与 checkpoint 里按需读取，事件流因此可以安全地
-    回放、审计和透传给前端。
+    过程展示需要的模型 reasoning 与工具输入/输出只保存有界摘要；工具
+    凭据等敏感键在写入前脱敏。最终回答正文仍由 messages 通道持久化，
+    不在事件中复制。该形状借鉴 typed event stream：工具调用 ID 关联
+    action/observation，parent_tool_call_id 关联子代理事件。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -83,8 +119,18 @@ class RunEvent(BaseModel):
     event_type: EventType
     sequence: int = Field(ge=0)  # 运行内递增序号，保证事件流有序
     session_id: str | None
+    # 一次用户消息触发的完整执行轮次。允许 None 以兼容旧 checkpoint；
+    # 新运行必须由 graph_builder 写入非空值。
+    run_id: str | None = None
     agent: str | None = None  # 相关 Agent 角色名
     tool_name: str | None = None  # 相关工具名
+    tool_call_id: str | None = None  # 关联工具开始与结束事件
+    parent_tool_call_id: str | None = None  # 子代理事件所属的父工具调用
+    input_summary: str | None = None  # 有界、脱敏的工具输入 JSON 摘要
+    output_summary: str | None = None  # 有界、脱敏的工具结果摘要
+    content: str | None = None  # provider 显式 reasoning 内容（有界）
+    output_stream: Literal["stdout", "stderr"] | None = None
+    message_id: str | None = None  # reasoning 所属模型消息 ID
     success: bool | None = None  # 成功/失败标记（工具与步骤事件）
     duration_ms: float | None = Field(default=None, ge=0)  # 执行耗时（毫秒）
     error_code: ErrorCode | None = None  # 失败时的错误分类
@@ -100,6 +146,14 @@ class RunEvent(BaseModel):
     # 被评价内容的细节，属敏感正文；完整结论存 state["evaluation"] 供
     # 审计读取）。默认 None 向后兼容——旧事件与未评价轮次不携带该字段。
     evaluation_verdict: str | None = None
+    # ── 六大功能 P2-8 批改摘要字段（GRADING_COMPLETED 事件携带）──
+    # pi 审查 🟡C：RunEvent 是 extra="forbid"，「题数与总分摘要」必须
+    # 走专有字段（仿 evaluation_verdict 先例）。脱敏原则：只记数字摘要，
+    # 不记题目正文与逐题反馈（完整结论存 state["grading"]）。全部默认
+    # None 向后兼容：旧事件与非批改轮次不携带。
+    grading_item_count: int | None = Field(default=None, ge=0)
+    grading_total_score: float | None = Field(default=None, ge=0)
+    grading_max_total_score: float | None = Field(default=None, ge=0)
     # ── S4-T3 检索决策字段（RETRIEVAL_DECISION 事件携带）──
     # 来源：graph_builder._wrap 从 search_knowledge 成功 ToolResult 的
     # JSON metadata 解析（转换在 core 侧，knowledge 包零依赖本模块）。
@@ -115,6 +169,18 @@ class RunEvent(BaseModel):
     retrieval_top_score: float | None = Field(default=None, ge=0)
     retrieval_needed: bool | None = None
     retrieval_need_reason: str | None = None
+    # ── 固定工作流字段（WORKFLOW_* 事件族携带）──
+    # 仿 plan_step_sequence 先例：workflow_step_index 为 1 起步骤序号，
+    # workflow_step_id 为注册表 step_id（如 "collect"）。脱敏原则：不记
+    # 步骤指令与产出正文。全部默认 None 向后兼容：旧事件与非工作流轮次
+    # 不携带。
+    workflow_id: str | None = None
+    workflow_step_id: str | None = None
+    workflow_step_index: int | None = Field(default=None, ge=1)
+    # TOOL_COMPLETED 附属标记（lesson-workflow-design §五）：本次写操作
+    # 经产物区自动授权执行（未经人工审批）。审计可见性要求该事实随事件
+    # 持久化，消费方未映射时安全跳过。
+    auto_approved: bool | None = None
 
 
 class RunError(BaseModel):

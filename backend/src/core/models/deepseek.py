@@ -41,16 +41,33 @@ class DeepSeekSettings:
 
 def create_deepseek_model(
     settings: DeepSeekSettings | None = None,
+    *,
+    timeout: float = 60,
+    max_retries: int = 1,
+    max_tokens: int | None = None,
 ) -> ChatOpenAI:
-    """创建兼容 OpenAI Tool Calling 协议的 DeepSeek 模型。"""
+    """创建兼容 OpenAI Tool Calling 协议的 DeepSeek 模型。
+
+    可选覆盖参数（默认值与原行为逐项一致，零回归）：供辅助链路创建
+    轻量实例——例如查询改写器（api/app.py 装配 LLMQueryRewriter）
+    用更紧的 timeout / max_tokens 控制改写延迟与成本，与主对话模型
+    互不影响。
+
+    max_tokens 直接传顶层参数：langchain-openai 运行期本就有该 pydantic
+    字段（走 model_kwargs 会被重定向并发出警告），但类型存根的构造
+    签名未声明——用单行 type: ignore 标注这一存根缺漏（与 service.py
+    既有 type: ignore 先例一致）。
+    """
     config = settings or DeepSeekSettings.from_env()  # 没传配置就自动从环境/.env 读取
     return ChatOpenAI(
         model=config.model,  # 模型名，如 deepseek-chat
         base_url=config.base_url,  # 直连 DeepSeek 的 API 地址，不走 OpenAI
         api_key=SecretStr(config.api_key),  # SecretStr 防止日志泄露明文 Key
         temperature=0,  # 教学要确定性输出，关闭随机采样
-        timeout=60,  # 单次请求最多等 60 秒
-        max_retries=1,  # 失败只重试一次，别拖慢课堂
+        timeout=timeout,  # 单次请求时长上限（默认 60 秒）
+        max_retries=max_retries,  # 失败重试次数（默认 1，别拖慢课堂）
+        # 输出 token 上限；None = 不限制（默认）
+        max_tokens=max_tokens,  # type: ignore[call-arg]
     )
 
 
