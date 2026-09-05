@@ -33,8 +33,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -206,9 +204,8 @@ THEMES: tuple[dict[str, Any], ...] = (
 def resolve_binary() -> str:
     """API_OFFICECLI_BINARY 优先，否则 PATH 查找；找不到 fail-fast。"""
     configured = os.getenv("API_OFFICECLI_BINARY", "officecli").strip() or "officecli"
-    if Path(configured).exists() or Path(configured).is_absolute():
-        if Path(configured).exists():
-            return configured
+    if Path(configured).exists():
+        return configured
     found = shutil.which(configured)
     if found is None:
         raise SystemExit(
@@ -235,6 +232,7 @@ class Builder:
             errors="replace",
             env=env,
             timeout=120,
+            check=False,
         )
         payload: dict[str, Any] = {}
         try:

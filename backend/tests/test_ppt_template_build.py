@@ -36,6 +36,7 @@ class TestBuildPptTemplatesScript:
             encoding="utf-8",
             errors="replace",
             timeout=300,
+            check=False,
         )
         assert result.returncode == 0, (
             f"构建脚本失败：\nstdout: {result.stdout[-800:]}\n"
@@ -64,6 +65,7 @@ class TestBuildPptTemplatesScript:
                 encoding="utf-8",
                 errors="replace",
                 timeout=300,
+                check=False,
             )
             assert result.returncode == 0, result.stderr[-500:]
         assert first.is_file() and first.stat().st_size > 0

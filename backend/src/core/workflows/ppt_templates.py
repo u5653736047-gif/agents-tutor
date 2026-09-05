@@ -102,8 +102,8 @@ def resolve_template_path(
 
 __all__ = [
     "DEFAULT_LAYOUT_MAP",
-    "PptTemplate",
     "TEMPLATES",
+    "PptTemplate",
     "assets_root_default",
     "resolve_template_path",
     "select_template",
