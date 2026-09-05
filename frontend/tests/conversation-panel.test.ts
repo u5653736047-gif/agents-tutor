@@ -537,6 +537,54 @@ test("MessageRow renders feedback buttons only for assistant rows", async () => 
   assert.doesNotMatch(userMarkup, /data-slot="feedback-up"/);
 });
 
+// 伦理合规:「AI 生成内容」标识与生成文件标注 ——————————————————
+test("MessageRow renders the AI content notice only on assistant rows", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const assistantMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: { agent: "teaching_assistant", content: "回答", role: "assistant" },
+    }),
+  );
+  assert.match(assistantMarkup, /data-slot="ai-content-notice"/);
+  assert.match(assistantMarkup, /内容由 AI 生成/);
+  // 无附件时不渲染生成文件标注(附件区整体零渲染)
+  assert.doesNotMatch(assistantMarkup, /data-slot="generated-files-notice"/);
+
+  const userMarkup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 1,
+      message: { agent: null, content: "问题", role: "user" },
+    }),
+  );
+  assert.doesNotMatch(userMarkup, /data-slot="ai-content-notice"/);
+});
+
+test("MessageRow marks assistant attachments as AI-generated files", async () => {
+  const { MessageRow } = await loadConversationPanel();
+
+  const markup = renderToStaticMarkup(
+    createElement(MessageRow, {
+      index: 0,
+      message: {
+        agent: "teaching_assistant",
+        attachments: [
+          {
+            file_id: "f-1",
+            name: "教案-反向传播.docx",
+            size: 1024,
+          },
+        ],
+        content: "教案已生成",
+        role: "assistant",
+      },
+    }),
+  );
+  assert.match(markup, /data-slot="generated-files-notice"/);
+  assert.match(markup, /文件由 AI 生成/);
+});
+
 test("feedback wiring covers both full and virtualized message paths in source", () => {
   const panel = readFileSync(panelPath, "utf8");
 

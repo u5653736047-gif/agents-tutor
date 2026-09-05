@@ -11,6 +11,7 @@
 import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
 
 import { AgentBadge } from "@/components/agent-badge";
+import { AiContentNotice } from "@/components/ai-content-notice";
 import { AttachmentPreview } from "@/components/conversation-panel";
 import type { components } from "@/contracts/api.generated";
 import { CUSTOM_METADATA_KEYS } from "@/lib/assistant/message-converter";
@@ -210,8 +211,17 @@ export function AssistantMessage() {
                   tone="default"
                 />
               ))}
+              {/* 伦理合规:助手附件即工作流/工具产物,附「文件由 AI 生成」标注 */}
+              <p
+                className="text-caption text-muted-foreground/80"
+                data-slot="generated-files-notice"
+              >
+                文件由 AI 生成，请核对内容后使用
+              </p>
             </div>
           ) : null}
+          {/* 伦理合规:每条助手回答携带「AI 生成内容」常驻标识 */}
+          <AiContentNotice />
         </div>
         <AssistantMessageFooter
           citations={citations}

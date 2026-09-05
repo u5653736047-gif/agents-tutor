@@ -488,6 +488,13 @@ export function AppShell({ apiConnected }: AppShellProps) {
                 <p className="mx-auto mt-3 max-w-lg text-body text-muted-foreground">
                   提出问题后，主智能体会按需调用助教、助学与评价智能体，并整合成一份完整回答。
                 </p>
+                {/* 伦理合规:空态全局声明——系统回答均为 AI 生成内容 */}
+                <p
+                  className="mx-auto mt-2 max-w-lg text-caption text-muted-foreground/80"
+                  data-slot="ai-content-notice"
+                >
+                  内容由 AI 生成，仅供参考，重要信息请人工复核。
+                </p>
               </div>
 
               {/* 示例问题始终展示，点击后创建会话并立即开始流式回答。 */}

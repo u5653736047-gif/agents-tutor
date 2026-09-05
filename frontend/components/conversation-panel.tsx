@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { AgentBadge } from "@/components/agent-badge";
 import { AssistantMarkdown } from "@/components/assistant-markdown";
+import { AiContentNotice } from "@/components/ai-content-notice";
 import { ChatInput } from "@/components/chat-input";
 import { CitationList } from "@/components/citation-list";
 import { GeneratedFilePreview } from "@/components/generated-file-preview";
@@ -241,7 +242,8 @@ export function MessageRow({
           <div className="mt-2">
             <AssistantMarkdown content={message.content} />
             {/* T5-3:助手消息附件区——officecli 生成的文件经后端注册为
-                受控下载附件,这里呈现下载入口;无附件零渲染(与用户侧同一语义)。 */}
+                受控下载附件,这里呈现下载入口;无附件零渲染(与用户侧同一语义)。
+                附件即工作流/工具产物,附「文件由 AI 生成」标注(伦理合规)。 */}
             {message.attachments && message.attachments.length > 0 ? (
               <div
                 className="mt-3 flex flex-col items-start gap-2"
@@ -254,6 +256,12 @@ export function MessageRow({
                     tone="default"
                   />
                 ))}
+                <p
+                  className="text-caption text-muted-foreground/80"
+                  data-slot="generated-files-notice"
+                >
+                  文件由 AI 生成，请核对内容后使用
+                </p>
               </div>
             ) : null}
             {/* P2-12(pi 审查 🟡4 + 审查 W7)：消息级批改卡——后端把
@@ -266,6 +274,8 @@ export function MessageRow({
                 <GradingCard grading={message.grading} />
               </div>
             ) : null}
+            {/* 伦理合规:每条助手回答携带「AI 生成内容」常驻标识 */}
+            <AiContentNotice />
           </div>
         )}
       </div>
